@@ -21,6 +21,8 @@ zaxbygraph --help
 
 Requires [GitHub CLI](https://cli.github.com/) authenticated (`gh auth login`).
 
+Tested on Windows and Linux (CI runs both on 3.11 and 3.12).
+
 Also requires **SQLite 3.35.0+** (2021-03-12), which Python links at build
 time. Python 3.11+ on any current platform satisfies this; a very old Linux
 (e.g. Ubuntu 20.04, SQLite 3.31) does not. The CLI checks on connect and exits

@@ -7,9 +7,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
+        # Windows is the primary target platform, so it is a first-class leg
+        # here: path handling, SQLite/WAL file locking and subprocess argv
+        # quoting all differ from Linux.
+        os: [windows-latest, ubuntu-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
