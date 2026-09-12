@@ -1,0 +1,26 @@
+[project]
+name = "zaxbygraph"
+version = "0.1.0"
+description = "Incremental SQLite knowledge graph of a repository's GitHub issues and pull requests."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "ZaxbyHub" }]
+keywords = ["github", "sqlite", "knowledge-graph", "issues", "pull-requests"]
+
+[project.urls]
+Homepage = "https://github.com/ZaxbyHub/zaxbygraph"
+Repository = "https://github.com/ZaxbyHub/zaxbygraph"
+
+[project.scripts]
+zaxbygraph = "zaxbygraph.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zaxbygraph = ["schema.sql"]
