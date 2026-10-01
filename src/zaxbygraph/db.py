@@ -136,12 +136,15 @@ def _fold_dedupe_table(
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
     collist = ", ".join(cols)
     lowered = ", ".join("lower(repo)" if c == "repo" else c for c in cols)
+    conn.execute("DROP TABLE IF EXISTS _fold")
     conn.execute(f"CREATE TEMP TABLE _fold AS SELECT {collist} FROM main.{table} WHERE 0")
     conn.execute(f"INSERT INTO _fold SELECT {collist} FROM main.{table} ORDER BY {order_by}")
     conn.execute(f"DELETE FROM main.{table}")
+    # ORDER BY rowid keeps the staging table's insertion order (and therefore
+    # the freshest-first survivor rule) SQL-guaranteed, not scan-order luck.
     conn.execute(
         f"INSERT INTO main.{table} ({collist}) "
-        f"SELECT {lowered} FROM _fold WHERE true {conflict_clause}"
+        f"SELECT {lowered} FROM _fold WHERE true ORDER BY rowid {conflict_clause}"
     )
     conn.execute("DROP TABLE _fold")
 

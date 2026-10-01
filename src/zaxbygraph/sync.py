@@ -87,14 +87,17 @@ def sync_repo(
     # one, or it resumed an interrupted one to a clean finish).
     full = since is None or pending_at_start
 
-    jsonl_handle: TextIO | None = None
-    if jsonl_path is not None:
-        jsonl_path.mkdir(parents=True, exist_ok=True)
-        jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
-
     ingested = 0
     last_number: int | None = None
+    jsonl_handle: TextIO | None = None
     try:
+        # Inside the try on purpose: a sidecar setup failure (e.g. the target
+        # path is a regular file) is a failed sync and must record last_error,
+        # not escape with state looking clean. The finally guard tolerates a
+        # half-failed setup because jsonl_handle is None until it opens.
+        if jsonl_path is not None:
+            jsonl_path.mkdir(parents=True, exist_ok=True)
+            jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
         for list_raw in source.list_issues(since):
             if not isinstance(list_raw, dict) or "number" not in list_raw:
                 continue

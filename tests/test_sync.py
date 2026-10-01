@@ -307,3 +307,29 @@ class SyncStateTests(TempDBTest):
         )
         # lookups fold too
         self.assertIsNotNone(item(self.conn, 1, repo="ZaxbyHub/ForgeGate"))
+
+    def test_jsonl_setup_failure_records_last_error_and_reports(self) -> None:
+        # A sidecar setup failure is a failed sync: it must record last_error
+        # (leaving complete false), and the CLI must report a result object,
+        # never a traceback (review round 1 finding, sync.py jsonl block).
+        self.src.add_issue(issue(1))
+        blocker = Path(self._td.name) / "blocker"
+        blocker.write_text("in the way", encoding="utf-8")
+        args = argparse.Namespace(
+            repo=REPO,
+            db=str(self.db_path),
+            force=False,
+            include_patches=False,
+            jsonl=str(blocker / "sub"),  # mkdir fails: blocker is a file
+            jsonl_flag=False,
+            format="json",
+        )
+        with patch("zaxbygraph.cli.GhApiSource", return_value=self.src):
+            code = cmd_sync(args)
+        self.assertEqual(code, 1)
+        row = self.conn.execute(
+            "SELECT last_error, full_sync_pending FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()
+        self.assertIsNotNone(row["last_error"])
+        self.assertEqual(row["full_sync_pending"], 1)
+        self.assertFalse(status(self.conn, REPO)["repos"][0]["complete"])
