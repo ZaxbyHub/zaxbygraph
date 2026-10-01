@@ -58,7 +58,8 @@ class GhApiSource:
                 cmd,
                 check=False,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except FileNotFoundError as exc:
             raise GitHubError(

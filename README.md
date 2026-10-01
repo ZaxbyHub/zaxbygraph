@@ -242,6 +242,10 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Object vs array.** `status`, `search`, `item`, `related`, `path`, and
   `export-graph` return JSON **objects**. `churn` and `open` return bare JSON
   **arrays**. Indexing `result["items"]` into `churn` output will fail.
+- **Output encoding.** stdout and stderr are UTF-8 on every platform,
+  regardless of the ambient locale — emoji and CJK in titles and bodies
+  round-trip exactly. `--repo` matches case-insensitively; canonical storage
+  is lowercase.
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
   request was malformed (bad flags, non-read SQL, multiple statements). **`1`** —
   a runtime failure: item not found, sync error, or an authorizer denial at

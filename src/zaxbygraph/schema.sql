@@ -155,7 +155,8 @@ CREATE TABLE IF NOT EXISTS sync_state (
     item_count         INTEGER NOT NULL DEFAULT 0,
     comment_count      INTEGER NOT NULL DEFAULT 0,
     edge_count         INTEGER NOT NULL DEFAULT 0,
-    include_patches    INTEGER NOT NULL DEFAULT 0
+    include_patches    INTEGER NOT NULL DEFAULT 0,
+    full_sync_pending  INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(

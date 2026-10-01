@@ -1,4 +1,4 @@
-# Schema reference (schema version 1)
+# Schema reference (schema version 2, `PRAGMA user_version` = 2)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -220,6 +220,34 @@ One row per repo. What `zaxbygraph status` reads.
 | `comment_count` | INTEGER | |
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
+| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+
+### Schema versions and migrations
+
+`PRAGMA user_version` is the authoritative schema state (currently `2`). The
+`meta.schema_version` row is informational only. On open, `init_schema`:
+
+- refuses loudly when `user_version` is newer than the build (a database from
+  a future zaxbygraph),
+- creates missing objects at the current shape (idempotent `IF NOT EXISTS`),
+- applies each pending migration in its own transaction that ends by stamping
+  `user_version` — an interrupted migration rolls back whole and re-runs.
+
+Migration 1→2 adds `sync_state.full_sync_pending` and folds repo slugs to
+lowercase across every repo-keyed table, merging case-split duplicates
+(freshest row per folded key; `sync_state` timestamps take MAX; distinct-id
+`(repo, number)` collisions keep the freshest item and delete the losers'
+number-scoped rows under their own casing). For a legacy row whose
+`last_full_sync_at` is NULL the migration sets `full_sync_pending = 1`: a
+complete-but-unprovable corpus reports `complete: false` until the next clean
+run drains the listing and stamps the timestamp — truthful because each item
+commits with its own watermark bump, so a clean run from the watermark has
+covered everything at or below it.
+
+Two operational notes: the first command that opens a legacy database (even a
+read like `search`) performs the one-time migration write; and the read-only
+`sql` path intentionally does not migrate — it reads whatever schema the file
+has.
 
 ### Identity and the watermark
 

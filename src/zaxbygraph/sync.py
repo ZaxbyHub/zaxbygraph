@@ -7,6 +7,7 @@ from typing import TextIO
 
 from zaxbygraph.extract import item_kind
 from zaxbygraph.github import GitHubError, GitHubSource
+from zaxbygraph.repo import validate_slug
 from zaxbygraph.store import (
     ingest_item,
     log_fetch,
@@ -20,6 +21,11 @@ from zaxbygraph.store import (
 
 class SyncError(RuntimeError):
     pass
+
+
+def _error_text(exc: BaseException) -> str:
+    text = str(exc) or type(exc).__name__
+    return text[:2000]
 
 
 def _write_jsonl(handle: TextIO | None, resource: str, payload: object) -> None:
@@ -52,19 +58,34 @@ def sync_repo(
     jsonl_path: Path | None = None,
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction."""
-    _ensure_state_row(conn, repo, include_patches)
+    repo = validate_slug(repo)  # canonical lowercase identity for every key
     if force:
+        # The force reset runs first so the pending marker below is computed
+        # from the watermark this run will actually use.
         conn.execute(
             "UPDATE sync_state SET issues_since = NULL, last_error = NULL WHERE repo = ?",
             (repo,),
         )
         conn.commit()
+    _ensure_state_row(conn, repo, include_patches)
 
     row = conn.execute(
-        "SELECT issues_since FROM sync_state WHERE repo = ?", (repo,)
+        "SELECT issues_since, full_sync_pending FROM sync_state WHERE repo = ?", (repo,)
     ).fetchone()
     since = None if row is None else row["issues_since"]
-    full = since is None
+    pending_at_start = bool(row is not None and row["full_sync_pending"])
+    if since is None:
+        # Beginning a full sync (fresh repo or --force): mark it pending so a
+        # crash mid-run leaves complete=false, and the resuming run can stamp
+        # last_full_sync_at when it drains the listing.
+        conn.execute(
+            "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
+        )
+        conn.commit()
+        pending_at_start = True
+    # "full" in the result means: this run completes a full sync (it started
+    # one, or it resumed an interrupted one to a clean finish).
+    full = since is None or pending_at_start
 
     jsonl_handle: TextIO | None = None
     if jsonl_path is not None:
@@ -150,7 +171,7 @@ def sync_repo(
         conn.execute("BEGIN IMMEDIATE")
         try:
             replace_releases(conn, repo, releases)
-            mark_sync_finished(conn, repo, full=full)
+            mark_sync_finished(conn, repo)
             recount(conn, repo)
             conn.commit()
         except Exception:
@@ -158,11 +179,23 @@ def sync_repo(
             raise
         for rec in releases:
             _write_jsonl(jsonl_handle, "release", rec)
-    except (GitHubError, sqlite3.Error) as exc:
-        conn.execute("BEGIN IMMEDIATE")
-        set_last_error(conn, repo, str(exc))
-        conn.commit()
-        raise SyncError(str(exc)) from exc
+    except BaseException as exc:
+        # Every failure leaves a truthful trail. A BaseException (decode
+        # error, AttributeError on a dead reader thread, KeyboardInterrupt)
+        # can escape between BEGIN IMMEDIATE and commit, so roll any open
+        # transaction back before recording, or the recorder itself would
+        # hit "cannot start a transaction within a transaction".
+        if conn.in_transaction:
+            conn.rollback()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            set_last_error(conn, repo, _error_text(exc))
+            conn.commit()
+        except sqlite3.Error:
+            pass  # a dying database cannot record; propagate the original
+        if isinstance(exc, (GitHubError, sqlite3.Error)):
+            raise SyncError(str(exc)) from exc
+        raise
     finally:
         if jsonl_handle is not None:
             jsonl_handle.close()

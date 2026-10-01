@@ -19,12 +19,22 @@ interpretation is yours to make and to label as yours.
 ## First action
 
 ```bash
+zaxbygraph status --repo OWNER/REPO
+```
+
+`status` answers whether a corpus already exists, and whether it is complete
+and error-free (`complete: true`, `last_error: null`). Only when status
+reports no corpus for the repo — no repo rows at all, or an empty database —
+run the one-time build:
+
+```bash
 zaxbygraph sync --repo OWNER/REPO
 ```
 
 Then query. After a successful sync, **never** page `gh api --paginate` of
 issues, PRs, comments, or reviews into context — that spends exactly the context
-the sync saved.
+the sync saved. A worktree or a different checkout may resolve to a different
+database, so checking `status` first is what stops a needless cold rebuild.
 
 Check the result before trusting the DB:
 

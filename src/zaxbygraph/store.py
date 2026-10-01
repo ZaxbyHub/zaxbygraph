@@ -355,18 +355,30 @@ def set_last_error(conn: sqlite3.Connection, repo: str, message: str) -> None:
     )
 
 
-def mark_sync_finished(conn: sqlite3.Connection, repo: str, *, full: bool) -> None:
-    col = "last_full_sync_at" if full else "last_incr_sync_at"
+def mark_sync_finished(conn: sqlite3.Connection, repo: str) -> None:
+    """Stamp a clean finish.
+
+    When a full sync is pending — this run started one, or it resumed an
+    interrupted one — completing cleanly IS the completion of that full sync:
+    stamp `last_full_sync_at` and clear the marker. Otherwise this was a plain
+    incremental run. Truthful because each item commits with its own watermark
+    bump in one transaction, so a run that drains the listing has covered
+    everything at or below the watermark.
+    """
     now = utcnow()
+    conn.execute("INSERT OR IGNORE INTO sync_state(repo) VALUES (?)", (repo,))
     conn.execute(
-        f"""
-        INSERT INTO sync_state(repo, {col}, last_error)
-        VALUES (?, ?, NULL)
-        ON CONFLICT(repo) DO UPDATE SET
-            {col} = excluded.{col},
+        """
+        UPDATE sync_state SET
+            last_full_sync_at = CASE WHEN full_sync_pending = 1
+                                THEN :now ELSE last_full_sync_at END,
+            last_incr_sync_at = CASE WHEN full_sync_pending = 0
+                                THEN :now ELSE last_incr_sync_at END,
+            full_sync_pending = 0,
             last_error = NULL
+        WHERE repo = :repo
         """,
-        (repo, now),
+        {"now": now, "repo": repo},
     )
 
 
