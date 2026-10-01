@@ -70,6 +70,18 @@ class CliTests(unittest.TestCase):
         code, out, err = self.run_cmd(["item", "99", "--db", self.db, "--format", "json"])
         self.assertEqual(code, 1)
 
+    def test_sync_storage_fault_reported_not_traceback(self) -> None:
+        # A storage fault before the sync starts (bad DB file) is a result
+        # object on stdout with a non-zero exit, never a traceback.
+        bad = Path(self._td.name) / "notadb"
+        bad.write_text("garbage", encoding="utf-8")
+        code, out, err = self.run_cmd(
+            ["sync", "--repo", "acme/forgegate", "--db", str(bad), "--format", "json"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn('"ok": false', out)
+        self.assertNotIn("Traceback", out + err)
+
 
 def _scrubbed_env() -> dict:
     env = {

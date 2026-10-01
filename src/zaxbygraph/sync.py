@@ -58,43 +58,48 @@ def sync_repo(
     jsonl_path: Path | None = None,
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction."""
+    # Everything that touches the database lives inside the try: the recorder
+    # must see prologue failures too (force reset, state-row ensure, pending
+    # marker) — a lock or disk fault landing there is still a failed sync and
+    # may not escape with state looking clean. validate_slug is pure and stays
+    # out; set_last_error upserts the state row, so recording works even when
+    # the row was never created.
     repo = validate_slug(repo)  # canonical lowercase identity for every key
-    if force:
-        # The force reset runs first so the pending marker below is computed
-        # from the watermark this run will actually use.
-        conn.execute(
-            "UPDATE sync_state SET issues_since = NULL, last_error = NULL WHERE repo = ?",
-            (repo,),
-        )
-        conn.commit()
-    _ensure_state_row(conn, repo, include_patches)
-
-    row = conn.execute(
-        "SELECT issues_since, full_sync_pending FROM sync_state WHERE repo = ?", (repo,)
-    ).fetchone()
-    since = None if row is None else row["issues_since"]
-    pending_at_start = bool(row is not None and row["full_sync_pending"])
-    if since is None:
-        # Beginning a full sync (fresh repo or --force): mark it pending so a
-        # crash mid-run leaves complete=false, and the resuming run can stamp
-        # last_full_sync_at when it drains the listing.
-        conn.execute(
-            "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
-        )
-        conn.commit()
-        pending_at_start = True
-    # "full" in the result means: this run completes a full sync (it started
-    # one, or it resumed an interrupted one to a clean finish).
-    full = since is None or pending_at_start
-
     ingested = 0
     last_number: int | None = None
     jsonl_handle: TextIO | None = None
     try:
-        # Inside the try on purpose: a sidecar setup failure (e.g. the target
-        # path is a regular file) is a failed sync and must record last_error,
-        # not escape with state looking clean. The finally guard tolerates a
-        # half-failed setup because jsonl_handle is None until it opens.
+        if force:
+            # The force reset runs first so the pending marker below is
+            # computed from the watermark this run will actually use.
+            conn.execute(
+                "UPDATE sync_state SET issues_since = NULL, last_error = NULL WHERE repo = ?",
+                (repo,),
+            )
+            conn.commit()
+        _ensure_state_row(conn, repo, include_patches)
+
+        row = conn.execute(
+            "SELECT issues_since, full_sync_pending FROM sync_state WHERE repo = ?", (repo,)
+        ).fetchone()
+        since = None if row is None else row["issues_since"]
+        pending_at_start = bool(row is not None and row["full_sync_pending"])
+        if since is None:
+            # Beginning a full sync (fresh repo or --force): mark it pending
+            # so a crash mid-run leaves complete=false, and the resuming run
+            # can stamp last_full_sync_at when it drains the listing.
+            conn.execute(
+                "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
+            )
+            conn.commit()
+            pending_at_start = True
+        # "full" in the result means: this run completes a full sync (it
+        # started one, or it resumed an interrupted one to a clean finish).
+        full = since is None or pending_at_start
+
+        # Sidecar setup is a failure path too (e.g. the target path is a
+        # regular file). The finally guard tolerates a half-failed setup
+        # because jsonl_handle is None until it opens.
         if jsonl_path is not None:
             jsonl_path.mkdir(parents=True, exist_ok=True)
             jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
@@ -201,7 +206,13 @@ def sync_repo(
         raise
     finally:
         if jsonl_handle is not None:
-            jsonl_handle.close()
+            # Every record is flushed as it is written, so a failing close
+            # loses nothing; and an exception raised in finally is not caught
+            # by the sibling except, so it must not escape unrecorded.
+            try:
+                jsonl_handle.close()
+            except OSError:
+                pass
 
     state = conn.execute(
         "SELECT * FROM sync_state WHERE repo = ?", (repo,)

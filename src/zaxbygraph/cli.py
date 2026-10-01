@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -86,7 +87,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     owner, name = slug.split("/", 1)
-    conn, db_path = _open_db(args)
+    db_path = Path(args.db) if args.db else default_db_path()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = connect(db_path)
+        init_schema(conn)
+    except Exception as exc:
+        # A storage fault before the sync starts is reported as the same
+        # result object, not a traceback (AGENTS.md: reported, not swallowed).
+        if conn is not None:
+            conn.close()
+        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        return 1
     jsonl: Path | None = None
     if args.jsonl:
         jsonl = Path(args.jsonl)

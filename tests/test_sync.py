@@ -333,3 +333,21 @@ class SyncStateTests(TempDBTest):
         self.assertIsNotNone(row["last_error"])
         self.assertEqual(row["full_sync_pending"], 1)
         self.assertFalse(status(self.conn, REPO)["repos"][0]["complete"])
+
+    def test_prologue_failure_records_last_error(self) -> None:
+        # A fault in the prologue (force reset / state-row ensure / pending
+        # marker) is still a failed sync: it must not escape with state
+        # looking clean (review round 2 finding, lock-landing experiment).
+        self.src.add_issue(issue(1))
+        with patch(
+            "zaxbygraph.sync._ensure_state_row",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            with self.assertRaises(SyncError):
+                self.sync()
+        row = self.conn.execute(
+            "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn("database is locked", row["last_error"])
+        self.assertFalse(status(self.conn, REPO)["repos"][0]["complete"])

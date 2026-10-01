@@ -34,10 +34,16 @@ def connect(db_path: Path) -> sqlite3.Connection:
     assert_sqlite_supported()
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
+    except BaseException:
+        # A PRAGMA failure (e.g. "file is not a database") must not orphan an
+        # open handle: on Windows that locks the file against cleanup.
+        conn.close()
+        raise
     return conn
 
 
