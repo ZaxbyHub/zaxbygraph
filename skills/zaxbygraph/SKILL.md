@@ -24,12 +24,16 @@ zaxbygraph status --repo OWNER/REPO
 
 `status` answers whether a corpus already exists, and whether it is complete
 and error-free (`complete: true`, `last_error: null`). Only when status
-reports no corpus for the repo — no repo rows at all, or an empty database —
+reports no corpus for the repo (exit 3) —
 run the one-time build:
 
 ```bash
 zaxbygraph sync --repo OWNER/REPO
 ```
+
+(On a GitHub Enterprise checkout, sync WITHOUT `--repo` from the checkout
+itself so the origin host is captured; a bare `--repo OWNER/REPO` always
+keys the store under `github.com`.)
 
 If a corpus exists but `complete: false` or `last_error` is non-null, the
 last sync stopped early — re-run the same `sync` (it resumes from the
@@ -37,10 +41,12 @@ watermark) and do not draw conclusions from the DB until it finishes clean.
 
 Then query. After a successful sync, **never** page `gh api --paginate` of
 issues, PRs, comments, or reviews into context — that spends exactly the context
-the sync saved. Every checkout of the same repo — worktrees, clones,
-subagents — resolves the SAME graph, so `status` answers identically from
-anywhere; it is still the cheap guard against drawing conclusions from a
-corpus that was never built.
+the sync saved. Once the user-level store exists, every checkout of the same repo —
+worktrees, clones, subagents — resolves the SAME graph. During migration
+(a checkout still serving a legacy in-repo DB before `doctor
+--consolidate` runs), `zaxbygraph where` tells you which file each
+checkout is serving; `status` remains the cheap guard against drawing
+conclusions from a corpus that was never built.
 
 Check the result before trusting the DB:
 
@@ -153,7 +159,7 @@ The graph is keyed by repo, not by checkout (issue #2). Resolution order:
 `--db` → `ZAXBYGRAPH_DB` → the user-level store for the slug
 (`<root>/<host>/<owner>/<repo>/history.db`, root = `%LOCALAPPDATA%\zaxbygraph`
 on Windows, `${XDG_DATA_HOME:-~/.local/share}/zaxbygraph` elsewhere,
-`ZAXBYGRAPH_HOME` overrides) → a legacy in-repo DB under the MAIN worktree
+`ZAXBYGRAPH_HOME` overrides) → a legacy in-repo DB under the MAIN worktree or the current checkout
 (migration continuity). Every checkout of the same repo resolves the same
 file. Only `sync` (and `doctor --consolidate`) creates a database: reads
 exit `3` and print the resolved path plus the exact sync command when no

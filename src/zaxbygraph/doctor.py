@@ -84,32 +84,36 @@ def inspect(path: Path, repo: str) -> dict | None:
             return None
         try:
             try:
+                # EVERY query below is inside this guard (PRR-003): a
+                # partial/foreign sqlite file that happens to be named
+                # history.db must be reported as unusable (None), never
+                # crash the whole doctor command.
                 if not _has_column(conn, "sync_state", "repo"):
                     return None
+                pend = _has_column(conn, "sync_state", "full_sync_pending")
+                complete_expr = "last_full_sync_at IS NOT NULL"
+                if pend:
+                    complete_expr += " AND full_sync_pending = 0"
+                state = conn.execute(
+                    "SELECT issues_since FROM sync_state WHERE lower(repo) = ?", (repo_l,)
+                ).fetchone()
+                items = conn.execute(
+                    "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
+                ).fetchone()["c"]
+                garbled = conn.execute(
+                    "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ? "
+                    "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
+                    (repo_l,),
+                ).fetchone()["c"]
+                complete = False
+                if state is not None:
+                    row = conn.execute(
+                        f"SELECT ({complete_expr}) AS c FROM sync_state WHERE lower(repo) = ?",
+                        (repo_l,),
+                    ).fetchone()
+                    complete = bool(row["c"])
             except sqlite3.DatabaseError:
                 return None
-            pend = _has_column(conn, "sync_state", "full_sync_pending")
-            complete_expr = "last_full_sync_at IS NOT NULL"
-            if pend:
-                complete_expr += " AND full_sync_pending = 0"
-            state = conn.execute(
-                f"SELECT issues_since FROM sync_state WHERE lower(repo) = ?", (repo_l,)
-            ).fetchone()
-            items = conn.execute(
-                "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
-            ).fetchone()["c"]
-            garbled = conn.execute(
-                "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ? "
-                "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
-                (repo_l,),
-            ).fetchone()["c"]
-            complete = False
-            if state is not None:
-                row = conn.execute(
-                    f"SELECT ({complete_expr}) AS c FROM sync_state WHERE lower(repo) = ?",
-                    (repo_l,),
-                ).fetchone()
-                complete = bool(row["c"])
             return {
                 "path": str(path),
                 "items": int(items),
@@ -121,29 +125,48 @@ def inspect(path: Path, repo: str) -> dict | None:
             conn.close()
 
 
-def _migrated_copy(path: Path) -> tuple[Path, bool]:
+class _MigratedCopy:
     """Temp copy of a legacy DB, migrated to the current schema if needed.
 
     connect+init_schema runs the MIGRATIONS framework on the copy (case
     folds, adds full_sync_pending); the original is never opened for write.
-    Returns (copy_path, was_migrated).
+    The temp directory is removed on close (PRR-006: every --consolidate
+    used to leak a full DB copy into the system temp dir).
     """
-    td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
-    copy = Path(td) / path.name
-    shutil.copy2(path, copy)
-    conn = sqlite3.connect(str(copy))
-    try:
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    except sqlite3.DatabaseError:
+
+    def __init__(self, path: Path) -> None:
+        self._td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
+        self.path = Path(self._td) / path.name
+        shutil.copy2(path, self.path)
+        conn = sqlite3.connect(str(self.path))
+        try:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        except sqlite3.DatabaseError:
+            self.migrated = False
+            conn.close()
+            return
         conn.close()
-        return copy, False
-    conn.close()
-    if version >= CURRENT_USER_VERSION:
-        return copy, False
-    conn = connect(copy)
-    init_schema(conn)
-    conn.close()
-    return copy, True
+        self.migrated = version < CURRENT_USER_VERSION
+        if self.migrated:
+            conn = connect(self.path)
+            init_schema(conn)
+            conn.close()
+
+    def close(self) -> None:
+        shutil.rmtree(self._td, ignore_errors=True)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def _migrated_copy(path: Path):
+    """Context manager yielding the migrated temp copy path."""
+    copy = _MigratedCopy(path)
+    try:
+        yield copy.path
+    finally:
+        copy.close()
 
 
 def consolidate(store_db: Path, path: Path, repo: str) -> None:
@@ -158,15 +181,14 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
     INSERT OR REPLACE's double-unique semantics could silently drop rows.
     """
     repo_l = repo.lower()
-    source, _migrated = _migrated_copy(path)
-    src = open_existing(source)
-    try:
+    with _migrated_copy(path) as source:
+        src = open_existing(source)
         dst = connect(store_db)
         init_schema(dst)  # the store may not exist yet; doctor may create it
         try:
             dst.execute("BEGIN IMMEDIATE")
             try:
-                for table, _keep in _COPY_TABLES:
+                for table, autoinc_pk in _COPY_TABLES:
                     dst.execute(f"DELETE FROM {table} WHERE repo = ?", (repo_l,))
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
@@ -214,7 +236,9 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                             state["full_sync_pending"],
                         ),
                     )
-                for (actor, url,) in src.execute("SELECT login, html_url FROM actors"):
+                # actors is a global login->url table (no repo column), so it
+                # is copied wholesale despite the slug-scoped delete above.
+                for actor, url in src.execute("SELECT login, html_url FROM actors"):
                     dst.execute(
                         "INSERT INTO actors(login, html_url) VALUES (?, ?) "
                         "ON CONFLICT(login) DO UPDATE SET html_url = excluded.html_url",
@@ -227,8 +251,7 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                 raise
         finally:
             dst.close()
-    finally:
-        src.close()
+            src.close()
 
 
 def doctor(

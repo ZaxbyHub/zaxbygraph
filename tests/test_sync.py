@@ -12,7 +12,7 @@ from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pr_file, pull
 from zaxbygraph.cli import cmd_sync
 from zaxbygraph.store import ingest_item as real_ingest_item
 from zaxbygraph.query import item, status
-from zaxbygraph.sync import SyncError, sync_repo
+from zaxbygraph.sync import SyncError, _pid_alive, sync_repo  # noqa: F401 — _pid_alive is the production helper (PRR-011): the suite must exercise the exact fail-closed semantics the lock ships with.
 
 
 class SyncTests(TempDBTest):
@@ -381,40 +381,6 @@ from fixtures import REPO, TempDBTest, issue, pr_file, pull
 from zaxbygraph.cli import main
 
 
-def _pid_alive(pid):
-    """True when `pid` names a process that is running right now.
-
-    Windows: os.kill(pid, 0) would TERMINATE the process (sig becomes the
-    exit code), so liveness is probed via OpenProcess/GetExitCodeProcess.
-    """
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        import ctypes
-
-        STILL_ACTIVE = 259
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32 = ctypes.windll.kernel32
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            code = ctypes.c_ulong()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return True
-    return True
-
 
 class SyncLockTests(TempDBTest):
     """Issue #2 AC5: one sync per repo at a time, enforced by <db>.sync.lock.
@@ -496,6 +462,23 @@ class SyncLockTests(TempDBTest):
         data = json.loads(out)
         self.assertIs(data["ok"], True)
         self.assertIs(data.get("joined"), True)
+
+        # --- foreign host with a DEAD pid: still never stolen (PRR-012) ---
+        dead_foreign = self.dead_pid()
+        self.assertFalse(_pid_alive(dead_foreign))
+        self.write_lock(dead_foreign, "foreign-host-" + socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
         self.assertEqual(self.src.extra_fetches, 0)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
 
@@ -533,6 +516,7 @@ class SyncLockTests(TempDBTest):
         data = json.loads(out)
         self.assertIs(data["ok"], True)
         self.assertIsNot(data.get("joined"), True)
-        self.assertGreaterEqual(elapsed, 0.2, "--wait did not block for the lock")
+        self.assertGreaterEqual(elapsed, 0.45, "--wait returned before the holder died")
+        self.assertLess(elapsed, 30.0, "--wait spun far too long")
         # Idempotent re-sync of the same corpus: still exactly the 2 items.
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)

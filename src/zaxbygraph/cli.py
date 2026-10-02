@@ -368,6 +368,7 @@ def cmd_where(args: argparse.Namespace) -> int:
     items = 0
     watermark = None
     complete = False
+    store_error = None
     if repo and store_path.exists():
         try:
             conn = open_existing(store_path)
@@ -388,8 +389,10 @@ def cmd_where(args: argparse.Namespace) -> int:
                 watermark = row["issues_since"]
                 complete = not row["full_sync_pending"] and row["last_error"] is None
                 exists = True
-        except sqlite3.DatabaseError:
-            pass
+        except sqlite3.DatabaseError as exc:
+            # A corrupt/unreadable store must stay distinguishable from a
+            # never-created one (PRR-007) without crashing the diagnostic.
+            store_error = str(exc)
     elif not repo and store_path.exists():
         # Slug-less where: report file-scoped facts. items is the UNFILTERED
         # count (matching --repo '' = no-filter); watermark/complete are
@@ -403,8 +406,8 @@ def cmd_where(args: argparse.Namespace) -> int:
                 )
             finally:
                 conn.close()
-        except sqlite3.DatabaseError:
-            pass
+        except sqlite3.DatabaseError as exc:
+            store_error = str(exc)
     data = {
         "cwd": str(cwd),
         "git_common_dir": str(common) if common is not None else None,
@@ -417,6 +420,7 @@ def cmd_where(args: argparse.Namespace) -> int:
         "legacy": [str(p) for p in legacy_db_paths(cwd)],
         "serving": str(serving),
         "sync_lock": read_lock_observer(serving),
+        "store_error": store_error,
     }
     _emit(data, _want_json(args))
     return 0
@@ -435,13 +439,19 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     if args.db:
         store_db = Path(args.db)
     scans = [Path(s) for s in args.scan]
-    data = doctor_run(
-        Path.cwd(),
-        repo,
-        store_db,
-        extra_scans=scans,
-        consolidate_flag=args.consolidate,
-    )
+    try:
+        data = doctor_run(
+            Path.cwd(),
+            repo,
+            store_db,
+            extra_scans=scans,
+            consolidate_flag=args.consolidate,
+        )
+    except Exception as exc:
+        # A storage fault during report/consolidation is a result object,
+        # never a traceback (AGENTS.md: reported, not swallowed; PRR-010).
+        _emit({"ok": False, "error": str(exc), "store": str(store_db)}, _want_json(args))
+        return 1
     data["store"] = str(store_db)
     _emit(data, _want_json(args))
     return 0

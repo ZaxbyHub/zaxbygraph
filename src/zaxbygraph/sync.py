@@ -248,7 +248,9 @@ def sync_repo(
 
 
 def lock_path_for(db_path: Path) -> Path:
-    return Path(str(db_path) + ".sync.lock")
+    # Resolve first (PRR-002): raw --db spellings of the same file (relative
+    # forms, trailing dots, symlink aliases) must share one lock.
+    return Path(str(Path(db_path).resolve()) + ".sync.lock")
 
 
 def _lock_range(fd: int) -> None:
@@ -401,6 +403,12 @@ def acquire_sync_lock(
             _lock_range(fd)
         except OSError:
             os.close(fd)
+            # Distinguish contention from an environmental fault (PRR-008):
+            # when the observer can see a holder, another process owns the
+            # lock; when it sees nothing, the range-lock failure was NOT
+            # contention and must surface as an error, not a silent join.
+            if read_lock_observer(path) is None:
+                raise
             if not wait:
                 return None
             time.sleep(poll_s)

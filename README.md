@@ -79,7 +79,7 @@ clone, and subagent of the same repository resolves the same file.
 | 1 | `--db PATH` when passed (explicit always wins) |
 | 2 | `ZAXBYGRAPH_DB` environment variable |
 | 3 | The user-level store: `<root>/<host>/<owner>/<repo>/history.db` |
-| 4 | A legacy in-repo DB under the **main** worktree (`.zaxbygraph/` or `.swarm/zaxbygraph/`), for migration continuity until `doctor --consolidate` runs |
+| 4 | A legacy in-repo DB under the **main** worktree or the current checkout (`.zaxbygraph/` or `.swarm/zaxbygraph/`), for migration continuity until `doctor --consolidate` runs |
 | 5 | Nothing yet — reads exit `3`; `sync` creates the store |
 
 The store root is `%LOCALAPPDATA%\zaxbygraph` on Windows and
@@ -106,7 +106,7 @@ consolidation DESTINATION (the store), not the scan sources.
 
 Concurrent `sync` runs of one
 repo serialize through a lock file (`<db>.sync.lock`): a second sync joins
-with `{"ok": true, "joined": true}` and zero GitHub calls, `--wait` blocks for
+with `{"ok": true, "joined": true, "repo": ..., "db": ...}` and zero GitHub calls, `--wait` blocks for
 the lock, and a lock left by a dead same-host pid is recovered automatically.
 
 **Do not commit `history.db`** — it is a rebuildable cache, not source.

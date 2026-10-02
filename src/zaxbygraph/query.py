@@ -449,6 +449,9 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200, repo: str | No
         # repo. Post-fetch and column-name based; a projection without a
         # repo column cannot be filtered (per-slug stores make that
         # store-scoped by construction — documented in README).
+        # truncated reports the PRE-filter rowset (PRR-004): the unfiltered
+        # query genuinely had more rows than the limit, so raising the limit
+        # always converges; the flag must not be recomputed post-filter.
         idx = cols.index("repo")
         rows = [row for row in rows if row[idx] == repo]
     return {"columns": cols, "rows": rows, "truncated": truncated}

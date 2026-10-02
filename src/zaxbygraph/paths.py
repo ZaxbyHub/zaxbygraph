@@ -121,11 +121,39 @@ def resolve_db(
         chain.append(f"store exists: {store}")
         return store, chain
     chain.append(f"store missing: {store}")
-    for legacy in legacy_db_paths(cwd):
+    # Corpus-aware legacy fallback (PRR-005): when several legacy layouts
+    # coexist, prefer one that actually holds the resolved repo instead of
+    # the hard-coded first candidate, which can mask a live corpus.
+    legacy_paths = legacy_db_paths(cwd)
+    for legacy in legacy_paths:
+        if _legacy_has_repo(legacy, repo):
+            chain.append(f"legacy holds {repo}: {legacy}")
+            return legacy, chain
+    for legacy in legacy_paths:
         chain.append(f"legacy: {legacy}")
         return legacy, chain
     chain.append("nothing exists; the store path is what sync would create")
     return store, chain
+
+
+def _legacy_has_repo(legacy: Path, repo: str) -> bool:
+    """True when the legacy DB has a sync_state row for the folded repo."""
+    from zaxbygraph.db import open_existing
+
+    try:
+        conn = open_existing(legacy)
+    except Exception:
+        return False
+    try:
+        try:
+            row = conn.execute(
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?", (repo,)
+            ).fetchone()
+        except Exception:
+            return False
+        return row is not None
+    finally:
+        conn.close()
 
 
 def default_jsonl_dir(db_path: Path) -> Path:
