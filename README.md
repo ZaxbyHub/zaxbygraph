@@ -252,7 +252,9 @@ Result rows carrying a `repo` column are filtered to the resolved repo
 (issue #2). A projection without a `repo` column is only store-scoped by
 construction - filter explicitly when aiming `--db` at a multi-repo file.
 A file that is not a zaxbygraph database exits 1 with a clean
-`error: ... is not a zaxbygraph database` message.
+`error: ... is not a zaxbygraph database` message. When the resolved repo is filtered, `truncated` reports the
+PRE-filter rowset: it stays `true` while any unfiltered rows remain above
+the limit, so raise the limit to converge.
 
 ```bash
 zaxbygraph sql "SELECT number, title FROM items WHERE state='open'"

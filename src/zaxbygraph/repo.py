@@ -6,12 +6,14 @@ from pathlib import Path
 
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-#: Store-safe host charset (lowercased before this check): RFC-1132-ish
-#: hostname — letters, digits, hyphens, single-dot separators. Rejects
-#: userinfo (`user:pass@`), ports (`host:2222`), path separators including
-#: Windows backslashes, and any `..` sequence (issue #10 review PRR-001:
-#: the host becomes ONE path segment under the store root, so `..` or `\`
-#: would escape it and a port would create an unusable directory).
+#: Store-safe host charset (lowercased before this check): hostname
+#: characters — letters, digits, hyphens, dots, underscore. `_clean_host`
+#: strips userinfo (`user:pass@`), folds a trailing `:port` into a
+#: path-safe `host_port` suffix (distinct ports keep distinct stores), and
+#: rejects path separators including Windows backslashes and any `..`
+#: sequence (issue #10 review PRR-001: the host becomes ONE path segment
+#: under the store root, so `..` or `\` would escape it and a raw `:`
+#: would create an unusable directory).
 HOST_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9._-]*[a-z0-9_])?$")
 
 DEFAULT_HOST = "github.com"
@@ -104,8 +106,12 @@ def _parse_remote_url(url: str) -> str | None:
 
 
 def _redact_url(url: str) -> str:
-    """Mask userinfo credentials before echoing an origin URL anywhere."""
-    return re.sub(r"//([^/@/]+)@", "//***@", url)
+    """Mask userinfo credentials before echoing an origin URL anywhere.
+
+    Greedy through the last `@` before the first `/`: `user:p@ss@host`
+    would otherwise leak the credential tail past a single-@ mask
+    (final-critic round on PR #10)."""
+    return re.sub(r"//[^/]*@", "//***@", url)
 
 
 def slug_from_git(cwd: Path | None = None) -> str:

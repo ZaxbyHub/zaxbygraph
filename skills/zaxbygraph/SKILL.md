@@ -31,9 +31,10 @@ run the one-time build:
 zaxbygraph sync --repo OWNER/REPO
 ```
 
-(On a GitHub Enterprise checkout, sync WITHOUT `--repo` from the checkout
-itself so the origin host is captured; a bare `--repo OWNER/REPO` always
-keys the store under `github.com`.)
+(On a GitHub Enterprise checkout, run every command WITHOUT `--repo` from
+the checkout itself so the origin host is captured; a bare
+`--repo OWNER/REPO` always keys the store under `github.com` - mixing the
+two forms splits one repo across two stores.)
 
 If a corpus exists but `complete: false` or `last_error` is non-null, the
 last sync stopped early — re-run the same `sync` (it resumes from the

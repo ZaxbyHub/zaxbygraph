@@ -407,6 +407,18 @@ class SyncLockTests(TempDBTest):
         self.assertFalse(_pid_alive(self.dead_pid()))
         self.assertTrue(_pid_alive(os.getpid()))
 
+    def test_empty_lock_file_with_held_range_lock_joins(self) -> None:
+        """Critic blocker: a holder that owns the range lock but has not
+        written its payload yet (empty file) is CONTENTION - the second
+        sync joins instead of raising (pre-payload window)."""
+        from zaxbygraph.sync import _lock_range
+
+        fd = os.open(str(self.lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            _lock_range(fd)  # hold the range lock; payload NOT written
+            self.assertIsNone(acquire_sync_lock(self.db_path))
+        finally:
+            os.close(fd)
     """Issue #2 AC5: one sync per repo at a time, enforced by <db>.sync.lock.
 
     The lock file is JSON: {"pid": int, "host": str, "started_at": str}.

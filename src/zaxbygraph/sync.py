@@ -407,10 +407,12 @@ def acquire_sync_lock(
         except OSError:
             os.close(fd)
             # Distinguish contention from an environmental fault (PRR-008):
-            # when the observer can see a holder, another process owns the
-            # lock; when it sees nothing, the range-lock failure was NOT
-            # contention and must surface as an error, not a silent join.
-            if _observe_lock_file(path) is None:
+            # a lock file that exists on disk means another process created
+            # it and may hold the range lock while its payload is not yet
+            # (re)written - that is contention, so join/wait. Only a lock
+            # file that has vanished (or is unreadable) under us is an
+            # environmental fault worth raising.
+            if not path.exists():
                 raise
             if not wait:
                 return None

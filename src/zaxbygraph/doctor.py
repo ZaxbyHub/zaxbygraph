@@ -23,6 +23,7 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema, open_existing
@@ -136,27 +137,28 @@ class _MigratedCopy:
 
     def __init__(self, path: Path) -> None:
         self._td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
-        self.path = Path(self._td) / path.name
-        shutil.copy2(path, self.path)
-        conn = sqlite3.connect(str(self.path))
         try:
-            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        except sqlite3.DatabaseError:
-            self.migrated = False
+            self.path = Path(self._td) / path.name
+            shutil.copy2(path, self.path)
+            conn = sqlite3.connect(str(self.path))
+            try:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            except sqlite3.DatabaseError:
+                self.migrated = False
+                conn.close()
+                return
             conn.close()
-            return
-        conn.close()
-        self.migrated = version < CURRENT_USER_VERSION
-        if self.migrated:
-            conn = connect(self.path)
-            init_schema(conn)
-            conn.close()
+            self.migrated = version < CURRENT_USER_VERSION
+            if self.migrated:
+                conn = connect(self.path)
+                init_schema(conn)
+                conn.close()
+        except BaseException:
+            self.close()
+            raise
 
     def close(self) -> None:
         shutil.rmtree(self._td, ignore_errors=True)
-
-
-from contextlib import contextmanager
 
 
 @contextmanager
