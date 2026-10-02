@@ -359,3 +359,180 @@ class SyncStateTests(TempDBTest):
         self.assertIsNotNone(row)
         self.assertIn("database is locked", row["last_error"])
         self.assertFalse(status(self.conn, REPO)["repos"][0]["complete"])
+
+
+# ==== issue-trace 2-worktree-global-store: acceptance append (AC5) ====
+# Appended by .agents/issue-traces/2-worktree-global-store/repro/patches/
+# patch_test_sync.py -- append-only; every class above is untouched and every
+# import needed below is restated here (no header edits).
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import threading
+import time
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from fixtures import REPO, TempDBTest, issue, pr_file, pull
+from zaxbygraph.cli import main
+
+
+def _pid_alive(pid):
+    """True when `pid` names a process that is running right now.
+
+    Windows: os.kill(pid, 0) would TERMINATE the process (sig becomes the
+    exit code), so liveness is probed via OpenProcess/GetExitCodeProcess.
+    """
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        STILL_ACTIVE = 259
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+class SyncLockTests(TempDBTest):
+    """Issue #2 AC5: one sync per repo at a time, enforced by <db>.sync.lock.
+
+    The lock file is JSON: {"pid": int, "host": str, "started_at": str}.
+    A second sync while a live same-host process holds it makes ZERO GitHub
+    calls and returns {"ok": true, "joined": true, ...}; a stale lock (dead
+    pid, same host) is recovered and the sync proceeds; a lock held by a
+    different host is never stolen; --wait blocks for the lock instead.
+    """
+
+    def lock_path(self):
+        return Path(str(self.db_path) + ".sync.lock")
+
+    def write_lock(self, pid, host):
+        path = self.lock_path()
+        path.write_text(
+            json.dumps({"pid": pid, "host": host, "started_at": "2026-10-02T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+
+    def cli_sync(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with patch("zaxbygraph.cli.GhApiSource", return_value=self.src):
+                code = main(
+                    ["sync", "--repo", REPO, "--db", str(self.db_path),
+                     "--format", "json", *extra]
+                )
+        return code, out.getvalue(), err.getvalue()
+
+    def spawn_holder(self):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+
+    def dead_pid(self):
+        """A provably-dead pid (retried in the unlikely event of pid reuse)."""
+        for _ in range(5):
+            proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+            proc.wait()
+            if not _pid_alive(proc.pid):
+                return proc.pid
+        self.fail("could not obtain a provably-dead pid")
+
+    def test_concurrent_sync_does_not_double_fetch(self):
+        self.src.add_issue(issue(1, title="one"))
+        self.src.add_pr(
+            issue(2, title="two", kind="pr", state="closed"),
+            pull(2, changed_files=1),
+            files=[pr_file("src/a.py")],
+        )
+
+        # --- holder is a live process on this host: join with zero calls ---
+        holder = self.spawn_holder()
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertTrue(_pid_alive(holder.pid), "holder child died prematurely")
+        self.write_lock(holder.pid, socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+        self.assertTrue(_pid_alive(holder.pid), "a joining sync must not kill the holder")
+        # Round-2 critic blocker 3: the join path must NOT wipe the live
+        # holder's payload (a wiped payload would let a third sync run).
+        payload = json.loads(self.lock_path().read_text(encoding="utf-8"))
+        self.assertEqual(payload["pid"], holder.pid, "join clobbered the holder's payload")
+        self.assertEqual(payload["host"], socket.gethostname())
+
+        # --- holder on a different host: never stolen, treated as held ---
+        self.write_lock(holder.pid, "foreign-host-" + socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+
+        # --- stale holder (dead pid, same host): recovered; sync proceeds ---
+        dead = self.dead_pid()
+        self.assertFalse(_pid_alive(dead))
+        self.write_lock(dead, socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIsNot(data.get("joined"), True)
+        self.assertEqual(data.get("ingested"), 2)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
+        self.assertGreater(self.src.extra_fetches, 0)
+
+        # --- --wait blocks for the lock instead of joining ---------------
+        self.write_lock(holder.pid, socket.gethostname())
+        self.assertTrue(_pid_alive(holder.pid))
+
+        def release():
+            time.sleep(0.5)
+            holder.kill()
+            self.lock_path().unlink(missing_ok=True)
+
+        releaser = threading.Thread(target=release)
+        releaser.start()
+        try:
+            started = time.monotonic()
+            code, out, err = self.cli_sync("--wait")
+            elapsed = time.monotonic() - started
+        finally:
+            releaser.join()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIsNot(data.get("joined"), True)
+        self.assertGreaterEqual(elapsed, 0.2, "--wait did not block for the lock")
+        # Idempotent re-sync of the same corpus: still exactly the 2 items.
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)

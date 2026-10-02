@@ -6,6 +6,8 @@ from pathlib import Path
 
 REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
+DEFAULT_HOST = "github.com"
+
 
 class RepoError(ValueError):
     pass
@@ -24,26 +26,46 @@ def validate_slug(slug: str) -> str:
     return f"{owner.lower()}/{name.lower()}"
 
 
-def _parse_remote_url(url: str) -> str | None:
+def _parse_remote_info(url: str) -> tuple[str, str] | None:
+    """Parse an origin URL into (host, slug) for any git host.
+
+    A slug-only flag (`--repo OWNER/REPO`) carries no host; callers default
+    it to `github.com` (README documents the collision boundary for other
+    hosts). Hosts are lowercased; the slug keeps REPO_SLUG_RE's charset and
+    is case-folded later by validate_slug.
+    """
     url = url.strip()
     if not url:
         return None
     if url.endswith(".git"):
         url = url[:-4]
+    # scp-like form: git@host:owner/repo (the host MUST survive — issue #2
+    # keys the store by <host>/<owner>/<repo>).
     if url.startswith("git@"):
-        # git@github.com:owner/repo
         _, _, rest = url.partition(":")
         rest = rest.strip("/")
         if REPO_SLUG_RE.match(rest):
-            return rest
+            host = url[4:].split(":", 1)[0].strip("/")
+            return (host.lower() if host else DEFAULT_HOST, rest)
         return None
-    # https://github.com/owner/repo
-    for prefix in ("https://github.com/", "http://github.com/", "ssh://git@github.com/"):
-        if url.startswith(prefix):
-            rest = url[len(prefix) :].strip("/")
-            if REPO_SLUG_RE.match(rest):
-                return rest
+    for scheme in ("https://", "http://", "ssh://"):
+        if url.startswith(scheme):
+            rest = url[len(scheme) :]
+            if rest.startswith("git@"):
+                rest = rest[4:]
+            host, _, path = rest.partition("/")
+            host = host.strip("/")
+            path = path.strip("/")
+            if host and REPO_SLUG_RE.match(path):
+                return (host.lower(), path)
+            return None
     return None
+
+
+def _parse_remote_url(url: str) -> str | None:
+    """Slug-only view of _parse_remote_info (legacy helper)."""
+    info = _parse_remote_info(url)
+    return None if info is None else info[1]
 
 
 def slug_from_git(cwd: Path | None = None) -> str:
@@ -64,6 +86,28 @@ def slug_from_git(cwd: Path | None = None) -> str:
     if not parsed:
         raise RepoError(f"could not parse origin remote: {proc.stdout.strip()!r}")
     return validate_slug(parsed)
+
+
+def remote_info(cwd: Path | None = None) -> tuple[str, str]:
+    """(host, slug) for the origin of cwd; host lowercased, slug case-folded."""
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(cwd) if cwd else None,
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except FileNotFoundError as exc:
+        raise RepoError("git not found; pass --repo OWNER/REPO") from exc
+    if proc.returncode != 0:
+        raise RepoError("no git origin remote; pass --repo OWNER/REPO")
+    info = _parse_remote_info(proc.stdout)
+    if info is None:
+        raise RepoError(f"could not parse origin remote: {proc.stdout.strip()!r}")
+    host, slug = info
+    return host, validate_slug(slug)
 
 
 def resolve_repo(explicit: str | None, cwd: Path | None = None) -> str:

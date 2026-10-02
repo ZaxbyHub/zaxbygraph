@@ -42,16 +42,29 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
 
     def test_status_empty_json(self) -> None:
-        code, out, err = self.run_cmd(["status", "--db", self.db, "--format", "json"])
-        self.assertEqual(code, 0, err)
-        data = json.loads(out)
-        self.assertIn("repos", data)
-        self.assertIn("counts", data)
-        self.assertEqual(data["repos"], [])
+        # Issue #2: a fresh path is no corpus - exit 3, nothing created, and
+        # the message names the path and the exact sync command. (Was: empty
+        # JSON with exit 0; behavior intentionally changed, see PR notes.)
+        fresh = Path(self._td.name) / "missing" / "history.db"
+        code, out, err = self.run_cmd(["status", "--db", str(fresh), "--format", "json"])
+        self.assertEqual(code, 3, err)
+        self.assertEqual(out, "")
+        self.assertTrue(err.lstrip().startswith("error:"), err)
+        self.assertIn(str(fresh), err)
+        self.assertIn("zaxbygraph sync --repo", err)
+        self.assertFalse(fresh.exists(), "read created the database file")
+        self.assertFalse(fresh.parent.exists(), "read created the database directory")
 
     def test_search_json_shape(self) -> None:
+        # Issue #2: reads resolve the repo and require its corpus. --repo is
+        # explicit here (origin resolution would key a different slug in
+        # forks/CI), and the corpus row makes the no-corpus guard pass.
+        conn = connect(Path(self.db))
+        conn.execute("INSERT INTO sync_state(repo) VALUES (?)", (REPO,))
+        conn.commit()
+        conn.close()
         code, out, err = self.run_cmd(
-            ["search", "nothing", "--db", self.db, "--format", "json"]
+            ["search", "nothing", "--repo", REPO, "--db", self.db, "--format", "json"]
         )
         self.assertEqual(code, 0, err)
         data = json.loads(out)
@@ -67,7 +80,15 @@ class CliTests(unittest.TestCase):
         self.assertTrue(err)
 
     def test_item_missing(self) -> None:
-        code, out, err = self.run_cmd(["item", "99", "--db", self.db, "--format", "json"])
+        # Issue #2: scoped lookup needs the corpus row (same reason as
+        # test_search_json_shape).
+        conn = connect(Path(self.db))
+        conn.execute("INSERT INTO sync_state(repo) VALUES (?)", (REPO,))
+        conn.commit()
+        conn.close()
+        code, out, err = self.run_cmd(
+            ["item", "99", "--repo", REPO, "--db", self.db, "--format", "json"]
+        )
         self.assertEqual(code, 1)
 
     def test_sync_env_guard_exits_2(self) -> None:
@@ -242,3 +263,203 @@ class LookupCaseFoldTests(unittest.TestCase):
         code, out = self._run_cmd(["search", "needle", "--repo", ""])
         self.assertEqual(code, 0, out)
         self.assertTrue(json.loads(out)["items"])
+
+
+# ==== issue-trace 2-worktree-global-store: acceptance append (AC3/AC6) ====
+# Appended by .agents/issue-traces/2-worktree-global-store/repro/patches/
+# patch_test_cli.py -- append-only; every class above is untouched and every
+# import needed below is restated here (no header edits).
+import io
+import json
+import os
+import socket
+import subprocess
+import tempfile
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+from fixtures import FakeGitHubSource, issue
+from zaxbygraph.cli import main
+from zaxbygraph.db import connect, init_schema
+from zaxbygraph.sync import sync_repo
+
+WIDGET_SLUG = "acme/widget"
+WIDGET_ORIGIN = "https://github.com/acme/widget.git"
+
+
+def _issue2_git(*argv, cwd):
+    proc = subprocess.run(
+        ["git", "-c", "commit.gpgsign=false", *argv],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert proc.returncode == 0, f"git {argv} failed:\n{proc.stderr}"
+
+
+class _Issue2Harness(unittest.TestCase):
+    """Temp ZAXBYGRAPH_HOME + git checkout of acme/widget; env and cwd restored."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._td.cleanup)
+        self.root = Path(self._td.name)
+        self.home = self.root / "zaxbygraph-home"
+        self.home.mkdir()
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        _issue2_git("init", "-b", "main", cwd=self.checkout)
+        _issue2_git("config", "user.email", "t@example.com", cwd=self.checkout)
+        _issue2_git("config", "user.name", "Tester", cwd=self.checkout)
+        (self.checkout / "README.md").write_text("probe\n", encoding="utf-8")
+        _issue2_git("add", "-A", cwd=self.checkout)
+        _issue2_git("commit", "-m", "init", cwd=self.checkout)
+        _issue2_git("remote", "add", "origin", WIDGET_ORIGIN, cwd=self.checkout)
+        self._issue2_set_env("ZAXBYGRAPH_HOME", str(self.home))
+        self._issue2_unset_env("ZAXBYGRAPH_DB")
+        self._saved_cwd = os.getcwd()
+        self.addCleanup(os.chdir, self._saved_cwd)
+        os.chdir(self.checkout)
+
+    def _issue2_set_env(self, key, value):
+        old = os.environ.get(key)
+
+        def restore():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+        os.environ[key] = value
+        self.addCleanup(restore)
+
+    def _issue2_unset_env(self, key):
+        if key not in os.environ:
+            return
+        old = os.environ[key]
+        del os.environ[key]
+        self.addCleanup(lambda: os.environ.__setitem__(key, old))
+
+    def _issue2_run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _issue2_entries_under(self, root):
+        if not root.exists():
+            return []
+        return sorted(str(p) for p in root.rglob("*"))
+
+
+class NoCorpusTests(_Issue2Harness):
+    """Issue #2 AC3: with no corpus for the resolved repo, every read command
+    (a) creates no file or directory anywhere, (b) exits 3, and (c) prints an
+    `error: ` message naming the resolved DB path and the exact sync command.
+    A resolved DB that exists but holds only OTHER repos is exit 2 instead."""
+
+    READS = [
+        ["status"],
+        ["search", "needle"],
+        ["item", "1"],
+        ["related", "1"],
+        ["churn"],
+        ["open"],
+        ["path", "1", "2"],
+        ["sql", "SELECT repo, number FROM items"],
+        ["export-graph"],
+    ]
+
+    def test_reads_never_create_and_exit_3(self):
+        store_db = self.home / "github.com" / "acme" / "widget" / "history.db"
+        for argv in self.READS:
+            with self.subTest(cmd=argv[0]):
+                checkout_before = self._issue2_entries_under(self.checkout)
+                home_before = self._issue2_entries_under(self.home)
+                code, out, err = self._issue2_run([*argv, "--format", "json"])
+                self.assertEqual(
+                    code, 3, f"{argv}: exit {code}, stderr={err!r}"
+                )
+                self.assertTrue(err.lstrip().startswith("error:"), err)
+                self.assertIn(str(store_db), err, err)
+                self.assertIn("zaxbygraph sync --repo acme/widget", err)
+                # Nothing is created: not under the checkout ...
+                self.assertEqual(self._issue2_entries_under(self.checkout), checkout_before)
+                self.assertFalse((self.checkout / ".zaxbygraph").exists())
+                self.assertFalse((self.checkout / ".swarm").exists())
+                # ... and not under the user-level store (no file, no dir).
+                self.assertEqual(self._issue2_entries_under(self.home), home_before)
+
+        # A resolved DB that exists but holds only OTHER repos exits 2 and
+        # names the repos it does hold.
+        other_db = self.root / "other.db"
+        conn = connect(other_db)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        src.add_issue(issue(101, title="other repo item"))
+        sync_repo(conn, src, "other/repo")
+        conn.close()
+        code, out, err = self._issue2_run(
+            ["status", "--db", str(other_db), "--format", "json"]
+        )
+        self.assertEqual(code, 2, err)
+        self.assertTrue(err.lstrip().startswith("error:"), err)
+        self.assertIn("other/repo", err)
+
+
+class WhereTests(_Issue2Harness):
+    """Issue #2 AC6: `where` reports the full resolution chain and always
+    exits 0.
+
+    Pinned JSON keys: cwd, git_common_dir, slug, db, exists, items,
+    watermark, complete, legacy (list of path strings), serving (the DB
+    reads actually use). db/exists/items/watermark/complete describe the
+    USER-LEVEL STORE for the slug (plan-critic round 1 blocker 3); with no
+    store DB for the slug: exists=false, items=0, watermark=null,
+    complete=false, and serving points at the legacy DB that reads fall
+    back to.
+    """
+
+    def test_where_prints_resolution_chain(self):
+        legacy = self.checkout / ".zaxbygraph" / "history.db"
+        conn = connect(legacy)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        src.add_issue(issue(1, title="legacy widget item"))
+        sync_repo(conn, src, WIDGET_SLUG)
+        conn.close()
+
+        code, out, err = self._issue2_run(["where", "--format", "json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        for key in (
+            "cwd",
+            "git_common_dir",
+            "slug",
+            "db",
+            "exists",
+            "items",
+            "watermark",
+            "complete",
+            "legacy",
+            "serving",
+        ):
+            self.assertIn(key, data)
+        self.assertEqual(Path(data["cwd"]).resolve(), self.checkout.resolve())
+        self.assertTrue(str(data["git_common_dir"]))
+        self.assertEqual(data["slug"], WIDGET_SLUG)
+        self.assertEqual(
+            Path(data["db"]),
+            self.home / "github.com" / "acme" / "widget" / "history.db",
+        )
+        self.assertIs(data["exists"], False)
+        self.assertEqual(data["items"], 0)
+        self.assertIsNone(data["watermark"])
+        self.assertIs(data["complete"], False)
+        self.assertIsInstance(data["legacy"], list)
+        self.assertIn(str(legacy), [str(Path(p)) for p in data["legacy"]])
+        # With the store absent and the legacy DB present, reads serve the
+        # legacy DB while db/exists still describe the (absent) store.
+        self.assertEqual(Path(data["serving"]), legacy.resolve())

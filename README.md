@@ -71,13 +71,35 @@ upstream changes is the expected result, not a failure.
 
 ### Where the database goes
 
-| Condition | Path |
-| --- | --- |
-| `.swarm/` exists, or `.gitignore` mentions `.swarm` | `<git-root>/.swarm/zaxbygraph/history.db` |
-| otherwise | `<git-root>/.zaxbygraph/history.db` |
+The graph is keyed by **repo**, not by checkout (issue #2): every worktree,
+clone, and subagent of the same repository resolves the same file.
 
-Override with `--db PATH` on any command. **Do not commit `history.db`** — it is
-a rebuildable cache, not source. The shipped `.gitignore` already excludes it.
+| Order | Source |
+| --- | --- |
+| 1 | `--db PATH` when passed (explicit always wins) |
+| 2 | `ZAXBYGRAPH_DB` environment variable |
+| 3 | The user-level store: `<root>/<host>/<owner>/<repo>/history.db` |
+| 4 | A legacy in-repo DB under the **main** worktree (`.zaxbygraph/` or `.swarm/zaxbygraph/`), for migration continuity until `doctor --consolidate` runs |
+| 5 | Nothing yet — reads exit `3`; `sync` creates the store |
+
+The store root is `%LOCALAPPDATA%\zaxbygraph` on Windows and
+`${XDG_DATA_HOME:-~/.local/share}/zaxbygraph` elsewhere; `ZAXBYGRAPH_HOME`
+overrides it. `<host>` comes from the origin URL host (`github.com` default —
+a bare `--repo OWNER/REPO` carries no host, so GitHub Enterprise users should
+sync from a checkout whose origin is the GHE URL rather than passing `--repo`
+by hand, or their store keys collide with github.com slugs).
+
+Reads never create anything: when no corpus exists for the resolved repo they
+exit **3** with the resolved path and the exact `zaxbygraph sync --repo <slug>`
+command on stderr. A DB that holds other repos but not the resolved one exits
+**2** and lists them. `zaxbygraph where` prints the full resolution chain;
+`zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
+consolidates, copy-only) scattered legacy DBs. Concurrent `sync` runs of one
+repo serialize through a lock file (`<db>.sync.lock`): a second sync joins
+with `{"ok": true, "joined": true}` and zero GitHub calls, `--wait` blocks for
+the lock, and a lock left by a dead same-host pid is recovered automatically.
+
+**Do not commit `history.db`** — it is a rebuildable cache, not source.
 
 ## Commands
 
@@ -86,7 +108,7 @@ Every command accepts:
 | Flag | Meaning |
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
-| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo. Required when the DB holds several repos and you want one. |
+| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. |
 | `--format json\|text` | Output format. Defaults to `text` on a TTY and `json` when piped, so scripts and agents get JSON without asking. Pass it explicitly when the destination is ambiguous. `text` is a light flattening — top-level scalars print as `key: value`, while nested objects and lists still print as indented JSON — so **prefer `json` for anything parsed**. |
 
 ### `sync` — fetch into the graph
@@ -250,10 +272,14 @@ Machine-readable rules, worth knowing before scripting against this:
   round-trip exactly. `--repo` matches case-insensitively; canonical storage
   is lowercase.
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
-  request was malformed (bad flags, non-read SQL, multiple statements). **`1`** —
-  a runtime failure: item not found, sync error, or an authorizer denial at
-  execution time. The distinction matters for retry logic: a `2` will never
-  succeed on retry unchanged, while a `1` sometimes will.
+  request was malformed (bad flags, non-read SQL, multiple statements), or the
+  resolved DB holds other repos but not this one. **`1`** — a runtime failure:
+  item not found, sync error, or an authorizer denial at execution time.
+  **`3`** — no corpus for the resolved repo (issue #2): the resolved DB is
+  missing or holds nothing for it; the message names the path and the exact
+  `sync` command. The distinction matters for retry logic: a `2` or `3` will
+  never succeed on retry unchanged (fix the request, or sync first), while a
+  `1` sometimes will.
 - **Errors** print `error: MESSAGE` to **stderr**, leaving stdout clean for
   parsing — with one exception worth special-casing: **`sync` reports failure as
   a normal result object on stdout**, `{"ok": false, "error": …, "db": …,
@@ -321,7 +347,7 @@ keyword said so", not as "these are unrelated".
 | `status` shows a non-null `last_error` | The previous sync stopped early. Just re-run `sync`; it resumes from the watermark. |
 | Sync returns `ingested: 0` | Nothing changed upstream. Use `--force` if you suspect updates that did not bump `updated_at`. |
 | `pr_files.patch` is NULL | Patches are off by default. Re-sync with `--include-patches --force` — `--force` is required because the watermark would otherwise skip unchanged items. |
-| No database found / wrong repo | Resolution depends on the git root and the `origin` remote. Pass `--db` and `--repo` explicitly to remove the ambiguity. |
+| No database found / wrong repo | Resolution is repo-keyed (see "Where the database goes"): the origin slug picks the store. Run `zaxbygraph where` to see the chain, `--db` to override the path, `--repo` to override the slug. |
 
 ## Development
 
