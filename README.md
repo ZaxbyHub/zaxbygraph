@@ -71,8 +71,11 @@ upstream changes is the expected result, not a failure.
 
 ### Where the database goes
 
-The graph is keyed by **repo**, not by checkout (issue #2): every worktree,
-clone, and subagent of the same repository resolves the same file.
+The graph is keyed by **repo**, not by checkout (issue #2). Once the
+user-level store exists, every worktree, clone, and subagent of the same
+repository resolves the same file; during migration (a checkout still
+serving a legacy in-repo DB, before `doctor --consolidate`) run
+`zaxbygraph where` to see which file each checkout is serving.
 
 | Order | Source |
 | --- | --- |

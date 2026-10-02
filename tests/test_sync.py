@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sqlite3
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -12,7 +13,12 @@ from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pr_file, pull
 from zaxbygraph.cli import cmd_sync
 from zaxbygraph.store import ingest_item as real_ingest_item
 from zaxbygraph.query import item, status
-from zaxbygraph.sync import SyncError, _pid_alive, sync_repo  # noqa: F401 — _pid_alive is the production helper (PRR-011): the suite must exercise the exact fail-closed semantics the lock ships with.
+from zaxbygraph.sync import (
+    SyncError,
+    _pid_alive,
+    acquire_sync_lock,
+    sync_repo,
+)  # noqa: F401 - _pid_alive is the production helper (PRR-011). — _pid_alive is the production helper (PRR-011): the suite must exercise the exact fail-closed semantics the lock ships with.
 
 
 class SyncTests(TempDBTest):
@@ -382,6 +388,25 @@ from zaxbygraph.cli import main
 
 
 class SyncLockTests(TempDBTest):
+    def test_real_contention_joins_and_pid_semantics(self) -> None:
+        """PRR-008 regression: a REAL range-lock holder (not a decoy
+        payload file) must join, never raise; production _pid_alive
+        semantics pinned (PRR-011)."""
+        lock = acquire_sync_lock(self.db_path)
+        try:
+            self.assertIsNotNone(lock)
+            # Real contention must JOIN (return None), never raise - the
+            # PRR-008 round-1 regression turned this into PermissionError.
+            self.assertIsNone(acquire_sync_lock(self.db_path))
+        finally:
+            lock.release_owned()
+        # After release, acquiring again must succeed (lock was freed).
+        lock2 = acquire_sync_lock(self.db_path)
+        self.assertIsNotNone(lock2)
+        lock2.release_owned()
+        self.assertFalse(_pid_alive(self.dead_pid()))
+        self.assertTrue(_pid_alive(os.getpid()))
+
     """Issue #2 AC5: one sync per repo at a time, enforced by <db>.sync.lock.
 
     The lock file is JSON: {"pid": int, "host": str, "started_at": str}.
@@ -499,9 +524,10 @@ class SyncLockTests(TempDBTest):
         self.assertTrue(_pid_alive(holder.pid))
 
         def release():
-            time.sleep(0.5)
+            time.sleep(0.6)
             holder.kill()
-            self.lock_path().unlink(missing_ok=True)
+            # Deliberately NO unlink (PRR-012): the waiter must observe the
+            # dead same-host payload and take over under the range lock.
 
         releaser = threading.Thread(target=release)
         releaser.start()

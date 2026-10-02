@@ -171,7 +171,7 @@ corpus exists for the resolved repo.
 - `zaxbygraph doctor [--consolidate] [--scan DIR]` reports scattered legacy
   DBs (per-DB item and garbled-row counts); `--consolidate` copies the
   freshest complete corpus into the store — originals are never modified.
-- A second `sync` while one is running joins it: `{ok: true, joined: true}`
+- A second `sync` while one is running joins it: `{ok: true, joined: true, repo: ..., db: ...}`
   with zero GitHub calls; `--wait` blocks for the lock instead.
 
 Never commit `history.db` — it is a rebuildable cache.
