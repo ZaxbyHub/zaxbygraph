@@ -466,7 +466,14 @@ class WhereTests(_Issue2Harness):
         self.assertIsNone(data["watermark"])
         self.assertIs(data["complete"], False)
         self.assertIsInstance(data["legacy"], list)
-        self.assertIn(str(legacy), [str(Path(p)) for p in data["legacy"]])
+        # Compare RESOLVED forms: on Windows CI the tempfile root arrives as
+        # an 8.3 short path (RUNNER~1) while the CLI's cwd-derived strings
+        # carry the long form; str equality across that boundary is the
+        # test's job to normalize, not the tool's.
+        self.assertIn(
+            str(legacy.resolve()),
+            [str(Path(p).resolve()) for p in data["legacy"]],
+        )
         # With the store absent and the legacy DB present, reads serve the
         # legacy DB while db/exists still describe the (absent) store.
         self.assertEqual(Path(data["serving"]), legacy.resolve())

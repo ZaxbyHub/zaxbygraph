@@ -182,10 +182,12 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         report = json.loads(out)
         self.assertIs(report["ok"], True)
-        scanned = {str(Path(e["path"])): e for e in report["scanned"]}
+        # Resolved-form keys: see the WhereTests note on Windows 8.3 short
+        # temp paths vs cwd-derived long paths.
+        scanned = {str(Path(e["path"]).resolve()): e for e in report["scanned"]}
         self.assertEqual(len(scanned), 3, scanned)
         for path in (older, fresh, incomplete):
-            self.assertIn(str(path), scanned)
+            self.assertIn(str(path.resolve()), scanned)
         # Older complete DB: reported, not adopted, no garbled rows.
         self.assertEqual(scanned[str(older)]["items"], 1)
         self.assertIs(scanned[str(older)]["complete"], True)
@@ -199,7 +201,7 @@ class DoctorTests(unittest.TestCase):
         # Incomplete DB: reported but never adopted, newest watermark or not.
         self.assertIs(scanned[str(incomplete)]["complete"], False)
         self.assertIs(scanned[str(incomplete)]["adopted"], False)
-        self.assertEqual(str(Path(report["adopted"])), str(fresh))
+        self.assertEqual(str(Path(report["adopted"]).resolve()), str(fresh.resolve()))
 
         # The user-level store now holds the freshest corpus, mojibake intact.
         store = self.home / "github.com" / "acme" / "widget" / "history.db"
