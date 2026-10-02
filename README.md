@@ -94,7 +94,15 @@ exit **3** with the resolved path and the exact `zaxbygraph sync --repo <slug>`
 command on stderr. A DB that holds other repos but not the resolved one exits
 **2** and lists them. `zaxbygraph where` prints the full resolution chain;
 `zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
-consolidates, copy-only) scattered legacy DBs. Concurrent `sync` runs of one
+consolidates, copy-only) scattered legacy DBs. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
+user-level store for the slug, while `serving` names the DB reads
+actually use (they differ while a legacy DB is being served);
+`sync_lock` surfaces the lock holder when one exists - a lock left by
+a dead machine (different host) is never stolen; delete
+`<db>.sync.lock` by hand to clear it. `doctor --db` overrides the
+consolidation DESTINATION (the store), not the scan sources.
+
+Concurrent `sync` runs of one
 repo serialize through a lock file (`<db>.sync.lock`): a second sync joins
 with `{"ok": true, "joined": true}` and zero GitHub calls, `--wait` blocks for
 the lock, and a lock left by a dead same-host pid is recovered automatically.
@@ -234,6 +242,12 @@ zaxbygraph path A B
 When no route exists, `path` is `null` and the exit code is still `0` — "not connected" is an answer, not a failure.
 
 ### `sql` — read-only SQL
+
+Result rows carrying a `repo` column are filtered to the resolved repo
+(issue #2). A projection without a `repo` column is only store-scoped by
+construction - filter explicitly when aiming `--db` at a multi-repo file.
+A file that is not a zaxbygraph database exits 1 with a clean
+`error: ... is not a zaxbygraph database` message.
 
 ```bash
 zaxbygraph sql "SELECT number, title FROM items WHERE state='open'"

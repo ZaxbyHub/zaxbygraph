@@ -448,7 +448,14 @@ class WhereTests(_Issue2Harness):
         ):
             self.assertIn(key, data)
         self.assertEqual(Path(data["cwd"]).resolve(), self.checkout.resolve())
-        self.assertTrue(str(data["git_common_dir"]))
+        # The resolution chain's git element: the MAIN worktree root (which
+        # for this harness IS the checkout). Asserting the value (not mere
+        # truthiness) keeps the chain step discriminating - implementation
+        # review round 1: str(None) is truthy, so the old assertTrue passed
+        # even with the chain broken.
+        self.assertEqual(
+            Path(data["git_common_dir"]).resolve(), self.checkout.resolve()
+        )
         self.assertEqual(data["slug"], WIDGET_SLUG)
         self.assertEqual(
             Path(data["db"]),
@@ -463,3 +470,19 @@ class WhereTests(_Issue2Harness):
         # With the store absent and the legacy DB present, reads serve the
         # legacy DB while db/exists still describe the (absent) store.
         self.assertEqual(Path(data["serving"]), legacy.resolve())
+
+    def test_where_no_repo_resolves_cleanly_or_errors(self):
+        # Implementation review round 1: `where --repo ''` must never
+        # traceback - without --db there is no slug to resolve a store from
+        # (documented exit 2), and with --db it reports the named file.
+        code, out, err = self._issue2_run(["where", "--repo", "", "--format", "json"])
+        self.assertEqual(code, 2, err)
+        self.assertTrue(err.lstrip().startswith("error:"), err)
+        self.assertNotIn("Traceback", err)
+        code, out, err = self._issue2_run(
+            ["where", "--repo", "", "--db", str(self.root / "plain.db"), "--format", "json"]
+        )
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIsNone(data["slug"])
+        self.assertEqual(Path(data["serving"]), Path(self.root / "plain.db"))

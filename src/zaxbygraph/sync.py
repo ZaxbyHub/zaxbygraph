@@ -375,6 +375,9 @@ class SyncLock:
             self._abandon()
 
     def abandon(self) -> None:
+        """Unlock + close without touching the payload. The join/poll paths
+        in acquire_sync_lock inline this cleanup (they hold no SyncLock
+        object); kept as the named primitive for callers that do."""
         self._abandon()
 
     def _abandon(self) -> None:

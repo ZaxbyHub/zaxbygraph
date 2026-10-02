@@ -23,6 +23,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -30,6 +31,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from fixtures import FakeGitHubSource, issue, pr_file, pull
+from test_migrations import V1_SCHEMA_SQL
 from zaxbygraph.cli import main
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.repo import remote_info
@@ -209,6 +211,55 @@ class WorktreeResolutionTests(StoreHarness):
         self.assertFalse(self.store_db().exists(), "read must not create the store")
         self.assertEqual(db_files_under(worktree), set())
         self.assertFalse((worktree / ".zaxbygraph").exists())
+
+    def test_mixed_case_legacy_corpus_is_never_called_another_repo(self) -> None:
+        """Implementation review round 1: a pre-#9 legacy DB stores the slug
+        with user-typed casing. The read guard must fold before claiming the
+        DB holds "other repos" - the row IS the resolved repo. The honest
+        answer is exit 2 naming the casing and the doctor adoption command.
+        (At base this read mutated the legacy DB in place and served it;
+        reads no longer mutate, so the actionable message replaces it.)"""
+        repo = self.make_repo("mainline")
+        legacy = repo / ".zaxbygraph" / "history.db"
+        legacy.parent.mkdir()
+        # Build the legacy DB at v1 with a mixed-case slug (the pre-#9
+        # shape; seeding via connect+init_schema would fold it and defeat
+        # the fix under test).
+        conn = sqlite3.connect(str(legacy))
+        try:
+            conn.executescript(V1_SCHEMA_SQL)
+            conn.execute(
+                "INSERT INTO sync_state(repo, issues_since, last_full_sync_at, item_count)"
+                " VALUES ('Acme/Widget', '2026-05-01T00:00:00Z',"
+                " '2026-05-01T00:00:00Z', 1)"
+            )
+            conn.execute(
+                "INSERT INTO items(id, repo, number, kind, title, body, labels_text,"
+                " state, author, created_at, updated_at, raw_json)"
+                " VALUES (400, 'Acme/Widget', 1, 'issue', 'mixed case legacy item',"
+                " 'corpus', '', 'open', 'alice', '2026-05-01T00:00:00Z',"
+                " '2026-05-01T00:00:00Z', '{}')"
+            )
+            conn.execute("PRAGMA user_version = 0")
+            conn.commit()
+        finally:
+            conn.close()
+
+        os.chdir(repo)
+        code, out, err = run_cmd(["status", "--format", "json"])
+        self.assertEqual(code, 2, err)
+        self.assertTrue(err.lstrip().startswith("error:"), err)
+        self.assertIn("Acme/Widget", err)
+        self.assertIn("same repo", err)
+        self.assertIn("zaxbygraph doctor --consolidate --repo acme/widget", err)
+        self.assertNotIn("this database holds:", err)
+        # The read never mutated the legacy file (v1 stays v1).
+        probe = sqlite3.connect(str(legacy))
+        try:
+            version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        finally:
+            probe.close()
+        self.assertEqual(version, 0)
 
 
 class GlobalStoreTests(StoreHarness):

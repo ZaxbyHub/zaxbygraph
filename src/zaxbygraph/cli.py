@@ -33,6 +33,7 @@ from zaxbygraph.query import (
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, resolve_repo, validate_slug
 from zaxbygraph.sync import (
     SyncError,
+    SyncLock,
     acquire_sync_lock,
     read_lock_observer,
     sync_repo,
@@ -144,12 +145,25 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
         )
     try:
         try:
+            # Case-fold the guard: a pre-#9 legacy DB stores the slug with
+            # user-typed casing. Telling the caller it holds "another repo"
+            # when the row IS the resolved repo would be the exact
+            # identity-ambiguity defect this issue removes.
             row = conn.execute(
-                "SELECT repo FROM sync_state WHERE repo = ?", (slug,)
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
             ).fetchone()
         except sqlite3.DatabaseError as exc:
             raise _ReadFailure(1, f"{db_path} is not a zaxbygraph database: {exc}")
-        if row is None:
+        if row is not None:
+            if row["repo"] != slug:
+                raise _ReadFailure(
+                    2,
+                    f"no corpus for {slug} in {db_path}; this database holds "
+                    f"{row['repo']} - the same repo with pre-fold casing; "
+                    f"run: zaxbygraph doctor --consolidate --repo {slug} to adopt it "
+                    f"(or zaxbygraph sync --repo {slug} to rebuild)",
+                )
+        else:
             others = [
                 r["repo"] for r in conn.execute("SELECT repo FROM sync_state ORDER BY repo")
             ]
@@ -213,7 +227,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
             conn.close()
         _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
         return 1
-    lock = acquire_sync_lock(db_path, wait=bool(getattr(args, "wait", False)))
+    lock: SyncLock | None = None
+    try:
+        lock = acquire_sync_lock(db_path, wait=bool(getattr(args, "wait", False)))
+    except OSError as exc:
+        # A lock-file storage fault (unreadable directory, permissions) is a
+        # failed sync, reported as the same result object - never a traceback.
+        conn.close()
+        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        return 1
     if lock is None:
         conn.close()
         _emit(
@@ -333,26 +355,31 @@ def cmd_where(args: argparse.Namespace) -> int:
     except RepoError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    serving, _chain = resolve_db(repo, explicit=getattr(args, "db", None), host=host)
+    try:
+        serving, _chain = resolve_db(repo, explicit=getattr(args, "db", None), host=host)
+        store_path = store_db_path(host, repo) if repo else serving
+    except RepoError as exc:
+        # e.g. `where --repo ''` with no --db: no slug, no store to resolve.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     cwd = Path.cwd()
     common = git_common_root(cwd)
-    store_path = store_db_path(host, repo)
     exists = False
     items = 0
     watermark = None
     complete = False
-    if store_path.exists():
+    if repo and store_path.exists():
         try:
             conn = open_existing(store_path)
             try:
                 row = conn.execute(
                     "SELECT issues_since, last_error, full_sync_pending FROM sync_state"
-                    " WHERE repo = ?",
+                    " WHERE lower(repo) = ?",
                     (repo,),
                 ).fetchone()
                 items = int(
                     conn.execute(
-                        "SELECT COUNT(*) AS c FROM items WHERE repo = ?", (repo,)
+                        "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo,)
                     ).fetchone()["c"]
                 )
             finally:
@@ -363,6 +390,8 @@ def cmd_where(args: argparse.Namespace) -> int:
                 exists = True
         except sqlite3.DatabaseError:
             pass
+    elif not repo and store_path.exists():
+        exists = True
     data = {
         "cwd": str(cwd),
         "git_common_dir": str(common) if common is not None else None,

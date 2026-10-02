@@ -82,6 +82,8 @@ def store_root() -> Path:
 
 def store_db_path(host: str, repo: str) -> Path:
     """`<store-root>/<host>/<owner>/<repo>/history.db` (slug case-folded)."""
+    if not repo:
+        raise RepoError("cannot resolve a store without a repo")
     repo = validate_slug(repo)
     owner, name = repo.split("/", 1)
     return store_root() / (host or DEFAULT_HOST).lower() / owner / name / "history.db"
