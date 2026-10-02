@@ -39,6 +39,11 @@ class SkillDocTests(unittest.TestCase):
             section,
             "section must route complete:false / last_error corpora back to sync",
         )
+        self.assertIn(
+            "last_error",
+            section,
+            "the resume rule must cover the last_error signal, not just complete",
+        )
         self.assertGreater(
             section.find("complete: false"),
             status_pos,
