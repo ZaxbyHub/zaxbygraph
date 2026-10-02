@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fixtures import scrubbed_env
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: Raw UTF-8 bytes from `gh api` carry the exact characters named in issue #1
@@ -44,6 +46,15 @@ PROBE = """
 import json, os, pathlib, sys
 sys.path.insert(0, {src!r})
 os.chdir({cwd!r})
+# The probe only discriminates the pre-fix decode defect when the child's
+# effective stdio/ANSI codec is NOT UTF-8-capable. On hosts where it is
+# (e.g. Windows system-wide UTF-8 codepage), even text=True would decode
+# cleanly, so report that instead of passing vacuously.
+import locale
+effective = (locale.getpreferredencoding(False) or "").lower()
+if effective.replace("-", "") in ("utf8", "utf8mb4") or effective == "cp65001":
+    print("SKIP_HOSTILE_LOCALE_ABSENT:" + effective)
+    raise SystemExit(0)
 from zaxbygraph.github import GhApiSource
 src = GhApiSource("acme", "forgegate", gh_bin=sys.executable)
 items = list(src.list_issues(None))
@@ -53,24 +64,6 @@ assert items[0]["title"] == expected[0]["title"], "title mismatch: %r" % items[0
 assert items[0]["body"] == expected[0]["body"], "body mismatch: %r" % items[0]["body"]
 print("ROUNDTRIP_OK")
 """
-
-
-def scrubbed_env() -> dict:
-    """Child environment without the UTF-8 overrides that mask the defect.
-
-    This session's shell may export PYTHONUTF8/PYTHONIOENCODING; a child run
-    with `-X utf8=0` and a scrubbed env decodes subprocess output with the
-    real locale codec (cp1252 on Windows, ascii under LC_ALL=C on POSIX), so
-    the decode policy itself is under test on both platforms.
-    """
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")
-    }
-    if os.name == "posix":
-        env.update(LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0")
-    return env
 
 
 class GhDecodeTests(unittest.TestCase):

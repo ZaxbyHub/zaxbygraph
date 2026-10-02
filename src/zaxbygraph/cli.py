@@ -92,6 +92,13 @@ def cmd_sync(args: argparse.Namespace) -> int:
     try:
         conn = connect(db_path)
         init_schema(conn)
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, database newer than this build)
+        # can never succeed on retry — README's exit-2 contract.
+        if conn is not None:
+            conn.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:
         # A storage fault before the sync starts is reported as the same
         # result object, not a traceback (AGENTS.md: reported, not swallowed).
@@ -324,9 +331,11 @@ def _sync_entry(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Pin the streams before argparse runs: its usage/error text is the first
+    # user-facing output and can carry non-ASCII from bad arguments.
+    _force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
-    _force_utf8_streams()
     if getattr(args, "repo", None):
         try:
             args.repo = validate_slug(args.repo)

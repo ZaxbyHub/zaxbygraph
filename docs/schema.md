@@ -244,6 +244,16 @@ run drains the listing and stamps the timestamp — truthful because each item
 commits with its own watermark bump, so a clean run from the watermark has
 covered everything at or below it.
 
+`complete` for a migrated legacy row means "no unresolved full sync since the
+last recorded one": v1 recorded nothing when a run crashed outside its caught
+exception types, so a database whose last full sync completed and whose later
+`--force` refresh crashed pre-upgrade migrates to `complete: true` even though
+that refresh never finished. The state is self-healing — the next clean sync
+drains the listing from the watermark and everything at or below it is
+covered — and `sync --force` re-establishes ground truth. v1 data cannot
+distinguish this shape from ordinary incrementals, so the migration keeps the
+recorded timestamp rather than forcing a full resync of healthy databases.
+
 Two operational notes: the first command that opens a legacy database (even a
 read like `search`) performs the one-time migration write; and the read-only
 `sql` path intentionally does not migrate — it reads whatever schema the file

@@ -468,6 +468,60 @@ class MigrationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             init_schema(conn2)
 
+    def test_migration_failure_rolls_back(self) -> None:
+        v1 = sqlite3.connect(str(self.db_path))
+        self._seed_case_split(v1)
+        v1.close()
+
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        from unittest.mock import patch
+
+        with patch(
+            "zaxbygraph.db._fold_dedupe_table",
+            side_effect=RuntimeError("fold exploded"),
+        ):
+            with self.assertRaises(RuntimeError):
+                init_schema(conn)
+        # Rollback contract: version unstamped, pre-migration data intact.
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 3
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM sync_state").fetchone()[0], 3
+        )
+        conn.close()
+        # A later clean run migrates fully.
+        conn2 = connect(self.db_path)
+        self.addCleanup(conn2.close)
+        init_schema(conn2)
+        self.assertEqual(conn2.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(
+            conn2.execute("SELECT COUNT(*) FROM items WHERE repo LIKE 'zaxbyhub/%'").fetchone()[0],
+            2,
+        )
+
+    def test_legacy_completed_row_reports_complete(self) -> None:
+        v1 = sqlite3.connect(str(self.db_path))
+        v1.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at, last_error)"
+            " VALUES ('done/repo', '2026-04-01T00:00:00Z', '2026-04-01T00:00:00Z', NULL)"
+        )
+        v1.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at, raw_json)"
+            " VALUES (41001, 'done/repo', 1, 'issue', 'done', 'open', '2026-04-01T00:00:00Z', '{}')"
+        )
+        v1.commit()
+        v1.close()
+
+        conn = self._open_current()
+        # A legacy row that completed a full sync and recorded no error is
+        # complete:true after the upgrade (the dual of the pending-seeding test).
+        row = conn.execute("SELECT * FROM sync_state WHERE repo = 'done/repo'").fetchone()
+        self.assertEqual(row["full_sync_pending"], 0)
+        self.assertEqual(status(conn, "done/repo")["repos"][0]["complete"], True)
+
 
 if __name__ == "__main__":
     unittest.main()

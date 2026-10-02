@@ -31,8 +31,19 @@ class SkillDocTests(unittest.TestCase):
             section,
             "section must state that sync runs only when no corpus is found",
         )
+        # the resume rule this PR added: incomplete-but-present corpora re-sync
         sync_pos = section.find("zaxbygraph sync")
         status_pos = section.find("zaxbygraph status")
+        self.assertIn(
+            "complete: false",
+            section,
+            "section must route complete:false / last_error corpora back to sync",
+        )
+        self.assertGreater(
+            section.find("complete: false"),
+            status_pos,
+            "the resume rule must appear after the status command",
+        )
         self.assertGreater(
             sync_pos,
             status_pos,

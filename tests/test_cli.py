@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 
-from fixtures import REPO, FakeGitHubSource, issue, sync_repo
+from fixtures import REPO, FakeGitHubSource, issue, scrubbed_env, sync_repo
 from zaxbygraph.cli import main
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -83,17 +83,6 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("Traceback", out + err)
 
 
-def _scrubbed_env() -> dict:
-    env = {
-        k: v
-        for k, v in os.environ.items()
-        if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")
-    }
-    if os.name == "posix":
-        env.update(LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0")
-    return env
-
-
 class CliEncodingTests(unittest.TestCase):
     """Issue #1 AC2: emoji/CJK output must survive a non-UTF-8 stdout."""
 
@@ -113,7 +102,7 @@ class CliEncodingTests(unittest.TestCase):
         conn.close()
 
     def _run_cli(self, argv: list[str]) -> subprocess.CompletedProcess:
-        env = _scrubbed_env()
+        env = scrubbed_env()
         env["PYTHONPATH"] = str(REPO_ROOT / "src")
         return subprocess.run(
             [sys.executable, "-X", "utf8=0", "-m", "zaxbygraph", *argv, "--db", self.db],
@@ -139,6 +128,8 @@ class CliEncodingTests(unittest.TestCase):
         )
         data = json.loads(proc.stdout.decode("utf-8"))
         self.assertTrue(data["nodes"])
+        labels = " ".join(n.get("label", "") for n in data["nodes"])
+        self.assertIn(self.EMOJI_TITLE, labels)
 
 
 class LookupCaseFoldTests(unittest.TestCase):
@@ -176,15 +167,28 @@ class LookupCaseFoldTests(unittest.TestCase):
                 code, out = self._run_cmd([*argv, "--repo", "ACME/ForgeGate"])
                 self.assertEqual(code, 0, out)
                 self.assertTrue(out.strip(), "command produced no output")
+        # Content assertions on two representative commands: a fold regression
+        # on the lookup path must not merely return valid-but-empty output.
+        _, out = self._run_cmd(["search", "needle", "--repo", "ACME/ForgeGate"])
+        self.assertIn("findable", json.loads(out)["items"][0]["title"])
+        _, out = self._run_cmd(["status", "--repo", "ACME/ForgeGate"])
+        self.assertEqual(json.loads(out)["repos"][0]["repo"], "acme/forgegate")
 
     def test_query_layer_folds_repo(self) -> None:
         conn = connect(Path(self.db))
         self.addCleanup(conn.close)
         from zaxbygraph.query import item as query_item
+        from zaxbygraph.query import search as query_search
+        from zaxbygraph.query import status as query_status
 
         self.assertIsNotNone(query_item(conn, 1, repo="ACME/ForgeGate"))
+        self.assertEqual(query_status(conn, "ACME/ForgeGate")["repos"][0]["repo"], "acme/forgegate")
+        self.assertTrue(query_search(conn, "needle", repo="ACME/ForgeGate")["items"])
 
     def test_empty_repo_flag_means_no_filter(self) -> None:
         # --repo '' keeps today's "no filter" meaning rather than raising
         code, out = self._run_cmd(["status", "--repo", ""])
         self.assertEqual(code, 0, out)
+        code, out = self._run_cmd(["search", "needle", "--repo", ""])
+        self.assertEqual(code, 0, out)
+        self.assertTrue(json.loads(out)["items"])

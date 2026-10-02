@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -12,6 +13,22 @@ from zaxbygraph.github import GitHubError, GitHubSource
 from zaxbygraph.sync import sync_repo
 
 REPO = "acme/forgegate"
+
+
+def scrubbed_env() -> dict:
+    """Child environment without the UTF-8 overrides that mask the locale
+    decode/encode defects (issue #1). One definition for every test module
+    that spawns a probe child, so the hostile-locale regime is corrected in
+    one place.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("PYTHONUTF8", "PYTHONIOENCODING", "PYTHONLEGACYWINDOWSSTDIO")
+    }
+    if os.name == "posix":
+        env.update(LC_ALL="C", LANG="C", PYTHONCOERCECLOCALE="0")
+    return env
 
 
 def ts(offset_s: int = 0) -> str:

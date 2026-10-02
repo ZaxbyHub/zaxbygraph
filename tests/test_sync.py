@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
 import sqlite3
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -324,9 +327,14 @@ class SyncStateTests(TempDBTest):
             jsonl_flag=False,
             format="json",
         )
+        out = io.StringIO()
         with patch("zaxbygraph.cli.GhApiSource", return_value=self.src):
-            code = cmd_sync(args)
+            with redirect_stdout(out):
+                code = cmd_sync(args)
         self.assertEqual(code, 1)
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ok"])
+        self.assertIn("blocker", payload["error"])
         row = self.conn.execute(
             "SELECT last_error, full_sync_pending FROM sync_state WHERE repo = ?", (REPO,)
         ).fetchone()

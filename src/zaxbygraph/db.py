@@ -235,6 +235,7 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
             ),
         )
 
+
 def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """v1 -> v2: `sync_state.full_sync_pending` + lowercase repo identity.
 
