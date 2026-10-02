@@ -140,6 +140,7 @@ def _legacy_has_repo(legacy: Path, repo: str) -> bool:
     """True when the legacy DB has a sync_state row for the folded repo."""
     from zaxbygraph.db import open_existing
 
+    repo = repo.lower()  # defensive: library callers may pass raw casing
     try:
         conn = open_existing(legacy)
     except Exception:

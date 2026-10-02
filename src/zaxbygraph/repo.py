@@ -12,7 +12,7 @@ REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 #: Windows backslashes, and any `..` sequence (issue #10 review PRR-001:
 #: the host becomes ONE path segment under the store root, so `..` or `\`
 #: would escape it and a port would create an unusable directory).
-HOST_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+HOST_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9._-]*[a-z0-9_])?$")
 
 DEFAULT_HOST = "github.com"
 
@@ -44,10 +44,14 @@ def _clean_host(raw_host: str) -> str | None:
     host = raw_host.strip().strip("/").strip(".")
     if "@" in host:
         host = host.rsplit("@", 1)[-1]
-    if ":" in host:  # port or junk: strip one port only
+    if ":" in host:  # port: keep it as a DISTINCT, path-safe suffix
+        # (PRR-001 round 2: two GHE instances on one hostname at different
+        # ports are different stores; merging them would silently collide.
+        # ':' itself cannot be a path segment on Windows, hence _port.)
         host, _, port = host.rpartition(":")
         if not port.isdigit():
             return None
+        host = f"{host}_{port}"
     host = host.strip(".").lower()
     if not host or ".." in host or "\\" in host or not HOST_RE.match(host):
         return None

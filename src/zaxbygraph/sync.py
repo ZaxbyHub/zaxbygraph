@@ -305,12 +305,10 @@ def _read_payload_locked(fd: int) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def read_lock_observer(db_path: Path) -> dict | str | None:
-    """Observer-side read (`where`): offset 1, best-effort, never raises.
-    Returns the holder dict, None (free), or the documented degradation."""
-    path = lock_path_for(db_path)
+def _observe_lock_file(lock_path: Path) -> dict | str | None:
+    """Read an ALREADY-DERIVED lock file path (offset 1, best-effort)."""
     try:
-        with open(path, "rb") as fh:
+        with open(lock_path, "rb") as fh:
             fh.seek(1)
             data = fh.read(65536)
     except OSError:
@@ -325,6 +323,11 @@ def read_lock_observer(db_path: Path) -> dict | str | None:
     except ValueError:
         return "held (holder unreadable)"
     return payload if isinstance(payload, dict) else "held (holder unreadable)"
+
+
+def read_lock_observer(db_path: Path) -> dict | str | None:
+    """Observer-side read (`where`): derives the lock path from the db."""
+    return _observe_lock_file(lock_path_for(db_path))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -407,7 +410,7 @@ def acquire_sync_lock(
             # when the observer can see a holder, another process owns the
             # lock; when it sees nothing, the range-lock failure was NOT
             # contention and must surface as an error, not a silent join.
-            if read_lock_observer(path) is None:
+            if _observe_lock_file(path) is None:
                 raise
             if not wait:
                 return None

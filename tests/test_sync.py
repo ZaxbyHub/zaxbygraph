@@ -367,7 +367,6 @@ class SyncStateTests(TempDBTest):
 # import needed below is restated here (no header edits).
 import io
 import json
-import os
 import socket
 import subprocess
 import sys
