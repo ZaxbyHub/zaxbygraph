@@ -491,9 +491,11 @@ class MigrationTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 init_schema(conn)
-        # The first fold ran destructively (items cleared and reinserted) and
-        # the ALTER had already added the column inside the transaction, so
-        # these assertions only hold if the rollback actually happened.
+        # The mock replaces _fold_dedupe_table entirely (no wraps=), so call 1
+        # is a no-op; the destructive statement that ran inside the transaction
+        # is the ALTER TABLE. These assertions therefore only hold if the
+        # rollback actually happened (neutered or committing rollback leaves
+        # the column and stamps visible).
         self.assertEqual(calls["n"], 2)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
         self.assertNotIn("full_sync_pending", cols)
