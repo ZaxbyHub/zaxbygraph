@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,26 @@ from zaxbygraph.query import (
     search,
     status,
 )
-from zaxbygraph.repo import RepoError, resolve_repo
+from zaxbygraph.repo import RepoError, resolve_repo, validate_slug
 from zaxbygraph.sync import SyncError, sync_repo
+
+
+def _force_utf8_streams() -> None:
+    """Pin stdout/stderr to UTF-8 regardless of the ambient locale.
+
+    On Windows without UTF-8 overrides, a piped stdout is cp1252 and
+    `json.dump(..., ensure_ascii=False)` aborts mid-encode on the first
+    emoji, leaving truncated JSON on a zero-exit-looking pipe. `replace`
+    keeps a lone surrogate in legacy garbled rows from crashing output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
 
 
 def _want_json(args: argparse.Namespace) -> bool:
@@ -68,7 +87,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     owner, name = slug.split("/", 1)
-    conn, db_path = _open_db(args)
+    db_path = Path(args.db) if args.db else default_db_path()
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = connect(db_path)
+        init_schema(conn)
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, database newer than this build)
+        # can never succeed on retry — README's exit-2 contract.
+        if conn is not None:
+            conn.close()
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        # A storage fault before the sync starts is reported as the same
+        # result object, not a traceback (AGENTS.md: reported, not swallowed).
+        if conn is not None:
+            conn.close()
+        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        return 1
     jsonl: Path | None = None
     if args.jsonl:
         jsonl = Path(args.jsonl)
@@ -84,6 +121,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
             jsonl_path=jsonl,
         )
     except SyncError as exc:
+        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        return 1
+    except Exception as exc:  # recorded by sync_repo; reported, not a traceback
         _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
         return 1
     finally:
@@ -291,6 +331,15 @@ def _sync_entry(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Pin the streams before argparse runs: its usage/error text is the first
+    # user-facing output and can carry non-ASCII from bad arguments.
+    _force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "repo", None):
+        try:
+            args.repo = validate_slug(args.repo)
+        except RepoError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     return int(args.func(args))

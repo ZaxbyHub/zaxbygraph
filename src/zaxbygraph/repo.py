@@ -18,7 +18,10 @@ def validate_slug(slug: str) -> str:
     owner, name = slug.split("/", 1)
     if owner in {".", ".."} or name in {".", ".."}:
         raise RepoError(f"invalid repo slug: {slug!r}")
-    return f"{owner}/{name}"
+    # Canonical storage is lowercase: GitHub slugs are case-insensitive, and
+    # every table keys on `repo`, so preserving caller casing would store one
+    # repo twice. Display case survives in the raw payloads, never in keys.
+    return f"{owner.lower()}/{name.lower()}"
 
 
 def _parse_remote_url(url: str) -> str | None:
@@ -50,7 +53,8 @@ def slug_from_git(cwd: Path | None = None) -> str:
             cwd=str(cwd) if cwd else None,
             check=False,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError as exc:
         raise RepoError("git not found; pass --repo OWNER/REPO") from exc

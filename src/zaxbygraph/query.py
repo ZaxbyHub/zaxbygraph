@@ -4,6 +4,8 @@ import re
 import sqlite3
 from collections import defaultdict, deque
 
+from zaxbygraph.repo import validate_slug
+
 _FIRST_KW = re.compile(r"\s*([A-Za-z]+)", re.I)
 
 #: U+FEFF is not whitespace per str.strip()/\s, so a UTF-8 BOM (common when
@@ -41,7 +43,17 @@ def _clamp_limit(limit: int) -> int:
     return limit if limit > 0 else _MIN_LIMIT
 
 
+def _fold_repo(repo: str | None) -> str | None:
+    """Canonical lowercase repo for every lookup (issue #1: one repo, one key).
+
+    Truthy guard matches cli.main(): an empty --repo means "no filter",
+    not an error.
+    """
+    return validate_slug(repo) if repo else None
+
+
 def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
+    repo = _fold_repo(repo)
     if repo:
         state = conn.execute("SELECT * FROM sync_state WHERE repo = ?", (repo,)).fetchone()
         states = [] if state is None else [_row_to_dict(state)]
@@ -53,6 +65,8 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
         + " GROUP BY repo, kind, state",
         (repo,) if repo else (),
     ).fetchall()
+    for row in states:
+        row["complete"] = not row.get("full_sync_pending") and row.get("last_error") is None
     return {
         "repos": states,
         "counts": [dict(r) for r in items],
@@ -60,6 +74,7 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
 
 
 def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | None = None) -> dict:
+    repo = _fold_repo(repo)
     match = fts_query(query)
     limit = _clamp_limit(limit)
     sql = """
@@ -98,6 +113,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
 
 
 def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict | None:
+    repo = _fold_repo(repo)
     if repo:
         row = conn.execute(
             "SELECT * FROM items WHERE repo = ? AND number = ?", (repo, number)
@@ -154,6 +170,7 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
 
 
 def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | None = None) -> dict:
+    repo = _fold_repo(repo)
     if repo is None:
         row = conn.execute("SELECT repo FROM items WHERE number = ?", (number,)).fetchone()
         if row is None:
@@ -194,6 +211,7 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
 
 
 def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) -> list[dict]:
+    repo = _fold_repo(repo)
     sql = """
         SELECT path, COUNT(*) AS prs,
                SUM(additions) AS additions, SUM(deletions) AS deletions
@@ -209,6 +227,7 @@ def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) ->
 
 
 def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
+    repo = _fold_repo(repo)
     sql = """
         SELECT repo, number, kind, title, author, updated_at, html_url
         FROM items WHERE state = 'open'
@@ -223,6 +242,7 @@ def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
 
 def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = None) -> dict:
     """Undirected BFS over item↔item and item↔file edges."""
+    repo = _fold_repo(repo)
     if repo is None:
         row = conn.execute("SELECT repo FROM items LIMIT 1").fetchone()
         if row is None:
@@ -428,6 +448,7 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
 
 
 def export_graph(conn: sqlite3.Connection, repo: str | None = None) -> dict:
+    repo = _fold_repo(repo)
     item_rows = conn.execute(
         "SELECT repo, number, kind, title, state FROM items" + (" WHERE repo = ?" if repo else ""),
         (repo,) if repo else (),

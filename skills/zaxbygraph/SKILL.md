@@ -19,12 +19,26 @@ interpretation is yours to make and to label as yours.
 ## First action
 
 ```bash
+zaxbygraph status --repo OWNER/REPO
+```
+
+`status` answers whether a corpus already exists, and whether it is complete
+and error-free (`complete: true`, `last_error: null`). Only when status
+reports no corpus for the repo — no repo rows at all, or an empty database —
+run the one-time build:
+
+```bash
 zaxbygraph sync --repo OWNER/REPO
 ```
 
+If a corpus exists but `complete: false` or `last_error` is non-null, the
+last sync stopped early — re-run the same `sync` (it resumes from the
+watermark) and do not draw conclusions from the DB until it finishes clean.
+
 Then query. After a successful sync, **never** page `gh api --paginate` of
 issues, PRs, comments, or reviews into context — that spends exactly the context
-the sync saved.
+the sync saved. A worktree or a different checkout may resolve to a different
+database, so checking `status` first is what stops a needless cold rebuild.
 
 Check the result before trusting the DB:
 
@@ -37,7 +51,7 @@ Check the result before trusting the DB:
 
 | You want to know | Use |
 | --- | --- |
-| Is there data, and is it stale or broken? | `status` — check `last_error` and `issues_since` |
+| Is there data, and is it stale, incomplete, or broken? | `status` — check `complete`, `last_error`, and `issues_since` |
 | Anything about a keyword, error string, symptom | `search "QUERY"` |
 | Everything about one issue/PR | `item N` |
 | What connects to this issue/PR | `related N [--depth 1]` |
@@ -47,9 +61,9 @@ Check the result before trusting the DB:
 | Anything the above don't shape | `sql "SELECT …"` |
 | Feed a graph viewer or join to a code graph | `export-graph` |
 
-Start with `status`. A non-null `last_error` means the last sync stopped early
-and the DB is incomplete — re-run `sync` (the watermark resumes it) before
-drawing conclusions from counts.
+Start with `status`. `complete: false` or a non-null `last_error` means the
+last sync stopped early and the DB is incomplete — re-run `sync` (the
+watermark resumes it) before drawing conclusions from counts.
 
 ## Output shapes
 
@@ -75,7 +89,7 @@ with exit code 0, because "not connected" is an answer.
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0` | Success | — |
-| `2` | Bad request: bad flags, non-read SQL, multiple statements | **Fix the request.** Retrying unchanged always fails again. |
+| `2` | Bad request: bad flags, non-read SQL, multiple statements, environment guards (SQLite too old, database newer than this build) | **Fix the request or the environment.** Retrying unchanged always fails again. |
 | `1` | Runtime: item not found, sync failure, authorizer denial | Situational — may be a real absence, or worth one retry |
 
 Errors print `error: MESSAGE` to stderr (except `sync`, above).

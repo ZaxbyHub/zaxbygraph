@@ -118,7 +118,8 @@ Returns an object with `repos` (one row per repo, from `sync_state`) and
     "repo": "acme/forgegate", "issues_since": "2026-01-03T05:40:10Z",
     "last_full_sync_at": "2026-09-12T19:23:04Z", "last_incr_sync_at": null,
     "last_error": null, "item_count": 3, "comment_count": 1,
-    "edge_count": 10, "include_patches": 0
+    "edge_count": 10, "include_patches": 0, "full_sync_pending": 0,
+    "complete": true
   }],
   "counts": [
     {"repo": "acme/forgegate", "kind": "issue", "state": "open", "c": 2},
@@ -127,7 +128,9 @@ Returns an object with `repos` (one row per repo, from `sync_state`) and
 }
 ```
 
-Check `last_error` first. Non-null means the last sync stopped early.
+Each `repos` row carries `complete`: true only when no full sync is pending
+and the last sync recorded no error — the readiness signal to gate on. Check
+`last_error` first. Non-null means the last sync stopped early.
 
 ### `search` — full-text
 
@@ -242,6 +245,10 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Object vs array.** `status`, `search`, `item`, `related`, `path`, and
   `export-graph` return JSON **objects**. `churn` and `open` return bare JSON
   **arrays**. Indexing `result["items"]` into `churn` output will fail.
+- **Output encoding.** stdout and stderr are UTF-8 on every platform,
+  regardless of the ambient locale — emoji and CJK in titles and bodies
+  round-trip exactly. `--repo` matches case-insensitively; canonical storage
+  is lowercase.
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
   request was malformed (bad flags, non-read SQL, multiple statements). **`1`** —
   a runtime failure: item not found, sync error, or an authorizer denial at
