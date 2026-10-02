@@ -109,8 +109,16 @@ class CliTests(unittest.TestCase):
             cwd=str(REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 2)
+        # The output must be valid UTF-8 with no crash: pre-reorder, a
+        # cp1252-locale stderr wrote the token as byte 0xFC and this decode
+        # raised (the defect this pins lives on Windows; POSIX argv arrives
+        # surrogate-escaped under LC_ALL=C, so the token itself cannot
+        # survive there regardless of stream encoding).
         stderr = proc.stderr.decode("utf-8")
-        self.assertIn("üser", stderr)
+        self.assertIn("invalid int value", stderr)
+        self.assertNotIn("Traceback", stderr)
+        if sys.platform == "win32":
+            self.assertIn("üser", stderr)
 
     def test_sync_storage_fault_reported_not_traceback(self) -> None:
         # A storage fault before the sync starts (bad DB file) is a result
