@@ -486,3 +486,24 @@ class WhereTests(_Issue2Harness):
         data = json.loads(out)
         self.assertIsNone(data["slug"])
         self.assertEqual(Path(data["serving"]), Path(self.root / "plain.db"))
+
+        # Review round 2: a POPULATED file must not read as empty. Slug-less
+        # items is the unfiltered count; watermark/complete stay per-slug
+        # null/false instead of claiming a row.
+        populated = self.root / "populated.db"
+        pconn = connect(populated)
+        init_schema(pconn)
+        psrc = FakeGitHubSource()
+        psrc.add_issue(issue(501, title="one"))
+        psrc.add_issue(issue(502, title="two"))
+        sync_repo(pconn, psrc, "acme/widget")
+        pconn.close()
+        code, out, err = self._issue2_run(
+            ["where", "--repo", "", "--db", str(populated), "--format", "json"]
+        )
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["exists"], True)
+        self.assertEqual(data["items"], 2)
+        self.assertIsNone(data["watermark"])
+        self.assertIs(data["complete"], False)

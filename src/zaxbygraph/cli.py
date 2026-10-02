@@ -391,7 +391,20 @@ def cmd_where(args: argparse.Namespace) -> int:
         except sqlite3.DatabaseError:
             pass
     elif not repo and store_path.exists():
+        # Slug-less where: report file-scoped facts. items is the UNFILTERED
+        # count (matching --repo '' = no-filter); watermark/complete are
+        # per-slug concepts and stay null/false rather than claiming a row.
         exists = True
+        try:
+            conn = open_existing(store_path)
+            try:
+                items = int(
+                    conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+                )
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            pass
     data = {
         "cwd": str(cwd),
         "git_common_dir": str(common) if common is not None else None,

@@ -92,7 +92,9 @@ by hand, or their store keys collide with github.com slugs).
 Reads never create anything: when no corpus exists for the resolved repo they
 exit **3** with the resolved path and the exact `zaxbygraph sync --repo <slug>`
 command on stderr. A DB that holds other repos but not the resolved one exits
-**2** and lists them. `zaxbygraph where` prints the full resolution chain;
+**2** and lists them; if it holds only a pre-fold (mixed-case) row of
+the resolved repo itself, exit **2** says so and points at
+`doctor --consolidate` - it is never reported as another repo. `zaxbygraph where` prints the full resolution chain;
 `zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
 consolidates, copy-only) scattered legacy DBs. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
