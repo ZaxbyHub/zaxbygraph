@@ -70,6 +70,48 @@ class CliTests(unittest.TestCase):
         code, out, err = self.run_cmd(["item", "99", "--db", self.db, "--format", "json"])
         self.assertEqual(code, 1)
 
+    def test_sync_env_guard_exits_2(self) -> None:
+        # An environment guard (database newer than this build) can never
+        # succeed on retry: README's exit-2 contract, not exit 1.
+        conn = connect(Path(self.db))
+        conn.execute("PRAGMA user_version = 99")
+        conn.commit()
+        conn.close()
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(
+                ["sync", "--repo", "acme/forgegate", "--db", self.db, "--format", "json"]
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("newer than this build", err.getvalue())
+
+    def test_argparse_error_output_is_utf8(self) -> None:
+        # argparse errors are user-facing output: the UTF-8 pinning must run
+        # before parse_args so a non-ASCII token survives a hostile locale.
+        env = scrubbed_env()
+        env["PYTHONPATH"] = str(REPO_ROOT / "src")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-X",
+                "utf8=0",
+                "-m",
+                "zaxbygraph",
+                "item",
+ "üser",
+                "--db",
+                self.db,
+            ],
+            capture_output=True,
+            env=env,
+            cwd=str(REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 2)
+        stderr = proc.stderr.decode("utf-8")
+        self.assertIn("üser", stderr)
+
     def test_sync_storage_fault_reported_not_traceback(self) -> None:
         # A storage fault before the sync starts (bad DB file) is a result
         # object on stdout with a non-zero exit, never a traceback.

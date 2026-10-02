@@ -477,13 +477,26 @@ class MigrationTests(unittest.TestCase):
         self.addCleanup(conn.close)
         from unittest.mock import patch
 
+        calls = {"n": 0}
+
+        def explode_on_second_fold(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("fold exploded")
+            return None
+
         with patch(
             "zaxbygraph.db._fold_dedupe_table",
-            side_effect=RuntimeError("fold exploded"),
+            side_effect=explode_on_second_fold,
         ):
             with self.assertRaises(RuntimeError):
                 init_schema(conn)
-        # Rollback contract: version unstamped, pre-migration data intact.
+        # The first fold ran destructively (items cleared and reinserted) and
+        # the ALTER had already added the column inside the transaction, so
+        # these assertions only hold if the rollback actually happened.
+        self.assertEqual(calls["n"], 2)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
+        self.assertNotIn("full_sync_pending", cols)
         self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 0)
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 3

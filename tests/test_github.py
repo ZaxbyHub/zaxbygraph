@@ -91,6 +91,12 @@ class GhDecodeTests(unittest.TestCase):
             0,
             "probe failed\nstdout=%r\nstderr=%r" % (proc.stdout, proc.stderr),
         )
+        if proc.stdout.startswith(b"SKIP_HOSTILE_LOCALE_ABSENT:"):
+            self.skipTest(
+                "probe child locale is UTF-8-capable (%s); the pre-fix decode "
+                "defect cannot be exercised on this host"
+                % proc.stdout.decode("utf-8").split(":", 1)[1].strip()
+            )
         self.assertIn(b"ROUNDTRIP_OK", proc.stdout)
 
 

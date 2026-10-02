@@ -89,7 +89,7 @@ with exit code 0, because "not connected" is an answer.
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `0` | Success | — |
-| `2` | Bad request: bad flags, non-read SQL, multiple statements | **Fix the request.** Retrying unchanged always fails again. |
+| `2` | Bad request: bad flags, non-read SQL, multiple statements, environment guards (SQLite too old, database newer than this build) | **Fix the request or the environment.** Retrying unchanged always fails again. |
 | `1` | Runtime: item not found, sync failure, authorizer denial | Situational — may be a real absence, or worth one retry |
 
 Errors print `error: MESSAGE` to stderr (except `sync`, above).
