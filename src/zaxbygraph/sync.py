@@ -247,10 +247,6 @@ def sync_repo(
 # while holding the range lock, which makes concurrent stale-recovery atomic.
 
 
-class SyncLockHeld(RuntimeError):
-    """The lock is held by a live process (or a foreign host)."""
-
-
 def lock_path_for(db_path: Path) -> Path:
     return Path(str(db_path) + ".sync.lock")
 
@@ -375,9 +371,8 @@ class SyncLock:
             self._abandon()
 
     def abandon(self) -> None:
-        """Unlock + close without touching the payload. The join/poll paths
-        in acquire_sync_lock inline this cleanup (they hold no SyncLock
-        object); kept as the named primitive for callers that do."""
+        """Unlock + close without touching the payload. The join/held paths
+        in acquire_sync_lock call this; only the owner may truncate."""
         self._abandon()
 
     def _abandon(self) -> None:
@@ -426,8 +421,7 @@ def acquire_sync_lock(
                 fd, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": utcnow()}
             )
             return SyncLock(path, fd)
-        _unlock_range(fd)
-        os.close(fd)
+        SyncLock(path, fd).abandon()
         if not wait:
             return None
         time.sleep(poll_s)

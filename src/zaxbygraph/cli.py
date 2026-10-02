@@ -30,7 +30,7 @@ from zaxbygraph.query import (
     search,
     status,
 )
-from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, resolve_repo, validate_slug
+from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
 from zaxbygraph.sync import (
     SyncError,
     SyncLock,
