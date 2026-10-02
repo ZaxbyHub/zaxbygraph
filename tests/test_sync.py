@@ -18,7 +18,8 @@ from zaxbygraph.sync import (
     _pid_alive,
     acquire_sync_lock,
     sync_repo,
-)  # noqa: F401 - _pid_alive is the production helper (PRR-011). — _pid_alive is the production helper (PRR-011): the suite must exercise the exact fail-closed semantics the lock ships with.
+)  # noqa: F401 - _pid_alive is the production helper (PRR-011): the
+# suite must exercise the exact fail-closed semantics the lock ships with.
 
 
 class SyncTests(TempDBTest):
@@ -388,6 +389,9 @@ from zaxbygraph.cli import main
 
 
 class SyncLockTests(TempDBTest):
+    """Sync-lock acceptance tests (issue #2 AC5): one sync per repo at a
+    time, enforced by <db>.sync.lock (join / --wait / stale takeover)."""
+
     def test_real_contention_joins_and_pid_semantics(self) -> None:
         """PRR-008 regression: a REAL range-lock holder (not a decoy
         payload file) must join, never raise; production _pid_alive
@@ -407,26 +411,51 @@ class SyncLockTests(TempDBTest):
         self.assertFalse(_pid_alive(self.dead_pid()))
         self.assertTrue(_pid_alive(os.getpid()))
 
-    def test_empty_lock_file_with_held_range_lock_joins(self) -> None:
-        """Critic blocker: a holder that owns the range lock but has not
-        written its payload yet (empty file) is CONTENTION - the second
-        sync joins instead of raising (pre-payload window)."""
-        from zaxbygraph.sync import _lock_range
+    def test_fault_with_unobservable_holder_raises(self) -> None:
+        """PRR-008 regression (reviewer round-5): a range-lock failure with
+        NO observable holder - a persistent environmental fault, or a lock
+        held empty well past the re-probe pause - must RAISE, never
+        silently report joined:true. The bounded re-probe resolves the
+        genuine pre-payload window (a real holder writes its payload
+        within it); this shape does not clear."""
+        from zaxbygraph.sync import _FAULT_REPROBE_PAUSE, _lock_range
 
         fd = os.open(str(self.lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
         try:
-            _lock_range(fd)  # hold the range lock; payload NOT written
+            _lock_range(fd)  # hold the range lock; payload stays absent
+            with patch("zaxbygraph.sync._FAULT_REPROBE_PAUSE", 0):
+                with self.assertRaises(OSError):
+                    acquire_sync_lock(self.db_path)
+        finally:
+            os.close(fd)
+
+    def test_monkeypatched_fault_raises_not_joins(self) -> None:
+        """The original PRR-008 repro: _lock_range fails (any OSError) with
+        no observable holder -> acquire_sync_lock RAISES, never returns a
+        silent joined:true."""
+        with patch(
+            "zaxbygraph.sync._lock_range", side_effect=PermissionError(13, "injected")
+        ):
+            with self.assertRaises(OSError):
+                acquire_sync_lock(self.db_path)
+
+    def test_empty_lock_file_with_held_range_lock_joins(self) -> None:
+        """Critic round-4 shape: a holder that owns the range lock and HAS
+        written its payload is contention - the second sync joins. (The
+        empty pre-payload window is covered by the fault-raise test.)"""
+        from zaxbygraph.sync import _lock_range, _write_payload_locked
+
+        fd = os.open(str(self.lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            _lock_range(fd)  # hold the range lock
+            # Write the payload THROUGH the locked fd: Windows region locks
+            # block writes from any other handle, even in this process.
+            _write_payload_locked(
+                fd, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": "t"}
+            )
             self.assertIsNone(acquire_sync_lock(self.db_path))
         finally:
             os.close(fd)
-    """Issue #2 AC5: one sync per repo at a time, enforced by <db>.sync.lock.
-
-    The lock file is JSON: {"pid": int, "host": str, "started_at": str}.
-    A second sync while a live same-host process holds it makes ZERO GitHub
-    calls and returns {"ok": true, "joined": true, ...}; a stale lock (dead
-    pid, same host) is recovered and the sync proceeds; a lock held by a
-    different host is never stolen; --wait blocks for the lock instead.
-    """
 
     def lock_path(self):
         return Path(str(self.db_path) + ".sync.lock")

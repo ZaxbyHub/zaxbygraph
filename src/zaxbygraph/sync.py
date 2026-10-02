@@ -390,6 +390,9 @@ class SyncLock:
             self.fd = -1
 
 
+_FAULT_REPROBE_PAUSE = 0.02  # bounded re-probe pause (PRR-008)
+
+
 def acquire_sync_lock(
     db_path: Path, *, wait: bool = False, poll_s: float = 0.2
 ) -> SyncLock | None:
@@ -404,20 +407,37 @@ def acquire_sync_lock(
         fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
         try:
             _lock_range(fd)
-        except OSError:
+        except OSError as lock_fault:
             os.close(fd)
-            # Distinguish contention from an environmental fault (PRR-008):
-            # a lock file that exists on disk means another process created
-            # it and may hold the range lock while its payload is not yet
-            # (re)written - that is contention, so join/wait. Only a lock
-            # file that has vanished (or is unreadable) under us is an
-            # environmental fault worth raising.
-            if not path.exists():
-                raise
-            if not wait:
-                return None
-            time.sleep(poll_s)
-            continue
+            # Distinguish contention from an environmental fault (PRR-008).
+            # The first instant is ambiguous: a genuine holder may hold the
+            # range lock with its payload not yet (re)written, while a
+            # transient environmental fault fails identically. Bounded
+            # re-probe (reviewer prescription): after one short pause,
+            # a holder still locks the file AND its payload is observable;
+            # a persistent fault keeps failing with nothing to observe -
+            # report it (a silent joined:true here was the original
+            # PRR-008 silent false-success).
+            time.sleep(_FAULT_REPROBE_PAUSE)
+            fd2 = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                _lock_range(fd2)
+            except OSError:
+                os.close(fd2)
+                holder = _observe_lock_file(path)
+                if holder is None:
+                    raise lock_fault
+                if not wait:
+                    return None
+                time.sleep(poll_s)
+                continue
+            # The re-probe ACQUIRED the range lock: the earlier failure was
+            # transient (and any prior holder died within the window, where
+            # our payload legitimately replaces theirs). Take ownership.
+            _write_payload_locked(
+                fd2, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": utcnow()}
+            )
+            return SyncLock(path, fd2)
         payload = _read_payload_locked(fd)
         if payload is None:
             _write_payload_locked(
