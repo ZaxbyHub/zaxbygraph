@@ -189,18 +189,18 @@ class DoctorTests(unittest.TestCase):
         for path in (older, fresh, incomplete):
             self.assertIn(str(path.resolve()), scanned)
         # Older complete DB: reported, not adopted, no garbled rows.
-        self.assertEqual(scanned[str(older)]["items"], 1)
-        self.assertIs(scanned[str(older)]["complete"], True)
-        self.assertIs(scanned[str(older)]["adopted"], False)
-        self.assertEqual(scanned[str(older)]["garbled"], 0)
+        self.assertEqual(scanned[str(older.resolve())]["items"], 1)
+        self.assertIs(scanned[str(older.resolve())]["complete"], True)
+        self.assertIs(scanned[str(older.resolve())]["adopted"], False)
+        self.assertEqual(scanned[str(older.resolve())]["garbled"], 0)
         # Fresher complete DB: adopted, and its mojibake row is counted.
-        self.assertEqual(scanned[str(fresh)]["items"], 2)
-        self.assertIs(scanned[str(fresh)]["complete"], True)
-        self.assertIs(scanned[str(fresh)]["adopted"], True)
-        self.assertGreaterEqual(scanned[str(fresh)]["garbled"], 1)
+        self.assertEqual(scanned[str(fresh.resolve())]["items"], 2)
+        self.assertIs(scanned[str(fresh.resolve())]["complete"], True)
+        self.assertIs(scanned[str(fresh.resolve())]["adopted"], True)
+        self.assertGreaterEqual(scanned[str(fresh.resolve())]["garbled"], 1)
         # Incomplete DB: reported but never adopted, newest watermark or not.
-        self.assertIs(scanned[str(incomplete)]["complete"], False)
-        self.assertIs(scanned[str(incomplete)]["adopted"], False)
+        self.assertIs(scanned[str(incomplete.resolve())]["complete"], False)
+        self.assertIs(scanned[str(incomplete.resolve())]["adopted"], False)
         self.assertEqual(str(Path(report["adopted"]).resolve()), str(fresh.resolve()))
 
         # The user-level store now holds the freshest corpus, mojibake intact.
