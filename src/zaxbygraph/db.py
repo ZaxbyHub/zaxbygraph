@@ -116,6 +116,25 @@ def connect_readonly_query(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def open_existing(db_path: Path) -> sqlite3.Connection:
+    """Open an existing graph read-only; NEVER create anything (issue #2).
+
+    Read commands route through this. mode=ro cannot create the file, and
+    no PRAGMA here mutates it. On a WAL-mode database the open may
+    materialize -shm/-wal beside it (documented; those are the store's own
+    files and hold no new data — legacy candidates that must not be touched
+    at all are read from temp copies by doctor/where). Raises
+    FileNotFoundError when the file is absent; a corrupt file surfaces as
+    sqlite3.DatabaseError from the first statement.
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"database not found: {db_path}")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
 def _schema_sql() -> str:
     return files("zaxbygraph").joinpath(SCHEMA_NAME).read_text(encoding="utf-8")
 

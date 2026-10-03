@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import sqlite3
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -12,7 +13,13 @@ from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pr_file, pull
 from zaxbygraph.cli import cmd_sync
 from zaxbygraph.store import ingest_item as real_ingest_item
 from zaxbygraph.query import item, status
-from zaxbygraph.sync import SyncError, sync_repo
+from zaxbygraph.sync import (
+    SyncError,
+    _pid_alive,
+    acquire_sync_lock,
+    sync_repo,
+)  # noqa: F401 - _pid_alive is the production helper (PRR-011): the
+# suite must exercise the exact fail-closed semantics the lock ships with.
 
 
 class SyncTests(TempDBTest):
@@ -359,3 +366,226 @@ class SyncStateTests(TempDBTest):
         self.assertIsNotNone(row)
         self.assertIn("database is locked", row["last_error"])
         self.assertFalse(status(self.conn, REPO)["repos"][0]["complete"])
+
+
+# ==== issue-trace 2-worktree-global-store: acceptance append (AC5) ====
+# Appended by .agents/issue-traces/2-worktree-global-store/repro/patches/
+# patch_test_sync.py -- append-only; every class above is untouched and every
+# import needed below is restated here (no header edits).
+import io
+import json
+import socket
+import subprocess
+import sys
+import threading
+import time
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from fixtures import REPO, TempDBTest, issue, pr_file, pull
+from zaxbygraph.cli import main
+
+
+
+class SyncLockTests(TempDBTest):
+    """Sync-lock acceptance tests (issue #2 AC5): one sync per repo at a
+    time, enforced by <db>.sync.lock (join / --wait / stale takeover)."""
+
+    def test_real_contention_joins_and_pid_semantics(self) -> None:
+        """PRR-008 regression: a REAL range-lock holder (not a decoy
+        payload file) must join, never raise; production _pid_alive
+        semantics pinned (PRR-011)."""
+        lock = acquire_sync_lock(self.db_path)
+        try:
+            self.assertIsNotNone(lock)
+            # Real contention must JOIN (return None), never raise - the
+            # PRR-008 round-1 regression turned this into PermissionError.
+            self.assertIsNone(acquire_sync_lock(self.db_path))
+        finally:
+            lock.release_owned()
+        # After release, acquiring again must succeed (lock was freed).
+        lock2 = acquire_sync_lock(self.db_path)
+        self.assertIsNotNone(lock2)
+        lock2.release_owned()
+        self.assertFalse(_pid_alive(self.dead_pid()))
+        self.assertTrue(_pid_alive(os.getpid()))
+
+    def test_fault_with_unobservable_holder_raises(self) -> None:
+        """PRR-008 regression (reviewer round-5): a range-lock failure with
+        NO observable holder - a persistent environmental fault, or a lock
+        held empty well past the re-probe pause - must RAISE, never
+        silently report joined:true. The bounded re-probe resolves the
+        genuine pre-payload window (a real holder writes its payload
+        within it); this shape does not clear."""
+        from zaxbygraph.sync import _FAULT_REPROBE_PAUSE, _lock_range
+
+        fd = os.open(str(self.lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            _lock_range(fd)  # hold the range lock; payload stays absent
+            with patch("zaxbygraph.sync._FAULT_REPROBE_PAUSE", 0):
+                with self.assertRaises(OSError):
+                    acquire_sync_lock(self.db_path)
+        finally:
+            os.close(fd)
+
+    def test_monkeypatched_fault_raises_not_joins(self) -> None:
+        """The original PRR-008 repro: _lock_range fails (any OSError) with
+        no observable holder -> acquire_sync_lock RAISES, never returns a
+        silent joined:true."""
+        with patch(
+            "zaxbygraph.sync._lock_range", side_effect=PermissionError(13, "injected")
+        ):
+            with self.assertRaises(OSError):
+                acquire_sync_lock(self.db_path)
+
+    def test_empty_lock_file_with_held_range_lock_joins(self) -> None:
+        """Critic round-4 shape: a holder that owns the range lock and HAS
+        written its payload is contention - the second sync joins. (The
+        empty pre-payload window is covered by the fault-raise test.)"""
+        from zaxbygraph.sync import _lock_range, _write_payload_locked
+
+        fd = os.open(str(self.lock_path()), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            _lock_range(fd)  # hold the range lock
+            # Write the payload THROUGH the locked fd: Windows region locks
+            # block writes from any other handle, even in this process.
+            _write_payload_locked(
+                fd, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": "t"}
+            )
+            self.assertIsNone(acquire_sync_lock(self.db_path))
+        finally:
+            os.close(fd)
+
+    def lock_path(self):
+        return Path(str(self.db_path) + ".sync.lock")
+
+    def write_lock(self, pid, host):
+        path = self.lock_path()
+        path.write_text(
+            json.dumps({"pid": pid, "host": host, "started_at": "2026-10-02T00:00:00Z"}),
+            encoding="utf-8",
+        )
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+
+    def cli_sync(self, *extra):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            with patch("zaxbygraph.cli.GhApiSource", return_value=self.src):
+                code = main(
+                    ["sync", "--repo", REPO, "--db", str(self.db_path),
+                     "--format", "json", *extra]
+                )
+        return code, out.getvalue(), err.getvalue()
+
+    def spawn_holder(self):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"]
+        )
+
+    def dead_pid(self):
+        """A provably-dead pid (retried in the unlikely event of pid reuse)."""
+        for _ in range(5):
+            proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(0)"])
+            proc.wait()
+            if not _pid_alive(proc.pid):
+                return proc.pid
+        self.fail("could not obtain a provably-dead pid")
+
+    def test_concurrent_sync_does_not_double_fetch(self):
+        self.src.add_issue(issue(1, title="one"))
+        self.src.add_pr(
+            issue(2, title="two", kind="pr", state="closed"),
+            pull(2, changed_files=1),
+            files=[pr_file("src/a.py")],
+        )
+
+        # --- holder is a live process on this host: join with zero calls ---
+        holder = self.spawn_holder()
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        self.assertTrue(_pid_alive(holder.pid), "holder child died prematurely")
+        self.write_lock(holder.pid, socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+        self.assertTrue(_pid_alive(holder.pid), "a joining sync must not kill the holder")
+        # Round-2 critic blocker 3: the join path must NOT wipe the live
+        # holder's payload (a wiped payload would let a third sync run).
+        payload = json.loads(self.lock_path().read_text(encoding="utf-8"))
+        self.assertEqual(payload["pid"], holder.pid, "join clobbered the holder's payload")
+        self.assertEqual(payload["host"], socket.gethostname())
+
+        # --- holder on a different host: never stolen, treated as held ---
+        self.write_lock(holder.pid, "foreign-host-" + socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+
+        # --- foreign host with a DEAD pid: still never stolen (PRR-012) ---
+        dead_foreign = self.dead_pid()
+        self.assertFalse(_pid_alive(dead_foreign))
+        self.write_lock(dead_foreign, "foreign-host-" + socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data.get("joined"), True)
+        self.assertEqual(self.src.extra_fetches, 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
+
+        # --- stale holder (dead pid, same host): recovered; sync proceeds ---
+        dead = self.dead_pid()
+        self.assertFalse(_pid_alive(dead))
+        self.write_lock(dead, socket.gethostname())
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIsNot(data.get("joined"), True)
+        self.assertEqual(data.get("ingested"), 2)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
+        self.assertGreater(self.src.extra_fetches, 0)
+
+        # --- --wait blocks for the lock instead of joining ---------------
+        self.write_lock(holder.pid, socket.gethostname())
+        self.assertTrue(_pid_alive(holder.pid))
+
+        def release():
+            time.sleep(0.6)
+            holder.kill()
+            holder.wait()  # reap: on Linux a killed-but-unreaped child is a
+            # zombie and _pid_alive(zombie) stays True forever, so the
+            # --wait takeover would never fire (Linux-only hang, found in CI).
+            # Deliberately NO unlink (PRR-012): the waiter must observe the
+            # dead same-host payload and take over under the range lock.
+
+        releaser = threading.Thread(target=release)
+        releaser.start()
+        try:
+            started = time.monotonic()
+            code, out, err = self.cli_sync("--wait")
+            elapsed = time.monotonic() - started
+        finally:
+            releaser.join()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIsNot(data.get("joined"), True)
+        self.assertGreaterEqual(elapsed, 0.45, "--wait returned before the holder died")
+        self.assertLess(elapsed, 30.0, "--wait spun far too long")
+        # Idempotent re-sync of the same corpus: still exactly the 2 items.
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)

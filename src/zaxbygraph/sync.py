@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sqlite3
+import time
 from pathlib import Path
 from typing import TextIO
 
@@ -229,3 +232,229 @@ def sync_repo(
         "edge_count": None if state is None else state["edge_count"],
         "last_error": None if state is None else state["last_error"],
     }
+
+
+# --- whole-run sync lock (issue #2 AC5) -------------------------------------
+#
+# Layout: byte 0 is a sentinel kept under an OS byte-range lock; the JSON
+# payload {"pid", "host", "started_at"} lives at offset >= 1. Windows range
+# locks are MANDATORY, so per-reader rules differ: the acquirer reads through
+# its own locked descriptor (exempt from the lock) including byte 0 and
+# parses from the first "{", which also tolerates hand-written files whose
+# payload starts at 0; unlocked observers (e.g. `where`) read from offset 1
+# best-effort and degrade when no "{" is found. The file is never unlinked
+# by a process that does not own it: takeover rewrites the payload in place
+# while holding the range lock, which makes concurrent stale-recovery atomic.
+
+
+def lock_path_for(db_path: Path) -> Path:
+    # Resolve first (PRR-002): raw --db spellings of the same file (relative
+    # forms, trailing dots, symlink aliases) must share one lock.
+    return Path(str(Path(db_path).resolve()) + ".sync.lock")
+
+
+def _lock_range(fd: int) -> None:
+    """Exclusive non-blocking lock on byte 0; raises OSError when held."""
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_range(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _write_payload_locked(fd: int, payload: dict) -> None:
+    """Truncate-then-write at the sentinel layout (byte 0 = NUL sentinel,
+    payload at offset 1). Truncation matters: an in-place shorter write over
+    a longer hand-written payload would leave tail residue and a stale `{`
+    at byte 0 that breaks parse-from-first-`{` for every later reader."""
+    blob = b"\x00" + json.dumps(payload).encode("utf-8")
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.ftruncate(fd, 0)
+    os.write(fd, blob)
+
+
+def _read_payload_locked(fd: int) -> dict | None:
+    """Acquirer-side read through the locked descriptor: from byte 0, parse
+    from the first '{' (covers both the sentinel layout and hand-written
+    files). None = no payload (free lock)."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    data = os.read(fd, 65536)
+    idx = data.find(b"{")
+    if idx < 0:
+        return None
+    try:
+        payload = json.loads(data[idx:].decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _observe_lock_file(lock_path: Path) -> dict | str | None:
+    """Read an ALREADY-DERIVED lock file path (offset 1, best-effort)."""
+    try:
+        with open(lock_path, "rb") as fh:
+            fh.seek(1)
+            data = fh.read(65536)
+    except OSError:
+        return None
+    idx = data.find(b"{")
+    if idx < 0:
+        if data:
+            return "held (holder unreadable)"
+        return None
+    try:
+        payload = json.loads(data[idx:].decode("utf-8", errors="replace"))
+    except ValueError:
+        return "held (holder unreadable)"
+    return payload if isinstance(payload, dict) else "held (holder unreadable)"
+
+
+def read_lock_observer(db_path: Path) -> dict | str | None:
+    """Observer-side read (`where`): derives the lock path from the db."""
+    return _observe_lock_file(lock_path_for(db_path))
+
+
+def _pid_alive(pid: int) -> bool:
+    """Liveness of a recorded lock pid. Windows never uses os.kill(pid, 0)
+    for this (it can terminate the process); OpenProcess failure with
+    ERROR_ACCESS_DENIED means ALIVE - fail closed, never steal."""
+    if os.name == "nt":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 0x103
+        ERROR_ACCESS_DENIED = 5
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return ctypes.GetLastError() == ERROR_ACCESS_DENIED
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+        k32.CloseHandle(handle)
+        if not ok:
+            return False
+        return code.value == STILL_ACTIVE
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+class SyncLock:
+    """A held whole-run lock. `release_owned` only on the acquired path;
+    `abandon` on join/held paths so a joining sync never wipes the holder's
+    payload."""
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self.fd = fd
+
+    def release_owned(self) -> None:
+        try:
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            os.ftruncate(self.fd, 0)
+        finally:
+            self._abandon()
+
+    def abandon(self) -> None:
+        """Unlock + close without touching the payload. The join/held paths
+        in acquire_sync_lock call this; only the owner may truncate."""
+        self._abandon()
+
+    def _abandon(self) -> None:
+        try:
+            _unlock_range(self.fd)
+        except OSError:
+            pass
+        finally:
+            os.close(self.fd)
+            self.fd = -1
+
+
+_FAULT_REPROBE_PAUSE = 0.02  # bounded re-probe pause (PRR-008)
+
+
+def acquire_sync_lock(
+    db_path: Path, *, wait: bool = False, poll_s: float = 0.2
+) -> SyncLock | None:
+    """Acquire the whole-run lock for db_path. None = held (join).
+
+    Same-host holders with a dead pid are taken over atomically under the
+    range lock; foreign-host holders are never stolen. wait=True polls until
+    the lock frees instead of returning None.
+    """
+    path = lock_path_for(db_path)
+    while True:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            _lock_range(fd)
+        except OSError as lock_fault:
+            os.close(fd)
+            # Distinguish contention from an environmental fault (PRR-008).
+            # The first instant is ambiguous: a genuine holder may hold the
+            # range lock with its payload not yet (re)written, while a
+            # transient environmental fault fails identically. Bounded
+            # re-probe (reviewer prescription): after one short pause,
+            # a holder still locks the file AND its payload is observable;
+            # a persistent fault keeps failing with nothing to observe -
+            # report it (a silent joined:true here was the original
+            # PRR-008 silent false-success).
+            time.sleep(_FAULT_REPROBE_PAUSE)
+            fd2 = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                _lock_range(fd2)
+            except OSError:
+                os.close(fd2)
+                holder = _observe_lock_file(path)
+                if holder is None:
+                    raise lock_fault
+                if not wait:
+                    return None
+                time.sleep(poll_s)
+                continue
+            # The re-probe ACQUIRED the range lock: the earlier failure was
+            # transient (and any prior holder died within the window, where
+            # our payload legitimately replaces theirs). Take ownership.
+            _write_payload_locked(
+                fd2, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": utcnow()}
+            )
+            return SyncLock(path, fd2)
+        payload = _read_payload_locked(fd)
+        if payload is None:
+            _write_payload_locked(
+                fd, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": utcnow()}
+            )
+            return SyncLock(path, fd)
+        holder_host = str(payload.get("host", ""))
+        try:
+            holder_pid = int(payload.get("pid", -1))
+        except (TypeError, ValueError):
+            holder_pid = -1
+        if holder_host == socket.gethostname() and not _pid_alive(holder_pid):
+            _write_payload_locked(
+                fd, {"pid": os.getpid(), "host": socket.gethostname(), "started_at": utcnow()}
+            )
+            return SyncLock(path, fd)
+        SyncLock(path, fd).abandon()
+        if not wait:
+            return None
+        time.sleep(poll_s)

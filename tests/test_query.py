@@ -327,3 +327,152 @@ class QueryTests(TempDBTest):
         from zaxbygraph import db as db_mod
 
         db_mod.assert_sqlite_supported()  # must not raise
+
+
+# ==== issue-trace 2-worktree-global-store: acceptance append (AC4) ====
+# Appended by .agents/issue-traces/2-worktree-global-store/repro/patches/
+# patch_test_query.py -- append-only; every class above is untouched and every
+# import needed below is restated here (no header edits).
+import io
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+from fixtures import FakeGitHubSource, issue, pr_file, pull
+from zaxbygraph.cli import main
+from zaxbygraph.db import connect, init_schema
+from zaxbygraph.sync import sync_repo
+
+
+class RepoScopeTests(unittest.TestCase):
+    """Issue #2 AC4: one --db holding acme/widget AND other/repo, cwd is a
+    checkout of acme/widget (origin set), NO --repo passed -- every read
+    returns only the resolved repo's rows."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._td.cleanup)
+        self.root = Path(self._td.name)
+        self.db = self.root / "history.db"
+        self.checkout = self.root / "checkout"
+        self.checkout.mkdir()
+        self._git("init", "-b", "main", cwd=self.checkout)
+        self._git("config", "user.email", "t@example.com", cwd=self.checkout)
+        self._git("config", "user.name", "Tester", cwd=self.checkout)
+        (self.checkout / "README.md").write_text("probe\n", encoding="utf-8")
+        self._git("add", "-A", cwd=self.checkout)
+        self._git("commit", "-m", "init", cwd=self.checkout)
+        self._git(
+            "remote", "add", "origin", "https://github.com/acme/widget.git",
+            cwd=self.checkout,
+        )
+        self._seed()
+        self._saved_cwd = os.getcwd()
+        self.addCleanup(os.chdir, self._saved_cwd)
+        os.chdir(self.checkout)
+
+    def _git(self, *argv, cwd):
+        proc = subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", *argv],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        assert proc.returncode == 0, f"git {argv} failed:\n{proc.stderr}"
+
+    def _seed(self):
+        conn = connect(self.db)
+        init_schema(conn)
+        wsrc = FakeGitHubSource()
+        wsrc.add_issue(issue(1, title="widget one", body="needle", state="open"))
+        wsrc.add_issue(issue(2, title="widget two", body="see #1", state="closed"))
+        wsrc.add_pr(
+            issue(3, title="widget pr", body="adds a file", kind="pr", state="closed"),
+            pull(3, changed_files=1, merged=True),
+            files=[pr_file("widget/x.py")],
+        )
+        sync_repo(conn, wsrc, "acme/widget")
+        osrc = FakeGitHubSource()
+        # Distinct item ids are required: items.id is the primary key, and the
+        # fixture derives id from number alone, so the other repo's #1 needs a
+        # hand-set id to coexist with the widget's #1 in one database.
+        other_one = issue(1, title="OTHERCORPUS one", body="needle", state="open")
+        other_one["id"] = 9101
+        osrc.add_issue(other_one)
+        osrc.add_pr(
+            issue(103, title="OTHERCORPUS pr", kind="pr", state="closed"),
+            pull(103, changed_files=1, merged=True),
+            files=[pr_file("other/y.py")],
+        )
+        sync_repo(conn, osrc, "other/repo")
+        conn.close()
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main([*argv, "--db", str(self.db), "--format", "json"])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_default_repo_scopes_every_command(self):
+        # open: only the widget's open item, never other/repo's open #1.
+        code, out, err = self._run(["open"])
+        self.assertEqual(code, 0, err)
+        rows = json.loads(out)
+        self.assertTrue(rows, "open returned no rows")
+        self.assertEqual({r["repo"] for r in rows}, {"acme/widget"})
+        self.assertEqual({r["number"] for r in rows}, {1})
+
+        # search: matches exist in both repos ("needle"); only widget's come back.
+        code, out, err = self._run(["search", "needle"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        titles = [i["title"] for i in data["items"]]
+        self.assertIn("widget one", titles)
+        for section in ("items", "comments"):
+            for row in data[section]:
+                self.assertEqual(row["repo"], "acme/widget")
+
+        # churn: only the widget's file paths.
+        code, out, err = self._run(["churn"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([r["path"] for r in json.loads(out)], ["widget/x.py"])
+
+        # item: number 1 exists in BOTH repos; the resolved repo's row wins.
+        code, out, err = self._run(["item", "1"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["repo"], "acme/widget")
+        self.assertEqual(data["number"], 1)
+        self.assertEqual(data["title"], "widget one")
+
+        # related / path: scoped to the resolved repo.
+        code, out, err = self._run(["related", "1"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["repo"], "acme/widget")
+        code, out, err = self._run(["path", "2", "1"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["repo"], "acme/widget")
+        self.assertIsNotNone(data["path"])
+
+        # export-graph: only the widget's nodes.
+        code, out, err = self._run(["export-graph"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        labels = " ".join(str(n.get("label", "")) for n in data["nodes"])
+        self.assertIn("widget one", labels)
+        self.assertNotIn("OTHERCORPUS", labels)
+
+        # sql: rows carrying a repo column are filtered to the resolved repo.
+        code, out, err = self._run(["sql", "SELECT repo, number FROM items"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertTrue(data["rows"], "sql returned no rows")
+        self.assertEqual({r[0] for r in data["rows"]}, {"acme/widget"})
+        self.assertNotIn("other/repo", [r[0] for r in data["rows"]])

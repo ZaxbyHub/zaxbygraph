@@ -107,7 +107,7 @@ shouldn't.
 ## After a successful sync
 
 **Forbidden:** paging `gh api --paginate` of issues, PRs, comments, or reviews
-into the lead context. Query `zaxbygraph search|item|related|churn|open|path|sql`
+into the lead context. Query `zaxbygraph search|item|related|churn|open|path|sql` (`where` explains resolution, `doctor` consolidates scattered DBs)
 instead. Re-fetching the corpus "to be sure" spends exactly the context the sync
 existed to save.
 

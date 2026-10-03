@@ -8,9 +8,16 @@ from pathlib import Path
 from typing import Any
 
 from zaxbygraph import __version__
-from zaxbygraph.db import connect, connect_readonly_query, init_schema
+from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
+from zaxbygraph.doctor import doctor as doctor_run
 from zaxbygraph.github import GhApiSource
-from zaxbygraph.paths import default_db_path, default_jsonl_dir
+from zaxbygraph.paths import (
+    default_jsonl_dir,
+    git_common_root,
+    legacy_db_paths,
+    resolve_db,
+    store_db_path,
+)
 from zaxbygraph.query import (
     assert_read_sql,
     churn,
@@ -23,8 +30,14 @@ from zaxbygraph.query import (
     search,
     status,
 )
-from zaxbygraph.repo import RepoError, resolve_repo, validate_slug
-from zaxbygraph.sync import SyncError, sync_repo
+from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
+from zaxbygraph.sync import (
+    SyncError,
+    SyncLock,
+    acquire_sync_lock,
+    read_lock_observer,
+    sync_repo,
+)
 
 
 def _force_utf8_streams() -> None:
@@ -73,21 +86,129 @@ def _emit(data: Any, as_json: bool) -> None:
     print(data)
 
 
-def _open_db(args: argparse.Namespace):
-    path = Path(args.db) if getattr(args, "db", None) else default_db_path()
-    conn = connect(path)
-    init_schema(conn)
-    return conn, path
+class _ReadFailure(Exception):
+    """A read that must not proceed: carries its exit code and message."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _resolved_repo(args: argparse.Namespace) -> tuple[str | None, str]:
+    """(repo, host) for a command. An explicitly empty --repo means
+    "no filter" (repo None). A bare --repo slug carries no host: it keys
+    the store under github.com (README documents the boundary)."""
+    repo_flag = getattr(args, "repo", None)
+    if repo_flag is None:
+        host, slug = remote_info()
+        return slug, host
+    if repo_flag == "":
+        return None, DEFAULT_HOST
+    return validate_slug(repo_flag), DEFAULT_HOST
+
+
+def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | None, Path]:
+    """Resolution + corpus guards for every read command (issue #2 AC3/AC4).
+
+    Returns (readonly connection, repo-or-None, resolved path). Never
+    creates a file or directory. Raises _ReadFailure with exit 3 (no corpus
+    for the resolved repo: DB missing or empty) or exit 2 (DB holds other
+    repos but not this one) or exit 1 (file is not a zaxbygraph database).
+    """
+    try:
+        repo, host = _resolved_repo(args)
+    except RepoError as exc:
+        raise _ReadFailure(2, f"could not determine repo ({exc}); pass --repo OWNER/REPO")
+    explicit = getattr(args, "db", None)
+    try:
+        db_path, _chain = resolve_db(repo, explicit=explicit, host=host)
+    except RepoError as exc:
+        raise _ReadFailure(2, str(exc))
+    if repo is None:
+        # Explicit no-filter: open whatever file was named, guards skipped.
+        try:
+            return open_existing(db_path), None, db_path
+        except FileNotFoundError:
+            raise _ReadFailure(
+                3,
+                f"no database at {db_path}; run: zaxbygraph sync --repo OWNER/REPO",
+            )
+    slug = repo
+    try:
+        conn = open_existing(db_path)
+    except FileNotFoundError:
+        raise _ReadFailure(
+            3,
+            f"no graph for {slug}; resolved database: {db_path}; "
+            f"run: zaxbygraph sync --repo {slug}",
+        )
+    try:
+        try:
+            # Case-fold the guard: a pre-#9 legacy DB stores the slug with
+            # user-typed casing. Telling the caller it holds "another repo"
+            # when the row IS the resolved repo would be the exact
+            # identity-ambiguity defect this issue removes.
+            row = conn.execute(
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise _ReadFailure(1, f"{db_path} is not a zaxbygraph database: {exc}")
+        if row is not None:
+            if row["repo"] != slug:
+                raise _ReadFailure(
+                    2,
+                    f"no corpus for {slug} in {db_path}; this database holds "
+                    f"{row['repo']} - the same repo with pre-fold casing; "
+                    f"run: zaxbygraph doctor --consolidate --repo {slug} to adopt it "
+                    f"(or zaxbygraph sync --repo {slug} to rebuild)",
+                )
+        else:
+            others = [
+                r["repo"] for r in conn.execute("SELECT repo FROM sync_state ORDER BY repo")
+            ]
+            if others:
+                raise _ReadFailure(
+                    2,
+                    f"no corpus for {slug} in {db_path}; this database holds: "
+                    + ", ".join(others),
+                )
+            raise _ReadFailure(
+                3,
+                f"no graph for {slug}; resolved database: {db_path}; "
+                f"run: zaxbygraph sync --repo {slug}",
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn, slug, db_path
+
+
+def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
+    try:
+        conn, repo, _path = _open_for_read(args)
+    except _ReadFailure as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        return exc.code
+    try:
+        data = query_fn(conn, *extra, repo=repo)
+    finally:
+        conn.close()
+    _emit(data, _want_json(args))
+    return 0
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
     try:
-        slug = resolve_repo(args.repo)
+        if args.repo:
+            slug = validate_slug(args.repo)
+            host = DEFAULT_HOST
+        else:
+            host, slug = remote_info()
     except RepoError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    owner, name = slug.split("/", 1)
-    db_path = Path(args.db) if args.db else default_db_path()
+    db_path, _chain = resolve_db(slug, explicit=args.db, host=host)
     conn: sqlite3.Connection | None = None
     try:
         conn = connect(db_path)
@@ -106,6 +227,27 @@ def cmd_sync(args: argparse.Namespace) -> int:
             conn.close()
         _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
         return 1
+    lock: SyncLock | None = None
+    try:
+        lock = acquire_sync_lock(db_path, wait=bool(getattr(args, "wait", False)))
+    except OSError as exc:
+        # A lock-file storage fault (unreadable directory, permissions) is a
+        # failed sync, reported as the same result object - never a traceback.
+        conn.close()
+        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        return 1
+    if lock is None:
+        conn.close()
+        _emit(
+            {
+                "ok": True,
+                "joined": True,
+                "repo": slug,
+                "db": str(db_path),
+            },
+            _want_json(args),
+        )
+        return 0
     jsonl: Path | None = None
     if args.jsonl:
         jsonl = Path(args.jsonl)
@@ -114,7 +256,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     try:
         result = sync_repo(
             conn,
-            GhApiSource(owner, name),
+            GhApiSource(*slug.split("/", 1)),
             slug,
             force=args.force,
             include_patches=args.include_patches,
@@ -127,6 +269,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
         return 1
     finally:
+        lock.release_owned()
         conn.close()
     result["ok"] = True
     result["db"] = str(db_path)
@@ -135,35 +278,21 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_status(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
-    try:
-        slug = None
-        if args.repo:
-            slug = resolve_repo(args.repo)
-        data = status(conn, slug)
-    except RepoError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    finally:
-        conn.close()
-    _emit(data, _want_json(args))
-    return 0
+    return _run_read(args, status)
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
-    try:
-        data = search(conn, args.query, limit=args.limit, repo=args.repo)
-    finally:
-        conn.close()
-    _emit(data, _want_json(args))
-    return 0
+    return _run_read(args, search, args.query, args.limit)
 
 
 def cmd_item(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
     try:
-        data = item(conn, args.number, repo=args.repo)
+        conn, repo, _path = _open_for_read(args)
+    except _ReadFailure as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        return exc.code
+    try:
+        data = item(conn, args.number, repo=repo)
     finally:
         conn.close()
     if data is None:
@@ -174,68 +303,168 @@ def cmd_item(args: argparse.Namespace) -> int:
 
 
 def cmd_related(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
-    try:
-        data = related(conn, args.number, depth=args.depth, repo=args.repo)
-    finally:
-        conn.close()
-    _emit(data, _want_json(args))
-    return 0
+    return _run_read(args, related, args.number, args.depth)
 
 
 def cmd_churn(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
-    try:
-        data = churn(conn, limit=args.limit, repo=args.repo)
-    finally:
-        conn.close()
-    _emit(data, _want_json(args))
-    return 0
+    return _run_read(args, churn, args.limit)
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
-    try:
-        data = open_items(conn, repo=args.repo)
-    finally:
-        conn.close()
-    _emit(data, _want_json(args))
-    return 0
+    return _run_read(args, open_items)
 
 
 def cmd_path(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
+    return _run_read(args, path_between, args.a, args.b)
+
+
+def cmd_sql(args: argparse.Namespace) -> int:
+    # Write rejection comes FIRST: the read-only contract is about the
+    # statement, and it must keep its exit 2 before any DB access.
     try:
-        data = path_between(conn, args.a, args.b, repo=args.repo)
+        assert_read_sql(args.statement)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        conn, repo, db_path = _open_for_read(args)
+    except _ReadFailure as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        return exc.code
+    conn.close()
+    try:
+        ro_conn = connect_readonly_query(db_path)
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3 if isinstance(exc, FileNotFoundError) else 2
+    try:
+        try:
+            data = run_sql(ro_conn, args.statement, repo=repo)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     finally:
-        conn.close()
+        ro_conn.close()
     _emit(data, _want_json(args))
     return 0
 
 
-def cmd_sql(args: argparse.Namespace) -> int:
-    db_path = Path(args.db) if args.db else default_db_path()
+def cmd_where(args: argparse.Namespace) -> int:
     try:
-        assert_read_sql(args.statement)
-        conn = connect_readonly_query(db_path)
-    except (ValueError, FileNotFoundError) as exc:
+        repo, host = _resolved_repo(args)
+    except RepoError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     try:
-        data = run_sql(conn, args.statement)
-    except ValueError as exc:
+        serving, _chain = resolve_db(repo, explicit=getattr(args, "db", None), host=host)
+        store_path = store_db_path(host, repo) if repo else serving
+    except RepoError as exc:
+        # e.g. `where --repo ''` with no --db: no slug, no store to resolve.
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    cwd = Path.cwd()
+    common = git_common_root(cwd)
+    exists = False
+    items = 0
+    watermark = None
+    complete = False
+    store_error = None
+    if repo and store_path.exists():
+        try:
+            conn = open_existing(store_path)
+            try:
+                row = conn.execute(
+                    "SELECT issues_since, last_error, full_sync_pending FROM sync_state"
+                    " WHERE lower(repo) = ?",
+                    (repo,),
+                ).fetchone()
+                items = int(
+                    conn.execute(
+                        "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo,)
+                    ).fetchone()["c"]
+                )
+            finally:
+                conn.close()
+            if row is not None:
+                watermark = row["issues_since"]
+                complete = not row["full_sync_pending"] and row["last_error"] is None
+                exists = True
+        except sqlite3.DatabaseError as exc:
+            # A corrupt/unreadable store must stay distinguishable from a
+            # never-created one (PRR-007) without crashing the diagnostic.
+            store_error = str(exc)
+    elif not repo and store_path.exists():
+        # Slug-less where: report file-scoped facts. items is the UNFILTERED
+        # count (matching --repo '' = no-filter); watermark/complete are
+        # per-slug concepts and stay null/false rather than claiming a row.
+        exists = True
+        try:
+            conn = open_existing(store_path)
+            try:
+                items = int(
+                    conn.execute("SELECT COUNT(*) AS c FROM items").fetchone()["c"]
+                )
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError as exc:
+            store_error = str(exc)
+    data = {
+        "cwd": str(cwd),
+        "git_common_dir": str(common) if common is not None else None,
+        "slug": repo,
+        "db": str(store_path),
+        "exists": exists,
+        "items": items,
+        "watermark": watermark,
+        "complete": complete,
+        "legacy": [str(p) for p in legacy_db_paths(cwd)],
+        "serving": str(serving),
+        "sync_lock": read_lock_observer(serving),
+        "store_error": store_error,
+    }
+    _emit(data, _want_json(args))
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    try:
+        if args.repo:
+            repo, host = validate_slug(args.repo), DEFAULT_HOST
+        else:
+            host, repo = remote_info()
+    except RepoError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    store_db = store_db_path(host, repo)
+    if args.db:
+        store_db = Path(args.db)
+    scans = [Path(s) for s in args.scan]
+    try:
+        data = doctor_run(
+            Path.cwd(),
+            repo,
+            store_db,
+            extra_scans=scans,
+            consolidate_flag=args.consolidate,
+        )
+    except Exception as exc:
+        # A storage fault during report/consolidation is a result object,
+        # never a traceback (AGENTS.md: reported, not swallowed; PRR-010).
+        _emit({"ok": False, "error": str(exc), "store": str(store_db)}, _want_json(args))
         return 1
-    finally:
-        conn.close()
+    data["store"] = str(store_db)
     _emit(data, _want_json(args))
     return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    conn, _ = _open_db(args)
     try:
-        data = export_graph(conn, repo=args.repo)
+        conn, repo, _path = _open_for_read(args)
+    except _ReadFailure as exc:
+        print(f"error: {exc.message}", file=sys.stderr)
+        return exc.code
+    try:
+        data = export_graph(conn, repo=repo)
     finally:
         conn.close()
     json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
@@ -252,7 +481,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(sp: argparse.ArgumentParser, *, repo: bool = True) -> None:
-        sp.add_argument("--db", help="SQLite path (default: .swarm or .zaxbygraph/history.db)")
+        sp.add_argument("--db", help="SQLite path (default: user-level store for the repo)")
         sp.add_argument(
             "--format",
             choices=("json", "text"),
@@ -273,6 +502,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         dest="jsonl_raw",
         help="Append JSONL sidecar (optional DIR; default sibling jsonl/)",
+    )
+    sp.add_argument(
+        "--wait",
+        action="store_true",
+        help="Wait for the sync lock instead of returning joined:true",
     )
     sp.set_defaults(func=_sync_entry)
 
@@ -320,6 +554,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("export-graph", help="Graphify-shaped {nodes, edges} JSON")
     add_common(sp)
     sp.set_defaults(func=cmd_export)
+
+    sp = sub.add_parser("where", help="Print the resolution chain for this checkout")
+    add_common(sp)
+    sp.set_defaults(func=cmd_where)
+
+    sp = sub.add_parser("doctor", help="Report (and optionally consolidate) legacy DBs")
+    add_common(sp)
+    sp.add_argument(
+        "--scan",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Extra directory to scan for history.db files (repeatable)",
+    )
+    sp.add_argument(
+        "--consolidate",
+        action="store_true",
+        help="Adopt the freshest complete corpus into the store (copies, never deletes)",
+    )
+    sp.set_defaults(func=cmd_doctor)
     return p
 
 

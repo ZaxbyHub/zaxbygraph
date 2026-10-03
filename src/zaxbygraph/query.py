@@ -419,7 +419,7 @@ def assert_read_sql(sql: str) -> None:
         raise ValueError("SQL must start with SELECT, WITH, or EXPLAIN")
 
 
-def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
+def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200, repo: str | None = None) -> dict:
     assert_read_sql(sql)
     limit = _clamp_limit(limit)
     cur = conn.cursor()
@@ -444,6 +444,16 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200) -> dict:
         [row[c] if isinstance(row, sqlite3.Row) else row[idx] for idx, c in enumerate(cols)]
         for row in fetched[:limit]
     ]
+    if repo is not None and "repo" in cols:
+        # Issue #2 AC4: rows that carry a repo column show only the resolved
+        # repo. Post-fetch and column-name based; a projection without a
+        # repo column cannot be filtered (per-slug stores make that
+        # store-scoped by construction — documented in README).
+        # truncated reports the PRE-filter rowset (PRR-004): the unfiltered
+        # query genuinely had more rows than the limit, so raising the limit
+        # always converges; the flag must not be recomputed post-filter.
+        idx = cols.index("repo")
+        rows = [row for row in rows if row[idx] == repo]
     return {"columns": cols, "rows": rows, "truncated": truncated}
 
 
