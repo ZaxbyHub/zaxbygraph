@@ -218,8 +218,9 @@ class EnvelopeContractTests(unittest.TestCase):
         row1 = data1["rows"][0]
         self.assertEqual(len(row1), 3, (data1["columns"], row1))
         # Real n_2 keeps its own key and its own value (a number).
-        self.assertEqual(row1["n_2"], data1["rows"][0]["n_2"])
         self.assertIsInstance(row1["n_2"], int)
+        self.assertEqual(row1["n"], 1)
+        self.assertEqual(row1["n_3"], REPO)
         # Order 2: the real n_2 comes FIRST; the duplicate gets n_3.
         sql2 = "SELECT number AS n_2, number AS n, repo AS n FROM items ORDER BY number LIMIT 1"
         code2, out2, err2 = self._run(["sql", sql2, "--format", "json"])
@@ -227,8 +228,8 @@ class EnvelopeContractTests(unittest.TestCase):
         data2 = json.loads(out2)["data"]
         row2 = data2["rows"][0]
         self.assertEqual(len(row2), 3, (data2["columns"], row2))
-        self.assertEqual(row2["n_2"], data2["rows"][0]["n_2"])
         self.assertIsInstance(row2["n_2"], int)
+        self.assertIsInstance(row2["n"], int)
         # Positions: 0=number(n_2), 1=number(n), 2=repo(n-dup -> n_3).
         self.assertEqual(row2["n"], row2["n_2"])
         self.assertEqual(row2["n_3"], REPO)

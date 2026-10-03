@@ -319,7 +319,8 @@ Machine-readable rules, worth knowing before scripting against this:
   never envelope keys. `--fields repo,number` projects rows to exactly those
   keys that exist (unknown keys are omitted) — it applies to list payloads and
   to `sql` rows in both modes (objects: keys; `--rows array`: positions), not
-  to nested arrays inside dict payloads. `sql` rows are objects keyed by
+  to nested arrays inside dict payloads. With duplicate-suffixed objects
+  rows, project by the suffixed key (`columns` keeps the true names). `sql` rows are objects keyed by
   column by default — duplicate column names are suffixed `name_2`, `name_3`,
   … so no value is lost (`columns` keeps the true names; `--rows array` keeps
   positional lists and exact duplicates); `--limit N` overrides the 200-row

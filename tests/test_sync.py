@@ -557,12 +557,21 @@ class SyncLockTests(TempDBTest):
         self.assertIs(data["ok"], True)
         self.assertIsNot(data["data"].get("joined"), True)
         self.assertEqual(data["data"].get("ingested"), 2)
-        # PRR-003: the joiner's envelope carries the recorded freshness of
-        # the corpus it joined — not null placeholders.
-        self.assertIsNotNone(data["freshness"]["synced_at"])
-        self.assertIs(data["freshness"]["complete"], True)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
         self.assertGreater(self.src.extra_fetches, 0)
+
+        # --- PRR-003: a join AFTER a corpus exists carries the recorded ---
+        # --- freshness of that corpus, not null placeholders. The join  ---
+        # --- blocks above run pre-corpus, where nulls are legitimate.   ---
+        self.write_lock(holder.pid, socket.gethostname())
+        self.assertTrue(_pid_alive(holder.pid))
+        code, out, err = self.cli_sync()
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertIs(data["ok"], True)
+        self.assertIs(data["data"].get("joined"), True)
+        self.assertIsNotNone(data["freshness"]["synced_at"])
+        self.assertIs(data["freshness"]["complete"], True)
 
         # --- --wait blocks for the lock instead of joining ---------------
         self.write_lock(holder.pid, socket.gethostname())
