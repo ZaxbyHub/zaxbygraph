@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,7 @@ from zaxbygraph.query import (
     status,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
+from zaxbygraph.schema_notes import describe_schema
 from zaxbygraph.sync import (
     SyncError,
     SyncLock,
@@ -58,20 +61,219 @@ def _force_utf8_streams() -> None:
             pass
 
 
-def _want_json(args: argparse.Namespace) -> bool:
+def _format_of(args: argparse.Namespace) -> str:
     fmt = getattr(args, "format", None)
-    if fmt == "json":
-        return True
+    if fmt in ("json", "compact", "jsonl", "text"):
+        return fmt
+    return "text" if sys.stdout.isatty() else "json"
+
+
+def _fields_of(args: argparse.Namespace) -> list[str]:
+    raw = getattr(args, "fields", None)
+    if not raw:
+        return []
+    return [f.strip() for f in str(raw).split(",") if f.strip()]
+
+
+def _freshness(conn: sqlite3.Connection | None, slug: str | None) -> dict:
+    """The envelope's freshness block (issue #3 AC2).
+
+    NULL-safe by construction: `mark_sync_finished` stamps exactly one of
+    `last_full_sync_at`/`last_incr_sync_at` per run, so after a first full
+    sync the other column is NULL — never max() the raw pair.
+    """
+    out: dict[str, Any] = {"synced_at": None, "age_s": None, "complete": False}
+    if conn is None or not slug:
+        return out
+    try:
+        row = conn.execute(
+            "SELECT last_full_sync_at, last_incr_sync_at, full_sync_pending,"
+            " last_error FROM sync_state WHERE lower(repo) = ?",
+            (slug,),
+        ).fetchone()
+    except sqlite3.Error:
+        return out
+    if row is None:
+        return out
+    stamps = [s for s in (row["last_full_sync_at"], row["last_incr_sync_at"]) if s]
+    if stamps:
+        synced_at = max(stamps)
+        out["synced_at"] = synced_at
+        try:
+            parsed = datetime.fromisoformat(synced_at.replace("Z", "+00:00"))
+            out["age_s"] = max(0, int((datetime.now(timezone.utc) - parsed).total_seconds()))
+        except ValueError:
+            out["age_s"] = None
+    out["complete"] = not row["full_sync_pending"] and row["last_error"] is None
+    return out
+
+
+def _item_count(conn: sqlite3.Connection | None, slug: str | None) -> int:
+    if conn is None or not slug:
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT item_count FROM sync_state WHERE lower(repo) = ?", (slug,)
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    if row is None or row["item_count"] is None:
+        return 0
+    return int(row["item_count"])
+
+
+def _identity_line(
+    conn: sqlite3.Connection | None, slug: str | None, db_path: Path | None
+) -> str | None:
+    """The one stderr identity line every successful read prints (AC7).
+
+    `synced` is the whole-second age (digits only — 0 means "no recorded
+    sync age", always accompanied by complete=no); never the ISO timestamp.
+    """
+    if not slug:
+        return None
+    fresh = _freshness(conn, slug)
+    age = fresh["age_s"]
+    return (
+        f"# db={db_path} repo={slug} items={_item_count(conn, slug)}"
+        f" synced={age if age is not None else 0}"
+        f" complete={'yes' if fresh['complete'] else 'no'}"
+    )
+
+
+_ERROR_CODES = {3: "no_corpus", 2: "bad_request", 1: "runtime"}
+
+
+def _error_for(code_key: str, message: str, hint: str | None = None) -> dict:
+    err: dict[str, Any] = {"code": code_key, "message": message}
+    if hint:
+        err["hint"] = hint
+    return err
+
+
+def _failure(code: int, message: str, hint: str | None = None) -> dict:
+    return _error_for(_ERROR_CODES.get(code, "runtime"), message, hint)
+
+
+def _project(row: Any, fields: list[str]) -> Any:
+    if not fields or not isinstance(row, dict):
+        return row
+    return {k: row[k] for k in fields if k in row}
+
+
+def build_envelope(
+    data: Any,
+    *,
+    conn: sqlite3.Connection | None = None,
+    slug: str | None = None,
+    db_path: Path | str | None = None,
+    error: dict | None = None,
+    truncated: bool = False,
+    freshness: dict | None = None,
+) -> dict:
+    """The one envelope shape (issue #3 AC2): ok, db, repo, freshness,
+    data, truncated — plus error on failures."""
+    if freshness is None:
+        freshness = _freshness(conn, slug)
+    env: dict[str, Any] = {
+        "ok": error is None,
+        "db": str(db_path) if db_path else None,
+        "repo": slug,
+        "freshness": freshness,
+        "data": None if error is not None else data,
+        "truncated": bool(truncated),
+    }
+    if error is not None:
+        env["error"] = error
+    return env
+
+
+def _render_json(env: dict, indent: int | None) -> None:
+    json.dump(env, sys.stdout, indent=indent, ensure_ascii=False, default=str)
+    sys.stdout.write("\n")
+
+
+def emit_result(
+    args: argparse.Namespace,
+    data: Any,
+    *,
+    conn: sqlite3.Connection | None = None,
+    slug: str | None = None,
+    db_path: Path | str | None = None,
+    error: dict | None = None,
+    truncated: bool = False,
+    freshness: dict | None = None,
+    identity_line: str | None = None,
+    identity: bool = True,
+    echo: bool = True,
+) -> None:
+    """The single output owner (issue #3): envelope assembly, all formats,
+    --fields projection, the stderr identity line on success, and the
+    one-line stderr error echo on failure (the human contract the error-
+    channel tests pin; the structured envelope goes to stdout)."""
+    fields = _fields_of(args)
+    payload = data
+    columns: list[str] | None = None
+    if fields and error is None:
+        if isinstance(data, list):
+            payload = [_project(row, fields) for row in data]
+        elif isinstance(data, dict) and isinstance(data.get("rows"), list):
+            # sql's rows project despite dict-shaped data (plan item 5).
+            # Objects mode projects keys; array mode projects positions so
+            # columns and rows stay aligned (PRR-002).
+            cols = data.get("columns")
+            payload = dict(data)
+            if (
+                data["rows"]
+                and isinstance(data["rows"][0], list)
+                and isinstance(cols, list)
+            ):
+                idxs = [i for i, c in enumerate(cols) if c in fields]
+                payload["rows"] = [
+                    [row[i] for i in idxs if i < len(row)] for row in data["rows"]
+                ]
+                payload["columns"] = [cols[i] for i in idxs]
+            else:
+                payload["rows"] = [_project(row, fields) for row in data["rows"]]
+                if isinstance(cols, list):
+                    payload["columns"] = [c for c in cols if c in fields]
+    env = build_envelope(
+        payload,
+        conn=conn,
+        slug=slug,
+        db_path=db_path,
+        error=error,
+        truncated=truncated,
+        freshness=freshness,
+    )
+    if error is not None and echo:
+        print(f"error: {error.get('message', '')}", file=sys.stderr)
+    fmt = _format_of(args)
     if fmt == "text":
-        return False
-    return not sys.stdout.isatty()
+        # Failures answer through the stderr echo; rendering the null payload
+        # would print a literal "None" to stdout (4.5 review finding 2).
+        if error is None:
+            _emit_text(payload)
+    elif fmt == "jsonl":
+        if error is None and isinstance(payload, list):
+            for row in payload:
+                sys.stdout.write(
+                    json.dumps(row, ensure_ascii=False, default=str) + "\n"
+                )
+        else:
+            _render_json(env, indent=None)
+    elif fmt == "compact":
+        _render_json(env, indent=None)
+    else:
+        _render_json(env, indent=2)
+    if identity_line is None and identity and error is None and slug:
+        identity_line = _identity_line(conn, slug, db_path)
+    if identity_line:
+        print(identity_line, file=sys.stderr)
 
 
-def _emit(data: Any, as_json: bool) -> None:
-    if as_json:
-        json.dump(data, sys.stdout, indent=2, ensure_ascii=False, default=str)
-        sys.stdout.write("\n")
-        return
+def _emit_text(data: Any) -> None:
+    """The historical text-mode rendering: bare data, never envelope keys."""
     if isinstance(data, dict):
         for key, val in data.items():
             if isinstance(val, (dict, list)):
@@ -84,6 +286,34 @@ def _emit(data: Any, as_json: bool) -> None:
         print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
         return
     print(data)
+
+
+def emit_failure(
+    args: argparse.Namespace,
+    code: int,
+    message: str,
+    *,
+    slug: str | None = None,
+    db_path: Path | str | None = None,
+    code_key: str | None = None,
+    hint: str | None = None,
+) -> int:
+    """Post-parse failure: structured error envelope on stdout, the one-line
+    human echo on stderr, exit code unchanged."""
+    err = (
+        _error_for(code_key, message, hint)
+        if code_key
+        else _failure(code, message, hint)
+    )
+    emit_result(
+        args,
+        None,
+        slug=slug,
+        db_path=db_path,
+        error=err,
+        identity=False,
+    )
+    return code
 
 
 class _ReadFailure(Exception):
@@ -185,16 +415,29 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
 
 
 def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
+    repo: str | None = None
+    db_path: Path | None = None
     try:
-        conn, repo, _path = _open_for_read(args)
+        conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        print(f"error: {exc.message}", file=sys.stderr)
-        return exc.code
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = query_fn(conn, *extra, repo=repo)
+        fresh = _freshness(conn, repo)
+        line = _identity_line(conn, repo, db_path)
     finally:
         conn.close()
-    _emit(data, _want_json(args))
+    emit_result(
+        args, data, slug=repo, db_path=db_path, freshness=fresh, identity_line=line
+    )
     return 0
 
 
@@ -206,8 +449,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
         else:
             host, slug = remote_info()
     except RepoError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(args, 2, str(exc), slug=None)
     db_path, _chain = resolve_db(slug, explicit=args.db, host=host)
     conn: sqlite3.Connection | None = None
     try:
@@ -218,14 +460,20 @@ def cmd_sync(args: argparse.Namespace) -> int:
         # can never succeed on retry — README's exit-2 contract.
         if conn is not None:
             conn.close()
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(args, 2, str(exc), slug=slug, db_path=db_path)
     except Exception as exc:
         # A storage fault before the sync starts is reported as the same
         # result object, not a traceback (AGENTS.md: reported, not swallowed).
         if conn is not None:
             conn.close()
-        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        emit_result(
+            args,
+            None,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
         return 1
     lock: SyncLock | None = None
     try:
@@ -234,18 +482,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
         # A lock-file storage fault (unreadable directory, permissions) is a
         # failed sync, reported as the same result object - never a traceback.
         conn.close()
-        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        emit_result(
+            args,
+            None,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
         return 1
     if lock is None:
+        fresh = _freshness(conn, slug)
         conn.close()
-        _emit(
-            {
-                "ok": True,
-                "joined": True,
-                "repo": slug,
-                "db": str(db_path),
-            },
-            _want_json(args),
+        emit_result(
+            args,
+            {"joined": True},
+            slug=slug,
+            db_path=db_path,
+            freshness=fresh,
+            identity=False,
         )
         return 0
     jsonl: Path | None = None
@@ -263,17 +518,40 @@ def cmd_sync(args: argparse.Namespace) -> int:
             jsonl_path=jsonl,
         )
     except SyncError as exc:
-        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        emit_result(
+            args,
+            None,
+            conn=conn,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
         return 1
     except Exception as exc:  # recorded by sync_repo; reported, not a traceback
-        _emit({"ok": False, "error": str(exc), "db": str(db_path), "repo": slug}, _want_json(args))
+        emit_result(
+            args,
+            None,
+            conn=conn,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
         return 1
     finally:
         lock.release_owned()
+        fresh = _freshness(conn, slug)
         conn.close()
-    result["ok"] = True
-    result["db"] = str(db_path)
-    _emit(result, _want_json(args))
+    data = {k: v for k, v in result.items() if k not in ("repo", "db")}
+    emit_result(
+        args,
+        data,
+        slug=slug,
+        db_path=db_path,
+        freshness=fresh,
+        identity=False,
+    )
     return 0
 
 
@@ -286,20 +564,70 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 
 def cmd_item(args: argparse.Namespace) -> int:
+    repo: str | None = None
+    db_path: Path | None = None
     try:
-        conn, repo, _path = _open_for_read(args)
+        conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        print(f"error: {exc.message}", file=sys.stderr)
-        return exc.code
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = item(conn, args.number, repo=repo)
+        if data is not None:
+            truncated = _truncate_bodies(data, args.max_body_chars)
+            fresh = _freshness(conn, repo)
+            line = _identity_line(conn, repo, db_path)
     finally:
         conn.close()
     if data is None:
-        print(f"error: item #{args.number} not found", file=sys.stderr)
-        return 1
-    _emit(data, _want_json(args))
+        return emit_failure(
+            args,
+            1,
+            f"item #{args.number} not found",
+            slug=repo,
+            db_path=db_path,
+            code_key="not_found",
+        )
+    emit_result(
+        args,
+        data,
+        slug=repo,
+        db_path=db_path,
+        truncated=truncated,
+        freshness=fresh,
+        identity_line=line,
+    )
     return 0
+
+
+def _truncate_bodies(data: dict, limit: int) -> bool:
+    """AC6: cut item/comment/review bodies to --max-body-chars and mark each
+    truncated object `truncated: true`. Returns whether anything was cut."""
+    if limit is None or limit <= 0:
+        return False
+    cut = False
+    body = data.get("body")
+    if isinstance(body, str) and len(body) > limit:
+        data["body"] = body[:limit]
+        data["truncated"] = True
+        cut = True
+    for key in ("comments", "reviews"):
+        for obj in data.get(key) or []:
+            if not isinstance(obj, dict):
+                continue
+            text = obj.get("body")
+            if isinstance(text, str) and len(text) > limit:
+                obj["body"] = text[:limit]
+                obj["truncated"] = True
+                cut = True
+    return cut
 
 
 def cmd_related(args: argparse.Namespace) -> int:
@@ -318,34 +646,142 @@ def cmd_path(args: argparse.Namespace) -> int:
     return _run_read(args, path_between, args.a, args.b)
 
 
+_NO_SUCH_RE = re.compile(r"^(no such column|no such table)", re.IGNORECASE)
+_TABLE_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+
+
+def _hint_table(sql_text: str) -> str | None:
+    """First FROM/JOIN table in CODE spans only (PRR-006): a plain regex
+    over raw SQL matches the words inside string literals and comments and
+    mis-targets the hint. query._sql_tokens already classifies spans, so
+    scan only its 'code' output."""
+    from zaxbygraph.query import _sql_tokens
+
+    code = " ".join(text for kind, text in _sql_tokens(sql_text) if kind == "code")
+    match = _TABLE_RE.search(code)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _column_hint(conn: sqlite3.Connection, sql_text: str) -> str | None:
+    """Real column names for the first FROM/JOIN table (issue #3 AC1).
+
+    PRAGMA-free by design: the hint probe is a plain `SELECT * FROM <token>
+    LIMIT 0` on the already-open authorizer-guarded connection, read through
+    cursor.description — no path through the `sql` subcommand ever issues a
+    PRAGMA (AGENTS.md escape-hatch invariant). The token is identifier-
+    charset-only so it cannot break out of the SELECT. Any probe failure
+    (missing table, CTE names) omits the hint; the envelope still emits.
+    """
+    token = _hint_table(sql_text)
+    if token is None:
+        return None
+    try:
+        probe = conn.execute(f"SELECT * FROM {token} LIMIT 0")
+        cols = [d[0] for d in probe.description or []]
+    except sqlite3.Error:
+        return None
+    if not cols:
+        return None
+    return f"columns of {token}: " + ", ".join(cols)
+
+
 def cmd_sql(args: argparse.Namespace) -> int:
     # Write rejection comes FIRST: the read-only contract is about the
     # statement, and it must keep its exit 2 before any DB access.
     try:
         assert_read_sql(args.statement)
     except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=getattr(args, "repo", None) or None,
+            db_path=getattr(args, "db", None),
+            code_key="bad_sql",
+        )
+    repo: str | None = None
+    db_path: Path | None = None
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        print(f"error: {exc.message}", file=sys.stderr)
-        return exc.code
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     conn.close()
     try:
         ro_conn = connect_readonly_query(db_path)
     except (ValueError, FileNotFoundError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 3 if isinstance(exc, FileNotFoundError) else 2
+        code = 3 if isinstance(exc, FileNotFoundError) else 2
+        return emit_failure(args, code, str(exc), slug=repo, db_path=db_path)
     try:
         try:
-            data = run_sql(ro_conn, args.statement, repo=repo)
+            data = run_sql(ro_conn, args.statement, limit=args.limit, repo=repo)
         except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
+            message = str(exc)
+            match = _NO_SUCH_RE.match(message)
+            if match is not None:
+                code_key = match.group(1).lower().replace(" ", "_")
+                hint = _column_hint(ro_conn, args.statement)
+            else:
+                code_key, hint = "runtime", None
+            emit_result(
+                args,
+                None,
+                conn=ro_conn,
+                slug=repo,
+                db_path=db_path,
+                error=_error_for(code_key, message, hint),
+                identity=False,
+            )
             return 1
+        fresh = _freshness(ro_conn, repo)
+        line = _identity_line(ro_conn, repo, db_path)
     finally:
         ro_conn.close()
-    _emit(data, _want_json(args))
+    truncated = bool(data.get("truncated"))
+    cols = data["columns"]
+    rows = data["rows"]
+    if args.rows_mode == "objects":
+        # A SELECT can yield duplicate column names (joins of tables sharing
+        # columns, `SELECT a, a`); a plain dict(zip) would silently drop the
+        # later positions. Repeats get suffixed keys, generated collision-
+        # safe against every ORIGINAL name (so a real `n_2` column keeps its
+        # own key and the generated duplicate moves to `n_3`), so every
+        # value survives under a deterministic key; `columns` keeps the true
+        # names and `--rows array` preserves positions exactly.
+        reserved = set(cols)
+        used: set[str] = set()
+        counts: dict[str, int] = {}
+        keys: list[str] = []
+        for c in cols:
+            counts[c] = counts.get(c, 0) + 1
+            if counts[c] == 1 and c not in used:
+                keys.append(c)
+                used.add(c)
+                continue
+            i = 2
+            while f"{c}_{i}" in used or f"{c}_{i}" in reserved:
+                i += 1
+            keys.append(f"{c}_{i}")
+            used.add(f"{c}_{i}")
+        rows = [dict(zip(keys, row)) for row in rows]
+    emit_result(
+        args,
+        {"columns": cols, "rows": rows},
+        slug=repo,
+        db_path=db_path,
+        truncated=truncated,
+        freshness=fresh,
+        identity_line=line,
+    )
     return 0
 
 
@@ -353,15 +789,13 @@ def cmd_where(args: argparse.Namespace) -> int:
     try:
         repo, host = _resolved_repo(args)
     except RepoError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(args, 2, str(exc))
     try:
         serving, _chain = resolve_db(repo, explicit=getattr(args, "db", None), host=host)
         store_path = store_db_path(host, repo) if repo else serving
     except RepoError as exc:
         # e.g. `where --repo ''` with no --db: no slug, no store to resolve.
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(args, 2, str(exc), slug=repo)
     cwd = Path.cwd()
     common = git_common_root(cwd)
     exists = False
@@ -369,6 +803,8 @@ def cmd_where(args: argparse.Namespace) -> int:
     watermark = None
     complete = False
     store_error = None
+    fresh = None
+    line = None
     if repo and store_path.exists():
         try:
             conn = open_existing(store_path)
@@ -383,6 +819,8 @@ def cmd_where(args: argparse.Namespace) -> int:
                         "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo,)
                     ).fetchone()["c"]
                 )
+                fresh = _freshness(conn, repo)
+                line = _identity_line(conn, repo, serving)
             finally:
                 conn.close()
             if row is not None:
@@ -393,11 +831,15 @@ def cmd_where(args: argparse.Namespace) -> int:
             # A corrupt/unreadable store must stay distinguishable from a
             # never-created one (PRR-007) without crashing the diagnostic.
             store_error = str(exc)
+            fresh = None
+            line = None
     elif not repo and store_path.exists():
         # Slug-less where: report file-scoped facts. items is the UNFILTERED
         # count (matching --repo '' = no-filter); watermark/complete are
         # per-slug concepts and stay null/false rather than claiming a row.
         exists = True
+        fresh = None
+        line = None
         try:
             conn = open_existing(store_path)
             try:
@@ -422,7 +864,14 @@ def cmd_where(args: argparse.Namespace) -> int:
         "sync_lock": read_lock_observer(serving),
         "store_error": store_error,
     }
-    _emit(data, _want_json(args))
+    emit_result(
+        args,
+        data,
+        slug=repo,
+        db_path=serving,
+        freshness=fresh,
+        identity_line=line,
+    )
     return 0
 
 
@@ -433,8 +882,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         else:
             host, repo = remote_info()
     except RepoError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return emit_failure(args, 2, str(exc), slug=None)
     store_db = store_db_path(host, repo)
     if args.db:
         store_db = Path(args.db)
@@ -450,25 +898,84 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:
         # A storage fault during report/consolidation is a result object,
         # never a traceback (AGENTS.md: reported, not swallowed; PRR-010).
-        _emit({"ok": False, "error": str(exc), "store": str(store_db)}, _want_json(args))
+        emit_result(
+            args,
+            None,
+            slug=repo,
+            db_path=store_db,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
         return 1
-    data["store"] = str(store_db)
-    _emit(data, _want_json(args))
+    data.pop("store", None)
+    # doctor's own ok/True is dead weight under the envelope (root ok is the
+    # contract); dropping it keeps one source of truth for success.
+    data.pop("ok", None)
+    emit_result(args, data, slug=repo, db_path=store_db, identity=False)
     return 0
 
 
 def cmd_export(args: argparse.Namespace) -> int:
+    repo: str | None = None
+    db_path: Path | None = None
     try:
-        conn, repo, _path = _open_for_read(args)
+        conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        print(f"error: {exc.message}", file=sys.stderr)
-        return exc.code
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = export_graph(conn, repo=repo)
+        fresh = _freshness(conn, repo)
+        line = _identity_line(conn, repo, db_path)
     finally:
         conn.close()
-    json.dump(data, sys.stdout, indent=2, ensure_ascii=False)
-    sys.stdout.write("\n")
+    emit_result(
+        args, data, slug=repo, db_path=db_path, freshness=fresh, identity_line=line
+    )
+    return 0
+
+
+def cmd_schema(args: argparse.Namespace) -> int:
+    repo: str | None = None
+    db_path: Path | None = None
+    try:
+        conn, repo, db_path = _open_for_read(args)
+    except _ReadFailure as exc:
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
+    try:
+        try:
+            data = describe_schema(conn, args.table)
+        except LookupError as exc:
+            return emit_failure(
+                args,
+                1,
+                f"no such table: {exc.args[0]}",
+                slug=repo,
+                db_path=db_path,
+                code_key="not_found",
+            )
+        fresh = _freshness(conn, repo)
+        line = _identity_line(conn, repo, db_path)
+    finally:
+        conn.close()
+    emit_result(
+        args, data, slug=repo, db_path=db_path, freshness=fresh, identity_line=line
+    )
     return 0
 
 
@@ -484,9 +991,14 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--db", help="SQLite path (default: user-level store for the repo)")
         sp.add_argument(
             "--format",
-            choices=("json", "text"),
+            choices=("json", "compact", "jsonl", "text"),
             default=None,
-            help="json when stdout is not a TTY, text when it is",
+            help="json when stdout is not a TTY, text when it is; jsonl/compact for streams",
+        )
+        sp.add_argument(
+            "--fields",
+            default=None,
+            help="Comma-separated keys to project result rows to (e.g. repo,number)",
         )
         if repo:
             sp.add_argument("--repo", help="OWNER/REPO (default: git origin)")
@@ -523,6 +1035,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("item", help="One issue/PR with comments, files, edges")
     add_common(sp)
     sp.add_argument("number", type=int)
+    sp.add_argument(
+        "--max-body-chars",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Truncate the item/comment/review bodies to N chars (marks truncated)",
+    )
     sp.set_defaults(func=cmd_item)
 
     sp = sub.add_parser("related", help="1-hop neighborhood")
@@ -549,7 +1068,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sql", help="Read-only SQL (SELECT/WITH/EXPLAIN)")
     add_common(sp)
     sp.add_argument("statement")
+    sp.add_argument(
+        "--rows",
+        choices=("objects", "array"),
+        default="objects",
+        dest="rows_mode",
+        help="Row shape: objects keyed by column (default) or positional arrays",
+    )
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum rows to return (default 200)",
+    )
     sp.set_defaults(func=cmd_sql)
+
+    sp = sub.add_parser("schema", help="Table DDL and per-column notes from the live DB")
+    add_common(sp)
+    sp.add_argument(
+        "table",
+        nargs="?",
+        default=None,
+        help="One table name (default: every table)",
+    )
+    sp.set_defaults(func=cmd_schema)
 
     sp = sub.add_parser("export-graph", help="Graphify-shaped {nodes, edges} JSON")
     add_common(sp)
@@ -594,6 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             args.repo = validate_slug(args.repo)
         except RepoError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
+            # Post-parse validation: still answers with the structured
+            # envelope on stdout (argparse's own usage errors stay on stderr).
+            return emit_failure(args, 2, str(exc))
     return int(args.func(args))

@@ -45,10 +45,16 @@ class CliTests(unittest.TestCase):
         # Issue #2: a fresh path is no corpus - exit 3, nothing created, and
         # the message names the path and the exact sync command. (Was: empty
         # JSON with exit 0; behavior intentionally changed, see PR notes.)
+        # Issue #3: the failure additionally answers on stdout with the
+        # structured error envelope (stderr keeps the one-line echo).
         fresh = Path(self._td.name) / "missing" / "history.db"
         code, out, err = self.run_cmd(["status", "--db", str(fresh), "--format", "json"])
         self.assertEqual(code, 3, err)
-        self.assertEqual(out, "")
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "no_corpus")
+        self.assertIn(str(fresh), payload["error"]["message"])
+        self.assertIn("zaxbygraph sync --repo", payload["error"]["message"])
         self.assertTrue(err.lstrip().startswith("error:"), err)
         self.assertIn(str(fresh), err)
         self.assertIn("zaxbygraph sync --repo", err)
@@ -67,7 +73,7 @@ class CliTests(unittest.TestCase):
             ["search", "nothing", "--repo", REPO, "--db", self.db, "--format", "json"]
         )
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertIn("items", data)
         self.assertIn("comments", data)
         self.assertEqual(data["items"], [])
@@ -105,7 +111,9 @@ class CliTests(unittest.TestCase):
                 ["sync", "--repo", "acme/forgegate", "--db", self.db, "--format", "json"]
             )
         self.assertEqual(code, 2)
-        self.assertEqual(out.getvalue(), "")
+        payload = json.loads(out.getvalue())
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "bad_request")
         self.assertIn("newer than this build", err.getvalue())
 
     def test_argparse_error_output_is_utf8(self) -> None:
@@ -189,7 +197,7 @@ class CliEncodingTests(unittest.TestCase):
         self.assertEqual(
             proc.returncode, 0, "cli failed\nstdout=%r\nstderr=%r" % (proc.stdout, proc.stderr)
         )
-        data = json.loads(proc.stdout.decode("utf-8"))
+        data = json.loads(proc.stdout.decode("utf-8"))["data"]
         self.assertEqual(data["title"], self.EMOJI_TITLE)
 
     def test_export_graph_emoji_under_cp1252_stdout(self) -> None:
@@ -197,7 +205,7 @@ class CliEncodingTests(unittest.TestCase):
         self.assertEqual(
             proc.returncode, 0, "cli failed\nstdout=%r\nstderr=%r" % (proc.stdout, proc.stderr)
         )
-        data = json.loads(proc.stdout.decode("utf-8"))
+        data = json.loads(proc.stdout.decode("utf-8"))["data"]
         self.assertTrue(data["nodes"])
         labels = " ".join(n.get("label", "") for n in data["nodes"])
         self.assertIn(self.EMOJI_TITLE, labels)
@@ -241,9 +249,9 @@ class LookupCaseFoldTests(unittest.TestCase):
         # Content assertions on two representative commands: a fold regression
         # on the lookup path must not merely return valid-but-empty output.
         _, out = self._run_cmd(["search", "needle", "--repo", "ACME/ForgeGate"])
-        self.assertIn("findable", json.loads(out)["items"][0]["title"])
+        self.assertIn("findable", json.loads(out)["data"]["items"][0]["title"])
         _, out = self._run_cmd(["status", "--repo", "ACME/ForgeGate"])
-        self.assertEqual(json.loads(out)["repos"][0]["repo"], "acme/forgegate")
+        self.assertEqual(json.loads(out)["data"]["repos"][0]["repo"], "acme/forgegate")
 
     def test_query_layer_folds_repo(self) -> None:
         conn = connect(Path(self.db))
@@ -262,7 +270,7 @@ class LookupCaseFoldTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         code, out = self._run_cmd(["search", "needle", "--repo", ""])
         self.assertEqual(code, 0, out)
-        self.assertTrue(json.loads(out)["items"])
+        self.assertTrue(json.loads(out)["data"]["items"])
 
 
 # ==== issue-trace 2-worktree-global-store: acceptance append (AC3/AC6) ====
@@ -433,7 +441,7 @@ class WhereTests(_Issue2Harness):
 
         code, out, err = self._issue2_run(["where", "--format", "json"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         for key in (
             "cwd",
             "git_common_dir",
@@ -490,7 +498,7 @@ class WhereTests(_Issue2Harness):
             ["where", "--repo", "", "--db", str(self.root / "plain.db"), "--format", "json"]
         )
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertIsNone(data["slug"])
         self.assertEqual(Path(data["serving"]), Path(self.root / "plain.db"))
 
@@ -509,7 +517,7 @@ class WhereTests(_Issue2Harness):
             ["where", "--repo", "", "--db", str(populated), "--format", "json"]
         )
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertIs(data["exists"], True)
         self.assertEqual(data["items"], 2)
         self.assertIsNone(data["watermark"])

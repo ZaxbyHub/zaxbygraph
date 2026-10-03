@@ -76,22 +76,44 @@ watermark resumes it) before drawing conclusions from counts.
 
 ## Output shapes
 
-Pass `--format json` when parsing; the default depends on whether stdout is a
-TTY, and `text` mode leaves nested structures as JSON anyway.
+Every command's JSON output is one self-describing **envelope** (v0.2):
+`{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
+plus `error:{code, message, hint?}` on failures. The per-command payload lives
+under `data`; `ok` is at the root. Errors answer on **stdout** in JSON mode
+(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; a
+successful read that resolves a repo also writes exactly one identity line
+(`sync`/`doctor` never do; slug-less reads print none; `synced=0` means "no
+recorded sync age"):
+`# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
 
-**Objects:** `status` → `{repos[], counts[]}` · `search` →
+**Formats:** `--format json` (pretty, default when piped) and `compact` (one
+line) always carry the envelope · `jsonl` (one object per line for list
+payloads — rows only, identity on the stderr line; any `head -n` prefix
+parses) · `text` (default on a TTY, renders the payload only).
+`--fields repo,number` projects rows to those keys that exist (unknown keys
+are omitted) — applies to list payloads and `sql` rows in both row modes, not
+to nested arrays inside dict payloads. `sql` rows are objects keyed by column
+by default — duplicate column names are suffixed `name_2`, `name_3`, ... so
+no value is lost (`--rows array` keeps positional lists with exact
+duplicates; `--limit N` for the cap). `item N --max-body-chars C` truncates
+bodies and marks them `truncated: true`.
+
+**Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
 `{items[], comments[]}` · `item` → all item columns plus
 `labels[] comments[] reviews[] files[] edges[]` · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
-`export-graph` → `{nodes[], edges[]}`
-
-**Bare arrays:** `churn` and `open` return top-level JSON arrays, *not* objects.
-Indexing `["items"]` into them fails.
+`export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row objects.
 
 Common fields: items carry `number kind title state author updated_at html_url`;
 edges carry `src_type src_id rel dst_type dst_id confidence evidence`. `search`
 marks hits in `snippet` with `«` `»`. `path` is `null` when no route exists —
 with exit code 0, because "not connected" is an answer.
+
+**Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
+per-column notes (TEXT-typed `edges.src_id`/`dst_id`; `pr_files.patch` is NULL
+unless the sync used `--include-patches`). Do not follow a file path to
+`docs/schema.md` from an installed copy of this skill — the command always
+answers from the database you are querying.
 
 ## Exit codes
 
@@ -102,15 +124,19 @@ with exit code 0, because "not connected" is an answer.
 | `1` | Runtime: item not found, sync failure, authorizer denial | Situational — may be a real absence, or worth one retry |
 | `3` | No corpus for the resolved repo: the resolved DB is missing or empty | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
 
-Errors print `error: MESSAGE` to stderr (except `sync`, above).
+Errors print `error: MESSAGE` to stderr and answer with the structured
+`{ok: false, error: {code, message, hint?}}` envelope on stdout (exit codes
+unchanged).
 
 ## `sql` — the escape hatch
 
 Read-only. `SELECT` / `WITH` / `EXPLAIN`, one statement per call. `PRAGMA`,
 `ATTACH`, and every write are rejected; `load_extension` is denied at execution.
 
-**Read [`../../docs/schema.md`](../../docs/schema.md) before writing queries.**
-Column names are not guessable, and three things trip up most first attempts:
+**Run `zaxbygraph schema [TABLE]` before writing queries** — it prints the
+live DDL and per-column notes from the database you are querying (the full
+column reference, `docs/schema.md`, lives in the repo). Column names are not
+guessable, and three things trip up most first attempts:
 
 - `edges.src_id` / `dst_id` are **TEXT** even for item numbers — use
   `dst_id = '10'`, not `dst_id = 10`.
@@ -172,7 +198,7 @@ corpus exists for the resolved repo.
 - `zaxbygraph doctor [--consolidate] [--scan DIR]` reports scattered legacy
   DBs (per-DB item and garbled-row counts); `--consolidate` copies the
   freshest complete corpus into the store — originals are never modified.
-- A second `sync` while one is running joins it: `{ok: true, joined: true, repo: ..., db: ...}`
+- A second `sync` while one is running joins it: `{ok: true, ..., data: {joined: true}}`
   with zero GitHub calls; `--wait` blocks for the lock instead.
 
 Never commit `history.db` — it is a rebuildable cache.

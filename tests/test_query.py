@@ -423,7 +423,7 @@ class RepoScopeTests(unittest.TestCase):
         # open: only the widget's open item, never other/repo's open #1.
         code, out, err = self._run(["open"])
         self.assertEqual(code, 0, err)
-        rows = json.loads(out)
+        rows = json.loads(out)["data"]
         self.assertTrue(rows, "open returned no rows")
         self.assertEqual({r["repo"] for r in rows}, {"acme/widget"})
         self.assertEqual({r["number"] for r in rows}, {1})
@@ -431,7 +431,7 @@ class RepoScopeTests(unittest.TestCase):
         # search: matches exist in both repos ("needle"); only widget's come back.
         code, out, err = self._run(["search", "needle"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         titles = [i["title"] for i in data["items"]]
         self.assertIn("widget one", titles)
         for section in ("items", "comments"):
@@ -441,12 +441,12 @@ class RepoScopeTests(unittest.TestCase):
         # churn: only the widget's file paths.
         code, out, err = self._run(["churn"])
         self.assertEqual(code, 0, err)
-        self.assertEqual([r["path"] for r in json.loads(out)], ["widget/x.py"])
+        self.assertEqual([r["path"] for r in json.loads(out)["data"]], ["widget/x.py"])
 
         # item: number 1 exists in BOTH repos; the resolved repo's row wins.
         code, out, err = self._run(["item", "1"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertEqual(data["repo"], "acme/widget")
         self.assertEqual(data["number"], 1)
         self.assertEqual(data["title"], "widget one")
@@ -454,17 +454,17 @@ class RepoScopeTests(unittest.TestCase):
         # related / path: scoped to the resolved repo.
         code, out, err = self._run(["related", "1"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["repo"], "acme/widget")
+        self.assertEqual(json.loads(out)["data"]["repo"], "acme/widget")
         code, out, err = self._run(["path", "2", "1"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertEqual(data["repo"], "acme/widget")
         self.assertIsNotNone(data["path"])
 
         # export-graph: only the widget's nodes.
         code, out, err = self._run(["export-graph"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         labels = " ".join(str(n.get("label", "")) for n in data["nodes"])
         self.assertIn("widget one", labels)
         self.assertNotIn("OTHERCORPUS", labels)
@@ -472,7 +472,7 @@ class RepoScopeTests(unittest.TestCase):
         # sql: rows carrying a repo column are filtered to the resolved repo.
         code, out, err = self._run(["sql", "SELECT repo, number FROM items"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertTrue(data["rows"], "sql returned no rows")
-        self.assertEqual({r[0] for r in data["rows"]}, {"acme/widget"})
-        self.assertNotIn("other/repo", [r[0] for r in data["rows"]])
+        self.assertEqual({r["repo"] for r in data["rows"]}, {"acme/widget"})
+        self.assertNotIn("other/repo", [r["repo"] for r in data["rows"]])

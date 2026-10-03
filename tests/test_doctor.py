@@ -4,9 +4,9 @@ untouched, and reports per-DB item and garbled-row counts.
 
 Materialize verbatim as tests/test_doctor.py.
 
-Pinned report shape (--format json):
-    {"ok": true,
-     "adopted": "<path of adopted DB or null>",
+Pinned report payload (under the issue-#3 envelope's `data`; `ok` lives on
+the envelope root):
+    {"adopted": "<path of adopted DB or null>",
      "scanned": [{"path": str, "items": int, "garbled": int,
                   "complete": bool, "adopted": bool}, ...]}
 Pinned semantics:
@@ -180,8 +180,8 @@ class DoctorTests(unittest.TestCase):
             ]
         )
         self.assertEqual(code, 0, err)
-        report = json.loads(out)
-        self.assertIs(report["ok"], True)
+        report = json.loads(out)["data"]
+        self.assertIs(json.loads(out)["ok"], True)
         # Resolved-form keys: see the WhereTests note on Windows 8.3 short
         # temp paths vs cwd-derived long paths.
         scanned = {str(Path(e["path"]).resolve()): e for e in report["scanned"]}
@@ -256,8 +256,8 @@ class DoctorTests(unittest.TestCase):
              "--format", "json"]
         )
         self.assertEqual(code, 0, err)
-        report = json.loads(out)
-        self.assertIs(report["ok"], True)
+        report = json.loads(out)["data"]
+        self.assertIs(json.loads(out)["ok"], True)
         self.assertEqual(str(Path(report["adopted"])), str(legacy))
 
         store = self.home / "github.com" / "acme" / "widget" / "history.db"
@@ -268,7 +268,7 @@ class DoctorTests(unittest.TestCase):
         # The folded corpus serves a default read from the checkout.
         code, out, err = run_cmd(["item", "1", "--format", "json"])
         self.assertEqual(code, 0, err)
-        self.assertEqual(json.loads(out)["title"], "mixed case v1 item")
+        self.assertEqual(json.loads(out)["data"]["title"], "mixed case v1 item")
 
         # Original untouched: still v1, still mixed case, still one item.
         self.assertEqual(int(read_only_rows(legacy, "PRAGMA user_version")[0][0]), 0)

@@ -7,6 +7,13 @@ re-dump rather than editing this from memory.
 `zaxbygraph sql` is read-only. See [SQL access](#sql-access) at the end for what
 the guard accepts and rejects.
 
+Tip: `zaxbygraph schema [TABLE]` prints this same shape (DDL plus per-column
+notes) from the live database you are querying, so an installed copy of the
+skill never needs a file path to this document. Every command's JSON output is
+the self-describing envelope documented in the README ("Output and error
+contract"): `{ok, db, repo, freshness, data, truncated}`, plus
+`error: {code, message, hint?}` on failures.
+
 ## Conventions
 
 - All timestamps are GitHub's ISO-8601 UTC strings (`2026-01-03T05:40:10Z`),
