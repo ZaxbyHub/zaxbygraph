@@ -434,9 +434,11 @@ class RepoScopeTests(unittest.TestCase):
         data = json.loads(out)["data"]
         titles = [i["title"] for i in data["items"]]
         self.assertIn("widget one", titles)
-        for section in ("items", "comments"):
-            for row in data[section]:
-                self.assertEqual(row["repo"], "acme/widget")
+        # Issue #4: search merges comment hits into items -- one list, and the
+        # separate comments section is gone.
+        self.assertNotIn("comments", data)
+        for row in data["items"]:
+            self.assertEqual(row["repo"], "acme/widget")
 
         # churn: only the widget's file paths.
         code, out, err = self._run(["churn"])

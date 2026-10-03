@@ -188,8 +188,20 @@ and the last sync recorded no error — the readiness signal to gate on. Check
 zaxbygraph search "QUERY" [--limit 20]
 ```
 
-Searches titles, bodies, labels, and comment bodies. Returns `items` and
-`comments` separately (under `data`); `snippet` marks hits with `«` `»`.
+Searches titles, bodies, labels, and comment bodies with the porter-stemmed
+FTS5 index (`memory` matches `memories`, `reconnect` matches
+`reconnection`). Tokens are quoted individually, so user input is never
+interpreted as FTS5 syntax (`OR`, `NEAR`, column filters in a query are
+inert words) — there is no operator surface, just words.
+
+Ranking is bm25 with the title weighted highest, then body, then labels;
+`updated_at` breaks ties. If the strict all-tokens pass finds fewer items
+than the page, the query is retried with common English stopwords removed
+and tokens OR-joined, and `matched_mode` reports which pass produced the
+page (`"all"` or `"any"`). Comment hits merge into their parent item — the
+item appears once with `matching_comments` (exact count) and
+`comment_snippet` (a highlighted snippet from the best-matching comment);
+an item-text hit keeps its highlight in `snippet`.
 
 ```json
 {
@@ -198,14 +210,20 @@ Searches titles, bodies, labels, and comment bodies. Returns `items` and
     "title": "Init hangs on empty repo", "state": "open", "author": "alice",
     "updated_at": "2026-01-03T05:40:10Z",
     "html_url": "https://github.com/acme/forgegate/issues/10",
-    "snippet": "«Init» hangs on empty repo"
+    "snippet": "«Init» hangs on empty repo",
+    "matching_comments": 0,
+    "comment_snippet": ""
   }],
-  "comments": []
+  "matched_mode": "all",
+  "total_matches": 1,
+  "corpus_items": 42
 }
 ```
 
-FTS5 syntax applies: `"exact phrase"`, `a OR b`, `NOT b`, `pref*`. A bare
-multi-word query is an implicit AND.
+`total_matches` counts distinct matching items before the limit and
+`corpus_items` counts the repo-scoped corpus, so "no hits in 42 items" is
+distinguishable from an empty database. **Shape change (v0.3): the separate
+`comments` list is gone** — comment hits are items now, as shown above.
 
 ### `item` — one issue or PR in full
 
@@ -370,8 +388,16 @@ prompt is at
 ## Data model
 
 Tables: `items`, `labels`, `comments`, `reviews`, `pr_files`, `releases`,
-`actors`, `edges`, `sync_state`, `fetch_log`, `meta`, plus FTS5 `items_fts` and
-`comments_fts`.
+`actors`, `edges`, `sync_state`, `fetch_log`, `meta`, plus FTS5 `items_fts`
+and `comments_fts` (porter-stemmed since schema v3).
+
+Schema versions are forward-only (`PRAGMA user_version`). A v2 database is
+rebuilt in place — both FTS tables drop and re-create with the porter
+tokenizer, no resync — on the next **writable** open (`sync`, `doctor`);
+reads never migrate a database. Two consequences worth knowing: a v2
+database keeps the old tokenizer until that first writable open, and once
+v3 is stamped, older zaxbygraph builds refuse the file. See
+[`docs/schema.md`](docs/schema.md) for the full migration reference.
 
 Edge relationships: `authored`, `has_label`, `commented`, `reviewed`, `touches`,
 `closes`, `mentions`. Node types are only `actor`, `item`, `label`, `file` — an

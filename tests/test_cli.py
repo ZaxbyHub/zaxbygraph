@@ -75,8 +75,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         data = json.loads(out)["data"]
         self.assertIn("items", data)
-        self.assertIn("comments", data)
+        # Issue #4: comment hits merge into items; the zero-hit shape also
+        # distinguishes "no hits" from "empty corpus".
+        self.assertNotIn("comments", data)
         self.assertEqual(data["items"], [])
+        self.assertEqual(data["total_matches"], 0)
+        self.assertEqual(data["corpus_items"], 0)
 
     def test_sql_write_rejected(self) -> None:
         code, out, err = self.run_cmd(

@@ -19,16 +19,44 @@ _BOM = "﻿"
 _MIN_LIMIT = 1
 
 
-def fts_query(raw: str) -> str:
-    """Quote each whitespace token so AND/OR/NEAR are literals."""
+#: Small fixed English stopword set for the search fallback (issue #4). Kept
+#: in code with no dependency; tokens are always quoted, so user input never
+#: becomes FTS5 syntax regardless of this list.
+_STOPWORDS = frozenset(
+    "a an and are as at be been being but by for from has have had he her his "
+    "i in is it its of on or she that the their them then there these they "
+    "this those to was were what when where which who will with you your".split()
+)
+
+#: bm25 weights for items_fts columns (title, body, labels_text): a title hit
+#: outweighs a body hit, which outweighs a labels hit. Lower (more negative)
+#: bm25 output ranks first, so ORDER BY ... ASC.
+_ITEM_BM25 = "bm25(items_fts, 10.0, 1.0, 3.0)"
+
+
+def _quote_token(token: str) -> str:
+    """Quote one token so AND/OR/NEAR/column filters stay literals."""
+    return f'"{token.replace(chr(34), " ")}"'
+
+
+def build_match_queries(raw: str) -> tuple[str, str]:
+    """Build the strict (all tokens ANDed) and broadened (non-stopword tokens
+    ORed) FTS5 MATCH strings for a user query.
+
+    Every token is double-quoted, so user input is never interpreted as FTS5
+    syntax. The two queries are equal when broadening cannot change the match
+    set — a single token, or a query whose every token is a stopword — and
+    the empty query yields the zero-token phrase for both.
+    """
     tokens = [t for t in raw.split() if t]
     if not tokens:
-        return '""'
-    quoted: list[str] = []
-    for tok in tokens:
-        cleaned = tok.replace('"', " ")
-        quoted.append(f'"{cleaned}"')
-    return " ".join(quoted)
+        return '""', '""'
+    all_query = " AND ".join(_quote_token(t) for t in tokens)
+    content = [t for t in tokens if t.lower() not in _STOPWORDS]
+    if not content or len(content) == 1 == len(tokens):
+        return all_query, all_query
+    any_query = " OR ".join(_quote_token(t) for t in content)
+    return all_query, any_query
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
@@ -73,42 +101,138 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
     }
 
 
-def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | None = None) -> dict:
-    repo = _fold_repo(repo)
-    match = fts_query(query)
-    limit = _clamp_limit(limit)
-    sql = """
-        SELECT items.repo, items.number, items.kind, items.title, items.state, items.author,
-               items.updated_at, items.html_url,
-               snippet(items_fts, 0, '«', '»', '…', 12) AS snippet
+#: One merged, ranked search pass (issue #4): item-text hits (weighted bm25)
+#: UNION ALL comment hits (plain bm25), grouped per item so each item appears
+#: once with its best rank, an item-text-hit flag, and the EXACT count of its
+#: matching comments. `total_matches` counts this grouping pre-limit; the
+#: page is `ORDER BY score ASC LIMIT ?` with recency handled at hydration.
+_SEARCH_MERGED = """
+    SELECT hit_key, MIN(score) AS score, MAX(src) AS has_item_hit,
+           SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments
+    FROM (
+        SELECT items.repo || '#' || items.number AS hit_key,
+               {item_bm25} AS score,
+               1 AS src
         FROM items_fts
         JOIN items ON items.id = items_fts.rowid
-        WHERE items_fts MATCH ?
-    """
-    params: list[object] = [match]
-    if repo:
-        sql += " AND items.repo = ?"
-        params.append(repo)
-    sql += " ORDER BY items.updated_at DESC LIMIT ?"
-    params.append(limit)
-    rows = conn.execute(sql, params).fetchall()
-    comment_sql = """
-        SELECT comments.repo, comments.number, comments.kind, comments.author,
-               snippet(comments_fts, 0, '«', '»', '…', 12) AS snippet
+        WHERE items_fts MATCH :match{item_repo}
+        UNION ALL
+        SELECT comments.repo || '#' || comments.number AS hit_key,
+               bm25(comments_fts) AS score,
+               0 AS src
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
-        WHERE comments_fts MATCH ?
-    """
-    cparams: list[object] = [match]
+        WHERE comments_fts MATCH :match{comment_repo}
+    )
+    GROUP BY hit_key
+"""
+
+
+def _run_search_pass(
+    conn: sqlite3.Connection, match: str, repo: str | None, limit: int
+) -> tuple[int, list[sqlite3.Row]]:
+    """One MATCH pass over items+comments: returns (total distinct items,
+    top-`limit` rows by best score). Total is computed pre-limit so the
+    fallback decision and `total_matches` are honest for any limit."""
+    item_repo = " AND items.repo = :repo" if repo else ""
+    comment_repo = " AND comments.repo = :repo" if repo else ""
+    merged = _SEARCH_MERGED.format(
+        item_bm25=_ITEM_BM25, item_repo=item_repo, comment_repo=comment_repo
+    )
+    params: dict[str, object] = {"match": match}
     if repo:
-        comment_sql += " AND comments.repo = ?"
-        cparams.append(repo)
-    comment_sql += " LIMIT ?"
-    cparams.append(limit)
-    comments = conn.execute(comment_sql, cparams).fetchall()
+        params["repo"] = repo
+    total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
+    page = conn.execute(
+        f"{merged} ORDER BY score ASC LIMIT :limit", {**params, "limit": limit}
+    ).fetchall()
+    return total, page
+
+
+def _hydrate_search_hit(
+    conn: sqlite3.Connection, match: str, hit: sqlite3.Row
+) -> dict | None:
+    """Materialize one merged hit: item columns, an item-text snippet when the
+    item text matched, the exact matching-comment count, and the best
+    matching comment's snippet when comments matched."""
+    repo, _, number = str(hit["hit_key"]).rpartition("#")
+    number = int(number)
+    row = conn.execute(
+        "SELECT repo, number, kind, title, state, author, updated_at, html_url "
+        "FROM items WHERE repo = ? AND number = ?",
+        (repo, number),
+    ).fetchone()
+    if row is None:
+        return None
+    rec = _row_to_dict(row)
+    snippet: str = ""
+    if hit["has_item_hit"]:
+        found = conn.execute(
+            "SELECT snippet(items_fts, -1, '«', '»', '…', 12) "
+            "FROM items_fts JOIN items ON items.id = items_fts.rowid "
+            "WHERE items_fts MATCH ? AND items.repo = ? AND items.number = ? "
+            "LIMIT 1",
+            (match, repo, number),
+        ).fetchone()
+        snippet = found[0] if found else ""
+    rec["snippet"] = snippet
+    rec["matching_comments"] = int(hit["matching_comments"] or 0)
+    comment_snippet: str = ""
+    if rec["matching_comments"]:
+        found = conn.execute(
+            "SELECT snippet(comments_fts, -1, '«', '»', '…', 12) "
+            "FROM comments_fts JOIN comments ON comments.pk = comments_fts.rowid "
+            "WHERE comments_fts MATCH ? AND comments.repo = ? AND comments.number = ? "
+            "ORDER BY bm25(comments_fts) ASC LIMIT 1",
+            (match, repo, number),
+        ).fetchone()
+        comment_snippet = found[0] if found else ""
+    rec["comment_snippet"] = comment_snippet
+    return rec
+
+
+def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | None = None) -> dict:
+    """Natural-language search over items and comments (issue #4).
+
+    Tokens are quoted (never FTS5 syntax) and stemmed via the porter
+    tokenizer. Ranking is bm25 (title-weighted) with `updated_at` as the
+    tie-break. When the strict all-tokens pass finds fewer hits than the
+    requested page, the query is retried with stopwords removed and tokens
+    OR-joined, and `matched_mode` reports which pass produced the page.
+    Comment-only matches merge into their parent item with
+    `matching_comments` and `comment_snippet`; `total_matches` and
+    `corpus_items` distinguish "no hits in N items" from an empty corpus.
+    """
+    repo = _fold_repo(repo)
+    limit = _clamp_limit(limit)
+    corpus_items = conn.execute(
+        "SELECT COUNT(*) FROM items" + (" WHERE repo = ?" if repo else ""),
+        (repo,) if repo else (),
+    ).fetchone()[0]
+    all_query, any_query = build_match_queries(query)
+    if all_query == '""':
+        return {
+            "items": [],
+            "matched_mode": "all",
+            "total_matches": 0,
+            "corpus_items": corpus_items,
+        }
+    mode = "all"
+    match = all_query
+    total, page = _run_search_pass(conn, match, repo, limit)
+    if total < limit and any_query != all_query:
+        mode = "any"
+        match = any_query
+        total, page = _run_search_pass(conn, match, repo, limit)
+    items = [
+        rec for rec in (_hydrate_search_hit(conn, match, hit) for hit in page)
+        if rec is not None
+    ]
     return {
-        "items": [_row_to_dict(r) for r in rows],
-        "comments": [_row_to_dict(r) for r in comments],
+        "items": items,
+        "matched_mode": mode,
+        "total_matches": total,
+        "corpus_items": corpus_items,
     }
 
 

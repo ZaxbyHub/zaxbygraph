@@ -1,4 +1,4 @@
--- zaxbygraph schema v2 (`PRAGMA user_version` = 2; see db.py MIGRATIONS)
+-- zaxbygraph schema v3 (`PRAGMA user_version` = 3; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -163,12 +163,14 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     title,
     body,
     labels_text,
+    tokenize = 'porter unicode61',
     content='items',
     content_rowid='id'
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
     body,
+    tokenize = 'porter unicode61',
     content='comments',
     content_rowid='pk'
 );

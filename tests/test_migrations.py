@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zaxbygraph.db import connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 from zaxbygraph.query import status, search
 
 #: The schema as it stood at base e2ef892 (v1): no `PRAGMA user_version`, no
@@ -219,6 +219,221 @@ END;
 """
 
 
+#: The schema as it stood at base 4789858 (v2): `full_sync_pending` present,
+#: FTS tables still on the default unicode61 tokenizer (no porter). Frozen
+#: verbatim from that commit's src/zaxbygraph/schema.sql so this suite can
+#: build genuine v2 databases; it must never track later schema edits. The
+#: v2 schema.sql does not itself stamp `PRAGMA user_version` -- a seeder
+#: must set `PRAGMA user_version = 2` explicitly after executing it.
+V2_SCHEMA_SQL = r"""-- zaxbygraph schema v2 (`PRAGMA user_version` = 2; see db.py MIGRATIONS)
+-- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
+-- Derived/interpreted tables are NEVER written by the fetcher.
+
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS actors (
+    login    TEXT PRIMARY KEY,
+    html_url TEXT
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    id            INTEGER PRIMARY KEY,
+    repo          TEXT NOT NULL,
+    number        INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN ('issue', 'pr')),
+    node_id       TEXT,
+    title         TEXT NOT NULL,
+    body          TEXT,
+    labels_text   TEXT,
+    state         TEXT NOT NULL,
+    state_reason  TEXT,
+    author        TEXT,
+    created_at    TEXT,
+    updated_at    TEXT,
+    closed_at     TEXT,
+    merged_at     TEXT,
+    merge_commit  TEXT,
+    draft         INTEGER NOT NULL DEFAULT 0,
+    locked        INTEGER NOT NULL DEFAULT 0,
+    base_ref      TEXT,
+    head_ref      TEXT,
+    additions     INTEGER,
+    deletions     INTEGER,
+    changed_files INTEGER,
+    commits       INTEGER,
+    html_url      TEXT,
+    api_url       TEXT,
+    raw_json      TEXT NOT NULL,
+    UNIQUE (repo, number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_kind_state ON items(kind, state);
+CREATE INDEX IF NOT EXISTS idx_items_updated ON items(updated_at);
+CREATE INDEX IF NOT EXISTS idx_items_author ON items(author);
+CREATE INDEX IF NOT EXISTS idx_items_repo_number ON items(repo, number);
+
+CREATE TABLE IF NOT EXISTS labels (
+    repo   TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    name   TEXT NOT NULL,
+    color  TEXT,
+    PRIMARY KEY (repo, number, name)
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+    pk          INTEGER PRIMARY KEY AUTOINCREMENT,
+    github_id   INTEGER NOT NULL,
+    repo        TEXT NOT NULL,
+    number      INTEGER NOT NULL,
+    kind        TEXT NOT NULL CHECK (kind IN ('issue_comment', 'review_comment')),
+    author      TEXT,
+    created_at  TEXT,
+    updated_at  TEXT,
+    body        TEXT,
+    html_url    TEXT,
+    in_reply_to INTEGER,
+    raw_json    TEXT NOT NULL,
+    UNIQUE (repo, kind, github_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_item ON comments(repo, number);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id           INTEGER PRIMARY KEY,
+    repo         TEXT NOT NULL,
+    number       INTEGER NOT NULL,
+    author       TEXT,
+    state        TEXT,
+    submitted_at TEXT,
+    body         TEXT,
+    html_url     TEXT,
+    raw_json     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reviews_item ON reviews(repo, number);
+
+CREATE TABLE IF NOT EXISTS pr_files (
+    repo      TEXT NOT NULL,
+    number    INTEGER NOT NULL,
+    path      TEXT NOT NULL,
+    status    TEXT,
+    additions INTEGER,
+    deletions INTEGER,
+    changes   INTEGER,
+    sha       TEXT,
+    patch     TEXT,
+    PRIMARY KEY (repo, number, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pr_files_path ON pr_files(path);
+
+CREATE TABLE IF NOT EXISTS releases (
+    id           INTEGER PRIMARY KEY,
+    repo         TEXT NOT NULL,
+    tag_name     TEXT NOT NULL,
+    name         TEXT,
+    body         TEXT,
+    draft        INTEGER NOT NULL DEFAULT 0,
+    prerelease   INTEGER NOT NULL DEFAULT 0,
+    author       TEXT,
+    created_at   TEXT,
+    published_at TEXT,
+    html_url     TEXT,
+    raw_json     TEXT NOT NULL,
+    UNIQUE (repo, tag_name)
+);
+
+CREATE TABLE IF NOT EXISTS edges (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo       TEXT NOT NULL,
+    src_type   TEXT NOT NULL,
+    src_id     TEXT NOT NULL,
+    rel        TEXT NOT NULL,
+    dst_type   TEXT NOT NULL,
+    dst_id     TEXT NOT NULL,
+    confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED')),
+    evidence   TEXT,
+    UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo, src_type, src_id);
+CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(repo, dst_type, dst_id);
+CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel);
+
+CREATE TABLE IF NOT EXISTS fetch_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo         TEXT NOT NULL,
+    resource     TEXT NOT NULL,
+    resource_id  TEXT,
+    fetched_at   TEXT NOT NULL,
+    http_status  INTEGER,
+    note         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS sync_state (
+    repo               TEXT PRIMARY KEY,
+    issues_since       TEXT,
+    last_full_sync_at  TEXT,
+    last_incr_sync_at  TEXT,
+    last_error         TEXT,
+    item_count         INTEGER NOT NULL DEFAULT 0,
+    comment_count      INTEGER NOT NULL DEFAULT 0,
+    edge_count         INTEGER NOT NULL DEFAULT 0,
+    include_patches    INTEGER NOT NULL DEFAULT 0,
+    full_sync_pending  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+    title,
+    body,
+    labels_text,
+    content='items',
+    content_rowid='id'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+    body,
+    content='comments',
+    content_rowid='pk'
+);
+
+CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, title, body, labels_text)
+    VALUES (new.id, new.title, new.body, new.labels_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
+    VALUES ('delete', old.id, old.title, old.body, old.labels_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
+    VALUES ('delete', old.id, old.title, old.body, old.labels_text);
+    INSERT INTO items_fts(rowid, title, body, labels_text)
+    VALUES (new.id, new.title, new.body, new.labels_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
+    INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, body)
+    VALUES ('delete', old.pk, old.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
+    INSERT INTO comments_fts(comments_fts, rowid, body)
+    VALUES ('delete', old.pk, old.body);
+    INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+END;
+"""
+
+
 class MigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -303,7 +518,9 @@ class MigrationTests(unittest.TestCase):
         conn = self._open_current()
 
         # upgraded in place, user_version stamped
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM sync_state WHERE repo LIKE 'zaxbyhub/%'").fetchone()[0], 1
         )
@@ -456,7 +673,9 @@ class MigrationTests(unittest.TestCase):
             conn.execute("SELECT COUNT(*) FROM labels").fetchone()[0],
         ]
         self.assertEqual(before, after)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
 
     def test_newer_user_version_refuses(self) -> None:
         conn = self._open_current()
@@ -511,7 +730,9 @@ class MigrationTests(unittest.TestCase):
         conn2 = connect(self.db_path)
         self.addCleanup(conn2.close)
         init_schema(conn2)
-        self.assertEqual(conn2.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(
+            conn2.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
         self.assertEqual(
             conn2.execute("SELECT COUNT(*) FROM items WHERE repo LIKE 'zaxbyhub/%'").fetchone()[0],
             2,
@@ -536,6 +757,73 @@ class MigrationTests(unittest.TestCase):
         row = conn.execute("SELECT * FROM sync_state WHERE repo = 'done/repo'").fetchone()
         self.assertEqual(row["full_sync_pending"], 0)
         self.assertEqual(status(conn, "done/repo")["repos"][0]["complete"], True)
+
+    def test_fts_tokenizer_migration_rebuilds_in_place(self) -> None:
+        """Issue #4 AC6: opening a v2 database (unicode61 FTS) migrates the
+        FTS tables to the porter tokenizer in place -- no resync -- and every
+        pre-migration row stays searchable."""
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "history.db"
+        v2 = sqlite3.connect(str(db_path))
+        v2.executescript(V2_SCHEMA_SQL)
+        # the v2 schema.sql never stamps user_version itself; a genuine v2
+        # database carries it from the migration that produced it
+        v2.execute("PRAGMA user_version = 2")
+        v2.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state, updated_at, raw_json)"
+            " VALUES (1001, 'acme/forgegate', 1, 'issue', 'WebSocket reconnect leaks memory',"
+            " 'every reconnect leaks a timer', 'open', '2026-01-03T00:00:00Z', '{}')"
+        )
+        v2.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state, updated_at, raw_json)"
+            " VALUES (1002, 'acme/forgegate', 2, 'issue', 'Reconnection drops timers',"
+            " 'reconnection and reconnecting both drop the timer', 'open', '2026-01-04T00:00:00Z', '{}')"
+        )
+        v2.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, author, body, raw_json)"
+            " VALUES (5001, 'acme/forgegate', 2, 'issue_comment', 'bob', 'the watermark quokka', '{}')"
+        )
+        v2.commit()
+        v2.close()
+
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+
+        # (a) the migration framework stamped the new schema version
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            3,
+            "v2 DB must migrate to user_version 3 (porter FTS rebuild)",
+        )
+        # (b) the rebuilt FTS DDL carries the porter tokenizer
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'items_fts'"
+        ).fetchone()[0]
+        self.assertIn("porter", ddl.lower())
+        # (c) a term now matching only by stemming (stored "reconnection",
+        # query "reconnect") finds item 2 -- item 2 never contains the literal
+        hits = search(conn, "reconnect", repo="acme/forgegate")
+        self.assertIn(2, [i["number"] for i in hits["items"]])
+        # (d) every pre-migration row stays searchable by a literal term
+        lit1 = search(conn, "leaks", repo="acme/forgegate")
+        self.assertIn(1, [i["number"] for i in lit1["items"]])
+        lit2 = search(conn, "drops", repo="acme/forgegate")
+        self.assertIn(2, [i["number"] for i in lit2["items"]])
+        crows = conn.execute(
+            "SELECT comments.number FROM comments_fts"
+            " JOIN comments ON comments.pk = comments_fts.rowid"
+            " WHERE comments_fts MATCH 'quokka'"
+        ).fetchall()
+        self.assertEqual([r[0] for r in crows], [2])
+        # (e) no resync happened: the items content is unchanged
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 2)
+        self.assertEqual(
+            conn.execute("SELECT title FROM items WHERE number = 1").fetchone()[0],
+            "WebSocket reconnect leaks memory",
+        )
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 1)
 
 
 if __name__ == "__main__":
