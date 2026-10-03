@@ -4,9 +4,9 @@ untouched, and reports per-DB item and garbled-row counts.
 
 Materialize verbatim as tests/test_doctor.py.
 
-Pinned report shape (--format json):
-    {"ok": true,
-     "adopted": "<path of adopted DB or null>",
+Pinned report payload (under the issue-#3 envelope's `data`; `ok` lives on
+the envelope root):
+    {"adopted": "<path of adopted DB or null>",
      "scanned": [{"path": str, "items": int, "garbled": int,
                   "complete": bool, "adopted": bool}, ...]}
 Pinned semantics:

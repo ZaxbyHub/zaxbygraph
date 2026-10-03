@@ -207,6 +207,32 @@ class EnvelopeContractTests(unittest.TestCase):
         self.assertEqual(row2[0], row2[2])
         self.assertEqual(row2[1], REPO)
 
+    def test_sql_suffix_never_collides_with_real_columns(self) -> None:
+        """4.5-review re-gate finding: a generated suffix must never claim a
+        REAL column's name. Both input orders exercise the collision."""
+        # Order 1: generated n_2 would collide with the real n_2 at pos 3.
+        sql1 = "SELECT number AS n, repo AS n, number AS n_2 FROM items ORDER BY number LIMIT 1"
+        code1, out1, err1 = self._run(["sql", sql1, "--format", "json"])
+        self.assertEqual(code1, 0, err1)
+        data1 = json.loads(out1)["data"]
+        row1 = data1["rows"][0]
+        self.assertEqual(len(row1), 3, (data1["columns"], row1))
+        # Real n_2 keeps its own key and its own value (a number).
+        self.assertEqual(row1["n_2"], data1["rows"][0]["n_2"])
+        self.assertIsInstance(row1["n_2"], int)
+        # Order 2: the real n_2 comes FIRST; the duplicate gets n_3.
+        sql2 = "SELECT number AS n_2, number AS n, repo AS n FROM items ORDER BY number LIMIT 1"
+        code2, out2, err2 = self._run(["sql", sql2, "--format", "json"])
+        self.assertEqual(code2, 0, err2)
+        data2 = json.loads(out2)["data"]
+        row2 = data2["rows"][0]
+        self.assertEqual(len(row2), 3, (data2["columns"], row2))
+        self.assertEqual(row2["n_2"], data2["rows"][0]["n_2"])
+        self.assertIsInstance(row2["n_2"], int)
+        # Positions: 0=number(n_2), 1=number(n), 2=repo(n-dup -> n_3).
+        self.assertEqual(row2["n"], row2["n_2"])
+        self.assertEqual(row2["n_3"], REPO)
+
     def test_sql_rows_array_fields_projection_aligns(self) -> None:
         """PRR-002 (MEDIUM): --fields with --rows array must project the
         rows by position so columns and rows stay aligned."""

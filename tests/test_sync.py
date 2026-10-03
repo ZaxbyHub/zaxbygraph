@@ -557,6 +557,10 @@ class SyncLockTests(TempDBTest):
         self.assertIs(data["ok"], True)
         self.assertIsNot(data["data"].get("joined"), True)
         self.assertEqual(data["data"].get("ingested"), 2)
+        # PRR-003: the joiner's envelope carries the recorded freshness of
+        # the corpus it joined — not null placeholders.
+        self.assertIsNotNone(data["freshness"]["synced_at"])
+        self.assertIs(data["freshness"]["complete"], True)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
         self.assertGreater(self.src.extra_fetches, 0)
 

@@ -752,15 +752,26 @@ def cmd_sql(args: argparse.Namespace) -> int:
     if args.rows_mode == "objects":
         # A SELECT can yield duplicate column names (joins of tables sharing
         # columns, `SELECT a, a`); a plain dict(zip) would silently drop the
-        # later positions. Suffix repeats as name_2, name_3, ... so every
+        # later positions. Repeats get suffixed keys, generated collision-
+        # safe against every ORIGINAL name (so a real `n_2` column keeps its
+        # own key and the generated duplicate moves to `n_3`), so every
         # value survives under a deterministic key; `columns` keeps the true
         # names and `--rows array` preserves positions exactly.
-        seen: dict[str, int] = {}
+        reserved = set(cols)
+        used: set[str] = set()
+        counts: dict[str, int] = {}
         keys: list[str] = []
         for c in cols:
-            n = seen.get(c, 0)
-            seen[c] = n + 1
-            keys.append(c if n == 0 else f"{c}_{n + 1}")
+            counts[c] = counts.get(c, 0) + 1
+            if counts[c] == 1 and c not in used:
+                keys.append(c)
+                used.add(c)
+                continue
+            i = 2
+            while f"{c}_{i}" in used or f"{c}_{i}" in reserved:
+                i += 1
+            keys.append(f"{c}_{i}")
+            used.add(f"{c}_{i}")
         rows = [dict(zip(keys, row)) for row in rows]
     emit_result(
         args,
