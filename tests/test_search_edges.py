@@ -181,11 +181,15 @@ class SearchEdgeTests(TempDBTest):
         self.assertEqual([i["number"] for i in data["items"]][:2], [1, 2])
 
     def test_same_item_dual_match_uses_best_score(self) -> None:
-        """MIN(score) aggregation pin: a title hit and a comment-only hit
-        both surface once with the right snippets — mutating MIN to MAX
-        must fail here (the dual-source shape was previously unpinned)."""
+        """MIN(score) aggregation pin with a GENUINE dual-source group: item
+        1 matches in its title (strong weighted score) AND via a long padded
+        comment (weak score) — MIN keeps its title score, MAX would take the
+        weak comment score and let the short-comment item 2 outrank it.
+        Mutation-verified: MIN→MAX flips the page to [2, 1] and fails this
+        test. Item 3 (comment-only) also surfaces once."""
         self.src.add_issue(
-            issue(1, title="zephyr scheduler", body="unrelated prose",
+            issue(1, title="zephyr scheduler",
+                  body="unrelated prose",
                   updated_at="2026-01-01T00:00:00Z")
         )
         self.src.add_issue(
@@ -196,16 +200,22 @@ class SearchEdgeTests(TempDBTest):
             issue(3, title="unrelated three", body="nothing",
                   updated_at="2026-01-03T00:00:00Z")
         )
-        self.src.comment_on(3, "zephyr mentioned in passing")
+        self.src.comment_on(
+            1, "zephyr " + "padding words diluting this comment's score " * 10
+        )
+        self.src.comment_on(3, "zephyr")
         self.sync()
         data = search(self.conn, "zephyr", repo=REPO)
         numbers = [i["number"] for i in data["items"]]
-        self.assertIn(1, numbers)
-        self.assertIn(3, numbers)
+        # MIN keeps item 1's strong title score ahead of item 3's strong
+        # comment score; under MAX item 1 takes its own weak comment score
+        # and the page flips to [3, 1]
+        self.assertEqual(numbers, [1, 3])
         self.assertEqual(numbers.count(3), 1)
-        # a strict-block row hydrates with the item-text snippet
+        # the title hit's snippet is the item-text snippet (all_query block)
         row1 = next(i for i in data["items"] if i["number"] == 1)
         self.assertIn("zephyr", row1["snippet"].lower())
+        self.assertEqual(row1["matching_comments"], 1)
 
     def test_total_matches_counts_merged_items_pre_limit(self) -> None:
         self.seed_corpus()
