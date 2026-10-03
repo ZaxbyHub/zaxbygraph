@@ -244,7 +244,6 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     # silently evict the very items the strict pass matched.
     blocks: list[tuple[str, list[sqlite3.Row]]] = [(match, page)]
     if total < limit and any_query != all_query:
-        mode = "any"
         match = any_query
         total, or_page = _run_search_pass(conn, match, repo, limit)
         seen = {row["hit_key"] for row in page}
@@ -253,7 +252,9 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
             for row in or_page
             if row["hit_key"] not in seen
         ][: max(0, limit - len(page))]
-        blocks.append((match, extra))
+        if extra:
+            mode = "any"
+            blocks.append((match, extra))
     items = []
     for block_match, block_rows in blocks:
         for hit in block_rows:
