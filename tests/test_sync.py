@@ -567,6 +567,9 @@ class SyncLockTests(TempDBTest):
         def release():
             time.sleep(0.6)
             holder.kill()
+            holder.wait()  # reap: on Linux a killed-but-unreaped child is a
+            # zombie and _pid_alive(zombie) stays True forever, so the
+            # --wait takeover would never fire (Linux-only hang, found in CI).
             # Deliberately NO unlink (PRR-012): the waiter must observe the
             # dead same-host payload and take over under the range lock.
 
