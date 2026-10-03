@@ -133,10 +133,24 @@ class EnvelopeContractTests(unittest.TestCase):
     def test_where_identity_line_matches_payload(self) -> None:
         """4.5 review finding 1 (HIGH): `where`'s stderr identity line must
         report the same items/synced/complete facts its envelope payload
-        does — not zeros from a closed connection."""
+        does — not zeros from a closed connection.
+
+        The fixture seeds the USER-LEVEL STORE (store_db_path under the
+        pinned ZAXBYGRAPH_HOME), because that is the file cmd_where's
+        store-exists branch reads; seeding only --db would leave that branch
+        untaken and the test would pass on the buggy pre-fix code (4.5
+        round-2 tautology finding R2-1)."""
+        from zaxbygraph.paths import store_db_path
+        from zaxbygraph.repo import DEFAULT_HOST
+
+        store = store_db_path(DEFAULT_HOST, REPO)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        _seed(store)
         code, out, err = self._run(["where", "--format", "json"])
         self.assertEqual(code, 0, err)
         data = json.loads(out)["data"]
+        self.assertTrue(data["exists"], "store-exists branch must be taken")
+        self.assertGreater(data["items"], 0, "store corpus must be nonzero")
         lines = [line for line in err.splitlines() if line.strip()]
         self.assertEqual(len(lines), 1, err)
         match = re.match(
@@ -144,6 +158,7 @@ class EnvelopeContractTests(unittest.TestCase):
             lines[0],
         )
         self.assertIsNotNone(match, lines[0])
+        self.assertEqual(match.group(1), REPO)
         self.assertEqual(int(match.group(2)), data["items"])
         self.assertEqual(match.group(4), "yes" if data["complete"] else "no")
 
