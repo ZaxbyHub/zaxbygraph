@@ -1,4 +1,4 @@
-# Schema reference (schema version 2, `PRAGMA user_version` = 2)
+# Schema reference (schema version 3, `PRAGMA user_version` = 3)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -231,7 +231,7 @@ One row per repo. What `zaxbygraph status` reads.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `2`). The
+`PRAGMA user_version` is the authoritative schema state (currently `3`). The
 `meta.schema_version` row is informational only. On open, `init_schema`:
 
 - refuses loudly when `user_version` is newer than the build (a database from
@@ -261,10 +261,28 @@ covered — and `sync --force` re-establishes ground truth. v1 data cannot
 distinguish this shape from ordinary incrementals, so the migration keeps the
 recorded timestamp rather than forcing a full resync of healthy databases.
 
-Two operational notes: the first command that opens a legacy database (even a
-read like `search`) performs the one-time migration write; and the read-only
-`sql` path intentionally does not migrate — it reads whatever schema the file
-has.
+Two operational notes: `sync` is the one command that can open a legacy
+database writable and perform the one-time migration write in place. Read
+commands open the file `mode=ro` and never migrate, and plain `doctor`
+never writes a legacy file either — it reads legacy databases through
+migrated temp copies, and `doctor --consolidate` migrates the destination
+store it adopts into (creating it if needed, whether that store is new or a
+pre-existing v2 store), never the source. A v2 database therefore keeps the
+old FTS tokenizer until its next in-place `sync` (`search` reports
+`index_stale: true` meanwhile). The forward-only version check runs in
+`init_schema`: older builds refuse a v3 database on those write paths, while
+their read commands (which never call `init_schema`) still open a v3 file —
+the FTS queries simply run against porter stemming they may not expect.
+
+Migration 2→3 rebuilds both FTS tables in place with the porter tokenizer:
+the six sync triggers and both virtual tables are dropped and recreated with
+`tokenize = 'porter unicode61'`, then `INSERT INTO <fts>(<fts>)
+VALUES('rebuild')` repopulates each index from its content table — no resync
+of `items`/`comments` happens. The migration runs per-statement (never
+`executescript`, which would commit the migration transaction) inside its
+own `BEGIN IMMEDIATE`, so an interrupted rebuild rolls back whole and
+re-runs. Stemming is why this matters: `reconnect` matches
+`reconnection`/`reconnecting` only after the rebuild.
 
 ### Identity and the watermark
 
@@ -322,12 +340,15 @@ ORDER BY rank;
 `items_fts` indexes `title`, `body`, and `labels_text`, with
 `content_rowid='id'` — so join it on `items.id`. `comments_fts` indexes comment
 `body` with `content_rowid='pk'` — join that one on `comments.pk`, not
-`comments.github_id`. FTS5 MATCH syntax applies: `"exact phrase"`, `a AND b`, `a OR b`,
-`NOT`, and `pref*` prefix matching. A bare multi-word string is an implicit AND.
+`comments.github_id`. Both tables tokenize with `porter unicode61` (schema
+v3; the v2→v3 migration rebuilds older databases in place). For hand-written
+SQL, FTS5 MATCH syntax applies: `"exact phrase"`, `a AND b`, `a OR b`,
+`NOT`, and `pref*` prefix matching — a bare multi-word string is an implicit
+AND, and a porter-stemmed term matches its morphological variants.
 
-Note that `zaxbygraph search` already wraps both tables and returns highlighted
-snippets, so prefer it over hand-written FTS SQL unless you need a shape it does
-not produce.
+Note that `zaxbygraph search` already wraps both tables with stemmed,
+bm25-ranked, OR-fallback matching and merged comment hits, so prefer it over
+hand-written FTS SQL unless you need a shape it does not produce.
 
 ## SQL access
 

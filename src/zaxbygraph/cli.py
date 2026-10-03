@@ -1026,10 +1026,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.set_defaults(func=cmd_status)
 
-    sp = sub.add_parser("search", help="FTS search over titles, bodies, comments")
+    sp = sub.add_parser(
+        "search",
+        help="relevance-ranked FTS search over titles, bodies, labels, comments",
+    )
     add_common(sp)
     sp.add_argument("query")
-    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="page size; also the AND-to-OR fallback threshold",
+    )
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("item", help="One issue/PR with comments, files, edges")

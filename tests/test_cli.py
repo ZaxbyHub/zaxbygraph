@@ -75,8 +75,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 0, err)
         data = json.loads(out)["data"]
         self.assertIn("items", data)
-        self.assertIn("comments", data)
+        # Issue #4: comment hits merge into items; the zero-hit shape also
+        # distinguishes "no hits" from "empty corpus".
+        self.assertNotIn("comments", data)
         self.assertEqual(data["items"], [])
+        self.assertEqual(data["total_matches"], 0)
+        self.assertEqual(data["corpus_items"], 0)
 
     def test_sql_write_rejected(self) -> None:
         code, out, err = self.run_cmd(
@@ -522,3 +526,18 @@ class WhereTests(_Issue2Harness):
         self.assertEqual(data["items"], 2)
         self.assertIsNone(data["watermark"])
         self.assertIs(data["complete"], False)
+
+
+class VersionConsistencyTests(unittest.TestCase):
+    """Review finding F6: pyproject.toml and zaxbygraph.__version__ must not
+    drift — --version reads the constant while installers read pyproject."""
+
+    def test_pyproject_version_matches_dunder(self) -> None:
+        import tomllib
+
+        root = Path(__file__).resolve().parents[1]
+        with open(root / "pyproject.toml", "rb") as fh:
+            data = tomllib.load(fh)
+        from zaxbygraph import __version__
+
+        self.assertEqual(data["project"]["version"], __version__)

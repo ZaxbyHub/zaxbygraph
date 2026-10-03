@@ -5,13 +5,13 @@ from importlib.resources import files
 from pathlib import Path
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 2
+CURRENT_USER_VERSION = 3
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -313,10 +313,109 @@ def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         recount(conn, repo)
 
 
+#: FTS objects as schema.sql creates them at the current shape (porter
+#: tokenizer). Kept as individual statements — NEVER run through
+#: `executescript`, which implicitly COMMITs the migration's open
+#: `BEGIN IMMEDIATE` and would break the rollback-whole guarantee that
+#: `test_migration_failure_rolls_back` (and the migration framework's
+#: per-migration transaction contract) relies on. The parity test
+#: (`test_fresh_shape_and_migrated_db_share_tokenizer`) pins this copy and
+#: schema.sql's copy to the same tokenizer behavior.
+_FTS_PORTER_STATEMENTS = (
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+        title,
+        body,
+        labels_text,
+        tokenize = 'porter unicode61',
+        content='items',
+        content_rowid='id'
+    )
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
+        body,
+        tokenize = 'porter unicode61',
+        content='comments',
+        content_rowid='pk'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+        INSERT INTO items_fts(rowid, title, body, labels_text)
+        VALUES (new.id, new.title, new.body, new.labels_text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
+        VALUES ('delete', old.id, old.title, old.body, old.labels_text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
+        VALUES ('delete', old.id, old.title, old.body, old.labels_text);
+        INSERT INTO items_fts(rowid, title, body, labels_text)
+        VALUES (new.id, new.title, new.body, new.labels_text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
+        INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS comments_ad AFTER DELETE ON comments BEGIN
+        INSERT INTO comments_fts(comments_fts, rowid, body)
+        VALUES ('delete', old.pk, old.body);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
+        INSERT INTO comments_fts(comments_fts, rowid, body)
+        VALUES ('delete', old.pk, old.body);
+        INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+    END
+    """,
+)
+
+
+def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+    """v2 -> v3: rebuild both FTS tables with the porter tokenizer.
+
+    Dropping an external-content FTS table drops its sync triggers with it,
+    so the six triggers are recreated alongside the tables, and
+    `INSERT INTO <fts>(<fts>) VALUES('rebuild')` repopulates each index from
+    its content table — no resync of items/comments is needed. Every
+    statement here is per-statement `execute` (see _FTS_PORTER_STATEMENTS
+    for why executescript is forbidden). No-op-safe on a fresh database,
+    where executescript already created the porter tables and the migration
+    loop still runs: drop/recreate/rebuild of already-current tables is
+    harmless.
+    """
+    for trigger in (
+        "items_ai",
+        "items_ad",
+        "items_au",
+        "comments_ai",
+        "comments_ad",
+        "comments_au",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE IF EXISTS items_fts")
+    conn.execute("DROP TABLE IF EXISTS comments_fts")
+    for statement in _FTS_PORTER_STATEMENTS:
+        conn.execute(statement)
+    conn.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
+    conn.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
     (2, migrate_v1_to_v2),
+    (3, migrate_v2_to_v3),
 ]
 
 

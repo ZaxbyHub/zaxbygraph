@@ -99,14 +99,20 @@ duplicates; `--limit N` for the cap). `item N --max-body-chars C` truncates
 bodies and marks them `truncated: true`.
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
-`{items[], comments[]}` · `item` → all item columns plus
+`{items[], matched_mode, total_matches, corpus_items, index_stale}`
+(comment hits merge into their item: `matching_comments` +
+`comment_snippet`; `index_stale` is true when the DB predates the schema —
+reads never migrate) · `item` → all item
+columns plus
 `labels[] comments[] reviews[] files[] edges[]` · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row objects.
 
 Common fields: items carry `number kind title state author updated_at html_url`;
 edges carry `src_type src_id rel dst_type dst_id confidence evidence`. `search`
-marks hits in `snippet` with `«` `»`. `path` is `null` when no route exists —
+marks hits in `snippet` with `«` `»` (stemmed, bm25-ranked; a zero-hit result
+carries `total_matches: 0` and `corpus_items: <n>`, so "no prior art" is
+distinguishable from an empty corpus). `path` is `null` when no route exists —
 with exit code 0, because "not connected" is an answer.
 
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
