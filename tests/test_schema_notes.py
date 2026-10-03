@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -128,6 +129,45 @@ class EnvelopeContractTests(unittest.TestCase):
         self.assertIn("patch", out)
         for banned in ("ok:", "freshness:", "truncated:"):
             self.assertNotIn(banned, out)
+
+    def test_where_identity_line_matches_payload(self) -> None:
+        """4.5 review finding 1 (HIGH): `where`'s stderr identity line must
+        report the same items/synced/complete facts its envelope payload
+        does — not zeros from a closed connection."""
+        code, out, err = self._run(["where", "--format", "json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)["data"]
+        lines = [line for line in err.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1, err)
+        match = re.match(
+            r"^# db=.* repo=(\S+) items=(\d+) synced=(\d+) complete=(yes|no)$",
+            lines[0],
+        )
+        self.assertIsNotNone(match, lines[0])
+        self.assertEqual(int(match.group(2)), data["items"])
+        self.assertEqual(match.group(4), "yes" if data["complete"] else "no")
+
+    def test_text_mode_failure_prints_nothing_to_stdout(self) -> None:
+        """4.5 review finding 2 (MEDIUM): a text-mode failure answers only
+        through the stderr echo — never a literal None on stdout (text is
+        the TTY default, so this is the interactive path)."""
+        code, out, err = self._run(["item", "99999", "--format", "text"])
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "", repr(out))
+        self.assertTrue(err.lstrip().startswith("error:"), err)
+
+    def test_pre_open_error_envelope_names_the_request(self) -> None:
+        """4.5 review finding 4 (LOW): a failure before the DB opens still
+        carries the requested repo/db in its envelope, not null-blind keys."""
+        missing = str(Path(self._td.name) / "missing" / "history.db")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(["status", "--repo", REPO, "--db", missing, "--format", "json"])
+        self.assertEqual(code, 3, err.getvalue())
+        payload = json.loads(out.getvalue())
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["repo"], REPO)
+        self.assertIsNotNone(payload["db"])
 
     def test_every_registered_subcommand_emits_envelope(self) -> None:
         """Guardrail: every subcommand build_parser() registers (minus the

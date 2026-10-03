@@ -68,10 +68,6 @@ def _format_of(args: argparse.Namespace) -> str:
     return "text" if sys.stdout.isatty() else "json"
 
 
-def _want_json(args: argparse.Namespace) -> bool:
-    return _format_of(args) in ("json", "compact", "jsonl")
-
-
 def _fields_of(args: argparse.Namespace) -> list[str]:
     raw = getattr(args, "fields", None)
     if not raw:
@@ -242,7 +238,10 @@ def emit_result(
         print(f"error: {error.get('message', '')}", file=sys.stderr)
     fmt = _format_of(args)
     if fmt == "text":
-        _emit_text(payload)
+        # Failures answer through the stderr echo; rendering the null payload
+        # would print a literal "None" to stdout (4.5 review finding 2).
+        if error is None:
+            _emit_text(payload)
     elif fmt == "jsonl":
         if error is None and isinstance(payload, list):
             for row in payload:
@@ -409,7 +408,15 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        return emit_failure(args, exc.code, exc.message, slug=repo, db_path=db_path)
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = query_fn(conn, *extra, repo=repo)
         fresh = _freshness(conn, repo)
@@ -548,7 +555,15 @@ def cmd_item(args: argparse.Namespace) -> int:
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        return emit_failure(args, exc.code, exc.message, slug=repo, db_path=db_path)
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = item(conn, args.number, repo=repo)
         if data is not None:
@@ -657,7 +672,15 @@ def cmd_sql(args: argparse.Namespace) -> int:
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        return emit_failure(args, exc.code, exc.message, slug=repo, db_path=db_path)
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     conn.close()
     try:
         ro_conn = connect_readonly_query(db_path)
@@ -724,6 +747,8 @@ def cmd_where(args: argparse.Namespace) -> int:
     watermark = None
     complete = False
     store_error = None
+    fresh = None
+    line = None
     if repo and store_path.exists():
         try:
             conn = open_existing(store_path)
@@ -739,6 +764,7 @@ def cmd_where(args: argparse.Namespace) -> int:
                     ).fetchone()["c"]
                 )
                 fresh = _freshness(conn, repo)
+                line = _identity_line(conn, repo, serving)
             finally:
                 conn.close()
             if row is not None:
@@ -750,12 +776,14 @@ def cmd_where(args: argparse.Namespace) -> int:
             # never-created one (PRR-007) without crashing the diagnostic.
             store_error = str(exc)
             fresh = None
+            line = None
     elif not repo and store_path.exists():
         # Slug-less where: report file-scoped facts. items is the UNFILTERED
         # count (matching --repo '' = no-filter); watermark/complete are
         # per-slug concepts and stay null/false rather than claiming a row.
         exists = True
         fresh = None
+        line = None
         try:
             conn = open_existing(store_path)
             try:
@@ -766,8 +794,6 @@ def cmd_where(args: argparse.Namespace) -> int:
                 conn.close()
         except sqlite3.DatabaseError as exc:
             store_error = str(exc)
-    else:
-        fresh = None
     data = {
         "cwd": str(cwd),
         "git_common_dir": str(common) if common is not None else None,
@@ -788,6 +814,7 @@ def cmd_where(args: argparse.Namespace) -> int:
         slug=repo,
         db_path=serving,
         freshness=fresh,
+        identity_line=line,
     )
     return 0
 
@@ -835,7 +862,15 @@ def cmd_export(args: argparse.Namespace) -> int:
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        return emit_failure(args, exc.code, exc.message, slug=repo, db_path=db_path)
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         data = export_graph(conn, repo=repo)
         fresh = _freshness(conn, repo)
@@ -854,7 +889,15 @@ def cmd_schema(args: argparse.Namespace) -> int:
     try:
         conn, repo, db_path = _open_for_read(args)
     except _ReadFailure as exc:
-        return emit_failure(args, exc.code, exc.message, slug=repo, db_path=db_path)
+        # Pre-open failures still name what was requested: fall back to the
+        # caller's --repo/--db so the envelope is not null-blind (4.5 review).
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
     try:
         try:
             data = describe_schema(conn, args.table)

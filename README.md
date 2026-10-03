@@ -55,9 +55,10 @@ zaxbygraph search "init hang"         # full-text over titles, bodies, comments
 zaxbygraph item 14                    # one item, with comments/files/edges
 ```
 
-`sync` prints the envelope with the run summary under `data` (keys `repo`,
-`ingested`, `last_number`, `full`, `finished_at`, `issues_since`, `item_count`,
-`comment_count`, `edge_count`, `last_error`):
+`sync` prints the envelope with the run summary under `data` (keys `ingested`,
+`last_number`, `full`, `finished_at`, `issues_since`, `item_count`,
+`comment_count`, `edge_count`, `last_error`; `repo` and `db` live on the
+envelope root):
 
 ```json
 {
