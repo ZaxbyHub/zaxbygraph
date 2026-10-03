@@ -110,16 +110,18 @@ class SearchEdgeTests(TempDBTest):
 
     def test_equal_scores_break_ties_by_recency(self) -> None:
         """The approved plan's tie-break: among identical bm25 scores, the
-        more recently updated item ranks first (not lexicographic hit_key
-        order, which puts #30 ahead of #9)."""
+        more recently updated item ranks first. The numbers are chosen so
+        lexicographic hit_key order DISAGREES with recency: #9 is newer but
+        "#30" < "#9" as strings, so removing the tie-break flips the
+        assertion (verified by mutation probe)."""
         later = issue(
-            30,
+            9,
             title="duplicate probe",
             body="identical text",
             updated_at="2026-06-01T00:00:00Z",
         )
         earlier = issue(
-            9,
+            30,
             title="duplicate probe",
             body="identical text",
             updated_at="2026-01-01T00:00:00Z",
@@ -129,7 +131,7 @@ class SearchEdgeTests(TempDBTest):
         self.sync()
         data = search(self.conn, "duplicate probe", repo=REPO)
         scores = [i["number"] for i in data["items"]]
-        self.assertEqual(scores, [30, 9])
+        self.assertEqual(scores, [9, 30])
 
     def test_index_stale_signals_unmigrated_db(self) -> None:
         """A v2 database read without migrating reports index_stale: true —

@@ -216,7 +216,8 @@ an item-text hit keeps its highlight in `snippet`.
   }],
   "matched_mode": "all",
   "total_matches": 1,
-  "corpus_items": 42
+  "corpus_items": 42,
+  "index_stale": false
 }
 ```
 

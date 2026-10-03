@@ -124,9 +124,10 @@ _SEARCH_MERGED = """
         SELECT comments.repo || '#' || comments.number AS hit_key,
                bm25(comments_fts) AS score,
                0 AS src,
-               NULL AS upd
+               items.updated_at AS upd
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
+        JOIN items ON items.repo = comments.repo AND items.number = comments.number
         WHERE comments_fts MATCH :match{comment_repo}
     )
     GROUP BY hit_key
