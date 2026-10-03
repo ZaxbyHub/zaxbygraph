@@ -261,11 +261,14 @@ covered — and `sync --force` re-establishes ground truth. v1 data cannot
 distinguish this shape from ordinary incrementals, so the migration keeps the
 recorded timestamp rather than forcing a full resync of healthy databases.
 
-Two operational notes: the first **writable** open (`sync`, `doctor`) of a
-legacy database performs the one-time migration write; read commands open
-the file `mode=ro` and never migrate — they read whatever schema the file
-has. A v2 database therefore keeps the old FTS tokenizer until its next
-writable open, and a v3 database cannot be opened by older builds (the
+Two operational notes: `sync` is the one command that can open a legacy
+database writable and perform the one-time migration write in place. Read
+commands open the file `mode=ro` and never migrate, and plain `doctor`
+never writes a legacy file either — it reads legacy databases through
+migrated temp copies, and `doctor --consolidate` migrates the store it
+builds, not the original. A v2 database therefore keeps the old FTS
+tokenizer until its next in-place `sync` (`search` reports `index_stale:
+true` meanwhile), and a v3 database cannot be opened by older builds (the
 forward-only version check refuses it).
 
 Migration 2→3 rebuilds both FTS tables in place with the porter tokenizer:

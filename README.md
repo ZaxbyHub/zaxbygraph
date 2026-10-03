@@ -222,7 +222,10 @@ an item-text hit keeps its highlight in `snippet`.
 
 `total_matches` counts distinct matching items before the limit and
 `corpus_items` counts the repo-scoped corpus, so "no hits in 42 items" is
-distinguishable from an empty database. **Shape change (v0.3): the separate
+distinguishable from an empty database. Every result also carries
+`index_stale`: true when the database predates the current schema (reads
+never migrate), so a zero-hit answer from an un-migrated v2 index is not
+mistaken for prior-art absence. **Shape change (v0.3): the separate
 `comments` list is gone** — comment hits are items now, as shown above.
 
 ### `item` — one issue or PR in full
@@ -393,10 +396,14 @@ and `comments_fts` (porter-stemmed since schema v3).
 
 Schema versions are forward-only (`PRAGMA user_version`). A v2 database is
 rebuilt in place — both FTS tables drop and re-create with the porter
-tokenizer, no resync — on the next **writable** open (`sync`, `doctor`);
-reads never migrate a database. Two consequences worth knowing: a v2
-database keeps the old tokenizer until that first writable open, and once
-v3 is stamped, older zaxbygraph builds refuse the file. See
+tokenizer, no resync — by the next `sync` that opens it (sync is the one
+command that resolves to and writes a legacy database in place). Reads never
+migrate a database, and plain `doctor` never writes one either: it reads
+legacy files through migrated temp copies and `doctor --consolidate`
+migrates the *store* it builds, not the original. Two consequences worth
+knowing: a v2 database keeps the old tokenizer (search reports
+`index_stale: true`) until that first in-place `sync`, and once v3 is
+stamped, older zaxbygraph builds refuse the file. See
 [`docs/schema.md`](docs/schema.md) for the full migration reference.
 
 Edge relationships: `authored`, `has_label`, `commented`, `reviewed`, `touches`,

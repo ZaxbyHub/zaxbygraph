@@ -108,6 +108,92 @@ class SearchEdgeTests(TempDBTest):
         data = search(self.conn, "memory", repo=REPO)
         self.assertEqual(data["matched_mode"], "all")
 
+    def test_equal_scores_break_ties_by_recency(self) -> None:
+        """The approved plan's tie-break: among identical bm25 scores, the
+        more recently updated item ranks first (not lexicographic hit_key
+        order, which puts #30 ahead of #9)."""
+        later = issue(
+            30,
+            title="duplicate probe",
+            body="identical text",
+            updated_at="2026-06-01T00:00:00Z",
+        )
+        earlier = issue(
+            9,
+            title="duplicate probe",
+            body="identical text",
+            updated_at="2026-01-01T00:00:00Z",
+        )
+        self.src.add_issue(earlier)
+        self.src.add_issue(later)
+        self.sync()
+        data = search(self.conn, "duplicate probe", repo=REPO)
+        scores = [i["number"] for i in data["items"]]
+        self.assertEqual(scores, [30, 9])
+
+    def test_index_stale_signals_unmigrated_db(self) -> None:
+        """A v2 database read without migrating reports index_stale: true —
+        a zero-hit answer there must never read as prior-art absence (the
+        issue's own failure mode, one writable-open away)."""
+        from zaxbygraph import db as db_mod
+
+        self.seed_corpus()
+        self.assertEqual(search(self.conn, "memory", repo=REPO)["index_stale"], False)
+        # build a real v2 DB and open it read-only, as reads do
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        v2_path = Path(td.name) / "v2.db"
+        v2 = sqlite3.connect(str(v2_path))
+        try:
+            from test_migrations import V2_SCHEMA_SQL
+        except ImportError:
+            from tests.test_migrations import V2_SCHEMA_SQL
+        v2.executescript(V2_SCHEMA_SQL)
+        v2.execute("PRAGMA user_version = 2")
+        v2.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state,"
+            " updated_at, raw_json) VALUES (1, 'acme/forgegate', 1, 'issue',"
+            " 'Reconnection drops timers', 'reconnection drops the timer',"
+            " 'open', '2026-01-01T00:00:00Z', '{}')"
+        )
+        v2.commit()
+        v2.close()
+        ro = db_mod.open_existing(v2_path)
+        self.addCleanup(ro.close)
+        stale = search(ro, "reconnect", repo="acme/forgegate")
+        self.assertEqual(stale["index_stale"], True)
+        self.assertEqual(stale["total_matches"], 0, "v2 index cannot stem-match")
+
+    def test_title_weighting_is_load_bearing(self) -> None:
+        """Pin the 10/1/3 weights behaviorally: on this corpus length
+        normalization ALONE ranks the body hit first (proven with flat
+        1/1/1 weights via raw SQL), so the shipped weights are what put the
+        title hit first. Mutating _ITEM_BM25 to flat weights fails this."""
+        long_title = (
+            "memory " + "padding words to make this title much longer "
+            "than any body here " * 4
+        )
+        corpus = [
+            (1, long_title, "nothing relevant in this body at all"),
+            (2, "totally unrelated title", "memory"),
+            (3, "filler three", "nothing to see in here"),
+            (4, "filler four", "more unrelated text"),
+            (5, "filler five", "still nothing matching"),
+            (6, "filler six", "and again nothing"),
+        ]
+        for id_, title, body in corpus:
+            self.src.add_issue(issue(id_, title=title, body=body))
+        self.sync()
+        flat = self.conn.execute(
+            "SELECT items.number FROM items_fts"
+            " JOIN items ON items.id = items_fts.rowid"
+            " WHERE items_fts MATCH '\"memory\"'"
+            " ORDER BY bm25(items_fts, 1.0, 1.0, 1.0) ASC"
+        ).fetchall()
+        self.assertEqual([r[0] for r in flat], [2, 1])
+        data = search(self.conn, "memory", repo=REPO)
+        self.assertEqual([i["number"] for i in data["items"]], [1, 2])
+
 
 class FreshShapeTokenizerTests(unittest.TestCase):
     """Genuine parity check: a database built from the shipped schema.sql

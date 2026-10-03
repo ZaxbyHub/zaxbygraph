@@ -99,8 +99,10 @@ duplicates; `--limit N` for the cap). `item N --max-body-chars C` truncates
 bodies and marks them `truncated: true`.
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
-`{items[], matched_mode, total_matches, corpus_items}` (comment hits merge
-into their item: `matching_comments` + `comment_snippet`) · `item` → all item
+`{items[], matched_mode, total_matches, corpus_items, index_stale}`
+(comment hits merge into their item: `matching_comments` +
+`comment_snippet`; `index_stale` is true when the DB predates the schema —
+reads never migrate) · `item` → all item
 columns plus
 `labels[] comments[] reviews[] files[] edges[]` · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·

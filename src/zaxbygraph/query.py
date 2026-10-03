@@ -4,6 +4,7 @@ import re
 import sqlite3
 from collections import defaultdict, deque
 
+from zaxbygraph.db import CURRENT_USER_VERSION
 from zaxbygraph.repo import validate_slug
 
 _FIRST_KW = re.compile(r"\s*([A-Za-z]+)", re.I)
@@ -105,21 +106,25 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
 #: UNION ALL comment hits (plain bm25), grouped per item so each item appears
 #: once with its best rank, an item-text-hit flag, and the EXACT count of its
 #: matching comments. `total_matches` counts this grouping pre-limit; the
-#: page is `ORDER BY score ASC LIMIT ?` with recency handled at hydration.
+#: page is `ORDER BY score ASC, updated_at DESC LIMIT ?` — recency breaks
+#: ties between equal bm25 scores.
 _SEARCH_MERGED = """
     SELECT hit_key, MIN(score) AS score, MAX(src) AS has_item_hit,
-           SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments
+           SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments,
+           MAX(upd) AS updated_at
     FROM (
         SELECT items.repo || '#' || items.number AS hit_key,
                {item_bm25} AS score,
-               1 AS src
+               1 AS src,
+               items.updated_at AS upd
         FROM items_fts
         JOIN items ON items.id = items_fts.rowid
         WHERE items_fts MATCH :match{item_repo}
         UNION ALL
         SELECT comments.repo || '#' || comments.number AS hit_key,
                bm25(comments_fts) AS score,
-               0 AS src
+               0 AS src,
+               NULL AS upd
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
         WHERE comments_fts MATCH :match{comment_repo}
@@ -144,7 +149,8 @@ def _run_search_pass(
         params["repo"] = repo
     total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
     page = conn.execute(
-        f"{merged} ORDER BY score ASC LIMIT :limit", {**params, "limit": limit}
+        f"{merged} ORDER BY score ASC, updated_at DESC LIMIT :limit",
+        {**params, "limit": limit},
     ).fetchall()
     return total, page
 
@@ -202,9 +208,14 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     Comment-only matches merge into their parent item with
     `matching_comments` and `comment_snippet`; `total_matches` and
     `corpus_items` distinguish "no hits in N items" from an empty corpus.
+    `index_stale` is true when the database predates the current schema
+    (reads never migrate), so a zero-hit result on an un-migrated v2 index
+    is not mistaken for prior-art absence.
     """
     repo = _fold_repo(repo)
     limit = _clamp_limit(limit)
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    index_stale = user_version < CURRENT_USER_VERSION
     corpus_items = conn.execute(
         "SELECT COUNT(*) FROM items" + (" WHERE repo = ?" if repo else ""),
         (repo,) if repo else (),
@@ -216,6 +227,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
             "matched_mode": "all",
             "total_matches": 0,
             "corpus_items": corpus_items,
+            "index_stale": index_stale,
         }
     mode = "all"
     match = all_query
@@ -233,6 +245,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
         "matched_mode": mode,
         "total_matches": total,
         "corpus_items": corpus_items,
+        "index_stale": index_stale,
     }
 
 
