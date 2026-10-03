@@ -80,17 +80,23 @@ Every command's JSON output is one self-describing **envelope** (v0.2):
 `{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
 plus `error:{code, message, hint?}` on failures. The per-command payload lives
 under `data`; `ok` is at the root. Errors answer on **stdout** in JSON mode
-(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo plus, on
-success, the identity line
+(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; a
+successful read that resolves a repo also writes exactly one identity line
+(`sync`/`doctor` never do; slug-less reads print none; `synced=0` means "no
+recorded sync age"):
 `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
 
-**Formats:** `--format json` (pretty, default when piped) · `compact` (one
-line) · `jsonl` (one object per line for list payloads — any `head -n` prefix
+**Formats:** `--format json` (pretty, default when piped) and `compact` (one
+line) always carry the envelope · `jsonl` (one object per line for list
+payloads — rows only, identity on the stderr line; any `head -n` prefix
 parses) · `text` (default on a TTY, renders the payload only).
-`--fields repo,number` projects rows to exactly those keys. `sql` rows are
-objects keyed by column by default (`--rows array` for positional;
-`--limit N` for the cap). `item N --max-body-chars C` truncates bodies and
-marks them `truncated: true`.
+`--fields repo,number` projects rows to those keys that exist (unknown keys
+are omitted) — applies to list payloads and `sql` rows in both row modes, not
+to nested arrays inside dict payloads. `sql` rows are objects keyed by column
+by default — duplicate column names are suffixed `name_2`, `name_3`, ... so
+no value is lost (`--rows array` keeps positional lists with exact
+duplicates; `--limit N` for the cap). `item N --max-body-chars C` truncates
+bodies and marks them `truncated: true`.
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
 `{items[], comments[]}` · `item` → all item columns plus
@@ -192,7 +198,7 @@ corpus exists for the resolved repo.
 - `zaxbygraph doctor [--consolidate] [--scan DIR]` reports scattered legacy
   DBs (per-DB item and garbled-row counts); `--consolidate` copies the
   freshest complete corpus into the store — originals are never modified.
-- A second `sync` while one is running joins it: `{ok: true, joined: true, repo: ..., db: ...}`
+- A second `sync` while one is running joins it: `{ok: true, ..., data: {joined: true}}`
   with zero GitHub calls; `--wait` blocks for the lock instead.
 
 Never commit `history.db` — it is a rebuildable cache.

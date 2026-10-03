@@ -184,6 +184,107 @@ class EnvelopeContractTests(unittest.TestCase):
         self.assertEqual(payload["repo"], REPO)
         self.assertIsNotNone(payload["db"])
 
+    def test_sql_duplicate_columns_survive_both_row_modes(self) -> None:
+        """PRR-001 (HIGH): duplicate SELECT column names must not silently
+        drop values. Objects mode suffixes repeats (n2, n2_2, ...); array
+        mode keeps every positional value (the old sqlite3.Row first-match
+        lookup substituted the first duplicate's value into later slots)."""
+        sql = "SELECT number AS n, repo AS n, number AS n FROM items ORDER BY number LIMIT 1"
+        code, out, err = self._run(["sql", sql, "--format", "json"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)["data"]
+        self.assertEqual(data["columns"], ["n", "n", "n"])
+        row = data["rows"][0]
+        self.assertEqual(list(row.keys()), ["n", "n_2", "n_3"])
+        # Positions: 0=number, 1=repo, 2=number. Every position keeps its OWN
+        # value — the old code collapsed positions 1-2 into position 0's.
+        self.assertEqual(row["n"], row["n_3"])
+        self.assertEqual(row["n_2"], REPO)
+        code2, out2, err2 = self._run(["sql", sql, "--format", "json", "--rows", "array"])
+        self.assertEqual(code2, 0, err2)
+        row2 = json.loads(out2)["data"]["rows"][0]
+        self.assertEqual(len(row2), 3)
+        self.assertEqual(row2[0], row2[2])
+        self.assertEqual(row2[1], REPO)
+
+    def test_sql_rows_array_fields_projection_aligns(self) -> None:
+        """PRR-002 (MEDIUM): --fields with --rows array must project the
+        rows by position so columns and rows stay aligned."""
+        sql = "SELECT number, repo FROM items ORDER BY number LIMIT 1"
+        code, out, err = self._run(
+            ["sql", sql, "--format", "json", "--rows", "array", "--fields", "repo"]
+        )
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)["data"]
+        self.assertEqual(data["columns"], ["repo"])
+        self.assertEqual(data["rows"], [[REPO]])
+
+    def test_compact_format_single_line_envelope(self) -> None:
+        """PRR-025c: --format compact emits the whole envelope on one line."""
+        code, out, err = self._run(["status", "--format", "compact"])
+        self.assertEqual(code, 0, err)
+        lines = [line for line in out.splitlines() if line.strip()]
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        for key in ("ok", "db", "repo", "freshness", "data", "truncated"):
+            self.assertIn(key, payload)
+
+    def test_schema_unknown_table_not_found(self) -> None:
+        """PRR-025d: `schema <unknown>` exits 1 with a not_found envelope."""
+        code, out, err = self._run(["schema", "no_such_table", "--format", "json"])
+        self.assertEqual(code, 1, err)
+        payload = json.loads(out)
+        self.assertIs(payload["ok"], False)
+        self.assertEqual(payload["error"]["code"], "not_found")
+
+    def test_truncate_bodies_marks_reviews(self) -> None:
+        """PRR-025e: the reviews branch of _truncate_bodies cuts and marks
+        exactly like comments do."""
+        from zaxbygraph.cli import _truncate_bodies
+
+        data = {
+            "body": "b" * 600,
+            "comments": [{"body": "c" * 600}],
+            "reviews": [{"body": "r" * 600}, {"body": "short"}],
+        }
+        cut = _truncate_bodies(data, 500)
+        self.assertTrue(cut)
+        self.assertEqual(len(data["body"]), 500)
+        self.assertIs(data["truncated"], True)
+        self.assertIs(data["comments"][0]["truncated"], True)
+        self.assertEqual(len(data["reviews"][0]["body"]), 500)
+        self.assertIs(data["reviews"][0]["truncated"], True)
+        self.assertNotIn("truncated", data["reviews"][1])
+
+    def test_bad_sql_error_envelope_names_the_request(self) -> None:
+        """PRR-004: a pre-open bad_sql failure still carries the requested
+        repo/db in its envelope."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(
+                ["sql", "DELETE FROM items", "--repo", REPO, "--db", self.db,
+                 "--format", "json"]
+            )
+        self.assertEqual(code, 2, err.getvalue())
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["error"]["code"], "bad_sql")
+        self.assertEqual(payload["repo"], REPO)
+        self.assertIsNotNone(payload["db"])
+
+    def test_hint_ignores_from_inside_string_literals(self) -> None:
+        """PRR-006: the column hint scans code spans only — a FROM inside a
+        string literal must not mis-target the probe."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(
+                ["sql", "SELECT 'FROM items' AS x, no_such_col FROM pr_files",
+                 "--repo", REPO, "--db", self.db, "--format", "json"]
+            )
+        self.assertEqual(code, 1, err.getvalue())
+        error = json.loads(out.getvalue())["error"]
+        self.assertEqual(error["code"], "no_such_column")
+        self.assertIn("columns of pr_files:", error.get("hint", ""))
+
     def test_every_registered_subcommand_emits_envelope(self) -> None:
         """Guardrail: every subcommand build_parser() registers (minus the
         network sync; its envelope is pinned by test_sync.py) must answer

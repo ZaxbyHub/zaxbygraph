@@ -440,10 +440,11 @@ def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200, repo: str | No
     except sqlite3.Error as exc:
         raise ValueError(str(exc)) from exc
     truncated = len(fetched) > limit
-    rows = [
-        [row[c] if isinstance(row, sqlite3.Row) else row[idx] for idx, c in enumerate(cols)]
-        for row in fetched[:limit]
-    ]
+    # Positional extraction only: sqlite3.Row resolves duplicate column
+    # names to the FIRST match (row["body"] on a joined SELECT returns the
+    # left table's value for both positions), so name-based access silently
+    # substitutes values. list(row) keeps every duplicate position honest.
+    rows = [list(row) for row in fetched[:limit]]
     if repo is not None and "repo" in cols:
         # Issue #2 AC4: rows that carry a repo column show only the resolved
         # repo. Post-fetch and column-name based; a projection without a

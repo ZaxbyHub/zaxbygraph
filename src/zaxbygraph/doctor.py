@@ -7,8 +7,9 @@ adoption always work on temp copies (a mode=ro open of a WAL-mode DB would
 still materialize -shm/-wal beside the original, so even inspection goes
 through a copy).
 
-Report shape (--format json):
-    {"ok": true, "adopted": <path|null>,
+Report payload (the CLI wraps it in the issue-#3 envelope; these keys live
+under `data`, with `ok`/`db`/`repo`/`freshness` on the envelope root):
+    {"adopted": <path|null>,
      "scanned": [{"path", "items", "garbled", "complete", "adopted"}, ...]}
 
 Pinned semantics:

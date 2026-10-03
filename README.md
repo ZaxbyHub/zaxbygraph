@@ -62,10 +62,14 @@ envelope root):
 
 ```json
 {
-  "repo": "acme/forgegate", "ingested": 3, "last_number": 10, "full": true,
-  "finished_at": "2026-09-12T19:23:04Z", "issues_since": "2026-01-03T05:40:10Z",
-  "item_count": 3, "comment_count": 1, "edge_count": 10, "last_error": null,
-  "ok": true, "db": "/path/to/.zaxbygraph/history.db"
+  "ok": true, "db": "/path/to/.zaxbygraph/history.db", "repo": "acme/forgegate",
+  "freshness": {"synced_at": "2026-09-12T19:23:04Z", "age_s": 0, "complete": true},
+  "data": {
+    "ingested": 3, "last_number": 10, "full": true,
+    "finished_at": "2026-09-12T19:23:04Z", "issues_since": "2026-01-03T05:40:10Z",
+    "item_count": 3, "comment_count": 1, "edge_count": 10, "last_error": null
+  },
+  "truncated": false
 }
 ```
 
@@ -105,6 +109,8 @@ the resolved repo itself, exit **2** says so and points at
 consolidates, copy-only) scattered legacy DBs. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);
+`cwd`/`git_common_dir`/`slug`/`legacy` are the chain steps, and
+`store_error` is set when the store file exists but cannot be read;
 `sync_lock` surfaces the lock holder when one exists - a lock left by
 a dead machine (different host) is never stolen; delete
 `<db>.sync.lock` by hand to clear it. `doctor --db` overrides the
@@ -112,7 +118,7 @@ consolidation DESTINATION (the store), not the scan sources.
 
 Concurrent `sync` runs of one
 repo serialize through a lock file (`<db>.sync.lock`): a second sync joins
-with `{"ok": true, "joined": true, "repo": ..., "db": ...}` and zero GitHub calls, `--wait` blocks for
+with `{"ok": true, ..., "data": {"joined": true}}` and zero GitHub calls, `--wait` blocks for
 the lock, and a lock left by a dead same-host pid is recovered automatically.
 
 **Do not commit `history.db`** — it is a rebuildable cache, not source.
@@ -125,8 +131,8 @@ Every command accepts:
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
 | `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. |
-| `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `jsonl` prints list payloads one object per line (any `head -n` prefix parses); `text` is a light flattening of the payload only — **prefer `json` for anything parsed**. All JSON formats carry the envelope (see Output and error contract). |
-| `--fields a,b` | Project result rows to exactly those keys (list payloads and `sql` rows). |
+| `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; identity is on the stderr line); `text` is a light flattening of the payload only — **prefer `json` for anything parsed**. |
+| `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
 
@@ -152,6 +158,9 @@ anything — the watermark stays at the last **fully committed** item and
 
 Returns an object with `repos` (one row per repo, from `sync_state`) and
 `counts` (items grouped by kind and state). Reads no bodies, so it is cheap.
+
+The payload below is what you get under `data` (the envelope adds
+`ok`/`db`/`repo`/`freshness`/`truncated` around it):
 
 ```json
 {
@@ -180,7 +189,7 @@ zaxbygraph search "QUERY" [--limit 20]
 ```
 
 Searches titles, bodies, labels, and comment bodies. Returns `items` and
-`comments` separately; `snippet` marks hits with `«` `»`.
+`comments` separately (under `data`); `snippet` marks hits with `«` `»`.
 
 ```json
 {
@@ -243,7 +252,7 @@ zaxbygraph path A B
 ```
 
 `A` and `B` are item numbers or file paths. Undirected breadth-first search over
-`touches`, `closes`, and `mentions`:
+`touches`, `closes`, and `mentions`. The `data` payload:
 
 ```json
 {"a": "14", "b": "11", "repo": "acme/forgegate",
@@ -297,16 +306,24 @@ Machine-readable rules, worth knowing before scripting against this:
   "data": <payload>, "truncated": bool}` - plus `"error": {"code", "message",
   "hint"?}` on failures. The payload you used to get at the top level now lives
   under `data`; `ok` is still at the root. `churn` and `open` payloads are
-  JSON arrays under `data`. Every successful read also writes exactly one
-  identity line to stderr:
-  `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
-- **Formats and rows.** `--format json` (pretty, default when piped),
-  `compact` (one line), `jsonl` (list payloads print one JSON object per line,
-  so any `head -n` prefix parses), `text` (default on a TTY; renders the
-  payload only, never envelope keys). `--fields repo,number` projects rows to
-  exactly those keys. `sql` rows are objects keyed by column by default;
-  `--rows array` keeps positional lists; `--limit N` overrides the 200-row cap.
-  `item N --max-body-chars C` truncates bodies and marks them
+  JSON arrays under `data`. Every successful read that resolves a repo also
+  writes exactly one identity line to stderr (slug-less reads — `--repo ''` —
+  print none; `sync` and `doctor` never do):
+  `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`
+  (`synced=0` means "no recorded sync age"; `synced=<age>` is whole seconds).
+- **Formats and rows.** `--format json` (pretty, default when piped) and
+  `compact` (one line) always carry the envelope; `jsonl` prints one JSON
+  object per line for list payloads (rows only — the envelope identity is on
+  the stderr line) and the whole envelope for single-payload commands, so any
+  `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
+  never envelope keys. `--fields repo,number` projects rows to exactly those
+  keys that exist (unknown keys are omitted) — it applies to list payloads and
+  to `sql` rows in both modes (objects: keys; `--rows array`: positions), not
+  to nested arrays inside dict payloads. `sql` rows are objects keyed by
+  column by default — duplicate column names are suffixed `name_2`, `name_3`,
+  … so no value is lost (`columns` keeps the true names; `--rows array` keeps
+  positional lists and exact duplicates); `--limit N` overrides the 200-row
+  cap. `item N --max-body-chars C` truncates bodies and marks them
   `"truncated": true`. `zaxbygraph schema [TABLE]` prints live DDL plus
   per-column notes - use it instead of a file path to learn the schema.
 - **Output encoding.** stdout and stderr are UTF-8 on every platform,

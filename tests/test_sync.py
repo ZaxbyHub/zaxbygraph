@@ -555,7 +555,7 @@ class SyncLockTests(TempDBTest):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIsNot(data.get("joined"), True)
+        self.assertIsNot(data["data"].get("joined"), True)
         self.assertEqual(data["data"].get("ingested"), 2)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
         self.assertGreater(self.src.extra_fetches, 0)
@@ -584,7 +584,7 @@ class SyncLockTests(TempDBTest):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIsNot(data.get("joined"), True)
+        self.assertIsNot(data["data"].get("joined"), True)
         self.assertGreaterEqual(elapsed, 0.45, "--wait returned before the holder died")
         self.assertLess(elapsed, 30.0, "--wait spun far too long")
         # Idempotent re-sync of the same corpus: still exactly the 2 items.

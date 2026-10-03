@@ -219,12 +219,24 @@ def emit_result(
             payload = [_project(row, fields) for row in data]
         elif isinstance(data, dict) and isinstance(data.get("rows"), list):
             # sql's rows project despite dict-shaped data (plan item 5).
+            # Objects mode projects keys; array mode projects positions so
+            # columns and rows stay aligned (PRR-002).
             cols = data.get("columns")
             payload = dict(data)
-            payload["rows"] = [_project(row, fields) for row in data["rows"]]
-            if isinstance(cols, list):
-                columns = [c for c in cols if c in fields]
-                payload["columns"] = columns
+            if (
+                data["rows"]
+                and isinstance(data["rows"][0], list)
+                and isinstance(cols, list)
+            ):
+                idxs = [i for i, c in enumerate(cols) if c in fields]
+                payload["rows"] = [
+                    [row[i] for i in idxs if i < len(row)] for row in data["rows"]
+                ]
+                payload["columns"] = [cols[i] for i in idxs]
+            else:
+                payload["rows"] = [_project(row, fields) for row in data["rows"]]
+                if isinstance(cols, list):
+                    payload["columns"] = [c for c in cols if c in fields]
     env = build_envelope(
         payload,
         conn=conn,
@@ -480,12 +492,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
         )
         return 1
     if lock is None:
+        fresh = _freshness(conn, slug)
         conn.close()
         emit_result(
             args,
             {"joined": True},
             slug=slug,
             db_path=db_path,
+            freshness=fresh,
             identity=False,
         )
         return 0
@@ -636,6 +650,20 @@ _NO_SUCH_RE = re.compile(r"^(no such column|no such table)", re.IGNORECASE)
 _TABLE_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 
 
+def _hint_table(sql_text: str) -> str | None:
+    """First FROM/JOIN table in CODE spans only (PRR-006): a plain regex
+    over raw SQL matches the words inside string literals and comments and
+    mis-targets the hint. query._sql_tokens already classifies spans, so
+    scan only its 'code' output."""
+    from zaxbygraph.query import _sql_tokens
+
+    code = " ".join(text for kind, text in _sql_tokens(sql_text) if kind == "code")
+    match = _TABLE_RE.search(code)
+    if match is None:
+        return None
+    return match.group(1)
+
+
 def _column_hint(conn: sqlite3.Connection, sql_text: str) -> str | None:
     """Real column names for the first FROM/JOIN table (issue #3 AC1).
 
@@ -646,10 +674,9 @@ def _column_hint(conn: sqlite3.Connection, sql_text: str) -> str | None:
     charset-only so it cannot break out of the SELECT. Any probe failure
     (missing table, CTE names) omits the hint; the envelope still emits.
     """
-    match = _TABLE_RE.search(sql_text)
-    if match is None:
+    token = _hint_table(sql_text)
+    if token is None:
         return None
-    token = match.group(1)
     try:
         probe = conn.execute(f"SELECT * FROM {token} LIMIT 0")
         cols = [d[0] for d in probe.description or []]
@@ -666,7 +693,14 @@ def cmd_sql(args: argparse.Namespace) -> int:
     try:
         assert_read_sql(args.statement)
     except ValueError as exc:
-        return emit_failure(args, 2, str(exc), code_key="bad_sql")
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=getattr(args, "repo", None) or None,
+            db_path=getattr(args, "db", None),
+            code_key="bad_sql",
+        )
     repo: str | None = None
     db_path: Path | None = None
     try:
@@ -716,7 +750,18 @@ def cmd_sql(args: argparse.Namespace) -> int:
     cols = data["columns"]
     rows = data["rows"]
     if args.rows_mode == "objects":
-        rows = [dict(zip(cols, row)) for row in rows]
+        # A SELECT can yield duplicate column names (joins of tables sharing
+        # columns, `SELECT a, a`); a plain dict(zip) would silently drop the
+        # later positions. Suffix repeats as name_2, name_3, ... so every
+        # value survives under a deterministic key; `columns` keeps the true
+        # names and `--rows array` preserves positions exactly.
+        seen: dict[str, int] = {}
+        keys: list[str] = []
+        for c in cols:
+            n = seen.get(c, 0)
+            seen[c] = n + 1
+            keys.append(c if n == 0 else f"{c}_{n + 1}")
+        rows = [dict(zip(keys, row)) for row in rows]
     emit_result(
         args,
         {"columns": cols, "rows": rows},
@@ -852,6 +897,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         )
         return 1
     data.pop("store", None)
+    # doctor's own ok/True is dead weight under the envelope (root ok is the
+    # contract); dropping it keeps one source of truth for success.
+    data.pop("ok", None)
     emit_result(args, data, slug=repo, db_path=store_db, identity=False)
     return 0
 
