@@ -526,3 +526,18 @@ class WhereTests(_Issue2Harness):
         self.assertEqual(data["items"], 2)
         self.assertIsNone(data["watermark"])
         self.assertIs(data["complete"], False)
+
+
+class VersionConsistencyTests(unittest.TestCase):
+    """Review finding F6: pyproject.toml and zaxbygraph.__version__ must not
+    drift — --version reads the constant while installers read pyproject."""
+
+    def test_pyproject_version_matches_dunder(self) -> None:
+        import tomllib
+
+        root = Path(__file__).resolve().parents[1]
+        with open(root / "pyproject.toml", "rb") as fh:
+            data = tomllib.load(fh)
+        from zaxbygraph import __version__
+
+        self.assertEqual(data["project"]["version"], __version__)

@@ -265,11 +265,14 @@ Two operational notes: `sync` is the one command that can open a legacy
 database writable and perform the one-time migration write in place. Read
 commands open the file `mode=ro` and never migrate, and plain `doctor`
 never writes a legacy file either — it reads legacy databases through
-migrated temp copies, and `doctor --consolidate` migrates the store it
-builds, not the original. A v2 database therefore keeps the old FTS
-tokenizer until its next in-place `sync` (`search` reports `index_stale:
-true` meanwhile), and a v3 database cannot be opened by older builds (the
-forward-only version check refuses it).
+migrated temp copies, and `doctor --consolidate` migrates the destination
+store it adopts into (creating it if needed, whether that store is new or a
+pre-existing v2 store), never the source. A v2 database therefore keeps the
+old FTS tokenizer until its next in-place `sync` (`search` reports
+`index_stale: true` meanwhile). The forward-only version check runs in
+`init_schema`: older builds refuse a v3 database on those write paths, while
+their read commands (which never call `init_schema`) still open a v3 file —
+the FTS queries simply run against porter stemming they may not expect.
 
 Migration 2→3 rebuilds both FTS tables in place with the porter tokenizer:
 the six sync triggers and both virtual tables are dropped and recreated with

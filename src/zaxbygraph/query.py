@@ -29,9 +29,10 @@ _STOPWORDS = frozenset(
     "this those to was were what when where which who will with you your".split()
 )
 
-#: bm25 weights for items_fts columns (title, body, labels_text): a title hit
-#: outweighs a body hit, which outweighs a labels hit. Lower (more negative)
-#: bm25 output ranks first, so ORDER BY ... ASC.
+#: bm25 weights for items_fts columns (title, body, labels_text): the title
+#: dominates; labels_text outranks body because a label is a short curated
+#: topic tag, while a term appearing in body prose is often incidental.
+#: Lower (more negative) bm25 output ranks first, so ORDER BY ... ASC.
 _ITEM_BM25 = "bm25(items_fts, 10.0, 1.0, 3.0)"
 
 
@@ -204,14 +205,16 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     Tokens are quoted (never FTS5 syntax) and stemmed via the porter
     tokenizer. Ranking is bm25 (title-weighted) with `updated_at` as the
     tie-break. When the strict all-tokens pass finds fewer hits than the
-    requested page, the query is retried with stopwords removed and tokens
-    OR-joined, and `matched_mode` reports which pass produced the page.
-    Comment-only matches merge into their parent item with
-    `matching_comments` and `comment_snippet`; `total_matches` and
-    `corpus_items` distinguish "no hits in N items" from an empty corpus.
-    `index_stale` is true when the database predates the current schema
-    (reads never migrate), so a zero-hit result on an un-migrated v2 index
-    is not mistaken for prior-art absence.
+    requested page, the page keeps every strict hit first and the broadened
+    pass (stopwords removed, tokens OR-joined) fills the remaining slots;
+    `matched_mode` reports whether broadening contributed ("any") or the
+    strict pass answered alone ("all"). Comment hits merge into their parent
+    item with `matching_comments` and `comment_snippet`; `total_matches`
+    counts the broadened set pre-limit, and `corpus_items` the scoped item
+    count — together they distinguish "no hits in N items" from an empty
+    corpus. `index_stale` is true when the database predates the current
+    schema (reads never migrate), so a zero-hit result on an un-migrated v2
+    index is not mistaken for prior-art absence.
     """
     repo = _fold_repo(repo)
     limit = _clamp_limit(limit)
@@ -233,14 +236,30 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     mode = "all"
     match = all_query
     total, page = _run_search_pass(conn, match, repo, limit)
+    # Blocks keep the page honest under the fallback: the strict pass's page
+    # is kept whole (its rows hydrated against the all-tokens match, so their
+    # snippets show every term), and the broadened pass fills the remaining
+    # slots with rows the strict page does not already have (hydrated against
+    # the broadened match). Without this, a top-`limit` broadened page could
+    # silently evict the very items the strict pass matched.
+    blocks: list[tuple[str, list[sqlite3.Row]]] = [(match, page)]
     if total < limit and any_query != all_query:
         mode = "any"
         match = any_query
-        total, page = _run_search_pass(conn, match, repo, limit)
-    items = [
-        rec for rec in (_hydrate_search_hit(conn, match, hit) for hit in page)
-        if rec is not None
-    ]
+        total, or_page = _run_search_pass(conn, match, repo, limit)
+        seen = {row["hit_key"] for row in page}
+        extra = [
+            row
+            for row in or_page
+            if row["hit_key"] not in seen
+        ][: max(0, limit - len(page))]
+        blocks.append((match, extra))
+    items = []
+    for block_match, block_rows in blocks:
+        for hit in block_rows:
+            rec = _hydrate_search_hit(conn, block_match, hit)
+            if rec is not None:
+                items.append(rec)
     return {
         "items": items,
         "matched_mode": mode,

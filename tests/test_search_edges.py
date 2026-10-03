@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, TempDBTest, comment, issue
+from fixtures import REPO, FakeGitHubSource, TempDBTest, comment, issue
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.query import build_match_queries, search
 
@@ -44,11 +44,53 @@ class SearchEdgeTests(TempDBTest):
     def test_all_stopword_query_does_not_broaden_or_crash(self) -> None:
         self.seed_corpus()
         data = search(self.conn, "the of and", repo=REPO)
-        # every token is a stopword, so broadening is a no-op and the strict
-        # pass answers; the shape stays complete either way
-        self.assertIn("matched_mode", data)
-        self.assertIn("total_matches", data)
-        self.assertIn("corpus_items", data)
+        # every token is a stopword, so broadening cannot change the match
+        # set and the strict pass answers: pin the exact shape, not just the
+        # presence of the fields
+        self.assertEqual(data["matched_mode"], "all")
+        self.assertEqual(data["items"], [])
+        self.assertEqual(data["total_matches"], 0)
+        self.assertEqual(data["corpus_items"], 3)
+
+    def test_index_stale_false_on_fresh_zero_hit(self) -> None:
+        """index_stale polarity pin: a fresh (current-schema) DB that also
+        returns zero hits must report False — the flag tracks schema age,
+        not hit count."""
+        self.seed_corpus()
+        data = search(self.conn, "quokka", repo=REPO)
+        self.assertEqual(data["total_matches"], 0)
+        self.assertEqual(data["index_stale"], False)
+
+    def test_corpus_items_counts_whole_store_without_repo_filter(self) -> None:
+        """repo=None (no --repo resolved / explicit empty) scopes
+        corpus_items to the whole store, not one repo."""
+        import tempfile as _tf
+
+        from zaxbygraph.db import connect as _connect
+        from zaxbygraph.db import init_schema as _init
+        from zaxbygraph.sync import sync_repo as _sync
+
+        td = _tf.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "multi.db"
+        conn = _connect(db_path)
+        self.addCleanup(conn.close)
+        _init(conn)
+        src = FakeGitHubSource()
+        for n in (1, 2):
+            src.add_issue(issue(n, title=f"widget memory {n}", body="x"))
+        _sync(conn, src, "acme/widget")
+        src2 = FakeGitHubSource()
+        other = issue(1, title="other repo filler", body="no match")
+        other["id"] = 9101  # distinct item id: ids collide across repos by fixture
+        src2.add_issue(other)
+        _sync(conn, src2, "other/repo")
+        whole = search(conn, "memory")
+        self.assertEqual(whole["corpus_items"], 3)
+        self.assertEqual(whole["total_matches"], 2)
+        scoped = search(conn, "memory", repo="acme/widget")
+        self.assertEqual(scoped["corpus_items"], 2)
+        self.assertEqual(scoped["total_matches"], 2)
 
     def test_no_separate_comments_section(self) -> None:
         self.seed_corpus()
@@ -69,17 +111,101 @@ class SearchEdgeTests(TempDBTest):
         self.assertEqual(data["items"][0]["matching_comments"], 7)
         self.assertIn("«zephyr»", data["items"][0]["comment_snippet"])
 
-    def test_fallback_never_drops_and_hits(self) -> None:
-        self.seed_corpus()
-        # "memory leak": item 1 matches both tokens, item 2 only "memory".
-        # The AND pass has a nonzero hit below the limit, so the OR pass runs;
-        # every AND hit must survive in the broadened page.
-        strict = search(self.conn, "memory leak", repo=REPO)
-        broad = search(self.conn, "memory leak", repo=REPO, limit=20)
-        strict_keys = {(i["repo"], i["number"]) for i in strict["items"]}
-        broad_keys = {(i["repo"], i["number"]) for i in broad["items"]}
-        self.assertTrue(strict_keys, "AND pass should find item 1")
-        self.assertLessEqual(strict_keys, broad_keys)
+    def test_fallback_keeps_strict_hits_on_the_page(self) -> None:
+        """The fallback must never evict strict (all-tokens) hits from the
+        page: when the broadened pass fills the page, every strict hit keeps
+        a slot ahead of broadened-only rows. The fixture makes the strict
+        hit's BROADENED rank provably beyond the limit (its matches sit in a
+        length-crushed long body, drowned by short-title matches of each
+        single token) — under the old replace-the-page behavior the strict
+        hit vanished from the default page entirely."""
+        long_body = (
+            "alpha beta " + "padding words to crush the length normalization " * 8
+        )
+        self.src.add_issue(
+            issue(1, title="zzz unrelated", body=long_body,
+                  updated_at="2026-01-01T00:00:00Z")
+        )
+        for i in range(2, 8):
+            self.src.add_issue(
+                issue(i, title=f"alpha padding {i}", body="nothing here",
+                      updated_at=f"2026-01-{i:02d}T00:00:00Z")
+            )
+        for i in range(8, 14):
+            self.src.add_issue(
+                issue(i, title=f"beta padding {i}", body="nothing here",
+                      updated_at=f"2026-01-{i:02d}T00:00:00Z")
+            )
+        self.sync()
+        limit = 3
+        from zaxbygraph.query import _run_search_pass, build_match_queries
+        all_query, any_query = build_match_queries("alpha beta")
+        # precondition, deterministic rather than corpus luck: the strict
+        # hit's broadened rank is beyond the limit
+        _, or_page = _run_search_pass(self.conn, any_query, REPO, 99)
+        or_keys = [r["hit_key"] for r in or_page]
+        strict_key = "acme/forgegate#1"
+        self.assertIn(strict_key, or_keys)
+        self.assertGreaterEqual(or_keys.index(strict_key), limit)
+        # the composition fix: the strict hit survives, ahead of the
+        # broadened-only rows
+        data = search(self.conn, "alpha beta", repo=REPO, limit=limit)
+        self.assertEqual(data["matched_mode"], "any")
+        numbers = [i["number"] for i in data["items"]]
+        self.assertEqual(numbers[0], 1)
+        self.assertEqual(len(numbers), limit)
+        self.assertEqual(len(set(numbers)), limit)
+        # total_matches stays the honest broadened-set count
+        self.assertEqual(data["total_matches"], 13)
+
+    def test_labels_outrank_body(self) -> None:
+        """The shipped weights (title 10, body 1, labels 3) put a label-only
+        match above a body-only match — the documented order no earlier
+        fixture exercised (labels_text was never populated)."""
+        self.src.add_issue(
+            issue(1, title="unrelated title one", body="nothing here",
+                  labels=[{"name": "memory", "color": "ff0000"}],
+                  updated_at="2026-01-01T00:00:00Z")
+        )
+        self.src.add_issue(
+            issue(2, title="unrelated title two", body="a memory note in prose",
+                  updated_at="2026-01-02T00:00:00Z")
+        )
+        for i in (3, 4, 5):
+            self.src.add_issue(
+                issue(i, title=f"filler {i}", body="nothing to match",
+                      updated_at=f"2026-01-0{i}T00:00:00Z")
+            )
+        self.sync()
+        data = search(self.conn, "memory", repo=REPO)
+        self.assertEqual([i["number"] for i in data["items"]][:2], [1, 2])
+
+    def test_same_item_dual_match_uses_best_score(self) -> None:
+        """MIN(score) aggregation pin: a title hit and a comment-only hit
+        both surface once with the right snippets — mutating MIN to MAX
+        must fail here (the dual-source shape was previously unpinned)."""
+        self.src.add_issue(
+            issue(1, title="zephyr scheduler", body="unrelated prose",
+                  updated_at="2026-01-01T00:00:00Z")
+        )
+        self.src.add_issue(
+            issue(2, title="unrelated two", body="nothing",
+                  updated_at="2026-01-02T00:00:00Z")
+        )
+        self.src.add_issue(
+            issue(3, title="unrelated three", body="nothing",
+                  updated_at="2026-01-03T00:00:00Z")
+        )
+        self.src.comment_on(3, "zephyr mentioned in passing")
+        self.sync()
+        data = search(self.conn, "zephyr", repo=REPO)
+        numbers = [i["number"] for i in data["items"]]
+        self.assertIn(1, numbers)
+        self.assertIn(3, numbers)
+        self.assertEqual(numbers.count(3), 1)
+        # a strict-block row hydrates with the item-text snippet
+        row1 = next(i for i in data["items"] if i["number"] == 1)
+        self.assertIn("zephyr", row1["snippet"].lower())
 
     def test_total_matches_counts_merged_items_pre_limit(self) -> None:
         self.seed_corpus()

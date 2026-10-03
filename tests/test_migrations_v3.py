@@ -103,6 +103,84 @@ class V3MigrationTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([r[0] for r in hits], [1])
 
+    def test_real_v3_with_poisoned_tail_rolls_back_atomically(self) -> None:
+        """Exercise the REAL migrate_v2_to_v3 (not a stand-in callback) with
+        an injected failure after its destructive DDL: poisoning the tail of
+        _FTS_PORTER_STATEMENTS drives the genuine code path, so an
+        executescript-style implicit COMMIT inside it would show porter DDL
+        on a second connection. Review finding F5: the mocked-callback
+        variant of this test cannot catch that bug class."""
+        _seed_v2(self.db_path)
+        poison = ("INSERT INTO items_fts(items_fts) VALUES('not-a-valid-fts5-command')",)
+        with mock.patch.object(
+            db_mod, "_FTS_PORTER_STATEMENTS", db_mod._FTS_PORTER_STATEMENTS + poison
+        ):
+            conn = connect(self.db_path)
+            with self.assertRaises(sqlite3.OperationalError):
+                init_schema(conn)
+            conn.close()
+        # observe from a SECOND connection: the failed migration must not
+        # have leaked any new-schema DDL past the rollback
+        witness = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        self.addCleanup(witness.close)
+        self.assertEqual(witness.execute("PRAGMA user_version").fetchone()[0], 2)
+        ddl = witness.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'items_fts'"
+        ).fetchone()[0]
+        self.assertNotIn(
+            "porter", ddl.lower(), "torn DDL state: migration leaked past rollback"
+        )
+        witness.close()
+        # a later clean run (unpoisoned) migrates fully and stems
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
+        hits = conn.execute(
+            "SELECT items.number FROM items_fts"
+            " JOIN items ON items.id = items_fts.rowid"
+            " WHERE items_fts MATCH '\"reconnect\"'"
+        ).fetchall()
+        self.assertEqual([r[0] for r in hits], [1])
+
+    def test_migrated_comments_fts_carries_porter_and_stems(self) -> None:
+        """Review finding F4: the migrated path's comments_fts coverage —
+        its DDL must carry porter AND a stemmed comment query must match
+        (stored 'reconnection', query 'reconnect'). Both mutations this
+        guards (dropping porter from either DDL copy) are suite-visible
+        only with these assertions on a genuine v2-seeded database."""
+        v2 = sqlite3.connect(str(self.db_path))
+        v2.executescript(V2_SCHEMA_SQL)
+        v2.execute("PRAGMA user_version = 2")
+        v2.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state,"
+            " updated_at, raw_json) VALUES (1, 'acme/forgegate', 1, 'issue',"
+            " 'Timer cleanup on socket teardown', 'nothing stemmy here',"
+            " 'open', '2026-01-04T00:00:00Z', '{}')"
+        )
+        v2.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, author, body,"
+            " raw_json) VALUES (501, 'acme/forgegate', 1, 'issue_comment',"
+            " 'bob', 'the reconnection attempt failed', '{}')"
+        )
+        v2.commit()
+        v2.close()
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        ddl = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'comments_fts'"
+        ).fetchone()[0]
+        self.assertIn("porter", ddl.lower())
+        hits = conn.execute(
+            "SELECT comments.number FROM comments_fts"
+            " JOIN comments ON comments.pk = comments_fts.rowid"
+            " WHERE comments_fts MATCH '\"reconnect\"'"
+        ).fetchall()
+        self.assertEqual([r[0] for r in hits], [1])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -194,14 +194,21 @@ FTS5 index (`memory` matches `memories`, `reconnect` matches
 interpreted as FTS5 syntax (`OR`, `NEAR`, column filters in a query are
 inert words) — there is no operator surface, just words.
 
-Ranking is bm25 with the title weighted highest, then body, then labels;
-`updated_at` breaks ties. If the strict all-tokens pass finds fewer items
-than the page, the query is retried with common English stopwords removed
-and tokens OR-joined, and `matched_mode` reports which pass produced the
-page (`"all"` or `"any"`). Comment hits merge into their parent item — the
+Ranking is bm25 with the title weighted highest (10.0), then labels (3.0),
+then body (1.0) — a match in a short curated label is a stronger signal
+than an incidental mention in body prose. `updated_at` breaks ties. When
+the strict all-tokens pass finds fewer items than the page, the page keeps
+every strict hit first and the broadened pass — common English stopwords
+removed, tokens OR-joined — fills the remaining slots; `matched_mode`
+reports whether broadening contributed (`"any"`) or the strict pass
+answered alone (`"all"`). `total_matches` counts the broadened set before
+the limit. Comment hits merge into their parent item — the
 item appears once with `matching_comments` (exact count) and
 `comment_snippet` (a highlighted snippet from the best-matching comment);
-an item-text hit keeps its highlight in `snippet`.
+an item-text hit keeps its highlight in `snippet`. Item and comment bm25
+scores share one ordering axis without cross-table normalization (the
+issue-pinned "best bm25 of either" rule), so cross-source rank ordering is
+approximate.
 
 ```json
 {
@@ -222,11 +229,15 @@ an item-text hit keeps its highlight in `snippet`.
 ```
 
 `total_matches` counts distinct matching items before the limit and
-`corpus_items` counts the repo-scoped corpus, so "no hits in 42 items" is
-distinguishable from an empty database. Every result also carries
+`corpus_items` counts the searched corpus — the whole store when no repo
+filter resolves, the repo's items when one does — so "no hits in 42 items"
+is distinguishable from an empty database. Every result also carries
 `index_stale`: true when the database predates the current schema (reads
 never migrate), so a zero-hit answer from an un-migrated v2 index is not
-mistaken for prior-art absence. **Shape change (v0.3): the separate
+mistaken for prior-art absence. Search cost scales with the match set: a
+term that matches most of the corpus pays an O(corpus) count, and each
+returned item costs at most three small indexed queries (row, item
+snippet, comment snippet). **Shape change (v0.3): the separate
 `comments` list is gone** — comment hits are items now, as shown above.
 
 ### `item` — one issue or PR in full
@@ -400,11 +411,13 @@ rebuilt in place — both FTS tables drop and re-create with the porter
 tokenizer, no resync — by the next `sync` that opens it (sync is the one
 command that resolves to and writes a legacy database in place). Reads never
 migrate a database, and plain `doctor` never writes one either: it reads
-legacy files through migrated temp copies and `doctor --consolidate`
-migrates the *store* it builds, not the original. Two consequences worth
-knowing: a v2 database keeps the old tokenizer (search reports
-`index_stale: true`) until that first in-place `sync`, and once v3 is
-stamped, older zaxbygraph builds refuse the file. See
+legacy files through migrated temp copies, and `doctor --consolidate`
+migrates the destination store it adopts into (creating it if needed), not
+the source. Two consequences worth knowing: a v2 database keeps the old
+tokenizer (search reports `index_stale: true`) until that first in-place
+`sync`, and once v3 is stamped, older zaxbygraph builds refuse it on the
+write path (`sync`, `doctor --consolidate` — the forward-only check runs in
+`init_schema`); older builds' read commands still open a v3 file fine. See
 [`docs/schema.md`](docs/schema.md) for the full migration reference.
 
 Edge relationships: `authored`, `has_label`, `commented`, `reviewed`, `touches`,
