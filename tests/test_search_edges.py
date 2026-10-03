@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, FakeGitHubSource, TempDBTest, comment, issue
+from fixtures import REPO, FakeGitHubSource, TempDBTest, issue
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.query import build_match_queries, search
 

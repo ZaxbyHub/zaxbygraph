@@ -201,8 +201,7 @@ the strict all-tokens pass finds fewer items than the page, the page keeps
 every strict hit first and the broadened pass — common English stopwords
 removed, tokens OR-joined — fills the remaining slots; `matched_mode`
 reports whether broadening contributed (`"any"`) or the strict pass
-answered alone (`"all"`). `total_matches` counts the broadened set before
-the limit. Comment hits merge into their parent item — the
+answered alone (`"all"`). `total_matches` counts the final matching set — strict or broadened — before the limit. Comment hits merge into their parent item — the
 item appears once with `matching_comments` (exact count) and
 `comment_snippet` (a highlighted snippet from the best-matching comment);
 an item-text hit keeps its highlight in `snippet`. Item and comment bm25
@@ -235,7 +234,7 @@ is distinguishable from an empty database. Every result also carries
 `index_stale`: true when the database predates the current schema (reads
 never migrate), so a zero-hit answer from an un-migrated v2 index is not
 mistaken for prior-art absence. Search cost scales with the match set: a
-term that matches most of the corpus pays an O(corpus) count, and each
+every query pays an O(corpus) scan for `corpus_items`, and a term that matches most of the corpus pays an O(corpus) match-set count, and each
 returned item costs at most three small indexed queries (row, item
 snippet, comment snippet). **Shape change (v0.3): the separate
 `comments` list is gone** — comment hits are items now, as shown above.
