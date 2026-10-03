@@ -1,6 +1,6 @@
 [project]
 name = "zaxbygraph"
-version = "0.1.0"
+version = "0.2.0"
 description = "Incremental SQLite knowledge graph of a repository's GitHub issues and pull requests."
 readme = "README.md"
 requires-python = ">=3.11"

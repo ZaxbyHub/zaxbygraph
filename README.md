@@ -55,7 +55,9 @@ zaxbygraph search "init hang"         # full-text over titles, bodies, comments
 zaxbygraph item 14                    # one item, with comments/files/edges
 ```
 
-`sync` prints a summary:
+`sync` prints the envelope with the run summary under `data` (keys `repo`,
+`ingested`, `last_number`, `full`, `finished_at`, `issues_since`, `item_count`,
+`comment_count`, `edge_count`, `last_error`):
 
 ```json
 {
@@ -122,7 +124,10 @@ Every command accepts:
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
 | `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. |
-| `--format json\|text` | Output format. Defaults to `text` on a TTY and `json` when piped, so scripts and agents get JSON without asking. Pass it explicitly when the destination is ambiguous. `text` is a light flattening — top-level scalars print as `key: value`, while nested objects and lists still print as indented JSON — so **prefer `json` for anything parsed**. |
+| `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `jsonl` prints list payloads one object per line (any `head -n` prefix parses); `text` is a light flattening of the payload only — **prefer `json` for anything parsed**. All JSON formats carry the envelope (see Output and error contract). |
+| `--fields a,b` | Project result rows to exactly those keys (list payloads and `sql` rows). |
+| `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
+| `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
 
 ### `sync` — fetch into the graph
 
@@ -220,7 +225,7 @@ plus `confidence` and `evidence`. Raising `--depth` grows results quickly.
 zaxbygraph churn [--limit 30]
 ```
 
-Returns a **bare JSON array**, ranked by how many PRs touched each path:
+Returns the ranked rows under `data` (an array), by how many PRs touched each path:
 
 ```json
 [{"path": "src/zaxbygraph/sync.py", "prs": 1, "additions": 3, "deletions": 1}]
@@ -228,7 +233,7 @@ Returns a **bare JSON array**, ranked by how many PRs touched each path:
 
 ### `open` — open issues and PRs
 
-Returns a **bare JSON array** of open items, newest first.
+Returns the open items under `data` (an array), newest first.
 
 ### `path` — how two things connect
 
@@ -285,9 +290,24 @@ viewer or joining with a code graph on `file:` nodes.
 
 Machine-readable rules, worth knowing before scripting against this:
 
-- **Object vs array.** `status`, `search`, `item`, `related`, `path`, and
-  `export-graph` return JSON **objects**. `churn` and `open` return bare JSON
-  **arrays**. Indexing `result["items"]` into `churn` output will fail.
+- **One envelope (v0.2, breaking).** Every command's JSON output is a single
+  self-describing object: `{"ok": true|false, "db": "<path>", "repo": "<slug>",
+  "freshness": {"synced_at": iso|null, "age_s": secs|null, "complete": bool},
+  "data": <payload>, "truncated": bool}` - plus `"error": {"code", "message",
+  "hint"?}` on failures. The payload you used to get at the top level now lives
+  under `data`; `ok` is still at the root. `churn` and `open` payloads are
+  JSON arrays under `data`. Every successful read also writes exactly one
+  identity line to stderr:
+  `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
+- **Formats and rows.** `--format json` (pretty, default when piped),
+  `compact` (one line), `jsonl` (list payloads print one JSON object per line,
+  so any `head -n` prefix parses), `text` (default on a TTY; renders the
+  payload only, never envelope keys). `--fields repo,number` projects rows to
+  exactly those keys. `sql` rows are objects keyed by column by default;
+  `--rows array` keeps positional lists; `--limit N` overrides the 200-row cap.
+  `item N --max-body-chars C` truncates bodies and marks them
+  `"truncated": true`. `zaxbygraph schema [TABLE]` prints live DDL plus
+  per-column notes - use it instead of a file path to learn the schema.
 - **Output encoding.** stdout and stderr are UTF-8 on every platform,
   regardless of the ambient locale — emoji and CJK in titles and bodies
   round-trip exactly. `--repo` matches case-insensitively; canonical storage
@@ -301,11 +321,12 @@ Machine-readable rules, worth knowing before scripting against this:
   `sync` command. The distinction matters for retry logic: a `2` or `3` will
   never succeed on retry unchanged (fix the request, or sync first), while a
   `1` sometimes will.
-- **Errors** print `error: MESSAGE` to **stderr**, leaving stdout clean for
-  parsing — with one exception worth special-casing: **`sync` reports failure as
-  a normal result object on stdout**, `{"ok": false, "error": …, "db": …,
-  "repo": …}`, and exits 1. So check `ok` on sync output rather than assuming an
-  empty stderr means success.
+- **Errors answer on stdout in JSON mode**: a failed command writes the
+  envelope with `ok: false` and a coded `error` object (`no_such_column` with a
+  `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
+  `bad_request`, `bad_sql`, `runtime`) to **stdout**, so `json.load(stdin)`
+  never sees an empty stream. The same `error: MESSAGE` one-liner is still
+  printed to stderr for humans; argparse usage errors remain plain stderr.
 - `sync` failures also persist to `sync_state.last_error`, so a later `status`
   still reports a sync that failed hours ago.
 

@@ -341,7 +341,7 @@ class SyncStateTests(TempDBTest):
         self.assertEqual(code, 1)
         payload = json.loads(out.getvalue())
         self.assertFalse(payload["ok"])
-        self.assertIn("blocker", payload["error"])
+        self.assertIn("blocker", payload["error"]["message"])
         row = self.conn.execute(
             "SELECT last_error, full_sync_pending FROM sync_state WHERE repo = ?", (REPO,)
         ).fetchone()
@@ -510,7 +510,7 @@ class SyncLockTests(TempDBTest):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIs(data.get("joined"), True)
+        self.assertIs(data["data"].get("joined"), True)
         self.assertEqual(self.src.extra_fetches, 0)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
         self.assertTrue(_pid_alive(holder.pid), "a joining sync must not kill the holder")
@@ -526,7 +526,7 @@ class SyncLockTests(TempDBTest):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIs(data.get("joined"), True)
+        self.assertIs(data["data"].get("joined"), True)
 
         # --- foreign host with a DEAD pid: still never stolen (PRR-012) ---
         dead_foreign = self.dead_pid()
@@ -536,14 +536,14 @@ class SyncLockTests(TempDBTest):
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIs(data.get("joined"), True)
+        self.assertIs(data["data"].get("joined"), True)
         self.assertEqual(self.src.extra_fetches, 0)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
         code, out, err = self.cli_sync()
         self.assertEqual(code, 0, err)
         data = json.loads(out)
         self.assertIs(data["ok"], True)
-        self.assertIs(data.get("joined"), True)
+        self.assertIs(data["data"].get("joined"), True)
         self.assertEqual(self.src.extra_fetches, 0)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
 
@@ -556,7 +556,7 @@ class SyncLockTests(TempDBTest):
         data = json.loads(out)
         self.assertIs(data["ok"], True)
         self.assertIsNot(data.get("joined"), True)
-        self.assertEqual(data.get("ingested"), 2)
+        self.assertEqual(data["data"].get("ingested"), 2)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
         self.assertGreater(self.src.extra_fetches, 0)
 

@@ -157,7 +157,7 @@ class WorktreeResolutionTests(StoreHarness):
         os.chdir(worktree)
         code, out, err = run_cmd(["item", "1", "--format", "json"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertEqual(data["repo"], SLUG)
         self.assertEqual(data["number"], 1)
         self.assertEqual(data["title"], SEEDED_TITLE)
@@ -203,7 +203,7 @@ class WorktreeResolutionTests(StoreHarness):
         os.chdir(worktree)
         code, out, err = run_cmd(["item", "7", "--format", "json"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertEqual(data["repo"], SLUG)
         self.assertEqual(data["title"], "legacy corpus row")
 
@@ -283,12 +283,12 @@ class GlobalStoreTests(StoreHarness):
             os.chdir(clone)
             code, out, err = run_cmd(["status", "--format", "json"])
             self.assertEqual(code, 0, err)
-            data = json.loads(out)
+            data = json.loads(out)["data"]
             self.assertEqual([r["repo"] for r in data["repos"]], [SLUG])
             self.assertEqual(int(data["repos"][0]["item_count"]), 2)
             code, out, err = run_cmd(["item", "1", "--format", "json"])
             self.assertEqual(code, 0, err)
-            titles.add(json.loads(out)["title"])
+            titles.add(json.loads(out)["data"]["title"])
             # Neither clone directory may grow a local DB.
             self.assertEqual(db_files_under(clone), set())
             self.assertFalse((clone / ".zaxbygraph").exists())
@@ -327,7 +327,7 @@ class RemoteInfoTests(StoreHarness):
         os.chdir(repo)
         code, out, err = run_cmd(["where", "--format", "json"])
         self.assertEqual(code, 0, err)
-        data = json.loads(out)
+        data = json.loads(out)["data"]
         self.assertEqual(data["slug"], SLUG)
         expected = self.home / "ghe.example.com" / "acme" / "widget" / "history.db"
         self.assertEqual(Path(data["db"]), expected)
