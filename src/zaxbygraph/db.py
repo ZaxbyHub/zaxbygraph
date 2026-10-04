@@ -5,13 +5,13 @@ from importlib.resources import files
 from pathlib import Path
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 3
+CURRENT_USER_VERSION = 4
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -217,6 +217,11 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
 def _fold_sync_state(conn: sqlite3.Connection) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
+    The explicit INSERT column list below is a snapshot of the PRE-v4 shape
+    and is order-dependent: MIGRATIONS runs v1->v2 before v3->v4, so the
+    rate-limit columns do not exist yet when this fold runs. Adding a v5
+    column requires revisiting this list (or copying via PRAGMA table_info).
+
     Winner = greatest `issues_since` (NULL ranks lowest, ties by rowid).
     Timestamps and `include_patches` take MAX so no real sync fact is lost;
     counts are recomputed afterwards. `full_sync_pending` is never carried
@@ -411,11 +416,27 @@ def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO comments_fts(comments_fts) VALUES('rebuild')")
 
 
+def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+    """v3 -> v4: `sync_state` rate-limit columns (issue #5).
+
+    `rate_limit_remaining` is `0` when the last clean run observed its
+    budget at the floor (it slept a window through, or proceeded with the
+    floor already reached) and NULL otherwise; `rate_limit_reset_at` carries
+    the reset instant of the window or observation.
+    Two guarded ALTERs, idempotent on any shape.
+    """
+    if not _column_exists(conn, "sync_state", "rate_limit_remaining"):
+        conn.execute("ALTER TABLE sync_state ADD COLUMN rate_limit_remaining INTEGER")
+    if not _column_exists(conn, "sync_state", "rate_limit_reset_at"):
+        conn.execute("ALTER TABLE sync_state ADD COLUMN rate_limit_reset_at TEXT")
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
     (2, migrate_v1_to_v2),
     (3, migrate_v2_to_v3),
+    (4, migrate_v3_to_v4),
 ]
 
 

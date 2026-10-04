@@ -238,3 +238,196 @@ class TempDBTest(unittest.TestCase):
 
     def count(self, sql: str, params: tuple = ()) -> int:
         return int(self.conn.execute(sql, params).fetchone()[0])
+
+
+# ==== issue #5 fetch-layer acceptance fakes (append-only) ====================
+#
+# Contracts these fakes pin. The reworked fetch layer must satisfy them; the
+# fakes are additive and leave FakeGitHubSource above untouched.
+#
+# Listing protocol: list_issues(since) stays a lazy iterator and may yield
+# either one item dict (REST shape, the --source rest path) or one PAGE - a
+# list of item dicts (GraphQL bulk shape). A page must be consumed as it
+# arrives, so everything delivered before a mid-listing failure is durable.
+#
+# Nested payload keys: a bulk item dict may carry its children inline under
+# REST-named keys - "issue_comments", "review_comments", "reviews" (lists of
+# the exact payloads the per-item REST methods return), "files" (list of REST
+# pr-file payloads) and "pull" (the REST pull payload). A present section
+# that is not flagged incomplete replaces every per-item REST call for that
+# connection. A "<name>_incomplete" boolean (e.g. "files_incomplete") marks a
+# truncated section the sync must finish through the per-item REST fallback
+# for that item only.
+#
+# Rate limit: a GitHubError may carry machine-readable budget attributes
+# rate_limit_remaining (int) and rate_limit_reset (ISO-8601 Z string). Such an
+# error must be slept out through the sync module's `time` (injectable clock)
+# and retried, not aborted; the observed window is reported as top-level
+# sync-result keys and sync_state columns named rate_limit_remaining and
+# rate_limit_reset_at (query.status surfaces them via SELECT *).
+#
+# Deletion: a source may expose check_deleted(numbers) -> {number: state}
+# with state 'deleted' | 'transferred' for items GitHub no longer lists. It
+# is consulted only after a listing that started at since=None drains to
+# completion; an item absent from an incremental listing means "not updated",
+# never "gone". Marking writes the verdict into items.state and leaves a
+# fetch_log row (resource 'item', resource_id str(number)) whose note names
+# the verdict.
+
+
+class RateLimitedError(GitHubError):
+    """A 429 with a machine-readable budget: hits remaining and the ISO-Z
+    instant the window resets."""
+
+    def __init__(self, message: str, *, remaining: int, reset_at: str) -> None:
+        super().__init__(message, status=429)
+        self.rate_limit_remaining = remaining
+        self.rate_limit_reset = reset_at
+
+
+class PagedFailureSource:
+    """Streams listing PAGES lazily, then dies mid-listing (issue #5 AC1).
+
+    Page 1 is genuinely delivered to the consumer before the page-2 fetch
+    raises, so a streaming sync keeps it and a buffering sync loses it. The
+    fixture items are plain zero-comment issues: no per-item fallback is ever
+    legitimate, so those methods guard with AssertionError."""
+
+    def __init__(self, pages: list[list[dict]]) -> None:
+        self.pages = deepcopy(pages)
+
+    def list_issues(self, since: str | None):
+        for page in self.pages:
+            if since is not None:
+                page = [r for r in page if r.get("updated_at", "") >= since]
+            yield deepcopy(page)
+        raise GitHubError("HTTP 502", status=502)
+
+    def _unreachable(self, name: str):
+        raise AssertionError(f"{name} must not be called for this fixture")
+
+    def get_pull(self, number: int) -> dict:
+        self._unreachable("get_pull")
+
+    def list_issue_comments(self, number: int) -> list[dict]:
+        self._unreachable("list_issue_comments")
+
+    def list_reviews(self, number: int) -> list[dict]:
+        self._unreachable("list_reviews")
+
+    def list_review_comments(self, number: int) -> list[dict]:
+        self._unreachable("list_review_comments")
+
+    def list_pr_files(self, number: int) -> list[dict]:
+        self._unreachable("list_pr_files")
+
+    def list_releases(self) -> list[dict]:
+        return []
+
+
+class BulkNestedSource(FakeGitHubSource):
+    """Bulk-pages source (issue #5 AC2/AC3): list_issues yields item dicts
+    whose nested connections ride inline under the REST-named keys. The
+    per-item REST methods exist only as the overflow fallback and every call
+    is counted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fallback_calls = 0
+        self.files_fallback_numbers: list[int] = []
+        self.incomplete_files: set[int] = set()
+
+    def list_issues(self, since: str | None):
+        items = sorted(self.issues.values(), key=lambda r: (r["updated_at"], r["number"]))
+        for rec in items:
+            if since is not None and rec["updated_at"] < since:
+                continue
+            n = int(rec["number"])
+            bulk = deepcopy(rec)
+            bulk["issue_comments"] = deepcopy(self.issue_comments.get(n, []))
+            bulk["review_comments"] = deepcopy(self.review_comments.get(n, []))
+            bulk["reviews"] = deepcopy(self.reviews.get(n, []))
+            if n in self.incomplete_files:
+                bulk["files"] = deepcopy(self.files.get(n, []))[:1]
+                bulk["files_incomplete"] = True
+            else:
+                bulk["files"] = deepcopy(self.files.get(n, []))
+            if n in self.pulls:
+                bulk["pull"] = deepcopy(self.pulls[n])
+            yield bulk
+
+    def get_pull(self, number: int) -> dict:
+        self.fallback_calls += 1
+        return super().get_pull(number)
+
+    def list_issue_comments(self, number: int) -> list[dict]:
+        self.fallback_calls += 1
+        return super().list_issue_comments(number)
+
+    def list_reviews(self, number: int) -> list[dict]:
+        self.fallback_calls += 1
+        return super().list_reviews(number)
+
+    def list_review_comments(self, number: int) -> list[dict]:
+        self.fallback_calls += 1
+        return super().list_review_comments(number)
+
+    def list_pr_files(self, number: int) -> list[dict]:
+        self.fallback_calls += 1
+        self.files_fallback_numbers.append(number)
+        return super().list_pr_files(number)
+
+
+class RateLimitSource(FakeGitHubSource):
+    """Serves one item, then rate-limits the next per-item call once (issue #5
+    AC4). The retry after the sleep must succeed."""
+
+    REMAINING = 0
+    RESET_AT = "2026-10-03T12:20:00Z"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.limit_failures_left = 1
+
+    def list_issue_comments(self, number: int) -> list[dict]:
+        if self.limit_failures_left > 0:
+            self.limit_failures_left -= 1
+            raise RateLimitedError(
+                "API rate limit exceeded HTTP 429",
+                remaining=self.REMAINING,
+                reset_at=self.RESET_AT,
+            )
+        return super().list_issue_comments(number)
+
+
+class DeletingSource(FakeGitHubSource):
+    """Full-listing source with a deletion oracle (issue #5 AC5):
+    check_deleted maps gone numbers to 'deleted' or 'transferred'."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.deletions: dict[int, str] = {}
+        self.check_deleted_calls = 0
+
+    def check_deleted(self, numbers) -> dict[int, str]:
+        self.check_deleted_calls += 1
+        return {n: self.deletions[n] for n in numbers if n in self.deletions}
+
+
+def add_bulk_prs(src: BulkNestedSource, count: int) -> None:
+    """count PRs, each with 2 issue comments, 1 review, 1 review comment and
+    2 files - every connection complete on its first page. Comment ids are
+    allocated per (number, slot): comment_on's len-based scheme collides
+    across numbers, and comments UNIQUE(repo, kind, github_id) would silently
+    fold adjacent PRs' comments into one row."""
+    for n in range(1, count + 1):
+        src.add_pr(
+            issue(n, title=f"pr-{n}", comments=2, kind="pr", updated_at=ts(n * 100)),
+            pull(n, changed_files=2),
+            files=[pr_file(f"src/mod{n}/a.py"), pr_file(f"src/mod{n}/b.py")],
+        )
+        for slot in range(2):
+            src.issue_comments[n].append(comment(50_000 + n * 10 + slot, f"note {slot}"))
+        src.issues[n]["comments"] = 2
+        src.reviews[n] = [review(60_000 + n, "APPROVED", body="ok")]
+        src.review_comments[n] = [comment(70_000 + n, "inline note", author="bob")]

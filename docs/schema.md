@@ -1,4 +1,4 @@
-# Schema reference (schema version 3, `PRAGMA user_version` = 3)
+# Schema reference (schema version 4, `PRAGMA user_version` = 4)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -44,8 +44,8 @@ One row per issue or pull request. The central table.
 | `title` | TEXT | |
 | `body` | TEXT | May be `NULL` or empty. |
 | `labels_text` | TEXT | Space-joined label names, denormalized for FTS. Use the `labels` table for structured access. |
-| `state` | TEXT | `'open'` or `'closed'`. |
-| `state_reason` | TEXT | GitHub's `state_reason` (e.g. `completed`, `not_planned`). |
+| `state` | TEXT | `'open'` or `'closed'`. A full sync whose listing drained may also mark a stored item `'deleted'` or `'transferred'` when the source reports it gone (the shipped GraphQL source reports only `'deleted'`; `'transferred'` requires a source that can distinguish the two). Marked rows are kept (edges pointing at them survive) and the marking leaves a `fetch_log` trail. |
+| `state_reason` | TEXT | GitHub's `state_reason` (e.g. `completed`, `not_planned`). Overwritten with `marked <verdict>: <note>` when a deletion verdict marks the row. |
 | `author` | TEXT | Login. Joins `actors.login`. |
 | `created_at` | TEXT | |
 | `updated_at` | TEXT | Drives the incremental watermark. |
@@ -228,10 +228,12 @@ One row per repo. What `zaxbygraph status` reads.
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
 | `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+| `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
+| `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `3`). The
+`PRAGMA user_version` is the authoritative schema state (currently `4`). The
 `meta.schema_version` row is informational only. On open, `init_schema`:
 
 - refuses loudly when `user_version` is newer than the build (a database from
@@ -239,6 +241,10 @@ One row per repo. What `zaxbygraph status` reads.
 - creates missing objects at the current shape (idempotent `IF NOT EXISTS`),
 - applies each pending migration in its own transaction that ends by stamping
   `user_version` — an interrupted migration rolls back whole and re-runs.
+
+Migration 3→4 adds `sync_state.rate_limit_remaining` / `rate_limit_reset_at`
+(issue #5: the sync layer sleeps out an exhausted core rate limit until the
+reported reset and reports the window instead of aborting).
 
 Migration 1→2 adds `sync_state.full_sync_pending` and folds repo slugs to
 lowercase across every repo-keyed table, merging case-split duplicates

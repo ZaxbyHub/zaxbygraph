@@ -12,7 +12,11 @@ from typing import Any
 from zaxbygraph import __version__
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.doctor import doctor as doctor_run
-from zaxbygraph.github import GhApiSource
+# The default sync source is the GraphQL bulk source (issue #5); it is bound
+# under the name the test suite patches (`zaxbygraph.cli.GhApiSource`), and
+# the REST fallback stays reachable as GhRestSource for `--source rest`.
+from zaxbygraph.github import GhApiSource as GhRestSource
+from zaxbygraph.graphql import GraphQLSource as GhApiSource
 from zaxbygraph.paths import (
     default_jsonl_dir,
     git_common_root,
@@ -509,9 +513,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
     elif args.jsonl_flag:
         jsonl = default_jsonl_dir(db_path)
     try:
+        # Default source is the GraphQL bulk source (issue #5); `--source rest`
+        # keeps the plain REST source (now page-streaming).
+        if getattr(args, "source", "graphql") == "rest":
+            source: object = GhRestSource(*slug.split("/", 1))
+        else:
+            source = GhApiSource(*slug.split("/", 1))
         result = sync_repo(
             conn,
-            GhApiSource(*slug.split("/", 1)),
+            source,
             slug,
             force=args.force,
             include_patches=args.include_patches,
@@ -1007,6 +1017,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp)
     sp.add_argument("--force", action="store_true", help="Ignore watermark; full pull")
     sp.add_argument("--include-patches", action="store_true", help="Store pull file patches")
+    sp.add_argument(
+        "--source",
+        choices=("graphql", "rest"),
+        default="graphql",
+        help="Fetch source: graphql bulk pages (default) or plain REST pages",
+    )
     sp.add_argument(
         "--jsonl",
         nargs="?",

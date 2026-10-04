@@ -55,7 +55,7 @@ zaxbygraph search "init hang"         # full-text over titles, bodies, comments
 zaxbygraph item 14                    # one item, with comments/files/edges
 ```
 
-`sync` prints the envelope with the run summary under `data` (keys `ingested`,
+`sync` prints the envelope with the run summary under `data` (keys `ingested`, `rate_limit_remaining`, `rate_limit_reset_at`,
 `last_number`, `full`, `finished_at`, `issues_since`, `item_count`,
 `comment_count`, `edge_count`, `last_error`; `repo` and `db` live on the
 envelope root):
@@ -67,7 +67,8 @@ envelope root):
   "data": {
     "ingested": 3, "last_number": 10, "full": true,
     "finished_at": "2026-09-12T19:23:04Z", "issues_since": "2026-01-03T05:40:10Z",
-    "item_count": 3, "comment_count": 1, "edge_count": 10, "last_error": null
+    "item_count": 3, "comment_count": 1, "edge_count": 10, "last_error": null,
+    "rate_limit_remaining": null, "rate_limit_reset_at": null
   },
   "truncated": false
 }
@@ -139,20 +140,38 @@ Every command accepts:
 ### `sync` — fetch into the graph
 
 ```bash
-zaxbygraph sync --repo OWNER/REPO [--force] [--include-patches] [--jsonl [DIR]]
+zaxbygraph sync --repo OWNER/REPO [--force] [--include-patches] [--source graphql|rest] [--wait] [--jsonl [DIR]]
 ```
 
 | Flag | Meaning |
 | --- | --- |
+| `--source` | `graphql` (default) or `rest`. Both stream the listing one page per call and commit each page as it arrives; `graphql` additionally fetches each page's comments, reviews, review comments, files and pull details in bulk GraphQL queries (one per up to 40 items, so a full 100-item page costs about three), with a per-item REST fallback for any connection that overflowed its page. Patches always come from REST (`pulls/{n}/files`), so `--include-patches` forces that fallback for files. |
+| `--wait` | Wait for the sync lock instead of returning `joined: true` when another sync holds it. |
 | `--force` | Ignore the watermark and do a full pull. Needed when you suspect updates that did not bump `updated_at` (review-only changes), and required to backfill patches after a no-patch sync. |
 | `--include-patches` | Store unified diffs in `pr_files.patch`. Off by default — patches dominate the database size. |
 | `--jsonl [DIR]` | Also append one JSON object per fetched resource to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). A resumed sync may duplicate lines, so consumers should key on `(resource, payload.id)`. |
 
-Sync is sequential and resumable. Rough cost is `≈ 1 + items + 4×prs` REST
-calls; issues with zero comments skip the comments request, and PRs with zero
-changed files skip the files request. If it stops partway — rate limit, network,
-anything — the watermark stays at the last **fully committed** item and
-`last_error` is recorded, so re-running `sync` resumes rather than restarting.
+Sync is sequential and resumable. With the default `graphql` source, cost is
+roughly one listing call per 100 items plus one bulk-children query per up
+to 40 items — three to four children queries per 100-item page (four to
+five `gh` invocations total once the listing call is counted) (instead of the old
+`≈ 1 + items + 5×prs` per-item fan-out, which `--source rest` still uses). Pages are committed as they arrive: if the listing fails
+partway — 502, network, anything — every page already delivered is ingested
+with its watermark, and `last_error` is recorded, so re-running `sync`
+resumes rather than restarting.
+
+Rate limits are budgeted, not fatal: a core rate-limit failure with an
+exhausted budget is slept out until the reported reset (reported afterwards
+as `rate_limit_remaining` / `rate_limit_reset_at` in the sync result and in
+`status`), then the listing resumes — after five slept windows (`graphql`
+also sleeps proactively when its budget is already at the floor) the run
+gives up and reports the error. Secondary limits that carry no resolvable
+reset fail fast as before. A full sync that starts without a watermark and
+drains its listing also consults the source's deletion oracle (the shipped
+GraphQL source; plain REST has no oracle): stored items the source reports
+gone are marked `deleted` in `items.state` (`transferred` only if a source
+can distinguish the two; rows are kept, never removed), and the marking
+leaves a `fetch_log` trail.
 
 ### `status` — counts and watermark
 
@@ -169,6 +188,7 @@ The payload below is what you get under `data` (the envelope adds
     "last_full_sync_at": "2026-09-12T19:23:04Z", "last_incr_sync_at": null,
     "last_error": null, "item_count": 3, "comment_count": 1,
     "edge_count": 10, "include_patches": 0, "full_sync_pending": 0,
+    "rate_limit_remaining": null, "rate_limit_reset_at": null,
     "complete": true
   }],
   "counts": [
@@ -408,7 +428,8 @@ and `comments_fts` (porter-stemmed since schema v3).
 Schema versions are forward-only (`PRAGMA user_version`). A v2 database is
 rebuilt in place — both FTS tables drop and re-create with the porter
 tokenizer, no resync — by the next `sync` that opens it (sync is the one
-command that resolves to and writes a legacy database in place). Reads never
+command that resolves to and writes a legacy database in place); v3 gains
+the `sync_state` rate-limit columns (v4) the same way, additively. Reads never
 migrate a database, and plain `doctor` never writes one either: it reads
 legacy files through migrated temp copies, and `doctor --consolidate`
 migrates the destination store it adopts into (creating it if needed), not

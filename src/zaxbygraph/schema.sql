@@ -1,4 +1,4 @@
--- zaxbygraph schema v3 (`PRAGMA user_version` = 3; see db.py MIGRATIONS)
+-- zaxbygraph schema v4 (`PRAGMA user_version` = 4; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -147,16 +147,18 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 );
 
 CREATE TABLE IF NOT EXISTS sync_state (
-    repo               TEXT PRIMARY KEY,
-    issues_since       TEXT,
-    last_full_sync_at  TEXT,
-    last_incr_sync_at  TEXT,
-    last_error         TEXT,
-    item_count         INTEGER NOT NULL DEFAULT 0,
-    comment_count      INTEGER NOT NULL DEFAULT 0,
-    edge_count         INTEGER NOT NULL DEFAULT 0,
-    include_patches    INTEGER NOT NULL DEFAULT 0,
-    full_sync_pending  INTEGER NOT NULL DEFAULT 0
+    repo                 TEXT PRIMARY KEY,
+    issues_since         TEXT,
+    last_full_sync_at    TEXT,
+    last_incr_sync_at    TEXT,
+    last_error           TEXT,
+    item_count           INTEGER NOT NULL DEFAULT 0,
+    comment_count        INTEGER NOT NULL DEFAULT 0,
+    edge_count           INTEGER NOT NULL DEFAULT 0,
+    include_patches      INTEGER NOT NULL DEFAULT 0,
+    full_sync_pending    INTEGER NOT NULL DEFAULT 0,
+    rate_limit_remaining INTEGER,
+    rate_limit_reset_at  TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(

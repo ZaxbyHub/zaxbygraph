@@ -355,7 +355,13 @@ def set_last_error(conn: sqlite3.Connection, repo: str, message: str) -> None:
     )
 
 
-def mark_sync_finished(conn: sqlite3.Connection, repo: str) -> None:
+def mark_sync_finished(
+    conn: sqlite3.Connection,
+    repo: str,
+    *,
+    rate_limit_remaining: int | None = None,
+    rate_limit_reset_at: str | None = None,
+) -> None:
     """Stamp a clean finish.
 
     When a full sync is pending — this run started one, or it resumed an
@@ -364,6 +370,9 @@ def mark_sync_finished(conn: sqlite3.Connection, repo: str) -> None:
     incremental run. Truthful because each item commits with its own watermark
     bump in one transaction, so a run that drains the listing has covered
     everything at or below the watermark.
+
+    The rate-limit columns carry the window this run slept through (NULL when
+    it saw none), verbatim as the source reported it (issue #5 AC4).
     """
     now = utcnow()
     conn.execute("INSERT OR IGNORE INTO sync_state(repo) VALUES (?)", (repo,))
@@ -375,10 +384,17 @@ def mark_sync_finished(conn: sqlite3.Connection, repo: str) -> None:
             last_incr_sync_at = CASE WHEN full_sync_pending = 0
                                 THEN :now ELSE last_incr_sync_at END,
             full_sync_pending = 0,
-            last_error = NULL
+            last_error = NULL,
+            rate_limit_remaining = :rate_remaining,
+            rate_limit_reset_at = :rate_reset_at
         WHERE repo = :repo
         """,
-        {"now": now, "repo": repo},
+        {
+            "now": now,
+            "repo": repo,
+            "rate_remaining": rate_limit_remaining,
+            "rate_reset_at": rate_limit_reset_at,
+        },
     )
 
 
