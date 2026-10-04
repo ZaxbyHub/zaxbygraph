@@ -137,9 +137,6 @@ class DegradedReingestSurvivalTests(ExtraEdgeIngestTest):
             "source_repo": "ZaxbyHub/zaxbygraph",
         }
         issue5 = issue(5, title="issue five")
-        pull8 = dict(
-            issue(5, title="issue five"),
-        )
         self.ingest(
             issue5,
             pull_raw=dict(
@@ -173,6 +170,67 @@ class DegradedReingestSurvivalTests(ExtraEdgeIngestTest):
         self.assertEqual(
             self.edge_count("rel = 'closes_keyword' AND src_id = '3'"), 1
         )
+
+
+class DegenerateTimelineEventTests(ExtraEdgeIngestTest):
+    """Reviewer finding 1: the guard branches for events that cannot yield a
+    truthful endpoint ship no fabricated edges."""
+
+    def test_closed_event_with_no_committable_closer_stores_no_edge(self) -> None:
+        # Closed manually (no commit, no PR): the payload state row is the
+        # only record; no closer edge may be fabricated.
+        self.ingest(
+            issue(6, title="manually closed"),
+            timeline=[
+                {
+                    "type": "closed",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "actor_login": "amy",
+                    "commit_id": None,
+                    "closer_type": None,
+                    "closer_number": None,
+                }
+            ],
+        )
+        self.assertEqual(self.edge_count("rel IN ('closes', 'closed_by_commit')"), 0)
+
+    def test_cross_referenced_event_with_missing_source_is_skipped(self) -> None:
+        self.ingest(
+            issue(6, title="weird timeline"),
+            timeline=[
+                {
+                    "type": "cross_referenced",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "actor_login": "bob",
+                    "is_cross_repository": False,
+                },
+                {
+                    "type": "cross_referenced",
+                    "created_at": "2026-01-01T00:01:00Z",
+                    "actor_login": "bob",
+                    "source_typename": "Issue",
+                    "source_number": "not-an-int",
+                    "source_repo": "ZaxbyHub/zaxbygraph",
+                },
+            ],
+        )
+        self.assertEqual(self.edge_count("rel = 'cross_referenced'"), 0)
+
+    def test_self_referential_cross_reference_is_skipped(self) -> None:
+        self.ingest(
+            issue(6, title="self reference"),
+            timeline=[
+                {
+                    "type": "cross_referenced",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "actor_login": "bob",
+                    "source_typename": "Issue",
+                    "source_number": 6,
+                    "source_repo": "ZaxbyHub/zaxbygraph",
+                }
+            ],
+        )
+        self.assertEqual(self.edge_count("rel = 'cross_referenced'"), 0)
 
 
 class MergeCloseConvergenceTests(ExtraEdgeIngestTest):
