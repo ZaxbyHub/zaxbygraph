@@ -4,6 +4,8 @@ restart behavior that the frozen acceptance checks do not cover: marking on
 restart, and the no-oracle / incremental no-mark paths."""
 from __future__ import annotations
 
+import unittest
+
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
