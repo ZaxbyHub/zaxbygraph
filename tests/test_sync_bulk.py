@@ -27,7 +27,11 @@ class _AlwaysRateLimitedSource:
     REMAINING = 0
     RESET_AT = "2026-10-03T12:20:00Z"
 
+    def __init__(self) -> None:
+        self.list_issues_calls = 0
+
     def list_issues(self, since):
+        self.list_issues_calls += 1
         raise RateLimitedError(
             "API rate limit exceeded HTTP 429",
             remaining=self.REMAINING,
@@ -71,6 +75,8 @@ class RateWindowCapTests(TempDBTest):
                 sync_repo(self.conn, src, REPO)
         slept = [c.args[0] for c in clock.sleep.call_args_list if c.args]
         self.assertEqual(len(slept), 5, f"windows slept: {slept}")
+        # retry accounting: five sleeps then ONE final attempt that raises
+        self.assertEqual(src.list_issues_calls, 6)
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 0)
 
     def test_floor_sleeps_proactively_and_counts_toward_cap(self) -> None:

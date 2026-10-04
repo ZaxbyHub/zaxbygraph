@@ -14,6 +14,7 @@ from zaxbygraph.github import GitHubError, GitHubSource
 from zaxbygraph.repo import validate_slug
 from zaxbygraph.store import (
     ISO_Z,
+    bump_watermark,
     ingest_item,
     log_fetch,
     mark_sync_finished,
@@ -440,6 +441,18 @@ def sync_repo(
                                     ingested += 1
                                     last_number = number
                                     _write_jsonl(jsonl_handle, "item", list_raw)
+                                else:
+                                    # Advance the watermark past the marked
+                                    # item without re-ingesting: otherwise
+                                    # every later run re-lists it until its
+                                    # updated_at ages past the watermark.
+                                    conn.execute("BEGIN IMMEDIATE")
+                                    try:
+                                        bump_watermark(conn, repo, list_raw.get("updated_at"))
+                                        conn.commit()
+                                    except Exception:
+                                        conn.rollback()
+                                        raise
                                 _mark_gone(
                                     conn, repo, number, "deleted",
                                     f"GitHub returned HTTP {exc.status} while fetching item data",
