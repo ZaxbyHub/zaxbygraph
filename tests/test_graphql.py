@@ -67,7 +67,7 @@ def _pull_node(number: int, *, comments_overflow: bool = False) -> dict:
                         "author": {"login": "bob"},
                         "comments": {
                             "totalCount": 1,
-                            "pageInfo": {"hasNextPage": False},
+                            "pageInfo": {"hasNextPage": number == 26},
                             "nodes": [
                                 {
                                     "databaseId": 700_000 + number,
@@ -97,6 +97,8 @@ def _pull_node(number: int, *, comments_overflow: bool = False) -> dict:
             },
         }
     )
+    if number == 26:
+        node["isDraft"] = True  # after update(): the literal above sets False
     if comments_overflow:
         node["comments"]["pageInfo"]["hasNextPage"] = True
     return node
@@ -221,6 +223,11 @@ class GraphQLChildrenTests(unittest.TestCase):
         self.assertEqual(issue_children["issue_comments"][0]["user"]["login"], "alice")
         self.assertNotIn("pull", issue_children)
         pull_children = children[26]
+        # the pull alias must surface PR issue comments AND the draft flag
+        self.assertEqual(pull_children["issue_comments"][0]["id"], 900_026)
+        self.assertIs(pull_children["pull"]["draft"], True)
+        # a review whose comments page overflows flags the fallback
+        self.assertIn("review_comments_incomplete", pull_children)
         self.assertEqual(pull_children["pull"]["changed_files"], 1)
         self.assertEqual(pull_children["pull"]["merge_commit_sha"], "abc123")
         self.assertEqual(pull_children["pull"]["base"], {"ref": "main"})
@@ -242,10 +249,6 @@ class GraphQLChildrenTests(unittest.TestCase):
         self.assertIn("isDraft", _PULL_FIELDS)
         self.assertNotIn("reviewComments", _PULL_FIELDS)
 
-        host = _FakeGraphQLHost()
-        host.write_graphql_responses([{"data": {"repository": {}}}])
-        with host:
-            host.source()
         # Build the actual query text for one PR alias and pin its shape.
         from zaxbygraph.graphql import _q
 
@@ -258,8 +261,11 @@ class GraphQLChildrenTests(unittest.TestCase):
         self.assertNotIn("reviewComments", alias_query)
         self.assertIn("reviews(first: 50)", alias_query)
         # PR issue comments must ride the same query (REST gets them from
-        # /issues/{n}/comments; the pull alias must not drop them).
-        self.assertIn("comments(first: 100)", alias_query)
+        # /issues/{n}/comments; the pull alias must not drop them). TWO
+        # comments connections must be requested: the PR's own issue
+        # comments AND the per-review comments nested under reviews - a
+        # single hit proves nothing because the nested one always matches.
+        self.assertGreaterEqual(alias_query.count("comments(first: 100)"), 2)
 
     def test_overflowing_connection_is_flagged_for_rest_fallback(self) -> None:
         host = _FakeGraphQLHost()

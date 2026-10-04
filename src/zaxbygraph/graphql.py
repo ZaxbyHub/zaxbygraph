@@ -40,22 +40,6 @@ comments(first: 100) {
 }
 """
 
-_REVIEW_NODES = """
-reviews(first: 50) {
-  totalCount
-  pageInfo { hasNextPage }
-  nodes {
-    databaseId
-    state
-    body
-    submittedAt
-    url
-    author { login }
-  }
-}
-"""
-
-
 _FILE_NODES = """
 files(first: 100) {
   totalCount
@@ -298,6 +282,7 @@ class GraphQLSource(GhApiSource):
                 c
                 for r in review_nodes
                 for c in _connection(r.get("comments"), "review.comments")[0]
+                if isinstance(c, dict)
             ]
             children["review_comments"] = [
                 {
