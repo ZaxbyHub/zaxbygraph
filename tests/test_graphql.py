@@ -337,6 +337,102 @@ class GraphQLChildrenTests(unittest.TestCase):
         self.assertIsNone(getattr(ctx.exception, "rate_limit_remaining", None))
 
 
+class SentQueryAndEdgeCaseTests(unittest.TestCase):
+    """Pins from the PR-13 review: the query ACTUALLY SENT must carry the
+    pinned schema shape (not just the constant), null sections must be
+    omitted (so sync falls back to REST), NOT_FOUND-typed errors degrade to
+    partial data, reviews>50 flags review comments incomplete, and a
+    whole-chunk-null deletion probe refuses to mass-mark."""
+
+    def test_sent_query_carries_the_pinned_shape(self) -> None:
+        host = _FakeGraphQLHost()
+        host.write_graphql_responses([_graphql_payload(0)])
+        with host:
+            src = host.source()
+            src.fetch_children(_listing_items(26))  # 26 is a PR in the fixture
+            calls = host.graphql_calls()
+        sent = [a for a in calls if a[0] == "graphql" for a in [next(
+            frag[6:] for frag in a if frag.startswith("query="))]][0]
+        self.assertIn("isDraft", sent)
+        self.assertGreaterEqual(sent.count("comments(first: 100)"), 2)
+
+    def test_null_section_is_omitted_not_empty(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        node = payload["data"]["repository"]["i1"]
+        del node["comments"]  # permission mask / partial error shape
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(1))
+        self.assertNotIn("issue_comments", children[1])
+
+    def test_not_found_errors_degrade_to_partial_data(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        payload["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 99."}
+        ]
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(1))
+        self.assertIn(1, children)  # partial data survived; nulls -> REST fallback
+
+    def test_non_not_found_errors_still_raise(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        payload["errors"] = [{"type": "SOME_OTHER", "message": "boom"}]
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError):
+                src.fetch_children(_listing_items(1))
+
+    def test_reviews_over_first_page_flags_review_comments_incomplete(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        node = payload["data"]["repository"]["p26"]
+        node["reviews"]["pageInfo"]["hasNextPage"] = True
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(26))
+        self.assertIn("reviews_incomplete", children[26])
+        self.assertIn("review_comments_incomplete", children[26])
+
+    def test_totalcount_overflow_flags_incomplete_without_hasnextpage(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        node = payload["data"]["repository"]["i1"]
+        node["comments"]["totalCount"] = 5  # hasNextPage stays False
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(1))
+        self.assertIn("issue_comments_incomplete", children[1])
+
+    def test_message_based_rate_limit_detection(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = {"errors": [{"message": "you have exceeded the rate limit"}]}
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.check_deleted([1])
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_all_null_chunk_refuses_mass_marking(self) -> None:
+        host = _FakeGraphQLHost()
+        payload = {"data": {"repository": {"i1": None, "p1": None}}}
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError):
+                src.check_deleted([1])
+
+
 class IncludePatchesForcesRestTests(TempDBTest):
     """--include-patches must come from REST pulls/{n}/files even when the
     bulk payload carried the files (GraphQL has no patch field)."""

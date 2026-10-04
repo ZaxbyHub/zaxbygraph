@@ -217,6 +217,11 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
 def _fold_sync_state(conn: sqlite3.Connection) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
+    The explicit INSERT column list below is a snapshot of the PRE-v4 shape
+    and is order-dependent: MIGRATIONS runs v1->v2 before v3->v4, so the
+    rate-limit columns do not exist yet when this fold runs. Adding a v5
+    column requires revisiting this list (or copying via PRAGMA table_info).
+
     Winner = greatest `issues_since` (NULL ranks lowest, ties by rowid).
     Timestamps and `include_patches` take MAX so no real sync fact is lost;
     counts are recomputed afterwards. `full_sync_pending` is never carried
@@ -414,9 +419,10 @@ def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
 def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     """v3 -> v4: `sync_state` rate-limit columns (issue #5).
 
-    `rate_limit_remaining` / `rate_limit_reset_at` carry the last window a
-    clean run slept through, verbatim as the source reported it; NULL means
-    the run saw no rate limit. Two guarded ALTERs, idempotent on any shape.
+    `rate_limit_remaining` is `0` when the last clean run slept through an
+    exhausted rate-limit window (the budget was at the floor) and NULL
+    otherwise; `rate_limit_reset_at` carries that window's reset instant.
+    Two guarded ALTERs, idempotent on any shape.
     """
     if not _column_exists(conn, "sync_state", "rate_limit_remaining"):
         conn.execute("ALTER TABLE sync_state ADD COLUMN rate_limit_remaining INTEGER")

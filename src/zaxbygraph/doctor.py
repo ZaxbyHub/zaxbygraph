@@ -239,6 +239,23 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                             state["full_sync_pending"],
                         ),
                     )
+                    # The candidate may predate schema v4: copy the rate-limit
+                    # columns only when the source actually carries them, so
+                    # consolidation never silently nulls newer state.
+                    src_cols = {
+                        row[1] for row in src.execute("PRAGMA table_info(sync_state)")
+                    }
+                    rate_cols = ("rate_limit_remaining", "rate_limit_reset_at")
+                    if set(rate_cols) <= src_cols:
+                        dst.execute(
+                            "UPDATE sync_state SET rate_limit_remaining = ?,"
+                            " rate_limit_reset_at = ? WHERE repo = ?",
+                            (
+                                state["rate_limit_remaining"],
+                                state["rate_limit_reset_at"],
+                                repo_l,
+                            ),
+                        )
                 # actors is a global login->url table (no repo column), so it
                 # is copied wholesale despite the slug-scoped delete above.
                 for actor, url in src.execute("SELECT login, html_url FROM actors"):

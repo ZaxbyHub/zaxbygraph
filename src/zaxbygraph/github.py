@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -11,6 +12,10 @@ from zaxbygraph.repo import validate_slug
 
 #: Issues listing page size (also the "is there another page" threshold).
 ISSUES_PAGE_SIZE = 100
+
+#: Seconds before a hung `gh` subprocess is killed instead of stalling the
+#: sync (which holds the whole-run lock) indefinitely.
+GH_TIMEOUT_S = 300
 
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -29,7 +34,10 @@ def _status_from_stderr(stderr: str) -> int | None:
         return 403
     if "404" in text or "not found" in text:
         return 404
-    if "410" in text or "gone" in text:
+    # Word-boundary digits: a substring "410" inside a larger number (an
+    # issue number, a URL, a byte count) must not classify as Gone — the
+    # verdict durably flips items.state to 'deleted'.
+    if re.search(r"\b410\b", text) or re.search(r"\bgone\b", text):
         return 410
     if "401" in text or "unauthorized" in text:
         return 401
@@ -68,10 +76,15 @@ class GhApiSource:
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
             raise GitHubError(
                 "gh CLI not found. Install GitHub CLI and authenticate with gh auth login."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubError(
+                f"gh api timed out after {GH_TIMEOUT_S}s: {path}"
             ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api failed").strip()
@@ -122,12 +135,24 @@ class GhApiSource:
             return exc
         remaining = core.get("remaining")
         reset = core.get("reset")
-        if remaining != 0 or not isinstance(reset, (int, float)):
+        # bool is an int subclass and NaN compares unequal to itself; a
+        # hostile/buggy value must never crash the enrichment path (that
+        # would replace the original 429), so anything unrepresentable keeps
+        # the original error.
+        if (
+            remaining != 0
+            or isinstance(reset, bool)
+            or not isinstance(reset, (int, float))
+            or reset != reset
+        ):
             return exc
-        exc.rate_limit_remaining = 0
-        exc.rate_limit_reset = datetime.fromtimestamp(
-            float(reset), tz=timezone.utc
-        ).strftime(_ISO_Z)
+        try:
+            exc.rate_limit_remaining = 0
+            exc.rate_limit_reset = datetime.fromtimestamp(
+                float(reset), tz=timezone.utc
+            ).strftime(_ISO_Z)
+        except (OverflowError, OSError, ValueError):
+            return exc
         return exc
 
     def list_issues(self, since: str | None) -> Iterator[list[dict]]:

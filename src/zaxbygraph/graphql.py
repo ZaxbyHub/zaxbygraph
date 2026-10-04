@@ -22,8 +22,18 @@ from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
 #: Numbers per aliased children query (issue + pullRequest aliases each).
 GRAPHQL_CHILDREN_PAGE = 40
 
+#: Upper bound on the rendered query so the argv element stays well under
+#: Windows' 32767-char CreateProcessW limit (a 40-PR chunk renders ~34.5k
+#: chars and would fail with WinError 206, an OSError no GitHubError handler
+#: catches). Chunks flush early when the rendered query approaches this.
+_MAX_QUERY_CHARS = 24000
+
 #: Numbers per aliased existence probe.
 GRAPHQL_DELETED_PAGE = 50
+
+#: Seconds before a hung `gh` subprocess is killed instead of stalling the
+#: sync (which holds the whole-run lock) indefinitely.
+GH_TIMEOUT_S = 300
 
 _ISSUE_COMMENT_NODES = """
 comments(first: 100) {
@@ -123,11 +133,29 @@ def _q(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _connection(nodes: dict | None, name: str) -> tuple[list[dict], bool]:
-    """(nodes, incomplete) for one GraphQL connection payload."""
+def _int_or_none(value) -> int | None:
+    """Coerce a scalar from an external JSON payload to int without ever
+    raising out of payload mapping (string digits concatenate otherwise)."""
+    if isinstance(value, bool) or value is None:
+        return None if value is None else int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
+    """(nodes, incomplete) for one GraphQL connection payload. A null or
+    malformed connection returns ([], False) — callers distinguish a
+    genuinely empty page from a section the node did not carry by checking
+    key presence before calling this."""
     if not isinstance(nodes, dict):
         return [], False
-    out = list(nodes.get("nodes") or [])
+    out = [n for n in (nodes.get("nodes") or []) if isinstance(n, dict)]
     total = nodes.get("totalCount")
     incomplete = bool((nodes.get("pageInfo") or {}).get("hasNextPage"))
     if isinstance(total, int) and total > len(out):
@@ -155,10 +183,15 @@ class GraphQLSource(GhApiSource):
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
             raise GitHubError(
                 "gh CLI not found. Install GitHub CLI and authenticate with gh auth login."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubError(
+                f"gh api graphql timed out after {GH_TIMEOUT_S}s"
             ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
@@ -177,7 +210,20 @@ class GraphQLSource(GhApiSource):
             message = str(first.get("message") or "graphql error") if isinstance(first, dict) else "graphql error"
             type_name = str(first.get("type", "")).upper() if isinstance(first, dict) else ""
             status = 429 if ("RATE_LIMIT" in type_name or "rate limit" in message.lower()) else None
-            raise self._with_rate_budget(GitHubError(message, status=status))
+            # Per-alias NOT_FOUND errors ride alongside partial data when an
+            # item was deleted between the listing and this query; the nulled
+            # aliases then degrade to the per-item REST path below instead of
+            # aborting the whole run. Anything else fails closed.
+            hard = [
+                e
+                for e in (errors if isinstance(errors, list) else [])
+                if isinstance(e, dict)
+                and str(e.get("type", "")).upper() != "NOT_FOUND"
+                and "Could not resolve to an issue" not in str(e.get("message", ""))
+                and "Could not resolve to a pullRequest" not in str(e.get("message", ""))
+            ]
+            if hard or not isinstance(data.get("data"), dict):
+                raise self._with_rate_budget(GitHubError(message, status=status))
         payload = data.get("data")
         if not isinstance(payload, dict):
             raise GitHubError("unexpected graphql payload")
@@ -194,7 +240,8 @@ class GraphQLSource(GhApiSource):
     # -- bulk children ------------------------------------------------------
 
     def fetch_children(self, items: list[dict]) -> dict[int, dict]:
-        """Nested children for a listing page in one query per chunk.
+        """Nested children for a listing page, one query per size-bounded
+        chunk (issue #5; Windows argv limit per the PR-13 review).
 
         Returns {number: children}. Children carry REST-shaped
         issue_comments / review_comments / reviews / files / pull; a
@@ -203,10 +250,26 @@ class GraphQLSource(GhApiSource):
         item only. Items whose node did not resolve are omitted (the sync
         then uses the per-item REST path for them)."""
         children: dict[int, dict] = {}
-        for start in range(0, len(items), GRAPHQL_CHILDREN_PAGE):
-            chunk = items[start:start + GRAPHQL_CHILDREN_PAGE]
+        chunk: list[dict] = []
+        for raw in items:
+            chunk.append(raw)
+            if len(chunk) >= GRAPHQL_CHILDREN_PAGE or self._chunk_query_len(chunk) >= _MAX_QUERY_CHARS:
+                children.update(self._fetch_children_chunk(chunk))
+                chunk = []
+        if chunk:
             children.update(self._fetch_children_chunk(chunk))
         return children
+
+    def _chunk_query_len(self, chunk: list[dict]) -> int:
+        """Rendered length of the query the chunk would produce (upper
+        bound: counts every alias at its full field-set size)."""
+        total = 120  # envelope + owner/repo + rateLimit selection
+        for raw in chunk:
+            if not isinstance(raw, dict) or "number" not in raw:
+                continue
+            fields = _PULL_FIELDS if "pull_request" in raw else _ISSUE_FIELDS
+            total += len(fields) + 80
+        return total
 
     def _fetch_children_chunk(self, chunk: list[dict]) -> dict[int, dict]:
         aliases: list[str] = []
@@ -240,28 +303,32 @@ class GraphQLSource(GhApiSource):
 
     def _children_from_node(self, node: dict) -> dict:
         children: dict = {}
-        comments, comments_more = _connection(node.get("comments"), "comments")
-        children["issue_comments"] = [
-            {
-                "id": c.get("databaseId"),
-                "body": c.get("body"),
-                "user": {
-                    "login": (c.get("author") or {}).get("login"),
-                    "html_url": (c.get("author") or {}).get("url"),
-                },
-                "created_at": c.get("createdAt"),
-                "updated_at": c.get("updatedAt"),
-                "html_url": c.get("url"),
-                "in_reply_to_id": None,
-            }
-            for c in comments
-            if isinstance(c, dict)
-        ]
-        if comments_more:
-            children["issue_comments_incomplete"] = True
+        # A section the node does not carry (permission mask, partial error)
+        # must stay ABSENT so the sync's per-item REST fallback runs for it;
+        # writing [] would present a silently empty page as complete.
+        if "comments" in node:
+            comments, comments_more = _connection(node.get("comments"))
+            children["issue_comments"] = [
+                {
+                    "id": c.get("databaseId"),
+                    "body": c.get("body"),
+                    "user": {
+                        "login": (c.get("author") or {}).get("login"),
+                        "html_url": (c.get("author") or {}).get("url"),
+                    },
+                    "created_at": c.get("createdAt"),
+                    "updated_at": c.get("updatedAt"),
+                    "html_url": c.get("url"),
+                    "in_reply_to_id": None,
+                }
+                for c in comments
+            ]
+            if comments_more:
+                children["issue_comments_incomplete"] = True
 
         if "reviews" in node:
-            reviews, reviews_more = _connection(node.get("reviews"), "reviews")
+            reviews, reviews_more = _connection(node.get("reviews"))
+            review_nodes = [r for r in reviews]
             children["reviews"] = [
                 {
                     "id": r.get("databaseId"),
@@ -271,19 +338,13 @@ class GraphQLSource(GhApiSource):
                     "submitted_at": r.get("submittedAt"),
                     "html_url": r.get("url"),
                 }
-                for r in reviews
-                if isinstance(r, dict)
+                for r in review_nodes
             ]
             if reviews_more:
                 children["reviews_incomplete"] = True
 
-            review_nodes = [r for r in reviews if isinstance(r, dict)]
-            review_comments = [
-                c
-                for r in review_nodes
-                for c in _connection(r.get("comments"), "review.comments")[0]
-                if isinstance(c, dict)
-            ]
+            review_payloads = [_connection(r.get("comments")) for r in review_nodes]
+            review_comments = [c for payload, _ in review_payloads for c in payload]
             children["review_comments"] = [
                 {
                     "id": c.get("databaseId"),
@@ -299,25 +360,26 @@ class GraphQLSource(GhApiSource):
                 }
                 for c in review_comments
             ]
-            rc_more = any(
-                _connection(r.get("comments"), "review.comments")[1]
-                for r in review_nodes
-            )
+            # Reviews beyond the first page never had their comments
+            # requested, so their review comments are incomplete too.
+            rc_more = reviews_more or any(more for _, more in review_payloads)
             if rc_more:
                 children["review_comments_incomplete"] = True
 
-            files, files_more = _connection(node.get("files"), "files")
+        if "files" in node:
+            files, files_more = _connection(node.get("files"))
             children["files"] = [
                 {
                     "filename": f.get("path"),
                     "status": _CHANGE_TYPE_TO_STATUS.get(f.get("changeType"), "changed"),
-                    "additions": f.get("additions"),
-                    "deletions": f.get("deletions"),
-                    "changes": (f.get("additions") or 0) + (f.get("deletions") or 0),
+                    "additions": _int_or_none(f.get("additions")),
+                    "deletions": _int_or_none(f.get("deletions")),
+                    "changes": _int_or_none(
+                        (f.get("additions") or 0) + (f.get("deletions") or 0)
+                    ),
                     "sha": None,
                 }
                 for f in files
-                if isinstance(f, dict)
             ]
             if files_more:
                 children["files_incomplete"] = True
@@ -355,14 +417,26 @@ class GraphQLSource(GhApiSource):
                 aliases.append(f"i{n}: issue(number: {n}) {{ number }}")
                 aliases.append(f"p{n}: pullRequest(number: {n}) {{ number }}")
             query = (
-                f"query {{ repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
+                "query { rateLimit { remaining resetAt } "
+                f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
                 + " ".join(aliases) + " } }"
             )
             payload = self._graphql(query)
             repo = payload.get("repository")
             if not isinstance(repo, dict):
                 raise GitHubError("unexpected graphql repository payload")
+            resolved = 0
             for n in chunk:
-                if repo.get(f"i{n}") is None and repo.get(f"p{n}") is None:
+                if repo.get(f"i{n}") is not None or repo.get(f"p{n}") is not None:
+                    resolved += 1
+                else:
                     gone[n] = "deleted"
+            if resolved == 0:
+                # A chunk where NOTHING resolves is indistinguishable from a
+                # repo-wide visibility change or a silently degraded
+                # response; refusing to mass-mark is the safe direction.
+                raise GitHubError(
+                    "deletion probe resolved no nodes for a whole chunk; "
+                    "refusing to mark items gone without corroboration"
+                )
         return gone

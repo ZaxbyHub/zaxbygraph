@@ -29,8 +29,16 @@ class SyncError(RuntimeError):
 
 
 #: Rate-limit windows slept through per fetch-layer call before giving up
-#: (issue #5). A window sleep can be up to an hour; five is the ceiling.
+#: (issue #5). Five is the ceiling; each sleep is additionally clamped so a
+#: hostile or far-future reset can never park the sync (and its whole-run
+#: lock) indefinitely.
 _MAX_RATE_WINDOWS = 5
+
+#: Upper bound on a single sleep-until-reset, in seconds: one hour, the
+#: longest real GitHub window. A hostile or far-future reset can therefore
+#: park the sync (and its whole-run lock) for at most one hour per window
+#: instead of indefinitely; a legitimate window always sleeps in full.
+_MAX_WINDOW_SLEEP_S = 60 * 60
 
 #: Nested child sections a bulk item payload may carry inline, mapped to the
 #: per-item REST fallback that completes them (issue #5 AC3).
@@ -60,21 +68,67 @@ def _rate_attrs(exc: BaseException) -> tuple[int, str] | None:
     return (remaining, reset)
 
 
+def _rate_reset_epoch(reset) -> float:
+    """Parse an ISO-Z (or ISO) reset instant; an offset-less value is UTC.
+    Anything unparseable raises so the caller can fall back to the original
+    error."""
+    if not isinstance(reset, str):
+        raise ValueError(f"rate_limit_reset is not a string: {reset!r}")
+    try:
+        return datetime.strptime(reset, ISO_Z).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        parsed = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+
+
 def _rate_sleep(exc: BaseException) -> None:
     """Sleep until the reported reset on the sync module's `time` (the
-    injectable clock tests patch). The reset string is consumed verbatim."""
+    injectable clock tests patch), clamped to `_MAX_WINDOW_SLEEP_S`. The
+    reset string is consumed verbatim; an unparseable one re-raises the
+    original rate-limit error rather than a parse failure."""
     reset = getattr(exc, "rate_limit_reset")
     try:
-        reset_epoch = datetime.strptime(reset, ISO_Z).replace(
-            tzinfo=timezone.utc
-        ).timestamp()
-    except (ValueError, TypeError):
-        try:
-            reset_epoch = datetime.fromisoformat(str(reset).replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            raise exc
-    delay = max(0.0, reset_epoch - time.time())
+        reset_epoch = _rate_reset_epoch(reset)
+    except (ValueError, TypeError, OSError, OverflowError):
+        raise exc
+    delay = min(_MAX_WINDOW_SLEEP_S, max(0.0, reset_epoch - time.time()))
     time.sleep(delay)
+
+
+def _call_with_rate_retry(fn, *args):
+    """Run one fetch-layer call under the bounded sleep-until-reset loop
+    (issue #5 AC4). Raises the last error once `_MAX_RATE_WINDOWS` windows
+    have been slept through."""
+    for attempt in range(_MAX_RATE_WINDOWS + 1):
+        try:
+            return fn(*args)
+        except GitHubError as exc:
+            if _rate_attrs(exc) is None or attempt >= _MAX_RATE_WINDOWS:
+                raise
+            _rate_sleep(exc)
+    raise AssertionError("unreachable")
+
+
+class _BudgetWindow:
+    """Carrier for a source-observed budget floor so `_rate_sleep` can
+    consume it exactly like an enriched error."""
+
+    def __init__(self, remaining: int, reset: str) -> None:
+        self.rate_limit_remaining = remaining
+        self.rate_limit_reset = reset
+
+
+def _source_budget_floor(source) -> tuple[int, str] | None:
+    """(remaining, reset_at) when the source tracks a live budget
+    (GraphQLSource, from each page query's rateLimit selection) and that
+    budget has reached the floor; None otherwise."""
+    remaining = getattr(source, "rate_limit_remaining", None)
+    reset_at = getattr(source, "rate_limit_reset_at", None)
+    if isinstance(remaining, int) and isinstance(reset_at, str) and remaining <= 0:
+        return (remaining, reset_at)
+    return None
 
 
 def _resolve_children(
@@ -154,7 +208,7 @@ def _mark_gone(
 ) -> None:
     """Record a deletion verdict in place (issue #5 AC5): items.state changes,
     the row stays (edges pointing at it survive), and a fetch_log trail names
-    the verdict."""
+    the verdict with a null http_status (no fetch happened on this row)."""
     conn.execute("BEGIN IMMEDIATE")
     try:
         conn.execute(
@@ -162,7 +216,7 @@ def _mark_gone(
             "WHERE repo = ? AND number = ?",
             (verdict, f"marked {verdict}: {note}", repo, number),
         )
-        log_fetch(conn, repo, "item", str(number), note=f"marked {verdict}: {note}")
+        log_fetch(conn, repo, "item", str(number), note=f"marked {verdict}: {note}", status=None)
         conn.commit()
     except Exception:
         conn.rollback()
@@ -177,7 +231,8 @@ def _deletion_pass(
     Only a run that started at since=None may mark: absence from an
     incremental listing means "not updated", never "gone". The candidate set
     is stored, unmarked items minus everything seen across the whole run
-    (including rate-limit restarts)."""
+    (including rate-limit restarts). The probe runs under the bounded
+    rate-limit retry so a window cannot fail an otherwise-complete run."""
     checker = getattr(source, "check_deleted", None)
     if not callable(checker):
         return
@@ -190,13 +245,22 @@ def _deletion_pass(
     )
     if not candidates:
         return
-    verdicts = checker(candidates) or {}
+    verdicts = _call_with_rate_retry(checker, candidates) or {}
+    if not isinstance(verdicts, dict):
+        return
     allowed = set(candidates)
-    clean = {
-        int(n): str(v)
-        for n, v in verdicts.items()
-        if int(n) in allowed and str(v) in ("deleted", "transferred")
-    }
+    clean: dict[int, str] = {}
+    for n, v in verdicts.items():
+        # Source-supplied keys/values are untrusted: malformed rows are
+        # skipped (never crash a completed run), unknown verdicts are
+        # dropped silently by design.
+        try:
+            number = int(n)
+            text = str(v)
+        except (TypeError, ValueError):
+            continue
+        if number in allowed and text in ("deleted", "transferred"):
+            clean[number] = text
     for number, verdict in sorted(clean.items()):
         _mark_gone(
             conn, repo, number, verdict,
@@ -293,10 +357,22 @@ def sync_repo(
         # injectable clock and the listing restarts from a fresh generator;
         # re-ingesting committed items is a no-op upsert and the watermark
         # never regresses. Attr-bearing errors only: anything else fails
-        # fast exactly as before.
+        # fast exactly as before. A source that exposes its live budget
+        # (GraphQLSource) is also checked proactively at the top of each
+        # attempt, so a budget already at the floor sleeps BEFORE burning
+        # the attempt (issue #5 AC4's "reaches the floor" clause).
         attempts = 0
         while True:
             try:
+                # Proactive floor check (issue #5 AC4 "reaches the floor"):
+                # a source tracking its live budget sleeps BEFORE the attempt
+                # instead of burning it on a guaranteed 429. Each floor sleep
+                # counts toward the window cap, so this is bounded.
+                floor = _source_budget_floor(source)
+                if floor is not None and attempts < _MAX_RATE_WINDOWS:
+                    rate_window = floor
+                    attempts += 1
+                    _rate_sleep(_BudgetWindow(*floor))
                 for payload in source.list_issues(since):
                     batch = _batch(payload)
                     # One bulk children call per listing page when the source
@@ -309,7 +385,21 @@ def sync_repo(
                     for list_raw in batch:
                         if not isinstance(list_raw, dict) or "number" not in list_raw:
                             continue
-                        number = int(list_raw["number"])
+                        try:
+                            number = int(list_raw["number"])
+                        except (TypeError, ValueError):
+                            conn.execute("BEGIN IMMEDIATE")
+                            try:
+                                log_fetch(
+                                    conn, repo, "item", None,
+                                    note=f"skipped malformed listing number: "
+                                    f"{str(list_raw['number'])[:100]!r}",
+                                )
+                                conn.commit()
+                            except Exception:
+                                conn.rollback()
+                                raise
+                            continue
                         seen_numbers.add(number)
                         kind = item_kind(list_raw)
                         try:
@@ -319,6 +409,23 @@ def sync_repo(
                             )
                         except GitHubError as exc:
                             if exc.status in (404, 410):
+                                # The item may never have been ingested (a
+                                # first-sighting 404): store the listing
+                                # payload first so the marking is truthful
+                                # and the watermark advances past it.
+                                conn.execute("BEGIN IMMEDIATE")
+                                try:
+                                    ingest_item(
+                                        conn, repo, list_raw,
+                                        pull_raw=None,
+                                        issue_comments=[], review_comments=[],
+                                        reviews=[], files=[],
+                                        include_patches=include_patches,
+                                    )
+                                    conn.commit()
+                                except Exception:
+                                    conn.rollback()
+                                    raise
                                 _mark_gone(
                                     conn, repo, number, "deleted",
                                     f"GitHub returned HTTP {exc.status} while fetching item data",
@@ -374,17 +481,23 @@ def sync_repo(
                 _rate_sleep(exc)
 
         # Deletion oracle: only a drained full listing may mark items gone
-        # (issue #5 AC5). Incremental absence marks nothing.
+        # (issue #5 AC5). Incremental absence marks nothing. Runs under the
+        # bounded retry so a window cannot fail an otherwise-complete run.
         if started_full:
             _deletion_pass(conn, source, repo, seen_numbers)
 
         try:
-            releases = source.list_releases()
+            releases = _call_with_rate_retry(source.list_releases)
         except GitHubError as exc:
             conn.execute("BEGIN IMMEDIATE")
             set_last_error(conn, repo, str(exc))
             conn.commit()
             raise SyncError(str(exc)) from exc
+
+        if rate_window is None:
+            # A clean run that slept no window still reports the last budget
+            # the source observed (GraphQLSource tracks it per page query).
+            rate_window = _source_budget_floor(source)
 
         conn.execute("BEGIN IMMEDIATE")
         try:

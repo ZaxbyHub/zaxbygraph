@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, _schema_sql, connect, init_schema
 from zaxbygraph.query import status, search
 
 #: The schema as it stood at base e2ef892 (v1): no `PRAGMA user_version`, no
@@ -757,6 +757,48 @@ class MigrationTests(unittest.TestCase):
         row = conn.execute("SELECT * FROM sync_state WHERE repo = 'done/repo'").fetchone()
         self.assertEqual(row["full_sync_pending"], 0)
         self.assertEqual(status(conn, "done/repo")["repos"][0]["complete"], True)
+
+    def test_v3_db_gains_rate_limit_columns(self) -> None:
+        """Issue #5 / PR-13 review TC-07: a genuine v3 database (no rate
+        columns, user_version = 3) migrates to v4 with the two new
+        sync_state columns present — an ALTER that silently no-ops would
+        leave upgrading users with NULL-forever columns while fresh
+        databases still pass every other test."""
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "history.db"
+        v3 = sqlite3.connect(str(db_path))
+        # Build the CURRENT shape, then wind it back to the exact v3 shape:
+        # v4's two columns must not exist when the migration runs.
+        v3.executescript(_schema_sql())
+        v3.execute("ALTER TABLE sync_state DROP COLUMN rate_limit_remaining")
+        v3.execute("ALTER TABLE sync_state DROP COLUMN rate_limit_reset_at")
+        v3.execute("PRAGMA user_version = 3")
+        v3.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_error, item_count, full_sync_pending)"
+            " VALUES ('acme/forgegate', '2026-01-03T00:00:00Z', NULL, NULL, 0, 1)"
+        )
+        v3.commit()
+        v3.close()
+
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0],
+            CURRENT_USER_VERSION,
+        )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+        self.assertIn("rate_limit_remaining", cols)
+        self.assertIn("rate_limit_reset_at", cols)
+        row = conn.execute(
+            "SELECT rate_limit_remaining, rate_limit_reset_at FROM sync_state"
+            " WHERE repo = 'acme/forgegate'"
+        ).fetchone()
+        self.assertIsNone(row[0])
+        self.assertIsNone(row[1])
 
     def test_fts_tokenizer_migration_rebuilds_in_place(self) -> None:
         """Issue #4 AC6: opening a v2 database (unicode61 FTS) migrates the
