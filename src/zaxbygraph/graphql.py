@@ -374,8 +374,12 @@ class GraphQLSource(GhApiSource):
                     "status": _CHANGE_TYPE_TO_STATUS.get(f.get("changeType"), "changed"),
                     "additions": _int_or_none(f.get("additions")),
                     "deletions": _int_or_none(f.get("deletions")),
-                    "changes": _int_or_none(
-                        (f.get("additions") or 0) + (f.get("deletions") or 0)
+                    "changes": (
+                        None
+                        if _int_or_none(f.get("additions")) is None
+                        or _int_or_none(f.get("deletions")) is None
+                        else _int_or_none(f.get("additions"))
+                        + _int_or_none(f.get("deletions"))
                     ),
                     "sha": None,
                 }

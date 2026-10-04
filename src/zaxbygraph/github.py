@@ -28,18 +28,18 @@ class GitHubError(RuntimeError):
 
 def _status_from_stderr(stderr: str) -> int | None:
     text = stderr.lower()
+    # Digit matches are word-boundary anchored: a bare "404"/"403"/"429"
+    # inside a larger number (an issue number, a URL, a request id) must not
+    # drive classification — the 404/410 verdicts durably flip items.state.
     if "429" in text or "rate limit" in text or "secondary rate" in text:
         return 429
-    if "403" in text or "forbidden" in text:
+    if re.search(r"\b403\b", text) or "forbidden" in text:
         return 403
-    if "404" in text or "not found" in text:
+    if re.search(r"\b404\b", text) or "not found" in text:
         return 404
-    # Word-boundary digits: a substring "410" inside a larger number (an
-    # issue number, a URL, a byte count) must not classify as Gone — the
-    # verdict durably flips items.state to 'deleted'.
     if re.search(r"\b410\b", text) or re.search(r"\bgone\b", text):
         return 410
-    if "401" in text or "unauthorized" in text:
+    if re.search(r"\b401\b", text) or "unauthorized" in text:
         return 401
     return None
 
@@ -64,7 +64,7 @@ class GhApiSource:
         self.slug = slug
 
     def _api(self, path: str, paginate: bool = False, _enrich_rate: bool = True) -> object:
-        if ".." in path or path.startswith("/"):
+        if ".." in path or path.startswith(("/", "-")):
             raise GitHubError(f"refusing API path: {path!r}")
         cmd = [self.gh_bin, "api", path]
         if paginate:

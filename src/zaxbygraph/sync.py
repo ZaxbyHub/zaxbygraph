@@ -409,23 +409,37 @@ def sync_repo(
                             )
                         except GitHubError as exc:
                             if exc.status in (404, 410):
-                                # The item may never have been ingested (a
-                                # first-sighting 404): store the listing
-                                # payload first so the marking is truthful
-                                # and the watermark advances past it.
-                                conn.execute("BEGIN IMMEDIATE")
-                                try:
-                                    ingest_item(
-                                        conn, repo, list_raw,
-                                        pull_raw=None,
-                                        issue_comments=[], review_comments=[],
-                                        reviews=[], files=[],
-                                        include_patches=include_patches,
-                                    )
-                                    conn.commit()
-                                except Exception:
-                                    conn.rollback()
-                                    raise
+                                # A first-sighting 404 stores the listing
+                                # payload so the marking is truthful and the
+                                # watermark advances past it. An item that was
+                                # ALREADY stored keeps its children and edges:
+                                # ingest_item replaces child rows and rebuilt
+                                # edges from scratch, so re-ingesting with
+                                # empty children would destroy the last local
+                                # copy of a deleted item's discussion. This
+                                # matches the oracle path, which marks without
+                                # touching children.
+                                exists = conn.execute(
+                                    "SELECT 1 FROM items WHERE repo = ? AND number = ?",
+                                    (repo, number),
+                                ).fetchone() is not None
+                                if not exists:
+                                    conn.execute("BEGIN IMMEDIATE")
+                                    try:
+                                        ingest_item(
+                                            conn, repo, list_raw,
+                                            pull_raw=None,
+                                            issue_comments=[], review_comments=[],
+                                            reviews=[], files=[],
+                                            include_patches=include_patches,
+                                        )
+                                        conn.commit()
+                                    except Exception:
+                                        conn.rollback()
+                                        raise
+                                    ingested += 1
+                                    last_number = number
+                                    _write_jsonl(jsonl_handle, "item", list_raw)
                                 _mark_gone(
                                     conn, repo, number, "deleted",
                                     f"GitHub returned HTTP {exc.status} while fetching item data",

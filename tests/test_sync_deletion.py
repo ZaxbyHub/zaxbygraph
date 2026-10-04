@@ -19,7 +19,7 @@ from fixtures import (
     pr_file,
     ts,
 )
-from zaxbygraph.sync import sync_repo
+from zaxbygraph.sync import SyncError, sync_repo
 
 
 class _RateLimitedError(GitHubError):
@@ -92,6 +92,20 @@ class MarkOnFetchFailureTests(TempDBTest):
             "SELECT state FROM items WHERE repo = ? AND number = 1", (REPO,)
         ).fetchone()[0]
         self.assertEqual(state, "deleted")
+        # Already-stored children and their edges MUST survive the marking
+        # (ingest_item with empty children would erase the last local copy
+        # of a deleted item's discussion - PR-13 review Critical).
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM pr_files WHERE number = 1"), 1
+        )
+        self.assertGreaterEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND dst_type = 'item'"
+                " AND dst_id = '1'",
+                (REPO,),
+            ),
+            1,
+        )
         trail = self.count(
             "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND resource = 'item' "
             "AND resource_id = '1' AND lower(note) LIKE '%deleted%'",
@@ -117,6 +131,36 @@ class MarkOnFetchFailureTests(TempDBTest):
         ).fetchone()[0]
         self.assertEqual(state, "deleted")
 
+    def test_first_sighting_404_stores_then_marks(self) -> None:
+        """A 404 on an item that was never stored: the listing payload is
+        stored first (truthful row + watermark), the row is marked deleted,
+        and the run counts it."""
+        from fixtures import pull, pr_file
+
+        self.src.add_pr(
+            issue(9, title="nine", kind="pr", updated_at=ts(90)),
+            pull(9, changed_files=1),
+            files=[pr_file("src/i.py")],
+        )
+
+        def gone(number: int):
+            raise GitHubError("HTTP 404 Not Found", status=404)
+
+        self.src.list_pr_files = gone  # type: ignore[method-assign]
+        result = self.sync(force=True)
+        row = self.conn.execute(
+            "SELECT state FROM items WHERE repo = ? AND number = 9", (REPO,)
+        ).fetchone()
+        self.assertIsNotNone(row, "listing payload must be stored before marking")
+        self.assertEqual(row[0], "deleted")
+        self.assertEqual(result["ingested"], 1)
+        trail = self.count(
+            "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND resource_id = '9'"
+            " AND lower(note) LIKE '%deleted%'",
+            (REPO,),
+        )
+        self.assertGreaterEqual(trail, 1)
+
     def test_other_statuses_still_abort(self) -> None:
         self.src.add_pr(
             issue(3, title="three", kind="pr"),
@@ -129,7 +173,7 @@ class MarkOnFetchFailureTests(TempDBTest):
             raise GitHubError("HTTP 500 oops", status=None)
 
         self.src.list_pr_files = broken  # type: ignore[method-assign]
-        self.assertRaises(Exception, self.sync, force=True)
+        self.assertRaises(SyncError, self.sync, force=True)
         state = self.conn.execute(
             "SELECT state FROM items WHERE repo = ? AND number = 3", (REPO,)
         ).fetchone()[0]
@@ -138,9 +182,9 @@ class MarkOnFetchFailureTests(TempDBTest):
 
 class DeletionPassSemanticsTests(TempDBTest):
     def test_marking_survives_rate_limit_listing_restart(self) -> None:
-        reset_at = (
-            datetime.now(timezone.utc) + timedelta(seconds=30)
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # fixed instants: deterministic regardless of host clock or load
+        base = datetime(2026, 10, 3, 12, 0, 0, tzinfo=timezone.utc)
+        reset_at = (base + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
         src = _RestartingDeletionSource(gone_number=3, reset_at=reset_at)
         src.add_issue(issue(1, updated_at=ts(10)))
         src.add_issue(issue(2, updated_at=ts(20)))
@@ -154,8 +198,8 @@ class DeletionPassSemanticsTests(TempDBTest):
         src.item_gone = True
         src.attempts = 0
         clock = MagicMock()
-        clock.time.return_value = datetime.now(timezone.utc).timestamp()
-        clock.monotonic.return_value = clock.time.return_value
+        clock.time.return_value = base.timestamp()
+        clock.monotonic.return_value = base.timestamp()
         with patch("zaxbygraph.sync.time", clock):
             result = sync_repo(self.conn, src, REPO, force=True)
         self.assertEqual(result["last_error"], None)
