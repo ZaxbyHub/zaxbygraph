@@ -53,7 +53,7 @@ def _pull_node(number: int, *, comments_overflow: bool = False) -> dict:
             "mergeCommit": {"oid": "abc123"},
             "baseRefName": "main",
             "headRefName": f"feat/{number}",
-            "draft": False,
+            "isDraft": False,
             "reviews": {
                 "totalCount": 1,
                 "pageInfo": {"hasNextPage": False},
@@ -65,21 +65,21 @@ def _pull_node(number: int, *, comments_overflow: bool = False) -> dict:
                         "submittedAt": "2026-01-02T00:00:00Z",
                         "url": f"https://github.com/{REPO}/pull/{number}#review",
                         "author": {"login": "bob"},
-                    }
-                ],
-            },
-            "reviewComments": {
-                "totalCount": 1,
-                "pageInfo": {"hasNextPage": False},
-                "nodes": [
-                    {
-                        "databaseId": 700_000 + number,
-                        "body": "inline",
-                        "createdAt": "2026-01-02T00:00:00Z",
-                        "updatedAt": "2026-01-02T00:00:01Z",
-                        "url": f"https://github.com/{REPO}/pull/{number}#discussion",
-                        "replyTo": {"databaseId": 900_000 + number},
-                        "author": {"login": "bob", "url": "https://github.com/bob"},
+                        "comments": {
+                            "totalCount": 1,
+                            "pageInfo": {"hasNextPage": False},
+                            "nodes": [
+                                {
+                                    "databaseId": 700_000 + number,
+                                    "body": "inline",
+                                    "createdAt": "2026-01-02T00:00:00Z",
+                                    "updatedAt": "2026-01-02T00:00:01Z",
+                                    "url": f"https://github.com/{REPO}/pull/{number}#discussion",
+                                    "replyTo": {"databaseId": 900_000 + number},
+                                    "author": {"login": "bob", "url": "https://github.com/bob"},
+                                }
+                            ],
+                        },
                     }
                 ],
             },
@@ -232,6 +232,34 @@ class GraphQLChildrenTests(unittest.TestCase):
         self.assertEqual(graphql_file["filename"], "src/mod26.py")
         self.assertEqual(graphql_file["status"], "modified")
         self.assertEqual(graphql_file["changes"], 4)
+
+    def test_pull_query_matches_the_real_graphql_schema(self) -> None:
+        """Live-schema regression pin (issue #5 smoke): PullRequest has
+        isDraft (not draft) and no top-level reviewComments connection -
+        review comments ride under each review's comments connection."""
+        from zaxbygraph.graphql import _PULL_FIELDS
+
+        self.assertIn("isDraft", _PULL_FIELDS)
+        self.assertNotIn("reviewComments", _PULL_FIELDS)
+
+        host = _FakeGraphQLHost()
+        host.write_graphql_responses([{"data": {"repository": {}}}])
+        with host:
+            host.source()
+        # Build the actual query text for one PR alias and pin its shape.
+        from zaxbygraph.graphql import _q
+
+        alias_query = (
+            "query { rateLimit { remaining resetAt } "
+            f"repository(owner: {_q('acme')}, name: {_q('forgegate')}) {{ "
+            f"p1: pullRequest(number: 1) {{{_PULL_FIELDS}}} }} }}"
+        )
+        self.assertIn("isDraft", alias_query)
+        self.assertNotIn("reviewComments", alias_query)
+        self.assertIn("reviews(first: 50)", alias_query)
+        # PR issue comments must ride the same query (REST gets them from
+        # /issues/{n}/comments; the pull alias must not drop them).
+        self.assertIn("comments(first: 100)", alias_query)
 
     def test_overflowing_connection_is_flagged_for_rest_fallback(self) -> None:
         host = _FakeGraphQLHost()

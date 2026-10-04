@@ -55,21 +55,6 @@ reviews(first: 50) {
 }
 """
 
-_REVIEW_COMMENT_NODES = """
-reviewComments(first: 100) {
-  totalCount
-  pageInfo { hasNextPage }
-  nodes {
-    databaseId
-    body
-    createdAt
-    updatedAt
-    url
-    replyTo { databaseId }
-    author { login url }
-  }
-}
-"""
 
 _FILE_NODES = """
 files(first: 100) {
@@ -84,6 +69,37 @@ files(first: 100) {
 }
 """
 
+#: Review comments ride UNDER each review (`Review.comments`); PullRequest
+#: has no top-level reviewComments connection, and the draft flag is
+#: `isDraft` — both validated against the live schema (issue #5 smoke).
+_REVIEW_NODES = """
+reviews(first: 50) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    databaseId
+    state
+    body
+    submittedAt
+    url
+    author { login }
+    comments(first: 100) {
+      totalCount
+      pageInfo { hasNextPage }
+      nodes {
+        databaseId
+        body
+        createdAt
+        updatedAt
+        url
+        replyTo { databaseId }
+        author { login url }
+      }
+    }
+  }
+}
+"""
+
 _PULL_SCALARS = """
 additions
 deletions
@@ -93,7 +109,7 @@ mergedAt
 mergeCommit { oid }
 baseRefName
 headRefName
-draft
+isDraft
 """
 
 _ISSUE_FIELDS = f"""
@@ -103,9 +119,9 @@ databaseId
 
 _PULL_FIELDS = f"""
 databaseId
+{_ISSUE_COMMENT_NODES}
 {_PULL_SCALARS}
 {_REVIEW_NODES}
-{_REVIEW_COMMENT_NODES}
 {_FILE_NODES}
 """
 
@@ -277,7 +293,12 @@ class GraphQLSource(GhApiSource):
             if reviews_more:
                 children["reviews_incomplete"] = True
 
-            review_comments, rc_more = _connection(node.get("reviewComments"), "reviewComments")
+            review_nodes = [r for r in reviews if isinstance(r, dict)]
+            review_comments = [
+                c
+                for r in review_nodes
+                for c in _connection(r.get("comments"), "review.comments")[0]
+            ]
             children["review_comments"] = [
                 {
                     "id": c.get("databaseId"),
@@ -292,8 +313,11 @@ class GraphQLSource(GhApiSource):
                     "in_reply_to_id": ((c.get("replyTo") or {}).get("databaseId")),
                 }
                 for c in review_comments
-                if isinstance(c, dict)
             ]
+            rc_more = any(
+                _connection(r.get("comments"), "review.comments")[1]
+                for r in review_nodes
+            )
             if rc_more:
                 children["review_comments_incomplete"] = True
 
@@ -323,7 +347,7 @@ class GraphQLSource(GhApiSource):
                 "merge_commit_sha": merge_commit.get("oid"),
                 "base": {"ref": node.get("baseRefName")},
                 "head": {"ref": node.get("headRefName")},
-                "draft": bool(node.get("draft")),
+                "draft": bool(node.get("isDraft")),
             }
         return children
 
