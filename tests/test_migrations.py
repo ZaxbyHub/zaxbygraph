@@ -794,8 +794,8 @@ class MigrationTests(unittest.TestCase):
         # (a) the migration framework stamped the new schema version
         self.assertEqual(
             conn.execute("PRAGMA user_version").fetchone()[0],
-            3,
-            "v2 DB must migrate to user_version 3 (porter FTS rebuild)",
+            CURRENT_USER_VERSION,
+            "v2 DB must migrate to the current user_version (porter FTS rebuild among them)",
         )
         # (b) the rebuilt FTS DDL carries the porter tokenizer
         ddl = conn.execute(

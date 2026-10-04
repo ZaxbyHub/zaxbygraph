@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from fixtures import scrubbed_env
+from zaxbygraph.github import GitHubError, GhApiSource
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,7 +58,8 @@ if effective.replace("-", "") in ("utf8", "utf8mb4") or effective == "cp65001":
     raise SystemExit(0)
 from zaxbygraph.github import GhApiSource
 src = GhApiSource("acme", "forgegate", gh_bin=sys.executable)
-items = list(src.list_issues(None))
+# list_issues yields PAGES (issue #5): flatten for the payload assertions.
+items = [item for page in src.list_issues(None) for item in page]
 expected = json.loads(pathlib.Path("payload.json").read_text(encoding="utf-8"))
 assert len(items) == 1, "expected 1 item, got %d" % len(items)
 assert items[0]["title"] == expected[0]["title"], "title mismatch: %r" % items[0]["title"]
@@ -98,6 +100,47 @@ class GhDecodeTests(unittest.TestCase):
                 % proc.stdout.decode("utf-8").split(":", 1)[1].strip()
             )
         self.assertIn(b"ROUNDTRIP_OK", proc.stdout)
+
+
+class StreamingListingTests(unittest.TestCase):
+    """Guardrail for the issue #5 defect class (buffered all-or-nothing
+    listing): a failure after page k must not take pages 1..k down with it.
+    Each fake-gh invocation serves one page; invocation 2 dies with a 502, so
+    the iterator must deliver page 1 BEFORE the error surfaces."""
+
+    def test_page_yields_before_later_page_fails(self) -> None:
+        # A full page (100 items) makes the source fetch page 2; the fake
+        # dies there, so page 1 must already have been delivered.
+        page1 = [{"id": n, "number": n, "title": f"item {n}"} for n in range(1, 101)]
+        script = "\n".join([
+            "import json, pathlib, sys",
+            "d = pathlib.Path(__file__).parent",
+            "n = d / 'invocations.txt'",
+            "count = int(n.read_text()) if n.exists() else 0",
+            "n.write_text(str(count + 1))",
+            "if count == 0:",
+            "    print(json.dumps(json.load(d.joinpath('page1.json').open())))",
+            "else:",
+            "    print('gh: HTTP 502 Bad Gateway (fetching page 2)', file=sys.stderr)",
+            "    raise SystemExit(1)",
+        ])
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            cwd = Path(td)
+            (cwd / "api").write_text(script, encoding="utf-8")
+            (cwd / "page1.json").write_text(json.dumps(page1), encoding="utf-8")
+            src = GhApiSource("acme", "forgegate", gh_bin=sys.executable)
+            prev = Path.cwd()
+            os.chdir(cwd)
+            pages: list = []
+            try:
+                with self.assertRaises(GitHubError) as ctx:
+                    for page in src.list_issues(None):
+                        pages.append(page)
+            finally:
+                os.chdir(prev)
+        self.assertIn("502", str(ctx.exception))
+        self.assertEqual(len(pages), 1, f"pages delivered before the failure: {len(pages)}")
+        self.assertEqual(len(pages[0]), 100)
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import os
 import socket
 import sqlite3
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
@@ -12,6 +13,7 @@ from zaxbygraph.extract import item_kind
 from zaxbygraph.github import GitHubError, GitHubSource
 from zaxbygraph.repo import validate_slug
 from zaxbygraph.store import (
+    ISO_Z,
     ingest_item,
     log_fetch,
     mark_sync_finished,
@@ -24,6 +26,182 @@ from zaxbygraph.store import (
 
 class SyncError(RuntimeError):
     pass
+
+
+#: Rate-limit windows slept through per fetch-layer call before giving up
+#: (issue #5). A window sleep can be up to an hour; five is the ceiling.
+_MAX_RATE_WINDOWS = 5
+
+#: Nested child sections a bulk item payload may carry inline, mapped to the
+#: per-item REST fallback that completes them (issue #5 AC3).
+_CHILD_FALLBACK = {
+    "issue_comments": "list_issue_comments",
+    "review_comments": "list_review_comments",
+    "reviews": "list_reviews",
+    "files": "list_pr_files",
+}
+
+
+def _batch(payload: object) -> list[dict]:
+    """Normalize one yielded listing payload: an item dict is a one-item
+    batch, a page list is itself, anything else is skipped."""
+    if isinstance(payload, dict):
+        return [payload]
+    if isinstance(payload, list):
+        return [raw for raw in payload if isinstance(raw, dict)]
+    return []
+
+
+def _rate_attrs(exc: BaseException) -> tuple[int, str] | None:
+    remaining = getattr(exc, "rate_limit_remaining", None)
+    reset = getattr(exc, "rate_limit_reset", None)
+    if remaining is None or reset is None:
+        return None
+    return (remaining, reset)
+
+
+def _rate_sleep(exc: BaseException) -> None:
+    """Sleep until the reported reset on the sync module's `time` (the
+    injectable clock tests patch). The reset string is consumed verbatim."""
+    reset = getattr(exc, "rate_limit_reset")
+    try:
+        reset_epoch = datetime.strptime(reset, ISO_Z).replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except (ValueError, TypeError):
+        try:
+            reset_epoch = datetime.fromisoformat(str(reset).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            raise exc
+    delay = max(0.0, reset_epoch - time.time())
+    time.sleep(delay)
+
+
+def _resolve_children(
+    source: GitHubSource,
+    list_raw: dict,
+    kind: str,
+    include_patches: bool,
+    provided: dict | None = None,
+) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict]]:
+    """Children for one item: inline or bulk-provided payload where present
+    and complete, per-item REST fallback where flagged incomplete or absent
+    (issue #5). `provided` is what the source's fetch_children bulk call
+    returned for this item; inline payload keys take precedence.
+
+    The absent-everywhere path keeps the legacy rules (comments only when the
+    count is nonzero, pull details only for PRs, files via changed_files),
+    which is what plain REST sources hit. `include_patches` forces the REST
+    files fetch even when a payload carried files: GraphQL cannot serve
+    patches.
+    """
+    number = int(list_raw["number"])
+    pull_raw = list_raw.get("pull")
+    if pull_raw is None and provided is not None:
+        pull_raw = provided.get("pull")
+    if pull_raw is None and kind == "pr" and "pull" not in list_raw and not (
+        provided is not None and "pull" in provided
+    ):
+        pull_raw = source.get_pull(number)
+
+    sections: dict[str, list[dict]] = {}
+    for name, fallback_name in _CHILD_FALLBACK.items():
+        provided_section = provided.get(name) if provided is not None else None
+        provided_flagged = bool(provided.get(f"{name}_incomplete")) if provided is not None else False
+        if name in list_raw:
+            if include_patches and name == "files":
+                sections[name] = list(source.list_pr_files(number))
+            elif list_raw.get(f"{name}_incomplete"):
+                sections[name] = list(getattr(source, fallback_name)(number))
+            else:
+                sections[name] = list(list_raw[name] or [])
+        elif provided_section is not None or provided_flagged:
+            if include_patches and name == "files":
+                sections[name] = list(source.list_pr_files(number))
+            elif provided_flagged:
+                sections[name] = list(getattr(source, fallback_name)(number))
+            else:
+                sections[name] = list(provided_section or [])
+        elif kind == "pr" or name == "issue_comments":
+            if name == "issue_comments":
+                if list_raw.get("comments"):
+                    sections[name] = list(source.list_issue_comments(number))
+                else:
+                    sections[name] = []
+            elif name == "files":
+                changed = (pull_raw or {}).get("changed_files")
+                if include_patches and name == "files":
+                    sections[name] = list(source.list_pr_files(number))
+                elif changed or changed is None:
+                    sections[name] = list(source.list_pr_files(number))
+                else:
+                    sections[name] = []
+            else:
+                sections[name] = list(getattr(source, fallback_name)(number))
+        else:
+            sections[name] = []
+    return (
+        pull_raw,
+        sections["issue_comments"],
+        sections["review_comments"],
+        sections["reviews"],
+        sections["files"],
+    )
+
+
+def _mark_gone(
+    conn: sqlite3.Connection, repo: str, number: int, verdict: str, note: str
+) -> None:
+    """Record a deletion verdict in place (issue #5 AC5): items.state changes,
+    the row stays (edges pointing at it survive), and a fetch_log trail names
+    the verdict."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE items SET state = ?, state_reason = ? "
+            "WHERE repo = ? AND number = ?",
+            (verdict, f"marked {verdict}: {note}", repo, number),
+        )
+        log_fetch(conn, repo, "item", str(number), note=f"marked {verdict}: {note}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _deletion_pass(
+    conn: sqlite3.Connection, source: GitHubSource, repo: str, seen_numbers: set[int]
+) -> None:
+    """Consult the source's deletion oracle after a drained full listing.
+
+    Only a run that started at since=None may mark: absence from an
+    incremental listing means "not updated", never "gone". The candidate set
+    is stored, unmarked items minus everything seen across the whole run
+    (including rate-limit restarts)."""
+    checker = getattr(source, "check_deleted", None)
+    if not callable(checker):
+        return
+    rows = conn.execute(
+        "SELECT number FROM items WHERE repo = ? AND state NOT IN ('deleted','transferred')",
+        (repo,),
+    ).fetchall()
+    candidates = sorted(
+        {int(r["number"]) for r in rows} - set(seen_numbers)
+    )
+    if not candidates:
+        return
+    verdicts = checker(candidates) or {}
+    allowed = set(candidates)
+    clean = {
+        int(n): str(v)
+        for n, v in verdicts.items()
+        if int(n) in allowed and str(v) in ("deleted", "transferred")
+    }
+    for number, verdict in sorted(clean.items()):
+        _mark_gone(
+            conn, repo, number, verdict,
+            "reported by source deletion check after a completed full listing",
+        )
 
 
 def _error_text(exc: BaseException) -> str:
@@ -99,6 +277,9 @@ def sync_repo(
         # "full" in the result means: this run completes a full sync (it
         # started one, or it resumed an interrupted one to a clean finish).
         full = since is None or pending_at_start
+        started_full = since is None
+        seen_numbers: set[int] = set()
+        rate_window: tuple[int, str] | None = None
 
         # Sidecar setup is a failure path too (e.g. the target path is a
         # regular file). The finally guard tolerates a half-failed setup
@@ -106,70 +287,96 @@ def sync_repo(
         if jsonl_path is not None:
             jsonl_path.mkdir(parents=True, exist_ok=True)
             jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
-        for list_raw in source.list_issues(since):
-            if not isinstance(list_raw, dict) or "number" not in list_raw:
-                continue
-            number = int(list_raw["number"])
-            kind = item_kind(list_raw)
-            pull_raw: dict | None = None
-            issue_comments: list[dict] = []
-            review_comments: list[dict] = []
-            reviews: list[dict] = []
-            files: list[dict] = []
+        # The listing is consumed in pages and each item commits with its
+        # own watermark bump, so everything delivered before a failure is
+        # durable (issue #5 AC1). A rate-limit window is slept out on the
+        # injectable clock and the listing restarts from a fresh generator;
+        # re-ingesting committed items is a no-op upsert and the watermark
+        # never regresses. Attr-bearing errors only: anything else fails
+        # fast exactly as before.
+        attempts = 0
+        while True:
             try:
-                comment_count = list_raw.get("comments")
-                if comment_count:
-                    issue_comments = source.list_issue_comments(number)
-                if kind == "pr":
-                    pull_raw = source.get_pull(number)
-                    reviews = source.list_reviews(number)
-                    review_comments = source.list_review_comments(number)
-                    changed = (pull_raw or {}).get("changed_files")
-                    if changed:
-                        files = source.list_pr_files(number)
-                    elif changed is None:
-                        files = source.list_pr_files(number)
-            except GitHubError:
-                raise
+                for payload in source.list_issues(since):
+                    batch = _batch(payload)
+                    # One bulk children call per listing page when the source
+                    # offers it (issue #5 AC2); items the source did not
+                    # answer fall through to the per-item REST path.
+                    provided_map: dict[int, dict] = {}
+                    fetch = getattr(source, "fetch_children", None)
+                    if callable(fetch) and batch:
+                        provided_map = fetch(batch) or {}
+                    for list_raw in batch:
+                        if not isinstance(list_raw, dict) or "number" not in list_raw:
+                            continue
+                        number = int(list_raw["number"])
+                        seen_numbers.add(number)
+                        kind = item_kind(list_raw)
+                        try:
+                            pull_raw, issue_comments, review_comments, reviews, files = _resolve_children(
+                                source, list_raw, kind, include_patches,
+                                provided=provided_map.get(number),
+                            )
+                        except GitHubError as exc:
+                            if exc.status in (404, 410):
+                                _mark_gone(
+                                    conn, repo, number, "deleted",
+                                    f"GitHub returned HTTP {exc.status} while fetching item data",
+                                )
+                                continue
+                            raise
 
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                ingest_item(
-                    conn,
-                    repo,
-                    list_raw,
-                    pull_raw=pull_raw,
-                    issue_comments=issue_comments,
-                    review_comments=review_comments,
-                    reviews=reviews,
-                    files=files,
-                    include_patches=include_patches,
-                )
-                if len(files) >= 3000:
-                    log_fetch(
-                        conn,
-                        repo,
-                        "pr_files",
-                        str(number),
-                        note="truncated at GitHub 3000-file cap",
-                    )
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-            ingested += 1
-            last_number = number
-            _write_jsonl(jsonl_handle, "item", list_raw)
-            if pull_raw:
-                _write_jsonl(jsonl_handle, "pull", pull_raw)
-            for rec in issue_comments:
-                _write_jsonl(jsonl_handle, "issue_comment", rec)
-            for rec in review_comments:
-                _write_jsonl(jsonl_handle, "review_comment", rec)
-            for rec in reviews:
-                _write_jsonl(jsonl_handle, "review", rec)
-            for rec in files:
-                _write_jsonl(jsonl_handle, "pr_file", rec)
+                        conn.execute("BEGIN IMMEDIATE")
+                        try:
+                            ingest_item(
+                                conn,
+                                repo,
+                                list_raw,
+                                pull_raw=pull_raw,
+                                issue_comments=issue_comments,
+                                review_comments=review_comments,
+                                reviews=reviews,
+                                files=files,
+                                include_patches=include_patches,
+                            )
+                            if len(files) >= 3000:
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "pr_files",
+                                    str(number),
+                                    note="truncated at GitHub 3000-file cap",
+                                )
+                            conn.commit()
+                        except Exception:
+                            conn.rollback()
+                            raise
+                        ingested += 1
+                        last_number = number
+                        _write_jsonl(jsonl_handle, "item", list_raw)
+                        if pull_raw:
+                            _write_jsonl(jsonl_handle, "pull", pull_raw)
+                        for rec in issue_comments:
+                            _write_jsonl(jsonl_handle, "issue_comment", rec)
+                        for rec in review_comments:
+                            _write_jsonl(jsonl_handle, "review_comment", rec)
+                        for rec in reviews:
+                            _write_jsonl(jsonl_handle, "review", rec)
+                        for rec in files:
+                            _write_jsonl(jsonl_handle, "pr_file", rec)
+                break
+            except GitHubError as exc:
+                window = _rate_attrs(exc)
+                if window is None or attempts >= _MAX_RATE_WINDOWS:
+                    raise
+                rate_window = window
+                attempts += 1
+                _rate_sleep(exc)
+
+        # Deletion oracle: only a drained full listing may mark items gone
+        # (issue #5 AC5). Incremental absence marks nothing.
+        if started_full:
+            _deletion_pass(conn, source, repo, seen_numbers)
 
         try:
             releases = source.list_releases()
@@ -182,7 +389,12 @@ def sync_repo(
         conn.execute("BEGIN IMMEDIATE")
         try:
             replace_releases(conn, repo, releases)
-            mark_sync_finished(conn, repo)
+            mark_sync_finished(
+                conn,
+                repo,
+                rate_limit_remaining=None if rate_window is None else rate_window[0],
+                rate_limit_reset_at=None if rate_window is None else rate_window[1],
+            )
             recount(conn, repo)
             conn.commit()
         except Exception:
@@ -231,6 +443,8 @@ def sync_repo(
         "comment_count": None if state is None else state["comment_count"],
         "edge_count": None if state is None else state["edge_count"],
         "last_error": None if state is None else state["last_error"],
+        "rate_limit_remaining": None if rate_window is None else rate_window[0],
+        "rate_limit_reset_at": None if rate_window is None else rate_window[1],
     }
 
 

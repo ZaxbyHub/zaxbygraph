@@ -139,20 +139,32 @@ Every command accepts:
 ### `sync` — fetch into the graph
 
 ```bash
-zaxbygraph sync --repo OWNER/REPO [--force] [--include-patches] [--jsonl [DIR]]
+zaxbygraph sync --repo OWNER/REPO [--force] [--include-patches] [--source graphql|rest] [--jsonl [DIR]]
 ```
 
 | Flag | Meaning |
 | --- | --- |
+| `--source` | `graphql` (default) or `rest`. Both stream the listing one page per call and commit each page as it arrives; `graphql` additionally fetches each page's comments, reviews, review comments, files and pull details in one bulk GraphQL query per page, with a per-item REST fallback for any connection that overflowed its page. Patches always come from REST (`pulls/{n}/files`), so `--include-patches` forces that fallback for files. |
 | `--force` | Ignore the watermark and do a full pull. Needed when you suspect updates that did not bump `updated_at` (review-only changes), and required to backfill patches after a no-patch sync. |
 | `--include-patches` | Store unified diffs in `pr_files.patch`. Off by default — patches dominate the database size. |
 | `--jsonl [DIR]` | Also append one JSON object per fetched resource to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). A resumed sync may duplicate lines, so consumers should key on `(resource, payload.id)`. |
 
-Sync is sequential and resumable. Rough cost is `≈ 1 + items + 4×prs` REST
-calls; issues with zero comments skip the comments request, and PRs with zero
-changed files skip the files request. If it stops partway — rate limit, network,
-anything — the watermark stays at the last **fully committed** item and
-`last_error` is recorded, so re-running `sync` resumes rather than restarting.
+Sync is sequential and resumable. With the default `graphql` source, cost is
+roughly one listing call per 100 items plus one bulk-children call per page
+(instead of the old `≈ 1 + items + 4×prs` per-item fan-out, which `--source
+rest` still uses). Pages are committed as they arrive: if the listing fails
+partway — 502, network, anything — every page already delivered is ingested
+with its watermark, and `last_error` is recorded, so re-running `sync`
+resumes rather than restarting.
+
+Rate limits are budgeted, not fatal: a core rate-limit failure with an
+exhausted budget is slept out until the reported reset (reported afterwards
+as `rate_limit_remaining` / `rate_limit_reset_at` in the sync result and in
+`status`), then the listing resumes. Secondary limits that carry no
+resolvable reset fail fast as before. A full sync that drains its listing
+also consults the source's deletion oracle: stored items the source reports
+gone are marked `deleted` / `transferred` in `items.state` (rows are kept,
+never removed), and the marking leaves a `fetch_log` trail.
 
 ### `status` — counts and watermark
 

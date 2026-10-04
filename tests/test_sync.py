@@ -602,3 +602,190 @@ class SyncLockTests(TempDBTest):
         self.assertLess(elapsed, 30.0, "--wait spun far too long")
         # Idempotent re-sync of the same corpus: still exactly the 2 items.
         self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
+
+
+# ==== issue #5 fetch-layer rework: acceptance append (AC1-AC5) ===============
+# Append-only; every class above is untouched and every import needed below
+# is restated here (no header edits). The contracts these tests pin are
+# documented alongside the fakes in tests/fixtures.py.
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
+
+from fixtures import (
+    REPO,
+    BulkNestedSource,
+    DeletingSource,
+    PagedFailureSource,
+    RateLimitSource,
+    TempDBTest,
+    add_bulk_prs,
+    issue,
+    pr_file,
+    ts,
+)
+from zaxbygraph.query import status
+from zaxbygraph.sync import SyncError
+
+
+class StreamingTests(TempDBTest):
+    """Issue #5 streaming-ingest acceptance: pages delivered before a failure
+    are durable, and a drained full listing is the deletion oracle."""
+
+    def test_listing_failure_keeps_pages_already_returned(self) -> None:
+        """AC1: a mid-listing 502 keeps every complete page already
+        delivered - items and watermark - instead of losing the whole run."""
+        page1 = [
+            issue(1, title="one", updated_at=ts(10), comments=0),
+            issue(2, title="two", updated_at=ts(20), comments=0),
+        ]
+        self.src = PagedFailureSource([page1])
+        with self.assertRaises(SyncError):
+            self.sync()
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 2)
+        since = self.conn.execute(
+            "SELECT issues_since FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()[0]
+        self.assertEqual(since, ts(20))
+
+    def test_deleted_item_is_marked(self) -> None:
+        """AC5: absence from a drained FULL listing marks deleted/transferred;
+        absence from an incremental listing marks nothing."""
+        self.src = DeletingSource()
+        self.src.add_issue(issue(1, title="one", updated_at=ts(10)))
+        self.src.add_issue(issue(2, title="two", updated_at=ts(20)))
+        self.src.add_issue(issue(3, title="three", updated_at=ts(30)))
+        self.sync()
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 3)
+
+        del self.src.issues[2]
+        del self.src.issues[3]
+        self.src.deletions = {2: "transferred", 3: "deleted"}
+        self.src.comment_on(1, "still alive")
+
+        # Incremental: #2/#3 are merely not updated - no marking, ever.
+        self.sync()
+        states = {
+            r[0]: r[1]
+            for r in self.conn.execute(
+                "SELECT number, state FROM items WHERE repo = ?", (REPO,)
+            )
+        }
+        self.assertEqual(states[2], "open")
+        self.assertEqual(states[3], "open")
+
+        # Full drain: absence now means gone. Rows are marked, not removed.
+        self.sync(force=True)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items"), 3)
+        states = {
+            r[0]: r[1]
+            for r in self.conn.execute(
+                "SELECT number, state FROM items WHERE repo = ?", (REPO,)
+            )
+        }
+        self.assertEqual(states[3], "deleted")
+        self.assertEqual(states[2], "transferred")
+        self.assertEqual(states[1], "open")
+        title = self.conn.execute(
+            "SELECT title FROM items WHERE repo = ? AND number = 1", (REPO,)
+        ).fetchone()[0]
+        self.assertEqual(title, "one")
+        trail = self.count(
+            "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND resource = 'item' "
+            "AND resource_id = '3' AND lower(note) LIKE '%deleted%'",
+            (REPO,),
+        )
+        self.assertGreaterEqual(trail, 1)
+        trail = self.count(
+            "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND resource = 'item' "
+            "AND resource_id = '2' AND lower(note) LIKE '%transferred%'",
+            (REPO,),
+        )
+        self.assertGreaterEqual(trail, 1)
+
+
+class GraphQLTests(TempDBTest):
+    """Issue #5 bulk-pages acceptance: nested connections replace the
+    per-item REST fan-out, and an overflowing connection is completed."""
+
+    def test_bulk_page_call_budget(self) -> None:
+        """AC2: 50 fully-nested PRs ingest with at most a handful of per-item
+        REST fallback calls, children included."""
+        self.src = BulkNestedSource()
+        add_bulk_prs(self.src, 50)
+        result = self.sync()
+        self.assertLessEqual(self.src.fallback_calls, 3)
+        self.assertEqual(result["ingested"], 50)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM items WHERE kind = 'pr'"), 50)
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM comments WHERE kind = 'issue_comment'"), 100
+        )
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM comments WHERE kind = 'review_comment'"), 50
+        )
+        self.assertEqual(self.count("SELECT COUNT(*) FROM reviews"), 50)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM pr_files"), 100)
+
+    def test_overflowing_connection_is_completed(self) -> None:
+        """AC3: the one connection flagged incomplete is completed through
+        its REST fallback; complete connections trigger none."""
+        self.src = BulkNestedSource()
+        add_bulk_prs(self.src, 50)
+        self.src.files[7] = [
+            pr_file("src/mod7/a.py"),
+            pr_file("src/mod7/b.py"),
+            pr_file("src/mod7/c.py"),
+        ]
+        self.src.pulls[7]["changed_files"] = 3
+        self.src.incomplete_files = {7}
+        self.sync()
+        self.assertEqual(self.src.files_fallback_numbers, [7])
+        self.assertLessEqual(self.src.fallback_calls, 3)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM pr_files WHERE number = 7"), 3)
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM pr_files WHERE number = 7 "
+                "AND path = 'src/mod7/c.py'"
+            ),
+            1,
+        )
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM pr_files WHERE number = 8"), 2
+        )
+
+
+class RateLimitTests(TempDBTest):
+    """Issue #5 rate-limit acceptance: the window is slept through on the
+    injectable clock and the budget is reported."""
+
+    def test_waits_for_reset_and_reports_budget(self) -> None:
+        """AC4: a 429 with a known reset is slept out and retried, and the
+        window lands in the sync result and in what `status` reads."""
+        self.src = RateLimitSource()
+        self.src.add_issue(issue(1, title="one", updated_at=ts(10), comments=1))
+        self.src.comment_on(1, "hello")
+        # 1200 s before the window resets: the exact sleep-until-reset length.
+        now_epoch = datetime(2026, 10, 3, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+        clock = MagicMock()
+        clock.time.return_value = now_epoch
+        clock.monotonic.return_value = now_epoch
+        completed = False
+        result: dict = {}
+        with patch("zaxbygraph.sync.time", clock):
+            try:
+                result = self.sync()
+                completed = True
+            except SyncError:
+                completed = False
+        self.assertTrue(completed, "a rate-limit window must be slept through, not aborted")
+        waited = [c.args[0] for c in clock.sleep.call_args_list if c.args]
+        self.assertTrue(
+            any(1195.0 <= w <= 1205.0 for w in waited),
+            f"sleep-until-reset not invoked with the window length: {waited}",
+        )
+        self.assertEqual(result.get("rate_limit_remaining"), RateLimitSource.REMAINING)
+        self.assertEqual(result.get("rate_limit_reset_at"), RateLimitSource.RESET_AT)
+        # cmd_status reads exactly this (SELECT * FROM sync_state).
+        state = status(self.conn, REPO)["repos"][0]
+        self.assertEqual(state.get("rate_limit_remaining"), RateLimitSource.REMAINING)
+        self.assertEqual(state.get("rate_limit_reset_at"), RateLimitSource.RESET_AT)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM comments"), 1)
