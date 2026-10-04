@@ -30,27 +30,31 @@ shouldn't.
   model what an item means. No INFERRED edges, no "purpose" field, no
   clustering, no summarization. A CHECK constraint enforces the column value;
   the real invariant is that no code path *wants* to write anything else.
-- **Node types are `actor`, `item`, `label`, `file` — and nothing else.** Never
-  `issue`, `pr`, `comment`, or `review` as an edge endpoint type. An issue and a
-  PR are both `item`; `items.kind` distinguishes them.
-- **Evidence is a payload, never part of an edge's identity.** The unique key is
-  `(repo, src_type, src_id, rel, dst_type, dst_id)`. Adding `evidence` to that
-  key would let the same relationship appear many times with different
-  provenance strings.
+- **Node types are `actor`, `item`, `label`, `file`, `commit` — and nothing
+  else.** Never `issue`, `pr`, `comment`, or `review` as an edge endpoint
+  type. An issue and a PR are both `item`; `items.kind` distinguishes them.
+  A commit endpoint's `dst_id` is the sha, joining the graph to `git log`.
+- **Evidence is a payload, never part of an edge's identity.** The unique key
+  is `(repo, src_type, src_id, rel, dst_type, dst_id, source)`. Adding
+  `evidence` to that key would let the same relationship appear many times
+  with different provenance strings; `source` **is** in the key because the
+  same pair reported by two provenance streams is two distinct facts.
 - **Actor `commented`/`reviewed` edges collapse** to one per actor×item. Full
   history lives in the `comments` and `reviews` tables; the graph stays
   item-centric rather than growing an edge per comment.
 - **Mentions and closes from comments roll up to the owning item**, so the graph
   never has a comment as an endpoint.
-- **A `closes` reference is not also a `mentions` reference.** The two are
-  mutually exclusive for a given pair.
-- **Cross-repo references are dropped, never localized.** A `#5` in another
-  repo's URL must not attach to local item 5.
-- **`closes` is keyword-derived and must keep being described that way.** It
-  reflects closing keywords in bodies and comments — not GitHub's
-  connected-issue graph, not merge-commit auto-close, not the timeline API. Any
-  doc or output that implies otherwise is a correctness bug, because a caller
-  will read a missing edge as "unrelated".
+- **A `closes_keyword` reference is not also a `mentions` reference.** The two
+  are mutually exclusive for a given pair.
+- **Cross-repo keyword references are dropped, never localized; timeline
+  cross-references are kept repo-qualified.** A `#5` in another repo's URL
+  must not attach to local item 5, and a foreign cross-reference is stored as
+  `owner/repo#N`, which can never attach to a same-numbered local item.
+- **`closes_keyword` is keyword-derived and must keep being described that
+  way. `closes` is reserved for timeline- and closing-reference-backed links
+  and must be described that way:** it reflects GitHub's timeline events and
+  closingIssuesReferences — keyword regexes must never write it. Any doc or
+  output that swaps the two is a correctness bug.
 
 ### Correctness of ingest
 
@@ -76,7 +80,9 @@ shouldn't.
   reviews, pr_files for that number), while edges pointing *at* the item from
   elsewhere survive — see the next point.
 - **On item upsert, delete only edges the item owns**: its outbound edges and
-  the actor relations pointing at it. Inbound `mentions`/`closes` from *other*
+  the actor relations pointing at it — except outbound edges with `source IN
+  ('timeline','closing_ref')`, which are append-only GitHub-reported link
+  facts and survive every re-ingest. Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.
 

@@ -68,7 +68,7 @@ class MentionTests(unittest.TestCase):
             "labels": [],
         }
         rels = {(e[2], e[4]) for e in edges_from_item(REPO, raw)}
-        self.assertIn(("closes", "1"), rels)
+        self.assertIn(("closes_keyword", "1"), rels)
         self.assertNotIn(("mentions", "1"), rels)
         self.assertIn(("mentions", "2"), rels)
 
@@ -78,7 +78,7 @@ class ReviewBodyTests(unittest.TestCase):
         raw = {"id": 99, "user": {"login": "bob"}, "state": "APPROVED", "body": "closes #12"}
         edges = edges_from_review(REPO, 3, raw)
         rels = {(e[2], e[4]) for e in edges}
-        self.assertIn(("closes", "12"), rels)
+        self.assertIn(("closes_keyword", "12"), rels)
         self.assertNotIn(("mentions", "12"), rels)
         self.assertIn(("reviewed", "3"), {(e[2], e[4]) for e in edges})
 
@@ -86,12 +86,18 @@ class ReviewBodyTests(unittest.TestCase):
 class CollapseTests(unittest.TestCase):
     def test_last_write_wins(self) -> None:
         edges = [
-            ("actor", "alice", "commented", "item", "1", "comment:1"),
-            ("actor", "alice", "commented", "item", "1", "comment:2"),
+            ("actor", "alice", "commented", "item", "1", "comment:1", "payload"),
+            ("actor", "alice", "commented", "item", "1", "comment:2", "payload"),
+            ("item", "1", "closes", "item", "2", "timeline: closed by pr", "timeline"),
+            ("item", "1", "closes", "item", "2", "body closing keyword", "keyword"),
         ]
         out = collapse_edges(edges)
-        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out), 3)
         self.assertEqual(out[0][5], "comment:2")
+        # source is part of the collapse key: the same (src, rel, dst) pair
+        # under two different sources survives as two distinct edges
+        close_sources = sorted(e[6] for e in out if e[2] == "closes")
+        self.assertEqual(close_sources, ["keyword", "timeline"])
 
 
 if __name__ == "__main__":

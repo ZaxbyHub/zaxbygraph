@@ -317,7 +317,7 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
     rec["edges"] = [
         _row_to_dict(x)
         for x in conn.execute(
-            "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence "
+            "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source "
             "FROM edges WHERE repo = ? AND ("
             "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
             ")",
@@ -341,7 +341,7 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
         nxt: set[str] = set()
         for nid in frontier:
             rows = conn.execute(
-                "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence "
+                "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source "
                 "FROM edges WHERE repo = ? AND ("
                 "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
                 ")",
@@ -357,14 +357,24 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
         frontier = nxt
     nodes = []
     for nid in visited:
+        # Repo-qualified foreign cross-reference ids (owner/repo#N, issue #6)
+        # have no local items row and are not numeric: surface them as
+        # unresolved placeholder nodes instead of crashing on int().
+        try:
+            number_value = int(nid)
+        except ValueError:
+            nodes.append(
+                {"number": None, "id": nid, "kind": None, "title": None, "state": None}
+            )
+            continue
         it = conn.execute(
             "SELECT number, kind, title, state FROM items WHERE repo = ? AND number = ?",
-            (repo, int(nid)),
+            (repo, number_value),
         ).fetchone()
         if it:
             nodes.append(_row_to_dict(it))
         else:
-            nodes.append({"number": int(nid), "kind": None, "title": None, "state": None})
+            nodes.append({"number": number_value, "kind": None, "title": None, "state": None})
     return {"number": number, "repo": repo, "nodes": nodes, "edges": seen_edges}
 
 
@@ -398,6 +408,29 @@ def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+#: Relations the `path` BFS traverses. Every relation the extractors emit
+#: (extract.RELATIONS) is either structural here or in PATH_EXCLUDED_RELATIONS
+#: — the Phase 4.2 guardrail test (tests/test_relation_registry.py) pins that
+#: partition so a new relation cannot ship silently unhandled. `merged_by` is
+#: excluded like the other actor relations: one login hub would join
+#: unrelated items.
+STRUCTURAL = frozenset(
+    {
+        "touches",
+        "closes",
+        "closes_keyword",
+        "mentions",
+        "cross_referenced",
+        "closed_by_commit",
+        "merged_commit",
+        "reverts",
+    }
+)
+PATH_EXCLUDED_RELATIONS = frozenset(
+    {"authored", "has_label", "commented", "reviewed", "merged_by"}
+)
+
+
 def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = None) -> dict:
     """Undirected BFS over item↔item and item↔file edges."""
     repo = _fold_repo(repo)
@@ -420,7 +453,6 @@ def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = No
     start = node_key(start_t, start_id)
     goal = node_key(goal_t, goal_id)
 
-    STRUCTURAL = {"touches", "closes", "mentions"}
     adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
     rows = conn.execute(
         "SELECT src_type, src_id, rel, dst_type, dst_id FROM edges WHERE repo = ?",

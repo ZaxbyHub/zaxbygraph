@@ -18,14 +18,18 @@ from zaxbygraph.query import (
 
 class QueryTests(TempDBTest):
     def seed_two_prs(self) -> None:
+        # Distinct merge commits: with issue #6, PRs merged by the SAME commit
+        # gain a second shortest path (item -> commit -> item), which would
+        # legitimately outroute the shared-file path this fixture exists to
+        # exercise.
         self.src.add_pr(
             issue(10, title="wal store", body="adds wal", kind="pr", state="closed"),
-            pull(10, changed_files=2, merged=True),
+            {**pull(10, changed_files=2, merged=True), "merge_commit_sha": "walsha"},
             files=[pr_file("src/store.py"), pr_file("src/db.py")],
         )
         self.src.add_pr(
             issue(11, title="fts rebuild", body="fixes fts", kind="pr", state="closed"),
-            pull(11, changed_files=1, merged=True),
+            {**pull(11, changed_files=1, merged=True), "merge_commit_sha": "ftssha"},
             files=[pr_file("src/store.py")],
         )
         self.src.add_issue(issue(12, title="open watermark", state="open", body="need inclusive since"))

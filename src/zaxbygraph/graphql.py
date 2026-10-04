@@ -22,6 +22,19 @@ from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
 #: Numbers per aliased children query (issue + pullRequest aliases each).
 GRAPHQL_CHILDREN_PAGE = 40
 
+#: Hard per-request cap on `timelineItems` (GitHub rejects first/last beyond
+#: 250 on that connection with EXCESSIVE_PAGINATION — live-verified, #6).
+_TIMELINE_PAGE_MAX = 250
+
+#: Continuation page size while draining a flagged timeline (stays well under
+#: the per-request cap).
+_TIMELINE_CONTINUATION_PAGE = 100
+
+#: Timeline events retained per item. Beyond this the retained set is the
+#: contiguous NEWEST 500 (closed events are typically the newest facts), and
+#: the sync records the truncation in fetch_log (#6).
+_MAX_TIMELINE_EVENTS = 500
+
 #: Upper bound on the rendered query so the argv element stays well under
 #: Windows' 32767-char CreateProcessW limit (a 40-PR chunk renders ~34.5k
 #: chars and would fail with WinError 206, an OSError no GitHubError handler
@@ -104,11 +117,54 @@ mergeCommit { oid }
 baseRefName
 headRefName
 isDraft
+mergedBy { login }
+closingIssuesReferences(first: 100) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    number
+    repository { nameWithOwner }
+  }
+}
+"""
+
+#: Timeline events ride every page query (issue #6): closed events carry the
+#: closer union (commit sha or pull request number), cross-references carry
+#: source/target so direction is stored as carried per side.
+_TIMELINE_NODES = """
+timelineItems(first: 50, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT]) {
+  totalCount
+  pageInfo { hasNextPage endCursor }
+  nodes {
+    __typename
+    ... on ClosedEvent {
+      createdAt
+      actor { login }
+      closer {
+        __typename
+        ... on Commit { oid }
+        ... on PullRequest { number }
+      }
+    }
+    ... on CrossReferencedEvent {
+      createdAt
+      actor { login }
+      isCrossRepository
+      willCloseTarget
+      source {
+        __typename
+        ... on Issue { number repository { nameWithOwner } }
+        ... on PullRequest { number repository { nameWithOwner } }
+      }
+    }
+  }
+}
 """
 
 _ISSUE_FIELDS = f"""
 databaseId
 {_ISSUE_COMMENT_NODES}
+{_TIMELINE_NODES}
 """
 
 _PULL_FIELDS = f"""
@@ -117,6 +173,7 @@ databaseId
 {_PULL_SCALARS}
 {_REVIEW_NODES}
 {_FILE_NODES}
+{_TIMELINE_NODES}
 """
 
 _CHANGE_TYPE_TO_STATUS = {
@@ -161,6 +218,54 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     if isinstance(total, int) and total > len(out):
         incomplete = True
     return out, incomplete
+
+
+def _timeline_event(node: dict) -> dict:
+    """One timelineItems node -> the normalized event dict the extract layer
+    consumes (transport-agnostic shape; #6)."""
+    typename = node.get("__typename")
+    if typename == "ClosedEvent":
+        closer = node.get("closer") or {}
+        closer_type = closer.get("__typename")
+        return {
+            "type": "closed",
+            "created_at": node.get("createdAt"),
+            "actor_login": (node.get("actor") or {}).get("login"),
+            "commit_id": closer.get("oid") if closer_type == "Commit" else None,
+            "closer_type": {"Commit": "commit", "PullRequest": "pull_request"}.get(closer_type),
+            "closer_number": _int_or_none(closer.get("number"))
+            if closer_type == "PullRequest"
+            else None,
+        }
+    if typename == "CrossReferencedEvent":
+        source = node.get("source") or {}
+        return {
+            "type": "cross_referenced",
+            "created_at": node.get("createdAt"),
+            "actor_login": (node.get("actor") or {}).get("login"),
+            "source_typename": source.get("__typename"),
+            "source_number": _int_or_none(source.get("number")),
+            "source_repo": (source.get("repository") or {}).get("nameWithOwner"),
+            "is_cross_repository": bool(node.get("isCrossRepository")),
+        }
+    return {"type": str(typename or "unknown").lower()}
+
+
+def _timeline_selection(args: str) -> str:
+    """The timelineItems selection shared by the page query and the
+    continuation/replacement queries (always inside the 250-per-request
+    GitHub cap)."""
+    return (
+        "timelineItems(%s itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT]) {"
+        " totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor }"
+        " nodes { __typename"
+        " ... on ClosedEvent { createdAt actor { login } closer { __typename"
+        " ... on Commit { oid } ... on PullRequest { number } } }"
+        " ... on CrossReferencedEvent { createdAt actor { login } isCrossRepository"
+        " willCloseTarget source { __typename"
+        " ... on Issue { number repository { nameWithOwner } }"
+        " ... on PullRequest { number repository { nameWithOwner } } } } } } }"
+    ) % args
 
 
 class GraphQLSource(GhApiSource):
@@ -258,21 +363,92 @@ class GraphQLSource(GhApiSource):
         chunk (issue #5; Windows argv limit per the PR-13 review).
 
         Returns {number: children}. Children carry REST-shaped
-        issue_comments / review_comments / reviews / files / pull; a
-        connection that overflowed its first page adds a
-        `<name>_incomplete` flag so the sync finishes it over REST for that
-        item only. Items whose node did not resolve are omitted (the sync
-        then uses the per-item REST path for them)."""
+        issue_comments / review_comments / reviews / files / pull, plus the
+        item's normalized timeline events (#6). A comments/reviews/files
+        connection that overflowed its first page adds a `<name>_incomplete`
+        flag so the sync finishes it over REST for that item only;
+        `timeline_incomplete` is different — GraphQL-only, never finished
+        over REST — so fetch_children drains it itself (bounded; at the cap
+        the retained set is the contiguous newest events and the flag stays
+        set for sync to record in fetch_log). Items whose node did not
+        resolve are omitted (the sync then uses the per-item REST path for
+        them)."""
         children: dict[int, dict] = {}
+        kinds: dict[int, str] = {}
         chunk: list[dict] = []
         for raw in items:
+            if isinstance(raw, dict) and "number" in raw:
+                kinds[int(raw["number"])] = "pr" if "pull_request" in raw else "issue"
             chunk.append(raw)
             if len(chunk) >= GRAPHQL_CHILDREN_PAGE or self._chunk_query_len(chunk) >= _MAX_QUERY_CHARS:
                 children.update(self._fetch_children_chunk(chunk))
                 chunk = []
         if chunk:
             children.update(self._fetch_children_chunk(chunk))
+        for number in sorted(kinds):
+            child = children.get(number)
+            if child is not None and child.get("timeline_incomplete"):
+                self._complete_timeline(number, kinds[number], child)
         return children
+
+    def _timeline_page(self, number: int, kind: str, args: str) -> tuple[list[dict], dict]:
+        """One timeline page for a single item: (events, pageInfo). `args`
+        carries the caller's pagination clause (first/last/after/before) —
+        every call site keeps its page size at or under _TIMELINE_PAGE_MAX,
+        the GitHub per-request cap."""
+        alias = ("p" if kind == "pr" else "i") + str(number)
+        node_name = "pullRequest" if kind == "pr" else "issue"
+        query = (
+            "query { rateLimit { remaining resetAt } "
+            f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
+            f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args)} }} }} }}"
+        )
+        payload = self._graphql(query)
+        repo_payload = payload.get("repository")
+        if not isinstance(repo_payload, dict):
+            raise GitHubError("unexpected graphql repository payload")
+        node = repo_payload.get(alias)
+        if not isinstance(node, dict):
+            return [], {}
+        connection = node.get("timelineItems")
+        if not isinstance(connection, dict):
+            return [], {}
+        events, _ = _connection(connection)
+        return [_timeline_event(e) for e in events], connection.get("pageInfo") or {}
+
+    def _complete_timeline(self, number: int, kind: str, child: dict) -> None:
+        """Finish a flagged timeline and own the `timeline_incomplete` flag.
+
+        A fully-drained connection CLEARS the flag (a 51-to-500-event item is
+        complete, not truncated). When the cap trips with pages still
+        remaining, the retained set becomes the contiguous NEWEST
+        _MAX_TIMELINE_EVENTS events — two chained `last:` pages walking back
+        through the first page's startCursor — and the flag stays set; sync
+        records the truncation in fetch_log (#6)."""
+        events = list(child.get("timeline") or [])
+        cursor = child.get("timeline_cursor")
+        while cursor and len(events) < _MAX_TIMELINE_EVENTS:
+            page, info = self._timeline_page(
+                number,
+                kind,
+                f"first: {_TIMELINE_CONTINUATION_PAGE} after: {_q(cursor)}",
+            )
+            events.extend(page)
+            cursor = info.get("endCursor") if info.get("hasNextPage") else None
+        if cursor is None:
+            child["timeline"] = events
+            child.pop("timeline_incomplete", None)
+        else:
+            newest, info = self._timeline_page(number, kind, f"last: {_TIMELINE_PAGE_MAX}")
+            if info.get("hasPreviousPage") and info.get("startCursor"):
+                older, _ = self._timeline_page(
+                    number,
+                    kind,
+                    f"last: {_TIMELINE_PAGE_MAX} before: {_q(info['startCursor'])}",
+                )
+                newest = older + newest
+            child["timeline"] = newest
+        child.pop("timeline_cursor", None)
 
     def _chunk_query_len(self, chunk: list[dict]) -> int:
         """Rendered length of the query the chunk would produce (upper
@@ -403,6 +579,8 @@ class GraphQLSource(GhApiSource):
                 children["files_incomplete"] = True
 
             merge_commit = node.get("mergeCommit") or {}
+            merged_by = node.get("mergedBy") or {}
+            closing_refs, closing_more = _connection(node.get("closingIssuesReferences"))
             children["pull"] = {
                 "additions": node.get("additions"),
                 "deletions": node.get("deletions"),
@@ -413,7 +591,28 @@ class GraphQLSource(GhApiSource):
                 "base": {"ref": node.get("baseRefName")},
                 "head": {"ref": node.get("headRefName")},
                 "draft": bool(node.get("isDraft")),
+                "merged_by": merged_by.get("login"),
+                "closing_issues_references": [
+                    {
+                        "number": _int_or_none(ref.get("number")),
+                        "repo": (ref.get("repository") or {}).get("nameWithOwner"),
+                    }
+                    for ref in closing_refs
+                ],
             }
+            if closing_more:
+                children["closing_refs_incomplete"] = True
+
+        if "timelineItems" in node:
+            events, timeline_more = _connection(node.get("timelineItems"))
+            children["timeline"] = [_timeline_event(e) for e in events]
+            # Retained for fetch_children's continuation; popped before the
+            # payload reaches ingest.
+            children["timeline_cursor"] = (node.get("timelineItems") or {}).get(
+                "pageInfo", {}
+            ).get("endCursor")
+            if timeline_more:
+                children["timeline_incomplete"] = True
         return children
 
     # -- deletion oracle ----------------------------------------------------

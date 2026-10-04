@@ -1,4 +1,4 @@
-# Schema reference (schema version 4, `PRAGMA user_version` = 4)
+# Schema reference (schema version 5, `PRAGMA user_version` = 5)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -141,15 +141,16 @@ The graph itself. One row per relationship.
 | --- | --- | --- |
 | `id` | INTEGER | Primary key. |
 | `repo` | TEXT | |
-| `src_type` | TEXT | `actor`, `item`, `label`, or `file`. |
-| `src_id` | TEXT | Login, item **number as text**, label name, or file path. |
+| `src_type` | TEXT | `actor`, `item`, `label`, `file`, or `commit`. |
+| `src_id` | TEXT | Login, item **number as text**, label name, or file path. A foreign cross-referenced source is a repo-qualified id (`owner/repo#N`), never a bare number. |
 | `rel` | TEXT | See the relationship table below. |
 | `dst_type` | TEXT | Same domain as `src_type`. |
-| `dst_id` | TEXT | |
+| `dst_id` | TEXT | A commit endpoint carries the sha, so the graph joins to `git log`. |
 | `confidence` | TEXT | Always `'EXTRACTED'`, enforced by a CHECK constraint. |
-| `evidence` | TEXT | Provenance string, e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key. |
+| `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is**. |
+| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts. |
 
-Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id)`.
+Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 
 `src_id` and `dst_id` are `TEXT` even for item numbers, so compare with
 `dst_id = '10'` or `CAST(dst_id AS INTEGER) = 10` — not `dst_id = 10`.
@@ -163,28 +164,64 @@ Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id)`.
 | `reviewed` | actor → item | Reviewed at least once. Also collapsed. |
 | `has_label` | item → label | |
 | `touches` | item → file | A PR changed this path. The join key to a code graph. |
-| `closes` | item → item | A closing keyword plus a same-repo reference. Keyword-derived only — see the caveat below. |
+| `closes_keyword` | item → item | A closing keyword plus a same-repo reference in a body or comment. Keyword-derived only — see the caveat below. |
 | `mentions` | item → item | A same-repo reference **without** a closing keyword. |
+| `closes` | item → item | GitHub-reported closing link: a `closed` timeline event (closer is a PR or a known merge commit) or a PR's `closingIssuesReferences`. Never written by keyword regexes. |
+| `cross_referenced` | item → item | Stored as carried on each item's timeline: source → owner. GitHub reports every reference on **both** items' timelines, so a linkage can appear in either direction (`related`/`path` are direction-agnostic). Foreign sources are repo-qualified (`owner/repo#N`). |
+| `closed_by_commit` | item → commit | The item's `closed` timeline event carries this commit sha. |
+| `merged_by` | item → actor | Who merged the PR. |
+| `merged_commit` | item → commit | The PR's merge commit sha — joins the graph to `git log`. |
+| `reverts` | item → commit, or item → item | A `This reverts commit <sha>` body line targets the commit; a title-only revert (`Revert "…"`) targets the item whose exact quoted title matches, when exactly one does. |
 
-`closes` and `mentions` are mutually exclusive for a given pair: a number that
-is closed is not also emitted as a mention.
+`closes_keyword` and `mentions` are mutually exclusive for a given pair: a
+number that is closed by keyword is not also emitted as a mention.
 
-Node types are only ever `actor`, `item`, `label`, `file`. Never `issue`, `pr`,
-`comment`, or `review` — an issue and a PR are both `item`, distinguished by
-`items.kind`.
+Node types are only ever `actor`, `item`, `label`, `file`, `commit`. Never
+`issue`, `pr`, `comment`, or `review` — an issue and a PR are both `item`,
+distinguished by `items.kind`. A commit endpoint's id is the sha.
 
-### What `closes` does and does not mean
+### What `closes_keyword` and `closes` do and do not mean
 
-`closes` is derived from **closing keywords in bodies and comments** —
-`close`/`closes`/`closed`, `fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved`
-— followed by `#N`, `owner/repo#N`, or a same-repo GitHub URL.
+`closes_keyword` (source='keyword') is derived from **closing keywords in
+bodies and comments** — `close`/`closes`/`closed`, `fix`/`fixes`/`fixed`,
+`resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
+same-repo GitHub URL. It means *a keyword said so*; nothing more is claimed.
 
-It is **not** GitHub's connected-issue graph. Not present in v0.1:
-auto-close from merge-commit messages, links made through the GitHub UI, and
-anything that only appears in the timeline API. Cross-repo references are
-ignored entirely rather than attached to a same-numbered local item. If a
-conclusion depends on auto-close, say so explicitly rather than treating the
-absence of a `closes` edge as evidence that no link exists.
+`closes` (source='timeline' or 'closing_ref') is what **GitHub reported**:
+`closed` timeline events — including auto-close from merge-commit messages,
+which lands as a closed event with a commit closer — and a PR's
+`closingIssuesReferences`. Keyword regexes never write it. Edges mirror the
+timeline events as reported, so after reopen/re-close cycles **multiple
+closers coexist**; evidence timestamps order them, and `items.state` is
+authoritative for current open/closed. `cross_referenced` is likewise stored
+as carried: GitHub reports every reference on both items' timelines, so the
+same linkage can appear in both directions.
+
+What remains absent is anything beyond GitHub's own reports — no edge claims
+a link GitHub did not report. Cross-repo keyword references are dropped
+entirely rather than attached to a same-numbered local item; timeline
+cross-references from other repos are kept as repo-qualified ids
+(`owner/repo#N`) that never attach to a same-numbered local item.
+
+Two boundaries:
+
+- **REST syncs see no timeline.** `--source rest` captures no timeline events
+  and no closing references — both ride the GraphQL page query only — so a
+  REST-only sync writes no `closes`/`cross_referenced` edges (keyword edges
+  still derive from bodies). Conversely, a GraphQL-degraded re-ingest can
+  never retract timeline- or closing-ref-backed edges once written (the
+  delete-owned pass exempts `source NOT IN ('timeline','closing_ref')` —
+  append-only), and `--force` preserves them too. Recovery for a genuinely
+  stale row is manual SQL against the database file (e.g. the `sqlite3`
+  CLI); the `sql` **subcommand** is read-only by design and is never a write
+  path.
+- **Timeline retention is bounded.** The page query carries
+  `timelineItems(first: 50, CLOSED_EVENT, CROSS_REFERENCED_EVENT)` and a
+  continuation drains up to 500 events per item; beyond 500 the retained set
+  is the contiguous **newest** 500 and sync logs a `fetch_log` note
+  (`timeline truncated: retained newest 500 events`) — `fetch_log` is the
+  durable, queryable truncation record. `closingIssuesReferences(first:
+  100)` notes truncation the same way.
 
 ## actors
 
@@ -233,7 +270,7 @@ One row per repo. What `zaxbygraph status` reads.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `4`). The
+`PRAGMA user_version` is the authoritative schema state (currently `5`). The
 `meta.schema_version` row is informational only. On open, `init_schema`:
 
 - refuses loudly when `user_version` is newer than the build (a database from
@@ -245,6 +282,15 @@ One row per repo. What `zaxbygraph status` reads.
 Migration 3→4 adds `sync_state.rate_limit_remaining` / `rate_limit_reset_at`
 (issue #5: the sync layer sleeps out an exhausted core rate limit until the
 reported reset and reports the window instead of aborting).
+
+Migration 4→5 rebuilds `edges` for timeline provenance (issue #6): a
+`source TEXT NOT NULL` column after `evidence`, the unique key widened to
+`(repo, src_type, src_id, rel, dst_type, dst_id, source)` — the same pair
+reported by two provenance streams is two facts — keyword `closes` rows
+renamed to `closes_keyword`, and a mechanism-honest backfill (legacy `closes`
+→ `closes_keyword` + 'keyword', legacy `mentions` → 'keyword', everything
+else → 'payload'). Ids and row counts are preserved and the migration is
+idempotent; older builds refuse a v5 database.
 
 Migration 1→2 adds `sync_state.full_sync_pending` and folds repo slugs to
 lowercase across every repo-keyed table, merging case-split duplicates

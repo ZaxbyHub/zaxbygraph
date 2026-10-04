@@ -10,7 +10,9 @@ from zaxbygraph.extract import (
     edges_from_comment,
     edges_from_files,
     edges_from_item,
+    edges_from_pr_state,
     edges_from_review,
+    edges_from_timeline,
     item_kind,
 )
 
@@ -62,9 +64,22 @@ def replace_item_children(conn: sqlite3.Connection, repo: str, number: int) -> N
 
 
 def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None:
+    """Delete the edges this item OWNS, keeping everything else.
+
+    Outbound text/payload edges are rebuilt from this item's payload, so they
+    go. The two GraphQL-only link streams (timeline events, closingIssue
+    references) are exempt (`source NOT IN ('timeline', 'closing_ref')`): a
+    degraded re-ingest (REST source, files-section-missing pull fallback, the
+    404 empty-children path) cannot re-derive them, and a closer PR's payload
+    can never re-derive an edge whose evidence lives on the closed item's
+    timeline. They are append-only once written — refreshed by upsert when
+    the source provides the section again, never retracted (issue #6; the
+    `--force` trade-off is documented in docs/schema.md). Inbound
+    mentions/closes from other items always survive."""
     nid = str(number)
     conn.execute(
-        "DELETE FROM edges WHERE repo = ? AND src_type = 'item' AND src_id = ?",
+        "DELETE FROM edges WHERE repo = ? AND src_type = 'item' AND src_id = ? "
+        "AND source NOT IN ('timeline', 'closing_ref')",
         (repo, nid),
     )
     conn.execute(
@@ -75,13 +90,13 @@ def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None
 
 
 def insert_edge(conn: sqlite3.Connection, repo: str, edge: tuple) -> None:
-    src_type, src_id, rel, dst_type, dst_id, evidence = edge
+    src_type, src_id, rel, dst_type, dst_id, evidence, source = edge
     conn.execute(
-        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id, confidence, evidence) "
-        "VALUES (?, ?, ?, ?, ?, ?, 'EXTRACTED', ?) "
-        "ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id) DO UPDATE SET "
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, 'EXTRACTED', ?, ?) "
+        "ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id, source) DO UPDATE SET "
         "evidence = excluded.evidence, confidence = 'EXTRACTED'",
-        (repo, src_type, src_id, rel, dst_type, dst_id, evidence),
+        (repo, src_type, src_id, rel, dst_type, dst_id, evidence, source),
     )
 
 
@@ -290,8 +305,23 @@ def rebuild_edges(
     review_comments: list[dict],
     reviews: list[dict],
     files: list[dict],
+    timeline: list[dict] | None = None,
 ) -> None:
     delete_owned_edges(conn, repo, number)
+
+    def merge_commit_lookup(sha: str) -> int | None:
+        row = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND merge_commit = ?", (repo, sha)
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def title_lookup(title: str) -> list[int]:
+        rows = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND title = ? AND number != ?",
+            (repo, title, number),
+        ).fetchall()
+        return [int(r[0]) for r in rows]
+
     collected: list[tuple] = []
     collected.extend(edges_from_item(repo, item_raw))
     for rec in issue_comments:
@@ -301,6 +331,23 @@ def rebuild_edges(
     for rec in reviews:
         collected.extend(edges_from_review(repo, number, rec))
     collected.extend(edges_from_files(number, files))
+    collected.extend(edges_from_timeline(repo, number, timeline or [], merge_commit_lookup))
+    collected.extend(edges_from_pr_state(repo, item_raw, title_lookup))
+    # Symmetric merge-close derivation (issue #6): a PR merged as commit X
+    # closes every issue whose timeline already recorded closed_by_commit X,
+    # whichever item ingests first. Self-excluded like the forward lookup,
+    # evidence copied so both orders upsert the identical 7-tuple.
+    merge_sha = item_raw.get("merge_commit_sha")
+    if isinstance(merge_sha, str) and merge_sha.strip():
+        nid = str(number)
+        for row in conn.execute(
+            "SELECT src_id, evidence FROM edges WHERE repo = ? AND rel = 'closed_by_commit' "
+            "AND dst_type = 'commit' AND dst_id = ? AND src_id != ?",
+            (repo, merge_sha.strip(), nid),
+        ).fetchall():
+            collected.append(
+                ("item", nid, "closes", "item", str(row["src_id"]), row["evidence"], "timeline")
+            )
     for edge in collapse_edges(collected):
         insert_edge(conn, repo, edge)
 
@@ -457,12 +504,17 @@ def ingest_item(
     reviews: list[dict],
     files: list[dict],
     include_patches: bool,
+    timeline: list[dict] | None = None,
 ) -> None:
     """One item, caller owns the transaction.
 
     Identity and watermark come from the *issues list* payload. GET /pulls/{n}
     uses a different `id` and may have a different `updated_at`; those must
     not overwrite the list row (since filter is on issue updated_at).
+    `timeline` carries the item's GraphQL timeline events (closed /
+    cross-referenced); None means the source could not provide them, which
+    leaves previously stored timeline edges untouched via the delete-owned
+    exemption.
     """
     merged = dict(list_raw)
     if pull_raw:
@@ -506,6 +558,7 @@ def ingest_item(
         review_comments,
         reviews,
         files,
+        timeline=timeline,
     )
     bump_watermark(conn, repo, list_raw.get("updated_at"))
     recount(conn, repo)

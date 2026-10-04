@@ -1,4 +1,4 @@
--- zaxbygraph schema v4 (`PRAGMA user_version` = 4; see db.py MIGRATIONS)
+-- zaxbygraph schema v5 (`PRAGMA user_version` = 5; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -129,7 +129,8 @@ CREATE TABLE IF NOT EXISTS edges (
     dst_id     TEXT NOT NULL,
     confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED')),
     evidence   TEXT,
-    UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id)
+    source     TEXT NOT NULL,
+    UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source)
 );
 
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo, src_type, src_id);

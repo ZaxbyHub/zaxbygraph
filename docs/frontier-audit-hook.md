@@ -19,8 +19,10 @@ The full program lives in [`skills/frontier-audit-enhance/`](../skills/frontier-
 5. Independent reviewers re-read cited files only.
 
 Do not page `gh api --paginate` of issues/PRs/comments into the lead after a
-successful sync. `closes` in this DB is keyword-in-body/comments, not GitHub’s
-connected-issue graph — say so if a candidate depends on auto-close.
+successful sync. `closes` in this DB is GitHub's own report (timeline closed
+events, which cover commit-message auto-close, plus PR closing references);
+`closes_keyword` is the keyword-in-body variant. Check `edges.source` for
+provenance before a candidate leans on either.
 
 If `zaxbygraph` is not installed, the skill falls back to `gh` pagination and
 names the gap in `identity-packet.md`.

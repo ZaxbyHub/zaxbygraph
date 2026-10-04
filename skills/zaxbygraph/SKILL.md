@@ -109,14 +109,15 @@ columns plus
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row objects.
 
 Common fields: items carry `number kind title state author updated_at html_url`;
-edges carry `src_type src_id rel dst_type dst_id confidence evidence`. `search`
+edges carry `src_type src_id rel dst_type dst_id confidence evidence source`. `search`
 marks hits in `snippet` with `«` `»` (stemmed, bm25-ranked; a zero-hit result
 carries `total_matches: 0` and `corpus_items: <n>`, so "no prior art" is
 distinguishable from an empty corpus). `path` is `null` when no route exists —
 with exit code 0, because "not connected" is an answer.
 
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
-per-column notes (TEXT-typed `edges.src_id`/`dst_id`; `pr_files.patch` is NULL
+per-column notes (TEXT-typed `edges.src_id`/`dst_id`; `edges.source` names the
+provenance stream; `pr_files.patch` is NULL
 unless the sync used `--include-patches`). Do not follow a file path to
 `docs/schema.md` from an installed copy of this skill — the command always
 answers from the database you are querying.
@@ -158,19 +159,32 @@ query is safe to run.
 
 ## Interpreting `closes` correctly
 
-`closes` edges come from **closing keywords in bodies and comments** — `close`,
-`closes`, `closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved` —
-followed by `#N` or a same-repo URL.
+There are two closing relations. `closes_keyword` edges come from **closing
+keywords in bodies and comments** — `close`, `closes`, `closed`, `fix`,
+`fixes`, `fixed`, `resolve`, `resolves`, `resolved` — followed by `#N` or a
+same-repo URL. A missing `closes_keyword` edge means *no keyword said so*,
+not that the two items are unrelated.
 
-This is **not** GitHub's connected-issue graph. Merge-commit auto-close, links
-made in the GitHub UI, and timeline-only links are absent in v0.1. So:
+`closes` edges are what **GitHub reported**: `closed` timeline events
+(merge-commit auto-close lands here, as a closed event with a commit closer)
+and a PR's `closingIssuesReferences`. Keyword regexes never write it. Edges
+mirror the timeline as reported, so multiple closers can coexist after
+reopen/re-close cycles — evidence timestamps order them, and `items.state`
+is authoritative for current open/closed. `cross_referenced` is stored as
+carried: GitHub reports every reference on both items' timelines, so the
+same linkage can appear in either direction.
 
-> A missing `closes` edge means *no keyword said so*. It does not mean the two
-> items are unrelated.
+> A missing edge means "GitHub never reported it" (`closes`) or "no keyword
+> said so" (`closes_keyword`). Neither means the two items are unrelated.
 
-If a conclusion depends on auto-close or UI-linked issues, say that the data
-cannot confirm it rather than treating absence as evidence. Cross-repo
-references are dropped entirely, never attached to a same-numbered local item.
+Two boundaries: timeline and closing-reference data rides the GraphQL page
+query only — a REST-only sync (`--source rest`) captures none of it (keyword
+edges still derive from bodies) — and a GraphQL-degraded re-ingest never
+retracts a timeline- or closing-ref-backed edge once written. Check
+`edges.source` to see which provenance stream produced a row. Cross-repo
+keyword references are dropped entirely, never attached to a same-numbered
+local item; timeline cross-references from other repos are kept as
+repo-qualified ids (`owner/repo#N`).
 
 ## Collectors
 

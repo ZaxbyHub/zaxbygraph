@@ -187,7 +187,7 @@ zaxbygraph sql "SELECT ..." --format json
 
 One `sync` per run unless `status` shows `last_error` (resume) or you suspect review-only updates that did not bump `updated_at` (`--force`). Dump truncated JSON into packets. Forbidden after a successful sync: `gh api --paginate` of issues, pulls, comments, or reviews into the lead.
 
-`closes` in this DB is a closing keyword in bodies/comments, not GitHub’s connected-issue / auto-close graph. Commit-message auto-close is absent in v0.1. If a candidate depends on auto-close, label it `UNVERIFIED HYPOTHESIS` or fetch that single item — do not re-page the corpus.
+Two closing relations in this DB: `closes` is GitHub's own report (timeline closed events — commit-message auto-close is covered there — plus PR closing references), and `closes_keyword` is a closing keyword in bodies/comments. Provenance rides `edges.source`. If a candidate depends on a link neither relation shows, label it `UNVERIFIED HYPOTHESIS` or fetch that single item — do not re-page the corpus.
 
 If `zaxbygraph` is missing but `gh` or a GitHub API tool works: name the gap, then paginate until exhausted. Enumerate every issue and every pull request, open and closed, with title, labels, state, dates, author, linked items, closing commit.
 

@@ -5,13 +5,13 @@ from importlib.resources import files
 from pathlib import Path
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 4
+CURRENT_USER_VERSION = 5
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -297,9 +297,7 @@ def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         "id DESC",
     )
     _fold_dedupe_table(
-        conn, "edges",
-        "ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id) DO NOTHING",
-        "id DESC",
+        conn, "edges", _edges_conflict_clause(conn), "id DESC"
     )
     conn.execute("UPDATE reviews SET repo = lower(repo)")
     conn.execute("UPDATE fetch_log SET repo = lower(repo)")
@@ -431,12 +429,93 @@ def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sync_state ADD COLUMN rate_limit_reset_at TEXT")
 
 
+def _edges_conflict_clause(conn: sqlite3.Connection) -> str:
+    """The ON CONFLICT target for the edges table AS IT EXISTS RIGHT NOW.
+
+    Fresh databases run the whole migration chain on the CURRENT shape, so by
+    the time migrate_v1_to_v2's fold runs, edges may already carry `source`
+    inside its unique key (v5) or not (a genuine legacy v1 table). SQLite
+    validates a conflict target against the table's unique indexes at prepare
+    time — a hardcoded literal cannot serve both shapes (issue #6)."""
+    if _column_exists(conn, "edges", "source"):
+        return "ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id, source) DO NOTHING"
+    return "ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id) DO NOTHING"
+
+
+def _edges_unique_key_has_source(conn: sqlite3.Connection) -> bool:
+    for index in conn.execute("PRAGMA index_list(edges)").fetchall():
+        if not index["unique"]:
+            continue
+        columns = [
+            row[2]
+            for row in conn.execute(f"PRAGMA index_info({index['name']})").fetchall()
+        ]
+        if "source" in columns:
+            return True
+    return False
+
+
+def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+    """v4 -> v5: `edges.source` provenance + the closes_keyword rename
+    (issue #6).
+
+    Rebuilds the edges table: `source TEXT NOT NULL` appended after evidence,
+    the unique key widened to include it (the same pair reported by two
+    provenance streams is two facts), keyword `closes` rows renamed to
+    `closes_keyword`, and a mechanism-honest backfill — text-derived rows
+    (closes, mentions) get source='keyword', structured-payload rows
+    (authored, has_label, commented, reviewed, touches) get source='payload'.
+    Row count and ids are preserved; the three indexes are recreated.
+    Idempotent: no-op when the table already carries `source` inside its
+    unique key, because fresh databases run the whole migration chain on the
+    current shape."""
+    if _column_exists(conn, "edges", "source") and _edges_unique_key_has_source(conn):
+        return
+    conn.execute("DROP INDEX IF EXISTS idx_edges_src")
+    conn.execute("DROP INDEX IF EXISTS idx_edges_dst")
+    conn.execute("DROP INDEX IF EXISTS idx_edges_rel")
+    conn.execute("ALTER TABLE edges RENAME TO edges_v4")
+    conn.execute(
+        """
+        CREATE TABLE edges (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo       TEXT NOT NULL,
+            src_type   TEXT NOT NULL,
+            src_id     TEXT NOT NULL,
+            rel        TEXT NOT NULL,
+            dst_type   TEXT NOT NULL,
+            dst_id     TEXT NOT NULL,
+            confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED')),
+            evidence   TEXT,
+            source     TEXT NOT NULL,
+            UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO edges (id, repo, src_type, src_id, rel, dst_type, dst_id,
+                           confidence, evidence, source)
+        SELECT id, repo, src_type, src_id,
+               CASE WHEN rel = 'closes' THEN 'closes_keyword' ELSE rel END,
+               dst_type, dst_id, confidence, evidence,
+               CASE WHEN rel IN ('closes', 'mentions') THEN 'keyword' ELSE 'payload' END
+        FROM edges_v4
+        """
+    )
+    conn.execute("DROP TABLE edges_v4")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo, src_type, src_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(repo, dst_type, dst_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel)")
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
     (2, migrate_v1_to_v2),
     (3, migrate_v2_to_v3),
     (4, migrate_v3_to_v4),
+    (5, migrate_v4_to_v5),
 ]
 
 
