@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 from fixtures import scrubbed_env
-from zaxbygraph.github import GitHubError, GhApiSource
+from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -100,6 +100,22 @@ class GhDecodeTests(unittest.TestCase):
                 % proc.stdout.decode("utf-8").split(":", 1)[1].strip()
             )
         self.assertIn(b"ROUNDTRIP_OK", proc.stdout)
+
+
+class StatusClassifierTests(unittest.TestCase):
+    """The stderr classifier must classify 410 Gone so the sync layer's
+    deletion marking (status in (404, 410)) is reachable from the real
+    transport, not only from hand-built errors."""
+
+    def test_410_gone_is_classified(self) -> None:
+        self.assertEqual(_status_from_stderr("gh: HTTP 410 Gone (api.github.com)"), 410)
+        self.assertEqual(_status_from_stderr("gh: This item is gone"), 410)
+
+    def test_older_classifications_unchanged(self) -> None:
+        self.assertEqual(_status_from_stderr("gh: HTTP 404 Not Found"), 404)
+        self.assertEqual(_status_from_stderr("gh: HTTP 403 Forbidden"), 403)
+        self.assertEqual(_status_from_stderr("API rate limit exceeded"), 429)
+        self.assertEqual(_status_from_stderr("HTTP 502 Bad Gateway"), None)
 
 
 class StreamingListingTests(unittest.TestCase):

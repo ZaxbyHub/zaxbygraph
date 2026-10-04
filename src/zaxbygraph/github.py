@@ -29,6 +29,8 @@ def _status_from_stderr(stderr: str) -> int | None:
         return 403
     if "404" in text or "not found" in text:
         return 404
+    if "410" in text or "gone" in text:
+        return 410
     if "401" in text or "unauthorized" in text:
         return 401
     return None

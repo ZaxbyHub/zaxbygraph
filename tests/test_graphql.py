@@ -108,8 +108,6 @@ def _graphql_payload(chunk_index: int) -> dict:
         n = i + 1
         alias = "p" if n > 25 else "i"
         node = _pull_node(n) if n > 25 else _issue_node(n)
-        if n == 7:
-            node = _issue_node(n, ) if False else node  # keep chunk shape stable
         repository[f"{alias}{n}"] = node
     return {
         "data": {
