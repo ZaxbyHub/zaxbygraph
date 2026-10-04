@@ -10,10 +10,10 @@ from unittest.mock import MagicMock, patch
 from fixtures import (
     REPO,
     TempDBTest,
-    add_page_prs,
     issue,
     ts,
 )
+from fixtures_bulk import PageShapedBulkSource, add_page_prs
 from zaxbygraph.sync import SyncError, sync_repo
 from fixtures import (
     RateLimitedError,
@@ -43,9 +43,6 @@ class BulkWiringTests(TempDBTest):
         """The real GraphQLSource shape: PAGES of plain items plus a
         fetch_children bulk call. The whole provided-map branch of
         _resolve_children must run with zero per-item REST fallbacks."""
-        self.src = None  # replaced below; TempDBTest's default is unused
-        from fixtures import PageShapedBulkSource
-
         src = PageShapedBulkSource()
         add_page_prs(src, 50)
         result = sync_repo(self.conn, src, REPO)

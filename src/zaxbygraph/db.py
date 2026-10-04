@@ -419,9 +419,10 @@ def migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
 def migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
     """v3 -> v4: `sync_state` rate-limit columns (issue #5).
 
-    `rate_limit_remaining` is `0` when the last clean run slept through an
-    exhausted rate-limit window (the budget was at the floor) and NULL
-    otherwise; `rate_limit_reset_at` carries that window's reset instant.
+    `rate_limit_remaining` is `0` when the last clean run observed its
+    budget at the floor (it slept a window through, or proceeded with the
+    floor already reached) and NULL otherwise; `rate_limit_reset_at` carries
+    the reset instant of the window or observation.
     Two guarded ALTERs, idempotent on any shape.
     """
     if not _column_exists(conn, "sync_state", "rate_limit_remaining"):

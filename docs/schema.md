@@ -228,7 +228,7 @@ One row per repo. What `zaxbygraph status` reads.
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
 | `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
-| `rate_limit_remaining` | INTEGER | `0` when the last clean run slept through an exhausted rate-limit window (the budget was at the floor); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
+| `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
 
 ### Schema versions and migrations

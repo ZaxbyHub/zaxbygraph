@@ -152,9 +152,9 @@ zaxbygraph sync --repo OWNER/REPO [--force] [--include-patches] [--source graphq
 | `--jsonl [DIR]` | Also append one JSON object per fetched resource to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). A resumed sync may duplicate lines, so consumers should key on `(resource, payload.id)`. |
 
 Sync is sequential and resumable. With the default `graphql` source, cost is
-roughly one listing call per 100 items plus one bulk-children call per up to
-40 items — three to four calls per 100-item page (issue-heavy pages three,
-PR-heavy pages four) (instead of the old
+roughly one listing call per 100 items plus one bulk-children query per up
+to 40 items — three to four children queries per 100-item page (four to
+five `gh` invocations total once the listing call is counted) (instead of the old
 `≈ 1 + items + 5×prs` per-item fan-out, which `--source rest` still uses). Pages are committed as they arrive: if the listing fails
 partway — 502, network, anything — every page already delivered is ingested
 with its watermark, and `last_error` is recorded, so re-running `sync`
