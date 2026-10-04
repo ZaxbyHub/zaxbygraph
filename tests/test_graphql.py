@@ -390,6 +390,42 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
             with self.assertRaises(GitHubError):
                 src.fetch_children(_listing_items(1))
 
+    def test_mixed_not_found_and_rate_limited_raises_429(self) -> None:
+        """PR-13 review pin: a payload mixing a per-alias NOT_FOUND with a
+        RATE_LIMITED error must surface the rate-limit error (status 429) so
+        sync's bounded sleep-retry sees it, instead of failing fast on the
+        NOT_FOUND's None status."""
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        payload["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 1."},
+            {"type": "RATE_LIMITED", "message": "API rate limit exceeded"},
+        ]
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        self.assertEqual(ctx.exception.status, 429)
+
+    def test_not_found_on_requested_alias_omits_it_sibling_survives(self) -> None:
+        """The degrade path with the error on a REQUESTED alias: the nulled
+        item is omitted (per-item REST fallback) while its sibling survives."""
+        host = _FakeGraphQLHost()
+        payload = _graphql_payload(0)
+        payload["data"]["repository"]["i1"] = None  # requested alias nulled
+        payload["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 1."}
+        ]
+        host.write_graphql_responses([payload])
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(2))
+        self.assertNotIn(1, children)
+        self.assertIn(2, children)
+
     def test_reviews_over_first_page_flags_review_comments_incomplete(self) -> None:
         host = _FakeGraphQLHost()
         payload = _graphql_payload(0)

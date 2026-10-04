@@ -106,6 +106,13 @@ class MarkOnFetchFailureTests(TempDBTest):
             ),
             1,
         )
+        # The mark branch must advance the watermark past the marked item
+        # (Cubic P1 conf-9: otherwise every later run re-lists it until its
+        # updated_at ages out of the since window).
+        since = self.conn.execute(
+            "SELECT issues_since FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()[0]
+        self.assertEqual(since, ts(10))
         trail = self.count(
             "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND resource = 'item' "
             "AND resource_id = '1' AND lower(note) LIKE '%deleted%'",
