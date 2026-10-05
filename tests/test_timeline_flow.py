@@ -152,6 +152,39 @@ class TimelineMappingTests(unittest.TestCase):
         )
         self.assertIn("timelineItems", _PULL_FIELDS)
 
+    def test_timeline_selection_is_brace_balanced(self) -> None:
+        """Live-sync regression (PR #14 review comment): the _timeline_selection
+        template shipped with one extra closing brace, so every continuation
+        query failed GitHub's parser with RCURLY while the mocked tests —
+        which parse with the same template — stayed green. A static balance
+        check catches this offline; canned fakes never can."""
+        from zaxbygraph.graphql import _q, _timeline_selection
+
+        source = GraphQLSource(*SRC)
+        for args in (
+            "first: 50",
+            f"first: {_TIMELINE_CONTINUATION_PAGE} after: {_q('c1')}",
+            f"last: {_TIMELINE_PAGE_MAX}",
+            f"last: {_TIMELINE_PAGE_MAX} before: {_q('s1')}",
+        ):
+            selection = _timeline_selection(args)
+            balance = selection.count("{") - selection.count("}")
+            self.assertEqual(
+                balance,
+                0,
+                f"brace-unbalanced timeline selection for args {args!r}",
+            )
+            full_query = (
+                "query { rateLimit { remaining resetAt } "
+                f"repository(owner: {_q(source.owner)}, name: {_q(source.repo)}) {{ "
+                f"i1: issue(number: 1) {{ {_timeline_selection(args)} }} }} }}"
+            )
+            self.assertEqual(
+                full_query.count("{") - full_query.count("}"),
+                0,
+                "the full rendered query must be brace-balanced",
+            )
+
 
 class FakeTimelineApi:
     """Scripted _graphql replacement recording every query and answering

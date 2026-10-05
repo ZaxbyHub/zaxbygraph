@@ -285,7 +285,7 @@ def _timeline_selection(args: str) -> str:
         " ... on CrossReferencedEvent { createdAt actor { login } isCrossRepository"
         " willCloseTarget source { __typename"
         " ... on Issue { number repository { nameWithOwner } }"
-        " ... on PullRequest { number repository { nameWithOwner } } } } } } }"
+        " ... on PullRequest { number repository { nameWithOwner } } } } } }"
     ) % args
 
 
