@@ -67,6 +67,14 @@ _LATEST_PROTOCOL_VERSION = _PROTOCOL_VERSIONS[0]
 
 #: Staleness threshold default: the issue's proposed 15 minutes.
 _DEFAULT_STALE_AFTER_S = 900
+
+#: Ceilings for client-controlled work on the serialized server: a single
+#: tool call must never scale its fetch or expansion with an unbounded
+#: argument (review round-2, finding F1/PRR-001).
+_MAX_PAGE = 500
+_MAX_CURSOR = 10000
+_MAX_DEPTH = 5
+_MAX_NUMBERS = 64
 _STALE_ENV = "ZAXBYGRAPH_MCP_STALE_SECONDS"
 
 _SCHEMA_RESOURCE_URI = "zaxbygraph://schema"
@@ -152,7 +160,7 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
             if job["db_path"] == key and job["state"] == "running":
                 return job_id, False
         finished = [k for k, v in _JOBS.items() if v["state"] != "running"]
-        while len(finished) > 50:  # bound the ledger in a long-lived server
+        while len(finished) >= 50:  # settled ledger bound: 50 finished entries
             _JOBS.pop(finished.pop(0), None)
         job_id = f"sync-{next(_JOB_SEQ)}"
         _JOBS[job_id] = {
@@ -164,16 +172,18 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
         }
     try:
         lock = acquire_sync_lock(db_path)
-    except OSError as exc:
+    except Exception as exc:
+        # Any failure here (not just OSError) must roll the entry back,
+        # or every later read joins a phantom forever (review F9).
         with _JOBS_LOCK:
-            _JOBS[job_id]["state"] = "failed"
-            _JOBS[job_id]["error"] = str(exc)
+            _JOBS.pop(job_id, None)
         raise
     if lock is None:
-        # Another process owns the run lock: our caller joins it.
-        with _JOBS_LOCK:
-            _JOBS[job_id]["state"] = "joined"
-        return job_id, False
+        # Another process owns the run lock: our caller joins it. The
+        # external sync is already visible through read_lock_observer,
+        # so no registry entry is inserted (a terminal 'joined' row
+        # would otherwise sit in graph_status forever).
+        return "external", False
 
     def _body() -> None:
         try:
@@ -189,7 +199,15 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
             # Registry state first, then the lock (plan-pinned order).
             lock.release_owned()
 
-    threading.Thread(target=_body, name=f"zaxbygraph-{job_id}", daemon=True).start()
+    try:
+        threading.Thread(target=_body, name=f"zaxbygraph-{job_id}", daemon=True).start()
+    except BaseException as exc:
+        # Roll everything back: the lock is ours, the registry entry is
+        # ours, and no thread exists to release either (review F9).
+        with _JOBS_LOCK:
+            _JOBS.pop(job_id, None)
+        lock.release_owned()
+        raise
     return job_id, True
 
 
@@ -255,7 +273,7 @@ def _roots_slugs(ctx) -> list[tuple[str, str]]:
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
             _error(ctx.stdout, None, _JSONRPC_PARSE_ERROR, "Parse error (line is not JSON)")
             continue
         if not isinstance(msg, dict):
@@ -285,16 +303,20 @@ def _roots_slugs(ctx) -> list[tuple[str, str]]:
 def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
     """(slug, db_path) for a tool call; raises ToolError on failure.
 
-    Resolution order: explicit repo argument > MCP roots > the server
-    cwd's git origin — then the same store-first resolve_db chain the CLI
-    uses, so a linked worktree and its main checkout resolve one DB and
-    nothing is ever created."""
+    Resolution order: explicit repo argument > the server --repo pin >
+    MCP roots > the server cwd's git origin — then the same store-first
+    resolve_db chain the CLI uses, so a linked worktree and its main
+    checkout resolve one DB and reads never create. The database itself
+    is operator-pinned (--db / ZAXBYGRAPH_DB); tool calls cannot choose
+    it."""
     repo_arg = arguments.get("repo")
     if repo_arg is None:
         repo_arg = ctx.default_repo
-    db_arg = arguments.get("db")
-    if db_arg is None:
-        db_arg = ctx.default_db
+    # The per-call `db` tool argument was removed (review round 2): a
+    # model-reachable path is a filesystem oracle and, via the sync tool,
+    # an arbitrary directory-creation primitive. The database is pinned
+    # by the OPERATOR (server --db / ZAXBYGRAPH_DB), never by a call.
+    db_arg = ctx.default_db
     if repo_arg is not None:
         try:
             slug = validate_slug(str(repo_arg))
@@ -456,12 +478,30 @@ def _int_arg(arguments: dict, key: str, default: int) -> int:
     return value
 
 
+def _bool_arg(arguments: dict, key: str) -> bool:
+    """A strict optional boolean argument: absent/None is False, a real
+    bool passes, anything else is a structured bad_request (the string
+    "false" must never silently mean True)."""
+    value = arguments.get(key)
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise ToolError(
+        "bad_request",
+        f"{key} must be a boolean",
+        hint=f"pass {key} as true or false",
+    )
+
+
 def _int_cursor(raw) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return 0
-    return value if value > 0 else 0
+    if value <= 0:
+        return 0
+    return min(value, _MAX_CURSOR)
 
 
 # ---------------------------------------------------------------------------
@@ -490,15 +530,20 @@ def _tool_search(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(_int_arg(arguments, "limit", 20))
+        limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
         offset = _int_cursor(arguments.get("cursor"))
         result = search(conn, query, limit=limit + offset, repo=slug)
         items = result.get("items") or []
         result["items"] = items[offset : offset + limit]
         total = result.get("total_matches")
         # Truncation is judged against the source's own match count, not
-        # the capped fetch (the fetch can never exceed offset+limit).
+        # the capped fetch — AND a full page always offers a cursor: the
+        # AND-to-OR fallback can reveal more matches at a wider window,
+        # so "page length == limit" alone must not read as "the end"
+        # (review F10).
         truncated = isinstance(total, int) and offset + len(result["items"]) < total
+        if len(result["items"]) == limit:
+            truncated = True
         if truncated:
             result["next_cursor"] = str(offset + len(result["items"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
@@ -522,7 +567,9 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
                 slug=slug,
                 db_path=db_path,
             )
-        truncated = _truncate_bodies(data, arguments.get("max_body_chars"))
+        truncated = _truncate_bodies(
+            data, _int_arg(arguments, "max_body_chars", None)
+        )
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
     finally:
         conn.close()
@@ -532,9 +579,17 @@ def _tool_related(arguments: dict, ctx) -> dict:
     number = arguments.get("number")
     if not isinstance(number, int) or isinstance(number, bool):
         raise ToolError("bad_request", "related needs an integer number", hint='try related {"number": 12}')
-    depth = arguments.get("depth", 1)
-    if not isinstance(depth, int) or isinstance(depth, bool) or depth < 1:
-        depth = 1
+    depth = _int_arg(arguments, "depth", 1)
+    if depth < 1:
+        raise ToolError(
+            "bad_request", "depth must be at least 1", hint='try related {"number": 12, "depth": 2}'
+        )
+    if depth > _MAX_DEPTH:
+        raise ToolError(
+            "bad_request",
+            f"depth is capped at {_MAX_DEPTH}",
+            hint="each hop is a full graph expansion on a serialized server",
+        )
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -568,6 +623,18 @@ def _tool_pr_overlap(arguments: dict, ctx) -> dict:
             "pr_overlap needs numbers as a list of integers",
             hint='try pr_overlap {"numbers": [10, 11]}',
         )
+    if len(numbers) < 2:
+        raise ToolError(
+            "bad_request",
+            "pr_overlap needs at least two numbers to form a pair",
+            hint='try pr_overlap {"numbers": [10, 11]}',
+        )
+    if len(numbers) > _MAX_NUMBERS:
+        raise ToolError(
+            "bad_request",
+            f"pr_overlap accepts at most {_MAX_NUMBERS} numbers",
+            hint="the pair count grows quadratically; split the request",
+        )
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -586,14 +653,15 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(_int_arg(arguments, "limit", 30))
+        limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
         offset = _int_cursor(arguments.get("cursor"))
         result = file_history(conn, path, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
         result["entries"] = entries[offset : offset + limit]
         # file_history over-fetches limit+1 at the window size, so its own
-        # truncated flag is the post-offset more-exist evidence.
-        truncated = bool(result.get("truncated"))
+        # truncated flag is the post-offset more-exist evidence. Promote
+        # (and remove) it for shape parity with the file-history command.
+        truncated = bool(result.pop("truncated", False))
         if truncated:
             result["next_cursor"] = str(offset + len(result["entries"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
@@ -620,13 +688,15 @@ def _tool_open_items(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(_int_arg(arguments, "limit", 50))
+        limit = min(_clamp_limit(_int_arg(arguments, "limit", 50)), _MAX_PAGE)
         offset = _int_cursor(arguments.get("cursor"))
-        rows = open_items(conn, repo=slug)
-        page, truncated, next_cursor = _page(rows, offset, limit)
+        # SQL-level paging: the fetch is bounded where the cost is (F1).
+        rows = open_items(conn, repo=slug, limit=limit + 1, offset=offset)
+        truncated = len(rows) > limit
+        page = rows[:limit]
         data: dict = {"items": page}
         if truncated:
-            data["next_cursor"] = next_cursor
+            data["next_cursor"] = str(offset + len(page))
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
     finally:
         conn.close()
@@ -662,7 +732,7 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         ) from None
     finally:
         conn.close()
-    limit = _clamp_limit(_int_arg(arguments, "limit", 200))
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 200)), _MAX_PAGE)
     try:
         data = run_sql(guarded, statement, limit=limit, repo=slug)
     except ValueError as exc:
@@ -703,8 +773,8 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     # a sync would create (cmd_sync's connect() does the same mkdir).
     db_path.parent.mkdir(parents=True, exist_ok=True)
     runner = ctx.sync_runner
-    force = bool(arguments.get("force"))
-    include_patches = bool(arguments.get("include_patches"))
+    force = _bool_arg(arguments, "force")
+    include_patches = _bool_arg(arguments, "include_patches")
     if runner is _default_sync_runner and (force or include_patches):
         # Advertised arguments must actually reach sync_repo; the injected
         # test seam keeps its pinned (db_path, repo) signature.
@@ -736,10 +806,17 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
 
 
 _REPO_DB = {
-    "repo": {"type": "string", "description": "OWNER/REPO slug (default: MCP roots, then the server cwd git origin)"},
-    "db": {"type": "string", "description": "Explicit database path override"},
+    "repo": {
+        "type": "string",
+        "description": "OWNER/REPO slug (default: the server --repo pin, then MCP roots, then the server cwd git origin)",
+    },
 }
-_LIMIT = {"type": "integer", "minimum": 1, "description": "Maximum rows to return"}
+_LIMIT = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": _MAX_PAGE,
+    "description": f"Maximum rows to return (capped at {_MAX_PAGE})",
+}
 _CURSOR = {"type": "string", "description": "Opaque cursor from a previous truncated page"}
 
 _TOOLS: list[dict] = [
@@ -768,7 +845,14 @@ _TOOLS: list[dict] = [
     {
         "name": "related",
         "description": "One-hop (or deeper) neighborhood of an item in the graph",
-        "inputSchema": _schema({"number": {"type": "integer"}, "depth": {"type": "integer", "minimum": 1}, **_REPO_DB}, ["number"]),
+        "inputSchema": _schema(
+            {
+                "number": {"type": "integer"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": _MAX_DEPTH},
+                **_REPO_DB,
+            },
+            ["number"],
+        ),
     },
     {
         "name": "path",
@@ -778,7 +862,18 @@ _TOOLS: list[dict] = [
     {
         "name": "pr_overlap",
         "description": "Shared file paths for each pair of the given PR numbers ([] for disjoint pairs) — the collision check before stacking PRs",
-        "inputSchema": _schema({"numbers": {"type": "array", "items": {"type": "integer"}}, **_REPO_DB}, ["numbers"]),
+        "inputSchema": _schema(
+            {
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": _MAX_NUMBERS,
+                },
+                **_REPO_DB,
+            },
+            ["numbers"],
+        ),
     },
     {
         "name": "file_history",
@@ -787,7 +882,7 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "what_closed",
-        "description": "Closing PRs and commits for an issue, each entry carrying its edge source provenance",
+        "description": "Closing PRs and commits for an issue (reports the item kind; a PR has no closers), each entry carrying its edge source provenance",
         "inputSchema": _schema({"number": {"type": "integer"}, **_REPO_DB}, ["number"]),
     },
     {
@@ -929,7 +1024,9 @@ def serve(
             continue
         try:
             msg = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError is not a ValueError subclass: a deeply
+            # nested frame must never kill the session (review F3).
             _error(stdout, None, _JSONRPC_PARSE_ERROR, "Parse error (line is not JSON)")
             continue
         if not isinstance(msg, dict):
@@ -970,7 +1067,22 @@ def _process(msg: dict, ctx: "_Context") -> None:
             _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, message)
     except Exception as exc:  # never let one fault kill the session
         _log(traceback.format_exc())
-        if has_id:
+        if method == "tools/call":
+            # A tool fault is a tool answer: the envelope error contract
+            # holds even when the handler did not raise ToolError
+            # (sqlite faults, unexpected TypeErrors — review F4).
+            env = _error_envelope(
+                "runtime", str(exc), "internal error; the server log has details"
+            )
+            _result(
+                stdout,
+                req_id,
+                {
+                    "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
+                    "isError": True,
+                },
+            )
+        elif has_id:
             _error(stdout, req_id, _JSONRPC_INTERNAL_ERROR, f"Internal error: {exc}")
 
 

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -66,10 +67,17 @@ class McpCursorTests(TempDBTest):
         _result, env = tool_envelope(self, response, "FB1")
         items2 = env["data"]["items"]
         self.assertEqual(len(items2), 5, "FB1: page 2 carries the remainder")
-        self.assertNotEqual(
-            {i["number"] for i in items},
-            {i["number"] for i in items2},
-            "FB1: page 2 must not repeat page 1",
+        page1 = {i["number"] for i in items}
+        page2 = {i["number"] for i in items2}
+        self.assertEqual(
+            page1 & page2,
+            set(),
+            "FB1: page 2 must be disjoint from page 1 (a repeating cursor passes a mere not-equal check)",
+        )
+        self.assertEqual(
+            len(page1 | page2),
+            25,
+            "FB1: the two pages must cover exactly the 25 seeded items",
         )
         self.assertIsNone(env["data"].get("next_cursor"), "FB1: the last page has no cursor")
         session.stop()
@@ -177,6 +185,7 @@ class McpSqlRefreshTests(TempDBTest):
         session = McpSession(
             self, cwd=str(self._td.name), stale_after_s=0, sync_runner=runner
         )
+        self.addCleanup(runner.release.set)  # release before tempdir teardown
         self.addCleanup(session.stop)
         session.initialize()
 
@@ -233,6 +242,11 @@ class McpPipeliningTests(StoreHarness):
         env_b = json.loads(resp_b["result"]["content"][0]["text"])
         self.assertIs(env_a.get("ok"), True, f"FB4: call A ok: {env_a}")
         self.assertIs(env_b.get("ok"), True, f"FB4: call B ok: {env_b}")
+        self.assertEqual(
+            session.unexpected,
+            [],
+            "FB4: every frame must be an answer to exactly one request",
+        )
         session.stop()
 
 
@@ -254,15 +268,13 @@ class McpResolutionPinTests(TempDBTest):
         self.assertEqual(env.get("repo"), REPO, "FB5: repo resolved from the pin")
         session.stop()
 
-    def test_tool_argument_outranks_the_server_pin(self) -> None:
+    def test_tool_db_argument_is_not_honored(self) -> None:
+        """Superseded decision (review round 2, finding F2): the per-call
+        `db` tool argument was removed — a model-reachable path is a
+        filesystem oracle and, via sync, an arbitrary directory-creation
+        primitive. The database is operator-pinned only; a client that
+        sends `db` anyway gets the operator-pinned database."""
         seed_small_db(self.db_path)
-        other = Path(self._td.name) / "other.db"
-        conn = connect(other)
-        init_schema(conn)
-        src = type(self.src)()
-        src.add_issue(issue(9, title="other corpus", body="x"))
-        sync_repo(conn, src, "acme/other")
-        conn.close()
         pin_env_for(self, Path(self._td.name), db=self.db_path)
         session = McpSession(
             self, cwd=str(self._td.name), repo=REPO, db=str(self.db_path)
@@ -270,11 +282,16 @@ class McpResolutionPinTests(TempDBTest):
         self.addCleanup(session.stop)
         session.initialize()
         response = session.call_tool(
-            "graph_status", {"repo": "acme/other", "db": str(other)}
+            "graph_status",
+            {"repo": "acme/other", "db": str(self.db_path)},
         )
         _result, env = tool_envelope(self, response, "FB5")
-        self.assertIs(env.get("ok"), True, f"FB5: the tool argument wins: {env}")
-        self.assertEqual(env.get("repo"), "acme/other", "FB5: per-call repo outranks the pin")
+        self.assertIs(env.get("ok"), False, f"FB5: db must be ignored: {env}")
+        self.assertEqual(
+            Path(str(env.get("db"))),
+            self.db_path,
+            "FB5: resolution must land on the operator-pinned database",
+        )
         session.stop()
 
 
@@ -316,8 +333,9 @@ class McpStdinEncodingTests(unittest.TestCase):
     _SENTINEL = "丁"
 
     def test_stdin_decodes_utf8_frames_under_cp1252_locale(self) -> None:
-        db = _REPO_ROOT / ".zcode" / "fb6-stdin.db"
-        self.addCleanup(lambda: db.unlink(missing_ok=True))
+        self._fb6_td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self._fb6_td.cleanup)
+        db = Path(self._fb6_td.name) / "fb6-stdin.db"
         conn = connect(db)
         try:
             init_schema(conn)
@@ -329,7 +347,10 @@ class McpStdinEncodingTests(unittest.TestCase):
 
         env = scrubbed_env()
         env.pop("PYTHONUTF8", None)
-        env.pop("PYTHONIOENCODING", None)
+        # Pin the hostile regime deterministically: a cp1252 stdin decodes
+        # the U+4E01 sentinel's 0x81 byte as mojibake on every platform,
+        # instead of trusting the ambient ANSI code page (review F15).
+        env["PYTHONIOENCODING"] = "cp1252"
         env["ZAXBYGRAPH_DB"] = str(db)
         statement = f"SELECT '{self._SENTINEL}' AS echo"
         frames = (
@@ -394,6 +415,188 @@ class McpStdinEncodingTests(unittest.TestCase):
             self._SENTINEL,
             "FB6: a non-ASCII sentinel must survive the stdin round trip "
             f"byte-faithfully (locale mojibake would corrupt it); got {echo!r}",
+        )
+
+
+class FeedbackRound2Tests(TempDBTest):
+    """Regression tests for the round-2 review findings (F1/F5/F6/F7/F8/F11/F12/F13)."""
+
+    def seed_tool_corpus(self) -> None:
+        self.src.add_issue(issue(1, title="probe one", body="needle", state="open"))
+        self.src.add_pr(
+            issue(3, title="probe pr", body="adds", kind="pr", state="closed"),
+            pull(3, changed_files=1, merged=True),
+            files=[pr_file("src/probe.py")],
+        )
+        self.sync()
+
+    def test_related_depth_is_strictly_validated_and_capped(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        for bad in (0, -2, "3", True, 4.5):
+            response = session.call_tool("related", {"repo": REPO, "number": 1, "depth": bad})
+            result, env = tool_envelope(self, response, "F11")
+            self.assertIs(
+                result.get("isError"), True, f"F11: depth {bad!r} must be rejected"
+            )
+            self.assertEqual(env.get("error", {}).get("code"), "bad_request")
+        response = session.call_tool(
+            "related", {"repo": REPO, "number": 1, "depth": 999}
+        )
+        result, _env = tool_envelope(self, response, "F11")
+        self.assertIs(
+            result.get("isError"), True, "F11: depth above the cap must be rejected"
+        )
+        session.stop()
+
+    def test_search_limit_and_cursor_are_capped(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        response = session.call_tool(
+            "search", {"repo": REPO, "query": "needle", "cursor": "1000000000"}
+        )
+        _result, env = tool_envelope(self, response, "F1")
+        self.assertIs(env.get("ok"), True, f"F1: a huge cursor must stay bounded: {env}")
+        response = session.call_tool(
+            "search", {"repo": REPO, "query": "needle", "limit": 100000}
+        )
+        _result, env = tool_envelope(self, response, "F1")
+        self.assertLessEqual(
+            len(env["data"]["items"]), 500, "F1: the page must stay under the ceiling"
+        )
+        session.stop()
+
+    def test_pr_overlap_rejects_short_and_oversized_lists(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        for numbers in ([1], []):
+            response = session.call_tool(
+                "pr_overlap", {"repo": REPO, "numbers": numbers}
+            )
+            result, env = tool_envelope(self, response, "F12")
+            self.assertIs(result.get("isError"), True, f"F12: {numbers} must be rejected")
+            self.assertEqual(env.get("error", {}).get("code"), "bad_request")
+        session.stop()
+
+    def test_sync_bool_arguments_are_strict(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name), sync_runner=lambda db, repo: None)
+        self.addCleanup(session.stop)
+        session.initialize()
+        response = session.call_tool(
+            "sync", {"repo": REPO, "force": "false", "include_patches": "yes"}
+        )
+        result, env = tool_envelope(self, response, "F6")
+        self.assertIs(result.get("isError"), True, "F6: string booleans must be rejected")
+        self.assertEqual(env.get("error", {}).get("code"), "bad_request")
+        self.assertEqual(
+            env.get("error", {}).get("hint"), "pass force as true or false"
+        )
+        session.stop()
+
+    def test_get_item_max_body_chars_is_validated(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        response = session.call_tool(
+            "get_item", {"repo": REPO, "number": 1, "max_body_chars": "50"}
+        )
+        result, env = tool_envelope(self, response, "F5")
+        self.assertIs(result.get("isError"), True, "F5: a string max_body_chars must be rejected")
+        self.assertEqual(env.get("error", {}).get("code"), "bad_request")
+        session.stop()
+
+    def test_tool_faults_answer_as_envelope_errors(self) -> None:
+        """F4: an unexpected handler exception still answers the envelope
+        contract (isError tool result), never a bare protocol error."""
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        # A directory in place of the database: open_existing raises
+        # sqlite3.OperationalError, which must reach the client as an
+        # envelope runtime error now that the db argument is gone this
+        # is driven through the environment-resolved path only; simplest
+        # in-contract probe is a repository fault: a number so large the
+        # handler raises is not reachable, so drive the sqlite path via
+        # a corrupted copy of the database.
+        corrupt = Path(self._td.name) / "corrupt.db"
+        corrupt.write_bytes(b"this is not a database" * 64)
+        import os as _os
+
+        _os.environ["ZAXBYGRAPH_DB"] = str(corrupt)
+        self.addCleanup(_os.environ.pop, "ZAXBYGRAPH_DB", None)
+        response = session.call_tool("graph_status", {"repo": REPO})
+        result, env = tool_envelope(self, response, "F4")
+        self.assertIs(result.get("isError"), True, "F4: a corrupt db is a tool error")
+        self.assertIsInstance(env.get("error"), dict, "F4: structured envelope error")
+        session.stop()
+
+    def test_what_closed_reports_kind(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        response = session.call_tool("what_closed", {"repo": REPO, "number": 3})
+        _result, env = tool_envelope(self, response, "F13")
+        self.assertEqual(
+            env["data"].get("kind"), "pr", "F13: a PR number must be recognizable"
+        )
+        session.stop()
+
+
+class ProductQueryRepoRequiredTests(TempDBTest):
+    """F8: the three product queries reject a falsy repo (number-keyed
+    lookups collapse distinct same-numbered items across repos)."""
+
+    def test_repo_is_required(self) -> None:
+        from zaxbygraph.query import file_history, pr_overlap, what_closed
+
+        for call in (
+            lambda: pr_overlap(self.conn, [1, 2], repo=None),
+            lambda: file_history(self.conn, "src/x.py", repo=None),
+            lambda: what_closed(self.conn, 1, repo=None),
+        ):
+            with self.assertRaises(ValueError):
+                call()
+
+    def test_file_history_dedupes_closed_issues(self) -> None:
+        from zaxbygraph.query import file_history
+
+        self.src.add_pr(
+            issue(40, title="dual closer", body="b", kind="pr", state="closed",
+                  updated_at="2026-04-01T00:00:00Z"),
+            pull(40, merged=True),
+            files=[pr_file("src/dual.py")],
+        )
+        self.src.add_issue(issue(7, title="the bug", body="x", state="closed"))
+        self.sync()
+        self.conn.execute(
+            "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+            " confidence, evidence, source) VALUES (?,?,?,?,?,?,?,?,?)",
+            (REPO, "item", "40", "closes", "item", "7", "EXTRACTED",
+             "timeline closed event", "timeline"),
+        )
+        self.conn.commit()
+        result = file_history(self.conn, "src/dual.py", repo=REPO)
+        self.assertEqual(
+            result["entries"][0]["closed_issues"],
+            [7],
+            "F7: two provenance streams for one closer must not emit [7, 7]",
         )
 
 

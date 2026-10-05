@@ -108,6 +108,24 @@ class SurfaceMappingTests(unittest.TestCase):
             + ", ".join(sorted(stale)),
         )
 
+    def test_tool_to_cli_values_are_registered_commands(self) -> None:
+        registered = registered_read_commands()
+        for tool, command in TOOL_TO_CLI.items():
+            self.assertIn(
+                command,
+                registered,
+                f"TOOL_TO_CLI[{tool!r}] names {command!r}, which build_parser does not register",
+            )
+
+    def test_every_advertised_tool_has_a_handler(self) -> None:
+        handlers = set(mcp_server._TOOL_HANDLERS)
+        tools = {tool["name"] for tool in mcp_server._TOOLS}
+        self.assertEqual(
+            tools,
+            handlers,
+            "tools/list and the dispatch table disagree; one of them is a lie",
+        )
+
     def test_mapped_tools_really_exist_in_the_registry(self) -> None:
         tools = {tool["name"] for tool in mcp_server._TOOLS}
         for command, tool in CLI_TO_SURFACE.items():

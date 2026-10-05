@@ -151,7 +151,7 @@ def _run_search_pass(
         params["repo"] = repo
     total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
     page = conn.execute(
-        f"{merged} ORDER BY score ASC, updated_at DESC LIMIT :limit",
+        f"{merged} ORDER BY score ASC, updated_at DESC, hit_key ASC LIMIT :limit",
         {**params, "limit": limit},
     ).fetchall()
     return total, page
@@ -426,7 +426,12 @@ def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) ->
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
+def open_items(
+    conn: sqlite3.Connection,
+    repo: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
     repo = _fold_repo(repo)
     sql = """
         SELECT repo, number, kind, title, author, updated_at, html_url
@@ -436,7 +441,11 @@ def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
     if repo:
         sql += " AND repo = ?"
         params.append(repo)
-    sql += " ORDER BY updated_at DESC"
+    # (updated_at, number) is a total order, so offset pages are stable.
+    sql += " ORDER BY updated_at DESC, number DESC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
@@ -738,7 +747,14 @@ def _require_item(conn: sqlite3.Connection, number: int, repo: str | None) -> No
     """Raise LookupError when `number` is not a stored item (issue #7 AC4).
 
     The callers map this to the not_found error contract rather than
-    answering with an empty result that reads like 'no matches'."""
+    answering with an empty result that reads like 'no matches'. A falsy
+    repo is rejected outright: these queries are number-keyed, and a
+    no-filter scan collapses distinct same-numbered items from different
+    repos into one unlabeled answer."""
+    if not repo:
+        raise ValueError(
+            "a repo is required for this query; pass --repo OWNER/REPO"
+        )
     if repo:
         row = conn.execute(
             "SELECT number FROM items WHERE repo = ? AND number = ?", (repo, number)
@@ -795,6 +811,12 @@ def file_history(
     can set the envelope truncated flag without a COUNT."""
     limit = _clamp_limit(limit)
     repo = _fold_repo(repo)
+    if not repo:
+        # Number/path-keyed like its siblings: a no-filter scan would mix
+        # rows from every repo in the store (review F8).
+        raise ValueError(
+            "a repo is required for this query; pass --repo OWNER/REPO"
+        )
     if repo:
         cur = conn.execute(
             "SELECT i.number, i.title, i.state, i.updated_at, i.html_url "
@@ -838,14 +860,22 @@ def file_history(
                 "state": row["state"],
                 "updated_at": row["updated_at"],
                 "html_url": row["html_url"],
-                "closed_issues": sorted(int(c["dst_id"]) for c in closes),
+                "closed_issues": sorted({int(c["dst_id"]) for c in closes}),
             }
         )
-    return {"entries": entries, "truncated": len(fetched) > limit}
+    return {
+        "entries": entries,
+        "truncated": len(fetched) > limit,
+        "index_stale": not source_available,
+    }
 
 
 def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict:
     """What closed issue `number`: closing PRs and closing commits.
+
+    The response carries the item's own `kind`, so querying a PR (which
+    has no closers by definition) is distinguishable from an issue that
+    nothing closed.
 
     PRs come from `closes` edges whose destination is this item (the source
     endpoint is the closing PR, provenance closing_ref/timeline); commits
@@ -856,6 +886,9 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
     number = int(number)
     repo = _fold_repo(repo)
     _require_item(conn, number, repo)
+    kind = conn.execute(
+        "SELECT kind FROM items WHERE repo = ? AND number = ?", (repo, number)
+    ).fetchone()["kind"]
     source_available = _edges_source_available(conn)
     source_col = ", source" if source_available else ""
     if repo:
@@ -902,6 +935,7 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
         commits.append(entry)
     return {
         "number": number,
+        "kind": kind,
         "prs": prs,
         "commits": commits,
         "index_stale": not source_available,

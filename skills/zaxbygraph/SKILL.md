@@ -66,16 +66,24 @@ registers it.
 - Tools: `graph_status`, `search`, `get_item`, `related`, `path`, `pr_overlap`,
   `file_history`, `what_closed`, `open_items`, `sql`, `sync`. Each tool result's
   text parses to the same JSON envelope the CLI prints; errors arrive as
-  `isError: true` with the `error{code, message, hint}` object.
+  `isError: true` with the `error{code, message, hint}` object. List tools take
+  `limit`/`cursor` and emit `truncated` + `data.next_cursor`; the MCP `sql`
+  tool returns rows as positional arrays (the CLI defaults to objects).
 - Resource `zaxbygraph://schema` carries the DDL + column notes.
-- Repo resolution: explicit `repo` argument, then client roots, then the
-  server cwd's git origin — the same slug-keyed store the CLI resolves, so a
-  worktree and its main checkout share one graph. Pass `repo` explicitly when
-  your roots span more than one checkout.
+- Repo resolution: explicit `repo` argument, then the server's `--repo`/`--db`
+  pin, then client roots, then the server cwd's git origin — the same
+  slug-keyed store the CLI resolves, so a worktree and its main checkout share
+  one graph. Pass `repo` explicitly when your roots span more than one
+  checkout. Note: the server asks the client for roots on every repo-less
+  call; a client that never answers that request stalls that call.
 - Stale reads (default threshold 15 minutes) answer immediately and start one
   background sync; `freshness.refreshing: true` tells you new data is landing.
-  Use `graph_status` for sync progress.
-- The CLI remains the fallback surface (and the only writer: `zaxbygraph sync`).
+  Use `graph_status` for sync progress. Note the `sync` tool's own envelope
+  always carries `freshness.complete: false` (the job is async — freshness is
+  not yet known); that is not the "broken corpus" signal it means on `status`.
+- The CLI remains the fallback surface. Writes: `sync` exists on BOTH surfaces
+  (CLI command and MCP tool), and a stale MCP read also starts a background
+  sync — the MCP surface is not read-only.
 
 ## Which command answers which question
 
@@ -88,6 +96,9 @@ registers it.
 | Which files change most / are riskiest | `churn [--limit 30]` |
 | What's currently open | `open` |
 | Whether two items or files are connected at all | `path A B` |
+| Which PRs collide with a given PR (shared files) | `overlap` |
+| Which PRs touched a file, and what they closed | `file-history` |
+| What closed an issue (PRs + commits, with provenance) | `what-closed` |
 | Anything the above don't shape | `sql "SELECT …"` |
 | Feed a graph viewer or join to a code graph | `export-graph` |
 
@@ -127,7 +138,10 @@ reads never migrate) · `item` → all item
 columns plus
 `labels[] comments[] reviews[] files[] edges[]` · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
-`export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row objects.
+`export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row
+objects · `overlap` → `{pairs: [{a, b, shared}]}` · `file-history` →
+`{entries: [{number, ..., closed_issues}], truncated, index_stale}` ·
+`what-closed` → `{number, kind, prs, commits, index_stale}`
 
 Common fields: items carry `number kind title state author updated_at html_url`;
 edges carry `src_type src_id rel dst_type dst_id confidence evidence source`.

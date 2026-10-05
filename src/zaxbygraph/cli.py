@@ -697,6 +697,17 @@ def _run_read_promote_truncated(
             db_path=db_path,
             code_key="not_found",
         )
+    except ValueError as exc:
+        # The product queries are number-keyed: a no-filter scan would
+        # collapse distinct same-numbered items across repos (review F8).
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_request",
+        )
     finally:
         conn.close()
     emit_result(
@@ -712,6 +723,14 @@ def _run_read_promote_truncated(
 
 
 def cmd_overlap(args: argparse.Namespace) -> int:
+    if len(args.numbers) < 2:
+        return emit_failure(
+            args,
+            2,
+            "overlap needs at least two numbers to form a pair",
+            slug=getattr(args, "repo", None) or None,
+            code_key="bad_request",
+        )
     return _run_read_promote_truncated(args, pr_overlap, args.numbers)
 
 
@@ -728,6 +747,12 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     # dependency only ever points one way at import time.
     from zaxbygraph.mcp_server import serve
 
+    try:
+        # MCP stdio frames are LF-delimited; a Windows pipe would
+        # otherwise translate every frame's \n to \r\n.
+        sys.stdout.reconfigure(newline="")
+    except (ValueError, OSError, AttributeError):
+        pass
     serve(
         sys.stdin,
         sys.stdout,
