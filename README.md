@@ -336,11 +336,14 @@ productized so nobody has to guess the join (issue #7).
 zaxbygraph file-history PATH [--limit N]
 ```
 
-The PRs whose `pr_files` include `path`, newest first (`data.entries`, with
+The PRs whose `pr_files` include `path` (exact match — a directory or a
+typo'd path is a normal empty answer), newest first (`data.entries`, with
 `title`, `state`, `updated_at`, `html_url`), each entry carrying
-`closed_issues`: the numbers of the issues that PR closed (any `closes`
-provenance). The riskiest-file question from `churn`, per path, with the
-"what did it fix" answers attached.
+`closed_issues`: the deduplicated numbers of the issues that PR closed
+(`closes` edges, any `source` provenance). On a pre-v5 database the
+entries omit `source` and the payload carries `index_stale: true`. The
+riskiest-file question from `churn`, per path, with the "what did it fix"
+answers attached.
 
 ### `what-closed` — what closed issue N
 
@@ -351,8 +354,11 @@ zaxbygraph what-closed NUMBER
 Closing PRs (`data.prs[]`, from `closes` edges whose destination is the
 issue) and closing commits (`data.commits[]`, from `closed_by_commit`
 edges), each entry carrying its edge's `source` provenance
-(`closing_ref` / `timeline`) and `evidence`. After reopen/re-close cycles
-multiple closers coexist; the DB is an evidence trail, not a verdict.
+(`closing_ref` / `timeline`) and `evidence`. The payload reports the
+item's `kind` — a PR has no closers, and now that is visible instead of a
+confident empty. On a pre-v5 database the entries omit `source` and
+`index_stale` is `true`. After reopen/re-close cycles multiple closers
+coexist; the DB is an evidence trail, not a verdict.
 
 ### `sql` — read-only SQL
 

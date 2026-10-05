@@ -160,7 +160,8 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
             if job["db_path"] == key and job["state"] == "running":
                 return job_id, False
         finished = [k for k, v in _JOBS.items() if v["state"] != "running"]
-        while len(finished) >= 50:  # settled ledger bound: 50 finished entries
+        while len(finished) >= 50:  # settled bound: after insert at most 50
+            # finished entries remain
             _JOBS.pop(finished.pop(0), None)
         job_id = f"sync-{next(_JOB_SEQ)}"
         _JOBS[job_id] = {
@@ -179,10 +180,13 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
             _JOBS.pop(job_id, None)
         raise
     if lock is None:
-        # Another process owns the run lock: our caller joins it. The
-        # external sync is already visible through read_lock_observer,
-        # so no registry entry is inserted (a terminal 'joined' row
-        # would otherwise sit in graph_status forever).
+        # Another process owns the run lock: our caller joins it. Roll
+        # the entry back — no thread exists to transition it, and a
+        # stuck 'running' row would wedge single-flight forever
+        # (review round-3). The external sync stays visible through
+        # read_lock_observer.
+        with _JOBS_LOCK:
+            _JOBS.pop(job_id, None)
         return "external", False
 
     def _body() -> None:
@@ -445,22 +449,11 @@ def _read_envelope(conn, slug, db_path, data, truncated, ctx) -> dict:
         try:
             _start_job(db_path, slug, ctx.sync_runner)
             fresh["refreshing"] = True
-        except OSError as exc:
+        except Exception as exc:
             _log(f"staleness refresh for {slug} could not start: {exc}")
     return build_envelope(
         data, conn=conn, slug=slug, db_path=db_path, truncated=truncated, freshness=fresh
     )
-
-
-def _page(items: list, offset: int, limit: int) -> tuple[list, bool, str | None]:
-    """Slice one page of an in-memory list and derive truncated + cursor.
-
-    Only correct when `items` holds the FULL result (open_items); capped
-    fetches judge truncation against their own source instead."""
-    page = items[offset : offset + limit]
-    truncated = offset + len(page) < len(items)
-    next_cursor = str(offset + len(page)) if truncated else None
-    return page, truncated, next_cursor
 
 
 def _int_arg(arguments: dict, key: str, default: int) -> int:
@@ -784,7 +777,7 @@ def _tool_sync(arguments: dict, ctx) -> dict:
             )
     try:
         job_id, started = _start_job(db_path, slug, runner)
-    except OSError as exc:
+    except Exception as exc:
         raise ToolError(
             "runtime", f"sync could not start: {exc}", hint="check the database directory permissions"
         ) from exc
@@ -1072,7 +1065,11 @@ def _process(msg: dict, ctx: "_Context") -> None:
             # holds even when the handler did not raise ToolError
             # (sqlite faults, unexpected TypeErrors — review F4).
             env = _error_envelope(
-                "runtime", str(exc), "internal error; the server log has details"
+                "runtime",
+                str(exc),
+                "internal error; the server log has details",
+                None,
+                None,
             )
             _result(
                 stdout,
