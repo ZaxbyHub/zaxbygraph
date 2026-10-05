@@ -319,6 +319,47 @@ the BFS. The `data` payload:
 
 When no route exists, `path` is `null` and the exit code is still `0` — "not connected" is an answer, not a failure.
 
+### `overlap` — the PR collision check
+
+```bash
+zaxbygraph overlap NUMBER [NUMBER ...]
+```
+
+The query agents used to hand-write against `pr_files`: for each unordered
+pair of the given numbers, the file paths both PRs touch (`data.pairs[].shared`,
+sorted; `[]` for disjoint pairs). The collision check before stacking PRs,
+productized so nobody has to guess the join (issue #7).
+
+### `file-history` — which PRs touched a path
+
+```bash
+zaxbygraph file-history PATH [--limit N]
+```
+
+The PRs whose `pr_files` include `path` (exact match — a directory or a
+typo'd path is a normal empty answer), newest first (`data.entries`, with
+`title`, `state`, `updated_at`, `html_url`), each entry carrying
+`closed_issues`: the deduplicated numbers of the issues that PR closed
+(`closes` edges, any `source` provenance). On a pre-v5 database the
+entries omit `source` and the payload carries `index_stale: true`. The
+riskiest-file question from `churn`, per path, with the "what did it fix"
+answers attached.
+
+### `what-closed` — what closed issue N
+
+```bash
+zaxbygraph what-closed NUMBER
+```
+
+Closing PRs (`data.prs[]`, from `closes` edges whose destination is the
+issue) and closing commits (`data.commits[]`, from `closed_by_commit`
+edges), each entry carrying its edge's `source` provenance
+(`closing_ref` / `timeline`) and `evidence`. The payload reports the
+item's `kind` — a PR has no closers, and now that is visible instead of a
+confident empty. On a pre-v5 database the entries omit `source` and
+`index_stale` is `true`. After reopen/re-close cycles multiple closers
+coexist; the DB is an evidence trail, not a verdict.
+
 ### `sql` — read-only SQL
 
 Result rows carrying a `repo` column are filtered to the resolved repo
@@ -357,6 +398,46 @@ names the src *endpoint* and is unrelated to the `edges.source` provenance
 column, which export-graph emits under the `provenance` key instead.
 Intended for handing to a graph viewer or joining with a code
 graph on `file:` nodes.
+
+## MCP server
+
+`zaxbygraph mcp` runs a stdio MCP (Model Context Protocol) server — the same
+data, exposed as typed tools so agents stop re-deriving cwd, column names and
+output shapes every session (issue #7). It is a thin adapter over the same
+query layer the CLI uses: every tool answers with the standard JSON envelope
+inside the tool result text, structured errors included.
+
+```bash
+zaxbygraph mcp [--stale-seconds N]
+```
+
+- **Tools** (11): `graph_status`, `search`, `get_item`, `related`, `path`,
+  `pr_overlap`, `file_history`, `what_closed`, `open_items`, `sql`, `sync`.
+  `sql` reuses the CLI's read-only guard stack; `sync` never blocks — it
+  returns a job id and `graph_status` reports progress.
+- **Resource**: `zaxbygraph://schema` serves the same DDL and column notes as
+  the `schema` command.
+- **Repo resolution**: explicit `repo` argument, then a server pin
+  (`zaxbygraph mcp --repo OWNER/REPO [--db PATH]`), then the client's MCP
+  roots, then the server cwd's git origin — resolving to the same slug-keyed
+  store as the CLI, so a worktree and its main checkout share one graph.
+- **Staleness**: when a read answers and `freshness.age_s` exceeds the
+  threshold (`--stale-seconds`, default 900, env
+  `ZAXBYGRAPH_MCP_STALE_SECONDS`), the answer still comes from current data
+  and one background incremental sync starts (guarded by the sync lock);
+  `freshness.refreshing` is `true` until it lands.
+
+Register it (Claude Code):
+
+```bash
+claude mcp add zaxbygraph -- zaxbygraph mcp
+```
+
+opencode (`~/.config/opencode/opencode.json`):
+
+```json
+{"mcp": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}
+```
 
 ## Output and error contract
 

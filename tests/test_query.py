@@ -482,3 +482,197 @@ class RepoScopeTests(unittest.TestCase):
         self.assertTrue(data["rows"], "sql returned no rows")
         self.assertEqual({r["repo"] for r in data["rows"]}, {"acme/widget"})
         self.assertNotIn("other/repo", [r["repo"] for r in data["rows"]])
+
+
+# ==== issue-trace 7-mcp-typed-agent-surface: acceptance append (AC4) =========
+# Appended by .agents/issue-traces/7-mcp-typed-agent-surface/repro — append
+# only; every class above is untouched and every import needed below is
+# restated here (no header edits).
+#
+# Pins the three productized queries of issue #7 AC4 — pr_overlap /
+# file_history / what_closed — as query functions AND as CLI subcommands
+# (overlap / file-history / what-closed). The FIRST call in the test is
+# query.pr_overlap, so at base this fails with:
+#   AttributeError: module 'zaxbygraph.query' has no attribute 'pr_overlap'
+#
+# Pinned return shapes (the implementation must conform):
+#   query.pr_overlap(conn, numbers, repo=None)
+#     -> {"pairs": [{"a": int, "b": int, "shared": [str, ...]}, ...]}
+#        one entry per unordered pair of `numbers`; "shared" is the pair's
+#        common file paths ([] for disjoint PRs).
+#   query.file_history(conn, path, limit=30, repo=None)
+#     -> {"entries": [{"number": int, ..., "closed_issues": [int, ...]},
+#                     ...]} newest first (items.updated_at DESC); each entry
+#        carries the numbers of the issues that PR closed (any closes
+#        provenance).
+#   query.what_closed(conn, number, repo=None)
+#     -> {"number": int, "prs": [{"number": int, ..., "source": str}, ...],
+#         "commits": [{"sha": str, ..., "source": str}, ...]}
+#        every entry carries its edge's `source` provenance value.
+
+import io
+import json
+from contextlib import redirect_stderr, redirect_stdout
+
+from zaxbygraph import query as query_module
+from zaxbygraph.cli import main as cli_main
+
+
+class ProductQueryTests(TempDBTest):
+    """Issue #7 AC4: the three productized queries, function surface first,
+    then the CLI envelope surface (overlap / file-history / what-closed)."""
+
+    def seed_product_corpus(self) -> None:
+        # PR 10 and PR 11 share src/store.py; PR 12 is disjoint from both.
+        # PR 11 closes issue 5 through closingIssuesReferences on the pull
+        # payload (source 'closing_ref', the real sync pipeline); PR 12's
+        # timeline closes edge and issue 5's closed_by_commit edge ride
+        # direct SQL (timeline provenance never comes from a REST source).
+        # updated_at rises with the PR number, so newest-first is 11, 10.
+        self.src.add_pr(
+            issue(10, title="wal store", body="adds wal", kind="pr", state="closed",
+                  updated_at="2026-01-01T10:00:00Z"),
+            {**pull(10, changed_files=2, merged=True), "merge_commit_sha": "walsha"},
+            files=[pr_file("src/store.py"), pr_file("src/db.py")],
+        )
+        self.src.add_pr(
+            issue(11, title="fix guide", body="updates docs", kind="pr", state="closed",
+                  updated_at="2026-02-01T10:00:00Z"),
+            {**pull(11, changed_files=1, merged=True), "merge_commit_sha": "guidesha",
+             "closing_issues_references": [{"number": 5, "repo": REPO}]},
+            files=[pr_file("src/store.py")],
+        )
+        self.src.add_pr(
+            issue(12, title="unrelated", body="other area", kind="pr", state="closed",
+                  updated_at="2026-03-01T10:00:00Z"),
+            {**pull(12, changed_files=1, merged=True), "merge_commit_sha": "othersha"},
+            files=[pr_file("src/other.py")],
+        )
+        self.src.add_issue(
+            issue(5, title="the bug", body="crashes", state="closed",
+                  updated_at="2025-12-01T10:00:00Z")
+        )
+        self.sync()
+        for edge in (
+            (REPO, "item", "5", "closed_by_commit", "commit", "cafebabecafebeef",
+             "EXTRACTED", "timeline closed event", "timeline"),
+            (REPO, "item", "12", "closes", "item", "5", "EXTRACTED",
+             "timeline closed event", "timeline"),
+        ):
+            self.conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source) VALUES (?,?,?,?,?,?,?,?,?)",
+                edge,
+            )
+        self.conn.commit()
+
+    def _run_cli(self, argv: list[str]) -> tuple[int, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = cli_main([*argv, "--repo", REPO, "--db", str(self.db_path),
+                                 "--format", "json"])
+            except SystemExit as exc:
+                code = exc.code if isinstance(exc.code, int) else 2
+        return code, out.getvalue()
+
+    def test_pr_overlap_file_history_what_closed(self) -> None:
+        self.seed_product_corpus()
+
+        # -- pr_overlap: shared paths, empty list for disjoint -------------
+        overlap = query_module.pr_overlap(self.conn, [10, 11], repo=REPO)
+        self.assertIsInstance(overlap, dict, "AC4: pr_overlap must return a dict")
+        pairs = overlap.get("pairs")
+        self.assertIsInstance(pairs, list, "AC4: pr_overlap must carry a pairs list")
+        self.assertEqual(len(pairs), 1, "AC4: two numbers make exactly one pair")
+        pair = pairs[0]
+        self.assertIsInstance(pair, dict, "AC4: each pair must be an object")
+        self.assertEqual(sorted((pair["a"], pair["b"])), [10, 11],
+                         "AC4: the pair must carry both PR numbers")
+        self.assertEqual(sorted(pair["shared"]), ["src/store.py"],
+                         "AC4: PRs 10 and 11 share src/store.py")
+
+        disjoint = query_module.pr_overlap(self.conn, [10, 12], repo=REPO)["pairs"]
+        self.assertEqual(len(disjoint), 1, "AC4: disjoint pair still reported")
+        self.assertEqual(disjoint[0]["shared"], [],
+                         "AC4: disjoint PRs must yield an empty shared list")
+
+        trio = query_module.pr_overlap(self.conn, [10, 11, 12], repo=REPO)["pairs"]
+        self.assertEqual(len(trio), 3, "AC4: three numbers make three pairs")
+        by_pair = {frozenset((p["a"], p["b"])): sorted(p["shared"]) for p in trio}
+        self.assertEqual(by_pair[frozenset((10, 11))], ["src/store.py"])
+        self.assertEqual(by_pair[frozenset((10, 12))], [])
+        self.assertEqual(by_pair[frozenset((11, 12))], [])
+
+        # -- file_history: PRs newest first, each with the issues it closed -
+        hist = query_module.file_history(self.conn, "src/store.py", repo=REPO)
+        self.assertIsInstance(hist, dict, "AC4: file_history must return a dict")
+        entries = hist.get("entries")
+        self.assertIsInstance(entries, list, "AC4: file_history must carry entries")
+        self.assertEqual([e["number"] for e in entries], [11, 10],
+                         "AC4: file_history must list PRs newest first")
+        by_number = {e["number"]: e for e in entries}
+        self.assertEqual(by_number[11].get("closed_issues"), [5],
+                         "AC4: PR 11 closed issue 5")
+        self.assertEqual(by_number[10].get("closed_issues"), [],
+                         "AC4: PR 10 closed no issue")
+        limited = query_module.file_history(self.conn, "src/store.py", limit=1,
+                                            repo=REPO)["entries"]
+        self.assertEqual([e["number"] for e in limited], [11],
+                         "AC4: file_history limit=1 keeps the newest PR")
+
+        # -- what_closed: closing PRs and commits, each with its source ----
+        closed = query_module.what_closed(self.conn, 5, repo=REPO)
+        self.assertIsInstance(closed, dict, "AC4: what_closed must return a dict")
+        self.assertEqual(closed.get("number"), 5, "AC4: what_closed echoes the issue")
+        prs = closed.get("prs")
+        self.assertIsInstance(prs, list, "AC4: what_closed must carry prs")
+        pr_sources = {p["number"]: p["source"] for p in prs}
+        self.assertEqual(len(prs), 2, "AC4: both closing PRs must be reported")
+        self.assertEqual(pr_sources.get(11), "closing_ref",
+                         "AC4: PR 11's closes edge is closing_ref provenance")
+        self.assertEqual(pr_sources.get(12), "timeline",
+                         "AC4: PR 12's closes edge is timeline provenance")
+        commits = closed.get("commits")
+        self.assertIsInstance(commits, list, "AC4: what_closed must carry commits")
+        self.assertEqual(len(commits), 1, "AC4: the closing commit must be reported")
+        self.assertEqual(commits[0].get("sha"), "cafebabecafebeef",
+                         "AC4: the commit entry carries the sha from dst_id")
+        self.assertEqual(commits[0].get("source"), "timeline",
+                         "AC4: the commit entry carries its edge's source")
+
+        # -- CLI surface: overlap / file-history / what-closed --------------
+        code, out = self._run_cli(["overlap", "10", "11"])
+        self.assertEqual(code, 0, "AC4: overlap must exit 0")
+        env = json.loads(out)
+        self.assertIs(env.get("ok"), True, "AC4: overlap envelope ok")
+        self.assertEqual(len(env["data"]["pairs"]), 1)
+        self.assertEqual(sorted(env["data"]["pairs"][0]["shared"]), ["src/store.py"])
+
+        code, out = self._run_cli(["overlap", "10", "12"])
+        self.assertEqual(code, 0, "AC4: overlap (disjoint) must exit 0")
+        self.assertEqual(json.loads(out)["data"]["pairs"][0]["shared"], [],
+                         "AC4: disjoint overlap CLI reports an empty shared list")
+
+        code, out = self._run_cli(["file-history", "src/store.py"])
+        self.assertEqual(code, 0, "AC4: file-history must exit 0")
+        entries = json.loads(out)["data"]["entries"]
+        self.assertEqual([e["number"] for e in entries], [11, 10],
+                         "AC4: file-history CLI lists PRs newest first")
+        self.assertEqual(
+            {e["number"]: e["closed_issues"] for e in entries}[11], [5],
+            "AC4: file-history CLI reports each PR's closed issues",
+        )
+
+        code, out = self._run_cli(["what-closed", "5"])
+        self.assertEqual(code, 0, "AC4: what-closed must exit 0")
+        data = json.loads(out)["data"]
+        self.assertEqual({p["number"] for p in data["prs"]}, {11, 12},
+                         "AC4: what-closed CLI reports both closing PRs")
+        self.assertEqual([c["sha"] for c in data["commits"]], ["cafebabecafebeef"],
+                         "AC4: what-closed CLI reports the closing commit")
+        sources = {p["number"]: p["source"] for p in data["prs"]}
+        self.assertEqual(sources[11], "closing_ref",
+                         "AC4: what-closed CLI carries each edge's source")
+        self.assertEqual(sources[12], "timeline",
+                         "AC4: what-closed CLI carries each edge's source")

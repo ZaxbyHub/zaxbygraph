@@ -151,7 +151,7 @@ def _run_search_pass(
         params["repo"] = repo
     total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
     page = conn.execute(
-        f"{merged} ORDER BY score ASC, updated_at DESC LIMIT :limit",
+        f"{merged} ORDER BY score ASC, updated_at DESC, hit_key ASC LIMIT :limit",
         {**params, "limit": limit},
     ).fetchall()
     return total, page
@@ -426,7 +426,12 @@ def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) ->
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
-def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
+def open_items(
+    conn: sqlite3.Connection,
+    repo: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
     repo = _fold_repo(repo)
     sql = """
         SELECT repo, number, kind, title, author, updated_at, html_url
@@ -436,7 +441,11 @@ def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
     if repo:
         sql += " AND repo = ?"
         params.append(repo)
-    sql += " ORDER BY updated_at DESC"
+    # (updated_at, number) is a total order, so offset pages are stable.
+    sql += " ORDER BY updated_at DESC, number DESC"
+    if limit is not None:
+        sql += " LIMIT ? OFFSET ?"
+        params.extend([int(limit), int(offset)])
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
@@ -732,3 +741,202 @@ def export_graph(conn: sqlite3.Connection, repo: str | None = None) -> dict:
             }
         )
     return {"nodes": nodes, "edges": edges}
+
+
+def _require_item(conn: sqlite3.Connection, number: int, repo: str | None) -> None:
+    """Raise LookupError when `number` is not a stored item (issue #7 AC4).
+
+    The callers map this to the not_found error contract rather than
+    answering with an empty result that reads like 'no matches'. A falsy
+    repo is rejected outright: these queries are number-keyed, and a
+    no-filter scan collapses distinct same-numbered items from different
+    repos into one unlabeled answer."""
+    if not repo:
+        raise ValueError(
+            "a repo is required for this query; pass --repo OWNER/REPO"
+        )
+    if repo:
+        row = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND number = ?", (repo, number)
+        ).fetchone()
+    else:
+        row = conn.execute("SELECT number FROM items WHERE number = ?", (number,)).fetchone()
+    if row is None:
+        raise LookupError(f"item #{number} not found")
+
+
+def pr_overlap(conn: sqlite3.Connection, numbers, repo: str | None = None) -> dict:
+    """Shared file paths for each unordered pair of the given items.
+
+    One pair entry per i<j combination of the caller's number list, in the
+    caller's order; "shared" is the sorted intersection of the two items'
+    pr_files paths ([] for disjoint pairs). Numbers naming no stored item
+    raise LookupError; an existing issue simply contributes an empty file
+    set."""
+    numbers = [int(n) for n in numbers]
+    # Order-preserving dedupe: a repeated number must not produce a
+    # self-pair whose "shared" is that PR's whole file set.
+    numbers = list(dict.fromkeys(numbers))
+    repo = _fold_repo(repo)
+    paths: dict[int, set[str]] = {}
+    for n in numbers:
+        if n in paths:
+            continue
+        _require_item(conn, n, repo)
+        if repo:
+            rows = conn.execute(
+                "SELECT path FROM pr_files WHERE repo = ? AND number = ?", (repo, n)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT path FROM pr_files WHERE number = ?", (n,)
+            ).fetchall()
+        paths[n] = {r["path"] for r in rows}
+    pairs = []
+    for i in range(len(numbers)):
+        for j in range(i + 1, len(numbers)):
+            a, b = numbers[i], numbers[j]
+            pairs.append({"a": a, "b": b, "shared": sorted(paths[a] & paths[b])})
+    return {"pairs": pairs}
+
+
+def file_history(
+    conn: sqlite3.Connection, path: str, limit: int = 30, repo: str | None = None
+) -> dict:
+    """The PRs that touched `path`, newest first, each with its closed issues.
+
+    Newest first is items.updated_at DESC with the number as a stable
+    tiebreak. closed_issues collects the PR's `closes` edges (issue
+    endpoints, any provenance stream). Over-fetches limit+1 rows so callers
+    can set the envelope truncated flag without a COUNT."""
+    limit = _clamp_limit(limit)
+    repo = _fold_repo(repo)
+    if not repo:
+        # Number/path-keyed like its siblings: a no-filter scan would mix
+        # rows from every repo in the store (review F8).
+        raise ValueError(
+            "a repo is required for this query; pass --repo OWNER/REPO"
+        )
+    if repo:
+        cur = conn.execute(
+            "SELECT i.number, i.title, i.state, i.updated_at, i.html_url "
+            "FROM pr_files f JOIN items i ON i.repo = f.repo AND i.number = f.number "
+            "WHERE f.repo = ? AND f.path = ? AND i.kind = 'pr' "
+            "ORDER BY i.updated_at DESC, i.number DESC",
+            (repo, path),
+        )
+    else:
+        cur = conn.execute(
+            "SELECT i.number, i.title, i.state, i.updated_at, i.html_url "
+            "FROM pr_files f JOIN items i ON i.repo = f.repo AND i.number = f.number "
+            "WHERE f.path = ? AND i.kind = 'pr' "
+            "ORDER BY i.updated_at DESC, i.number DESC",
+            (path,),
+        )
+    fetched = cur.fetchmany(limit + 1)
+    source_available = _edges_source_available(conn)
+    source_col = ", source" if source_available else ""
+    entries = []
+    for row in fetched[:limit]:
+        n = row["number"]
+        if repo:
+            closes = conn.execute(
+                f"SELECT dst_id{source_col} FROM edges "
+                "WHERE repo = ? AND src_type = 'item' AND src_id = ? "
+                "AND rel = 'closes' AND dst_type = 'item'",
+                (repo, str(n)),
+            ).fetchall()
+        else:
+            closes = conn.execute(
+                f"SELECT dst_id{source_col} FROM edges "
+                "WHERE src_type = 'item' AND src_id = ? "
+                "AND rel = 'closes' AND dst_type = 'item'",
+                (str(n),),
+            ).fetchall()
+        entries.append(
+            {
+                "number": n,
+                "title": row["title"],
+                "state": row["state"],
+                "updated_at": row["updated_at"],
+                "html_url": row["html_url"],
+                "closed_issues": sorted({int(c["dst_id"]) for c in closes}),
+            }
+        )
+    return {
+        "entries": entries,
+        "truncated": len(fetched) > limit,
+        "index_stale": not source_available,
+    }
+
+
+def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict:
+    """What closed issue `number`: closing PRs and closing commits.
+
+    The response carries the item's own `kind`, so querying a PR (which
+    has no closers by definition) is distinguishable from an issue that
+    nothing closed.
+
+    PRs come from `closes` edges whose destination is this item (the source
+    endpoint is the closing PR, provenance closing_ref/timeline); commits
+    come from `closed_by_commit` edges sourced at this item (destination is
+    the commit sha, provenance timeline). Every entry carries its edge's
+    `source`; after reopen/re-close cycles multiple closers coexist. A
+    pre-v5 database degrades with index_stale like item/related."""
+    number = int(number)
+    repo = _fold_repo(repo)
+    _require_item(conn, number, repo)
+    kind = conn.execute(
+        "SELECT kind FROM items WHERE repo = ? AND number = ?", (repo, number)
+    ).fetchone()["kind"]
+    source_available = _edges_source_available(conn)
+    source_col = ", source" if source_available else ""
+    if repo:
+        pr_rows = conn.execute(
+            f"SELECT src_id, evidence{source_col} FROM edges "
+            "WHERE repo = ? AND src_type = 'item' AND rel = 'closes' "
+            "AND dst_type = 'item' AND dst_id = ?",
+            (repo, str(number)),
+        ).fetchall()
+        commit_rows = conn.execute(
+            f"SELECT dst_id, evidence{source_col} FROM edges "
+            "WHERE repo = ? AND rel = 'closed_by_commit' AND src_type = 'item' AND src_id = ?",
+            (repo, str(number)),
+        ).fetchall()
+    else:
+        pr_rows = conn.execute(
+            f"SELECT src_id, evidence{source_col} FROM edges "
+            "WHERE src_type = 'item' AND rel = 'closes' "
+            "AND dst_type = 'item' AND dst_id = ?",
+            (str(number),),
+        ).fetchall()
+        commit_rows = conn.execute(
+            f"SELECT dst_id, evidence{source_col} FROM edges "
+            "WHERE rel = 'closed_by_commit' AND src_type = 'item' AND src_id = ?",
+            (str(number),),
+        ).fetchall()
+    prs = []
+    for row in pr_rows:
+        entry = {
+            "number": int(row["src_id"]),
+            "evidence": row["evidence"],
+        }
+        if source_available:
+            entry["source"] = row["source"]
+        prs.append(entry)
+    commits = []
+    for row in commit_rows:
+        entry = {
+            "sha": row["dst_id"],
+            "evidence": row["evidence"],
+        }
+        if source_available:
+            entry["source"] = row["source"]
+        commits.append(entry)
+    return {
+        "number": number,
+        "kind": kind,
+        "prs": prs,
+        "commits": commits,
+        "index_stale": not source_available,
+    }
