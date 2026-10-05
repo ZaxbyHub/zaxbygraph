@@ -600,5 +600,80 @@ class ProductQueryRepoRequiredTests(TempDBTest):
         )
 
 
+
+
+
+class FeedbackRound3Tests(TempDBTest):
+    """Round-3 reviewer regressions: the generic tools/call fault branch
+    must answer AND keep the session alive, and the external-join path
+    must roll its registry entry back."""
+
+    def seed_tool_corpus(self) -> None:
+        self.src.add_issue(issue(1, title="probe one", body="needle", state="open"))
+        self.src.add_pr(
+            issue(3, title="probe pr", body="adds", kind="pr", state="closed"),
+            pull(3, changed_files=1, merged=True),
+            files=[pr_file("src/probe.py")],
+        )
+        self.sync()
+
+    def test_generic_tool_fault_answers_and_session_survives(self) -> None:
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        session = McpSession(self, cwd=str(self._td.name))
+        self.addCleanup(session.stop)
+        session.initialize()
+        # Drive the GENERIC (non-ToolError) branch: corrupt the FTS tables
+        # out of the database after the corpus guard passes, so search
+        # raises sqlite3.OperationalError mid-handler.
+        self.conn.execute("DROP TABLE items_fts")
+        self.conn.execute("DROP TABLE comments_fts")
+        self.conn.commit()
+        response = session.call_tool("search", {"repo": REPO, "query": "needle"})
+        result, env = tool_envelope(self, response, "R3")
+        self.assertIs(result.get("isError"), True, "R3: a tool fault answers isError")
+        self.assertIs(env.get("ok"), False, "R3: the envelope reports ok false")
+        self.assertEqual(env.get("error", {}).get("code"), "runtime")
+        # The session must survive: a legal read still answers.
+        response = session.call_tool("graph_status", {"repo": REPO})
+        result, env = tool_envelope(self, response, "R3")
+        self.assertIs(env.get("ok"), True, f"R3: the session must survive: {env}")
+        session.stop()
+
+    def test_external_join_does_not_wedge_single_flight(self) -> None:
+        import threading
+
+        from zaxbygraph.sync import acquire_sync_lock
+
+        self.seed_tool_corpus()
+        pin_env_for(self, Path(self._td.name), db=self.db_path)
+        lock = acquire_sync_lock(self.db_path)
+        self.assertIsNotNone(lock, "R3: the test holds the external lock")
+        started_flag = threading.Event()
+        session = McpSession(
+            self,
+            cwd=str(self._td.name),
+            stale_after_s=0,
+            sync_runner=lambda db, repo: started_flag.set(),
+        )
+        self.addCleanup(session.stop)
+        session.initialize()
+        # First sync joins the external lock.
+        response = session.call_tool("sync", {"repo": REPO})
+        _result, env = tool_envelope(self, response, "R3")
+        self.assertIs(env.get("ok"), True, f"R3: the join answers: {env}")
+        lock.release_owned()
+        # After the external lock frees, a second sync must START (the
+        # pre-fix delta left a phantom running entry that joined forever).
+        response = session.call_tool("sync", {"repo": REPO})
+        _result, env = tool_envelope(self, response, "R3")
+        self.assertTrue(
+            env.get("data", {}).get("started"),
+            f"R3: single-flight must recover after the external lock frees: {env}",
+        )
+        self.assertTrue(started_flag.wait(timeout=10), "R3: the runner must run")
+        session.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
