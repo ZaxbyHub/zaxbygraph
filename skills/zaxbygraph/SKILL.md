@@ -109,7 +109,11 @@ columns plus
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row objects.
 
 Common fields: items carry `number kind title state author updated_at html_url`;
-edges carry `src_type src_id rel dst_type dst_id confidence evidence source`. `search`
+edges carry `src_type src_id rel dst_type dst_id confidence evidence source`.
+That edge list is the `item`/`related` shape — `export-graph` edges are
+`{source, target, rel, confidence, provenance}` with no `evidence`, and their
+`source` is the src *endpoint* (the `provenance` key is the edge's origin
+stream). `search`
 marks hits in `snippet` with `«` `»` (stemmed, bm25-ranked; a zero-hit result
 carries `total_matches: 0` and `corpus_items: <n>`, so "no prior art" is
 distinguishable from an empty corpus). `path` is `null` when no route exists —
@@ -160,13 +164,15 @@ query is safe to run.
 ## Interpreting `closes` correctly
 
 There are two closing relations. `closes_keyword` edges come from **closing
-keywords in bodies and comments** — `close`, `closes`, `closed`, `fix`,
-`fixes`, `fixed`, `resolve`, `resolves`, `resolved` — followed by `#N` or a
-same-repo URL. A missing `closes_keyword` edge means *no keyword said so*,
-not that the two items are unrelated.
+keywords in bodies, comments, and review bodies** — `close`, `closes`,
+`closed`, `fix`, `fixes`, `fixed`, `resolve`, `resolves`, `resolved` —
+followed by `#N` or a same-repo URL. A missing `closes_keyword` edge means
+*no keyword said so*, not that the two items are unrelated.
 
 `closes` edges are what **GitHub reported**: `closed` timeline events
-(merge-commit auto-close lands here, as a closed event with a commit closer)
+(merge-commit auto-close lands here as a closed event with a commit closer,
+which always yields `closed_by_commit` and yields `closes` only when the sha
+is a stored PR's merge commit or the closer is the PR itself)
 and a PR's `closingIssuesReferences`. Keyword regexes never write it. Edges
 mirror the timeline as reported, so multiple closers can coexist after
 reopen/re-close cycles — evidence timestamps order them, and `items.state`
@@ -174,8 +180,12 @@ is authoritative for current open/closed. `cross_referenced` is stored as
 carried: GitHub reports every reference on both items' timelines, so the
 same linkage can appear in either direction.
 
-> A missing edge means "GitHub never reported it" (`closes`) or "no keyword
-> said so" (`closes_keyword`). Neither means the two items are unrelated.
+> A missing `closes` edge usually means *GitHub never reported it* — but it
+> can also mean the commit closer was unmatched (a direct push yields
+> `closed_by_commit` only), that the closed event fell outside the retained
+> newest-500 timeline window (check `fetch_log`), or one of the boundaries
+> below. A missing `closes_keyword` edge means *no keyword said so*. Neither
+> means the two items are unrelated.
 
 Two boundaries: timeline and closing-reference data rides the GraphQL page
 query only — a REST-only sync (`--source rest`) captures none of it (keyword

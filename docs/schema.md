@@ -164,7 +164,7 @@ Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 | `reviewed` | actor → item | Reviewed at least once. Also collapsed. |
 | `has_label` | item → label | |
 | `touches` | item → file | A PR changed this path. The join key to a code graph. |
-| `closes_keyword` | item → item | A closing keyword plus a same-repo reference in a body or comment. Keyword-derived only — see the caveat below. |
+| `closes_keyword` | item → item | A closing keyword plus a same-repo reference in a body, comment, or review body. Keyword-derived only — see the caveat below. |
 | `mentions` | item → item | A same-repo reference **without** a closing keyword. |
 | `closes` | item → item | GitHub-reported closing link: a `closed` timeline event (closer is a PR or a known merge commit) or a PR's `closingIssuesReferences`. Never written by keyword regexes. |
 | `cross_referenced` | item → item | Stored as carried on each item's timeline: source → owner. GitHub reports every reference on **both** items' timelines, so a linkage can appear in either direction (`related`/`path` are direction-agnostic). Foreign sources are repo-qualified (`owner/repo#N`). |
@@ -173,8 +173,10 @@ Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 | `merged_commit` | item → commit | The PR's merge commit sha — joins the graph to `git log`. |
 | `reverts` | item → commit, or item → item | A `This reverts commit <sha>` body line targets the commit; a title-only revert (`Revert "…"`) targets the item whose exact quoted title matches, when exactly one does. |
 
-`closes_keyword` and `mentions` are mutually exclusive for a given pair: a
-number that is closed by keyword is not also emitted as a mention.
+`closes_keyword` and `mentions` are mutually exclusive within a single text
+payload — a body, one comment, or one review body: a number that is closed by
+keyword in a payload is not also emitted as a mention from that payload.
+Across payloads one pair can carry both.
 
 Node types are only ever `actor`, `item`, `label`, `file`, `commit`. Never
 `issue`, `pr`, `comment`, or `review` — an issue and a PR are both `item`,
@@ -183,25 +185,33 @@ distinguished by `items.kind`. A commit endpoint's id is the sha.
 ### What `closes_keyword` and `closes` do and do not mean
 
 `closes_keyword` (source='keyword') is derived from **closing keywords in
-bodies and comments** — `close`/`closes`/`closed`, `fix`/`fixes`/`fixed`,
-`resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
+bodies, comments, and review bodies** — `close`/`closes`/`closed`,
+`fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
 same-repo GitHub URL. It means *a keyword said so*; nothing more is claimed.
 
 `closes` (source='timeline' or 'closing_ref') is what **GitHub reported**:
 `closed` timeline events — including auto-close from merge-commit messages,
 which lands as a closed event with a commit closer — and a PR's
-`closingIssuesReferences`. Keyword regexes never write it. Edges mirror the
-timeline events as reported, so after reopen/re-close cycles **multiple
-closers coexist**; evidence timestamps order them, and `items.state` is
-authoritative for current open/closed. `cross_referenced` is likewise stored
-as carried: GitHub reports every reference on both items' timelines, so the
-same linkage can appear in both directions.
+`closingIssuesReferences`. Keyword regexes never write it. A commit closer
+always yields a `closed_by_commit` edge; it yields `closes` only when the
+closer itself is a PR, or the sha resolves to a stored PR's merge commit — a
+direct-push closer that matches no stored PR leaves `closed_by_commit` alone.
+Edges mirror the timeline events as reported, so after reopen/re-close cycles
+**multiple closers coexist**; evidence timestamps order them, and
+`items.state` is authoritative for current open/closed. `cross_referenced` is
+likewise stored as carried: GitHub reports every reference on both items'
+timelines, so the same linkage can appear in both directions.
 
 What remains absent is anything beyond GitHub's own reports — no edge claims
-a link GitHub did not report. Cross-repo keyword references are dropped
-entirely rather than attached to a same-numbered local item; timeline
-cross-references from other repos are kept as repo-qualified ids
-(`owner/repo#N`) that never attach to a same-numbered local item.
+a link GitHub did not report, with one deliberate exception: a title-only
+revert (`Revert "…"`) links `item → item` by exact quoted-title match
+against stored items, `source='keyword'` — a locally-derived lookup, not a
+GitHub report. Cross-repo keyword references are dropped entirely rather
+than attached to a same-numbered local item; foreign
+`closingIssuesReferences` entries are discarded outright — never stored,
+never repo-qualified — unlike timeline cross-references from other repos,
+which are kept as repo-qualified ids (`owner/repo#N`) that never attach to a
+same-numbered local item.
 
 Two boundaries:
 
@@ -209,12 +219,13 @@ Two boundaries:
   and no closing references — both ride the GraphQL page query only — so a
   REST-only sync writes no `closes`/`cross_referenced` edges (keyword edges
   still derive from bodies). Conversely, a GraphQL-degraded re-ingest can
-  never retract timeline- or closing-ref-backed edges once written (the
-  delete-owned pass exempts `source NOT IN ('timeline','closing_ref')` —
-  append-only), and `--force` preserves them too. Recovery for a genuinely
-  stale row is manual SQL against the database file (e.g. the `sqlite3`
-  CLI); the `sql` **subcommand** is read-only by design and is never a write
-  path.
+  never retract timeline- or closing-ref-backed edges once written: the
+  delete-owned pass exempts `source NOT IN ('timeline','closing_ref')` on
+  every re-ingest, `--force` included — and a `--force` run with a GraphQL
+  source re-fetches these edges and refreshes them via upsert. Recovery for a
+  genuinely stale row is manual SQL against the database file (e.g. the
+  `sqlite3` CLI); the `sql` **subcommand** is read-only by design and is
+  never a write path.
 - **Timeline retention is bounded.** The page query carries
   `timelineItems(first: 50, CLOSED_EVENT, CROSS_REFERENCED_EVENT)` and a
   continuation drains up to 500 events per item; beyond 500 the retained set

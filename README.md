@@ -350,10 +350,12 @@ million rows does not materialize a million rows.
 ### `export-graph` — Graphify-shaped JSON
 
 Returns `{nodes, edges}` with `id` values namespaced by type (`item:14`,
-`file:src/…`, `actor:alice`, `label:bug`) and edges as
-`{source, target, rel, confidence}` — that `source` names the src *endpoint*
-and is unrelated to the `edges.source` provenance column, which export-graph
-does not emit. Intended for handing to a graph viewer or joining with a code
+`file:src/…`, `actor:alice`, `label:bug`; a foreign cross-reference appears
+as `item:owner/repo#N` — repo-qualified, with no `items` row behind it) and
+edges as `{source, target, rel, confidence, provenance}` — that `source`
+names the src *endpoint* and is unrelated to the `edges.source` provenance
+column, which export-graph emits under the `provenance` key instead.
+Intended for handing to a graph viewer or joining with a code
 graph on `file:` nodes.
 
 ## Output and error contract
@@ -469,7 +471,8 @@ Full column-level reference: [`docs/schema.md`](docs/schema.md).
 
 There are two closing relations, and they answer different questions.
 
-`closes_keyword` edges come from **closing keywords in bodies and comments** —
+`closes_keyword` edges come from **closing keywords in bodies, comments, and
+review bodies** —
 `close`/`closes`/`closed`, `fix`/`fixes`/`fixed`,
 `resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
 same-repo GitHub URL. A missing `closes_keyword` edge means *no keyword said
@@ -477,8 +480,10 @@ so*, not that the items are unrelated. Cross-repo keyword references are
 dropped rather than attached to a same-numbered local item.
 
 `closes` edges are **GitHub's own reports**: `closed` timeline events —
-merge-commit auto-close lands here, as a closed event with a commit closer —
-and a PR's `closingIssuesReferences`. Keyword regexes never write it. Edges
+merge-commit auto-close lands here as a closed event with a commit closer,
+which always yields `closed_by_commit` and yields `closes` only when the sha
+is a stored PR's merge commit (or the closer is the PR itself) — and a PR's
+`closingIssuesReferences`. Keyword regexes never write it. Edges
 mirror the timeline as reported, so after reopen/re-close cycles multiple
 closers coexist; evidence timestamps order them, and `items.state` is
 authoritative for current open/closed. `cross_referenced` is stored as

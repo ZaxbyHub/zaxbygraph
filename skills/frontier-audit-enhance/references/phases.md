@@ -53,7 +53,7 @@ Rules:
 - One `sync` per run unless `status` shows `last_error` (resume) or the lead suspects review-only updates that did not bump `updated_at` (`--force`).
 - Dump truncated JSON into packets. Do not paste full issue threads into the lead context.
 - Forbidden after a successful sync: `gh api --paginate` of issues, pulls, comments, or reviews into the lead.
-- Two closing relations: `closes` is GitHub's own report (timeline closed events — commit-message auto-close lands there — plus PR closing references); `closes_keyword` is a closing keyword in bodies/comments (`close[sd]?`, `fix(e[sd])?`, `resolve[sd]?` plus `#N` / same-repo URL). Provenance rides `edges.source`. If a candidate depends on a link neither relation shows, label it `UNVERIFIED HYPOTHESIS` or re-read that item's GitHub thread as a named, single-item fetch — not a corpus re-page.
+- Two closing relations: `closes` is GitHub's own report (timeline closed events — commit-message auto-close lands there, always as `closed_by_commit`, with `closes` only when the sha is a stored PR's merge commit or the closer is the PR itself — plus PR closing references); `closes_keyword` is a closing keyword in bodies/comments/review bodies (`close[sd]?`, `fix(e[sd])?`, `resolve[sd]?` plus `#N` / same-repo URL). Provenance rides `edges.source`. If a candidate depends on a link neither relation shows, label it `UNVERIFIED HYPOTHESIS` or re-read that item's GitHub thread as a named, single-item fetch — not a corpus re-page.
 - Collectors do not cluster, assign severity, or write a taxonomy.
 
 The lead then writes, from packets plus its own targeted `item` / `related` / `sql` re-queries:

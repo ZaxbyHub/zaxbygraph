@@ -307,6 +307,8 @@ def edges_from_pr_state(
     number = int(raw["number"])
     nid = str(number)
     edges: list[tuple] = []
+    is_pr = raw.get("pull_request") is not None or raw.get("merged_at") is not None
+    merged = bool(raw.get("merged_at") or raw.get("merged"))
     merged_by = raw.get("merged_by")
     login: str | None = None
     if isinstance(merged_by, str):
@@ -314,10 +316,14 @@ def edges_from_pr_state(
     elif isinstance(merged_by, dict):
         value = merged_by.get("login")
         login = str(value) if value else None
-    if login and (raw.get("merged_at") or raw.get("merged")):
+    if is_pr and login and merged:
         edges.append(("item", nid, "merged_by", "actor", login, "pull mergedBy", "payload"))
     merge_sha = raw.get("merge_commit_sha")
-    if isinstance(merge_sha, str) and merge_sha.strip():
+    # GitHub keeps a speculative test-merge oid in merge_commit_sha while a PR
+    # is open (REST); a merged_commit edge to a commit that does not exist in
+    # the repository would be a false fact, so gate on the merged state like
+    # merged_by above.
+    if is_pr and merged and isinstance(merge_sha, str) and merge_sha.strip():
         edges.append(
             ("item", nid, "merged_commit", "commit", merge_sha.strip(), "pull mergeCommit", "payload")
         )
@@ -334,30 +340,43 @@ def edges_from_pr_state(
             ("item", nid, "closes", "item", str(ref_number), "closingIssuesReferences", "closing_ref")
         )
     body = raw.get("body") or ""
-    revert = _REVERT_SHA_RE.search(body)
-    if revert:
-        edges.append(
-            ("item", nid, "reverts", "commit", revert.group(1), "body reverts commit sha", "keyword")
-        )
-    elif title_lookup is not None:
-        title = raw.get("title") or ""
-        if title.startswith(_REVERT_TITLE_PREFIX):
-            span = title[len(_REVERT_TITLE_PREFIX) :]
-            if span.endswith('"'):
-                span = span[:-1]
-            span = span.strip()
-            if span:
-                matches = {int(n) for n in title_lookup(span) if int(n) != number}
-                if len(matches) == 1:
-                    edges.append(
-                        (
-                            "item",
-                            nid,
-                            "reverts",
-                            "item",
-                            str(matches.pop()),
-                            "title reverts quoted item title",
-                            "keyword",
+    # Revert edges describe a PR reverting earlier work; an issue whose body
+    # merely quotes "This reverts commit <sha>" (how-tos, templates) must not
+    # fabricate one, so both revert branches gate on the item being a PR.
+    if is_pr:
+        revert = _REVERT_SHA_RE.search(body)
+        if revert:
+            edges.append(
+                ("item", nid, "reverts", "commit", revert.group(1), "body reverts commit sha", "keyword")
+            )
+        elif title_lookup is not None:
+            title = raw.get("title") or ""
+            if title.startswith(_REVERT_TITLE_PREFIX):
+                span = title[len(_REVERT_TITLE_PREFIX) :]
+                if span.endswith('"'):
+                    span = span[:-1]
+                span = span.strip()
+                if span:
+                    matches = {int(n) for n in title_lookup(span) if int(n) != number}
+                    if len(matches) == 1:
+                        edges.append(
+                            (
+                                "item",
+                                nid,
+                                "reverts",
+                                "item",
+                                str(matches.pop()),
+                                "title reverts quoted item title",
+                                "keyword",
+                            )
                         )
-                    )
     return edges
+
+
+def revert_title_variants(target_title: str) -> tuple[str, str]:
+    """The two revert-PR titles that the title-only revert rule maps to
+    `target_title`: with and without the closing quote (a hand-edited title
+    may drop it). Used by the store's reverse pass so a title-only revert
+    edge is order-independent, mirroring the merge-close symmetry."""
+    quoted = f'{_REVERT_TITLE_PREFIX}{target_title}"'
+    return quoted, f"{_REVERT_TITLE_PREFIX}{target_title}"

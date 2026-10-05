@@ -30,15 +30,21 @@ _TIMELINE_PAGE_MAX = 250
 #: the per-request cap).
 _TIMELINE_CONTINUATION_PAGE = 100
 
+#: Hard ceiling on continuation pages per item: a server that keeps reporting
+#: hasNextPage with a non-advancing cursor can never spin the loop forever.
+_MAX_CONTINUATION_PAGES = 50
+
 #: Timeline events retained per item. Beyond this the retained set is the
 #: contiguous NEWEST 500 (closed events are typically the newest facts), and
 #: the sync records the truncation in fetch_log (#6).
 _MAX_TIMELINE_EVENTS = 500
 
 #: Upper bound on the rendered query so the argv element stays well under
-#: Windows' 32767-char CreateProcessW limit (a 40-PR chunk renders ~34.5k
-#: chars and would fail with WinError 206, an OSError no GitHubError handler
-#: catches). Chunks flush early when the rendered query approaches this.
+#: Windows' 32767-char CreateProcessW limit (since the timeline selection
+#: joined the field sets, a 40-PR chunk renders ~68k chars and would fail
+#: with WinError 206, an OSError no GitHubError handler catches; chunks now
+#: flush at ~15 PRs / ~26 issues). Chunks flush early when the rendered query
+#: approaches this.
 _MAX_QUERY_CHARS = 24000
 
 #: Numbers per aliased existence probe.
@@ -222,15 +228,22 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
 
 def _timeline_event(node: dict) -> dict:
     """One timelineItems node -> the normalized event dict the extract layer
-    consumes (transport-agnostic shape; #6)."""
+    consumes (transport-agnostic shape; #6). Sub-objects are hardening
+    against malformed payloads: an `or {}` guards null, and an isinstance
+    guard keeps a non-object JSON value (string/list/number) from raising."""
     typename = node.get("__typename")
     if typename == "ClosedEvent":
-        closer = node.get("closer") or {}
+        closer = node.get("closer")
+        if not isinstance(closer, dict):
+            closer = {}
+        actor = node.get("actor")
         closer_type = closer.get("__typename")
         return {
             "type": "closed",
             "created_at": node.get("createdAt"),
-            "actor_login": (node.get("actor") or {}).get("login"),
+            "actor_login": actor.get("login")
+            if isinstance(actor, dict)
+            else None,
             "commit_id": closer.get("oid") if closer_type == "Commit" else None,
             "closer_type": {"Commit": "commit", "PullRequest": "pull_request"}.get(closer_type),
             "closer_number": _int_or_none(closer.get("number"))
@@ -238,14 +251,22 @@ def _timeline_event(node: dict) -> dict:
             else None,
         }
     if typename == "CrossReferencedEvent":
-        source = node.get("source") or {}
+        source = node.get("source")
+        if not isinstance(source, dict):
+            source = {}
+        actor = node.get("actor")
+        source_repo = source.get("repository")
         return {
             "type": "cross_referenced",
             "created_at": node.get("createdAt"),
-            "actor_login": (node.get("actor") or {}).get("login"),
+            "actor_login": actor.get("login")
+            if isinstance(actor, dict)
+            else None,
             "source_typename": source.get("__typename"),
             "source_number": _int_or_none(source.get("number")),
-            "source_repo": (source.get("repository") or {}).get("nameWithOwner"),
+            "source_repo": source_repo.get("nameWithOwner")
+            if isinstance(source_repo, dict)
+            else None,
             "is_cross_repository": bool(node.get("isCrossRepository")),
         }
     return {"type": str(typename or "unknown").lower()}
@@ -378,7 +399,10 @@ class GraphQLSource(GhApiSource):
         chunk: list[dict] = []
         for raw in items:
             if isinstance(raw, dict) and "number" in raw:
-                kinds[int(raw["number"])] = "pr" if "pull_request" in raw else "issue"
+                try:
+                    kinds[int(raw["number"])] = "pr" if "pull_request" in raw else "issue"
+                except (TypeError, ValueError):
+                    pass  # malformed listing numbers are skipped per item in sync
             chunk.append(raw)
             if len(chunk) >= GRAPHQL_CHILDREN_PAGE or self._chunk_query_len(chunk) >= _MAX_QUERY_CHARS:
                 children.update(self._fetch_children_chunk(chunk))
@@ -419,23 +443,58 @@ class GraphQLSource(GhApiSource):
     def _complete_timeline(self, number: int, kind: str, child: dict) -> None:
         """Finish a flagged timeline and own the `timeline_incomplete` flag.
 
-        A fully-drained connection CLEARS the flag (a 51-to-500-event item is
-        complete, not truncated). When the cap trips with pages still
-        remaining, the retained set becomes the contiguous NEWEST
-        _MAX_TIMELINE_EVENTS events — two chained `last:` pages walking back
-        through the first page's startCursor — and the flag stays set; sync
-        records the truncation in fetch_log (#6)."""
+        The flag is CLEARED only when a continuation page explicitly reported
+        `hasNextPage: false` AND the accumulated set is within
+        _MAX_TIMELINE_EVENTS — a genuinely drained, genuinely small timeline
+        is complete, not truncated. Every degenerate outcome keeps the flag
+        set so sync records the truncation in fetch_log rather than silently
+        presenting a partial timeline as complete:
+
+        - the cap trips with pages still remaining (the retained set becomes
+          the contiguous NEWEST _MAX_TIMELINE_EVENTS events via two chained
+          `last:` pages walking back through the newest page's startCursor);
+        - the accumulated set overshoots the cap because the last continuation
+          page straddled it (same newest-window replacement);
+        - a page is unanswerable (null endCursor with hasNextPage, a missing
+          or null alias mid-drain) or the cursor stops advancing — the
+          partial set is kept and the flag stays set.
+        """
         events = list(child.get("timeline") or [])
         cursor = child.get("timeline_cursor")
-        while cursor and len(events) < _MAX_TIMELINE_EVENTS:
+        last_page_saw_more: bool | None = None
+        pages = 0
+        while (
+            cursor
+            and len(events) < _MAX_TIMELINE_EVENTS
+            and pages < _MAX_CONTINUATION_PAGES
+        ):
             page, info = self._timeline_page(
                 number,
                 kind,
                 f"first: {_TIMELINE_CONTINUATION_PAGE} after: {_q(cursor)}",
             )
+            pages += 1
+            if not page and not info:
+                # Unanswerable page (missing/null alias): we cannot know
+                # whether more events exist, so keep the flag set.
+                child["timeline"] = events
+                child.pop("timeline_cursor", None)
+                return
             events.extend(page)
-            cursor = info.get("endCursor") if info.get("hasNextPage") else None
-        if cursor is None:
+            last_page_saw_more = bool(info.get("hasNextPage"))
+            new_cursor = info.get("endCursor")
+            if last_page_saw_more and new_cursor and new_cursor != cursor:
+                cursor = new_cursor
+            else:
+                cursor = None
+                if last_page_saw_more:
+                    # hasNextPage true but the cursor is missing or did not
+                    # advance: undrillable, keep the flag set.
+                    child["timeline"] = events
+                    child.pop("timeline_cursor", None)
+                    return
+        drained = last_page_saw_more is False and len(events) <= _MAX_TIMELINE_EVENTS
+        if drained:
             child["timeline"] = events
             child.pop("timeline_incomplete", None)
         else:
@@ -578,8 +637,15 @@ class GraphQLSource(GhApiSource):
             if files_more:
                 children["files_incomplete"] = True
 
+        if "baseRefName" in node or "mergedAt" in node:
+            # The pull section is gated on its OWN fields, not on `files`:
+            # a node whose files connection is masked must not silently lose
+            # mergedBy / closingIssuesReferences (issue #6 review round 2).
             merge_commit = node.get("mergeCommit") or {}
-            merged_by = node.get("mergedBy") or {}
+            merged_by = node.get("mergedBy")
+            merged_by_login = (
+                merged_by.get("login") if isinstance(merged_by, dict) else None
+            )
             closing_refs, closing_more = _connection(node.get("closingIssuesReferences"))
             children["pull"] = {
                 "additions": node.get("additions"),
@@ -591,7 +657,7 @@ class GraphQLSource(GhApiSource):
                 "base": {"ref": node.get("baseRefName")},
                 "head": {"ref": node.get("headRefName")},
                 "draft": bool(node.get("isDraft")),
-                "merged_by": merged_by.get("login"),
+                "merged_by": merged_by_login,
                 "closing_issues_references": [
                     {
                         "number": _int_or_none(ref.get("number")),
@@ -606,11 +672,10 @@ class GraphQLSource(GhApiSource):
         if "timelineItems" in node:
             events, timeline_more = _connection(node.get("timelineItems"))
             children["timeline"] = [_timeline_event(e) for e in events]
-            # Retained for fetch_children's continuation; popped before the
-            # payload reaches ingest.
-            children["timeline_cursor"] = (node.get("timelineItems") or {}).get(
-                "pageInfo", {}
-            ).get("endCursor")
+            # Retained for fetch_children's continuation; _resolve_children
+            # never forwards it, and _complete_timeline pops it when it runs.
+            page_info = (node.get("timelineItems") or {}).get("pageInfo") or {}
+            children["timeline_cursor"] = page_info.get("endCursor")
             if timeline_more:
                 children["timeline_incomplete"] = True
         return children

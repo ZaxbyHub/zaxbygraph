@@ -66,9 +66,11 @@ Use the search, fetch, GitHub, and shell tools this host actually exposes. Name 
 Prefer ZaxbyGraph. After a successful `zaxbygraph sync`, collectors query SQLite (`status`, `search`, `item`, `related`, `churn`, `open`, `path`, `sql`) and paste truncated JSON. They do not page `gh api --paginate` of issues/PRs/comments into the lead. Details in `references/phases.md` and `docs/frontier-audit-hook.md` at the zaxbygraph repo root.
 
 The graph has two closing relations: `closes` is GitHub's own report (timeline
-closed events — which cover commit-message auto-close — plus PR closing
-references), and `closes_keyword` is a closing keyword in a body or comment.
-Treat provenance via `edges.source`.
+closed events — which cover commit-message auto-close, where a commit closer
+always yields `closed_by_commit` and yields `closes` only when the sha is a
+stored PR's merge commit or the closer is the PR itself — plus PR closing
+references), and `closes_keyword` is a closing keyword in a body, comment, or
+review body. Treat provenance via `edges.source`.
 
 ## Start
 

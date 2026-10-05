@@ -47,6 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_items_kind_state ON items(kind, state);
 CREATE INDEX IF NOT EXISTS idx_items_updated ON items(updated_at);
 CREATE INDEX IF NOT EXISTS idx_items_author ON items(author);
 CREATE INDEX IF NOT EXISTS idx_items_repo_number ON items(repo, number);
+CREATE INDEX IF NOT EXISTS idx_items_repo_merge ON items(repo, merge_commit);
 
 CREATE TABLE IF NOT EXISTS labels (
     repo   TEXT NOT NULL,

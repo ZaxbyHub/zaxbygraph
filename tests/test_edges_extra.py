@@ -162,13 +162,22 @@ class DegradedReingestSurvivalTests(ExtraEdgeIngestTest):
         self.assertEqual(after, before, "link edges must survive a degraded re-ingest")
 
         # Text/payload edges keep their freshness: a changed body retracts a
-        # keyword edge on rebuild.
+        # keyword edge on rebuild — ingest with the body, re-ingest without,
+        # and the edge is gone.
         self.ingest(
             issue(3, title="issue three", body="Fixes #5"),
             timeline=None,
         )
         self.assertEqual(
             self.edge_count("rel = 'closes_keyword' AND src_id = '3'"), 1
+        )
+        self.ingest(
+            issue(3, title="issue three", body="no keyword anymore"),
+            timeline=None,
+        )
+        self.assertEqual(
+            self.edge_count("rel = 'closes_keyword' AND src_id = '3'"), 0,
+            "a retracted closing keyword must retract the edge on rebuild",
         )
 
 
@@ -258,6 +267,10 @@ class MergeCloseConvergenceTests(ExtraEdgeIngestTest):
         self.assertEqual(issue_first, [("7", "closes", "9", "timeline closed event 2026-01-01T00:00:00Z", "timeline")])
 
         # PR-first order converges on the identical 7-tuple for a fresh DB.
+        # Release the first fixture's connection and temp dir BEFORE
+        # re-entering setUp, or Windows pins history.db and the temp dir
+        # cleanup PermissionErrors (review round 2, PRR-023).
+        self.tearDown()
         self.setUp()
         self.ingest(pr7, pull_raw=dict(pull(7, merged=True), merge_commit_sha="abc1234"))
         self.ingest(issue9, timeline=[closed])

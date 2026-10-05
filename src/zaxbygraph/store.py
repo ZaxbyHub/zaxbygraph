@@ -14,6 +14,7 @@ from zaxbygraph.extract import (
     edges_from_review,
     edges_from_timeline,
     item_kind,
+    revert_title_variants,
 )
 
 ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
@@ -150,7 +151,7 @@ def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -
             raw.get("updated_at"),
             raw.get("closed_at"),
             raw.get("merged_at"),
-            raw.get("merge_commit_sha"),
+            (raw.get("merge_commit_sha") or "").strip() or None,
             1 if raw.get("draft") else 0,
             1 if raw.get("locked") else 0,
             base.get("ref") if base else None,
@@ -337,6 +338,7 @@ def rebuild_edges(
     # closes every issue whose timeline already recorded closed_by_commit X,
     # whichever item ingests first. Self-excluded like the forward lookup,
     # evidence copied so both orders upsert the identical 7-tuple.
+    nid = str(number)
     merge_sha = item_raw.get("merge_commit_sha")
     if isinstance(merge_sha, str) and merge_sha.strip():
         nid = str(number)
@@ -348,6 +350,28 @@ def rebuild_edges(
             collected.append(
                 ("item", nid, "closes", "item", str(row["src_id"]), row["evidence"], "timeline")
             )
+    # Symmetric title-revert derivation: this item's stored title completes
+    # any already-stored revert PR that quotes it, whichever ingests first
+    # (same order-independence as the merge-close pass above).
+    title = item_raw.get("title")
+    if isinstance(title, str) and title:
+        evidence = "title reverts quoted item title"
+        for variant in revert_title_variants(title):
+            for row in conn.execute(
+                "SELECT number FROM items WHERE repo = ? AND title = ? AND number != ?",
+                (repo, variant, number),
+            ).fetchall():
+                collected.append(
+                    (
+                        "item",
+                        str(row["number"]),
+                        "reverts",
+                        "item",
+                        nid,
+                        evidence,
+                        "keyword",
+                    )
+                )
     for edge in collapse_edges(collected):
         insert_edge(conn, repo, edge)
 

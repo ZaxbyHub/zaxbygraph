@@ -3,6 +3,7 @@ replacement (every request <= 250), and the sync-side fetch_log trail."""
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from unittest.mock import patch
 
@@ -207,14 +208,98 @@ class ContinuationTests(unittest.TestCase):
         self.assertEqual(len(child["timeline"]), 2 * _TIMELINE_PAGE_MAX)
         self.assertEqual(child["timeline"][0]["source_number"], 600)
         self.assertEqual(child["timeline"][-1]["source_number"], 900 + _TIMELINE_PAGE_MAX - 1)
-        # Every timeline request stays inside the GitHub per-request cap, and
-        # the older page walks back through the newest page's startCursor.
+        # Every timeline request stays inside the GitHub per-request cap —
+        # asserted NUMERICALLY per query so `last: 251`-style mutants fail —
+        # and the older page walks back through the newest page's startCursor.
         for query in api.queries:
             self.assertIn("timelineItems(", query)
-            self.assertNotIn("last: 500", query)
-            self.assertNotIn("first: 500", query)
+            for size in re.findall(r"(?:first|last): (\d+)", query):
+                self.assertLessEqual(
+                    int(size),
+                    _TIMELINE_PAGE_MAX,
+                    f"per-request cap violated: {query}",
+                )
         self.assertIn("last: 250", api.queries[0])
         self.assertIn('before: "newest-start"', api.queries[1])
+        self.assertIn("last: 250", api.queries[1])
+
+
+class DispatchAndMappingTests(unittest.TestCase):
+    """PRR-028: fetch_children really dispatches into _complete_timeline with
+    the right kind, and the closing-refs overflow mapping raises its flag."""
+
+    def test_fetch_children_dispatches_flagged_timelines_with_kind(self) -> None:
+        """The real fetch_children dispatch loop: only flagged children are
+        completed, and `kind` is derived from the listing payload
+        (pull_request present → 'pr')."""
+        source = GraphQLSource(*SRC)
+        flagged = _child_with_timeline([_closed_event()] * 60, cursor="c1")
+        complete = _child_with_timeline([_closed_event()], cursor=None)
+        calls: list[tuple[int, str]] = []
+
+        def fake_complete(self, number, kind, child):
+            calls.append((number, kind))
+
+        listing = [
+            {"id": 1, "number": 1, "title": "issue one"},
+            {"id": 2, "number": 2, "title": "pr two", "pull_request": {"url": "x"}},
+        ]
+        with patch.object(GraphQLSource, "_fetch_children_chunk", return_value={1: complete, 2: dict(flagged)}), patch.object(
+            GraphQLSource, "_complete_timeline", fake_complete
+        ):
+            source.fetch_children(listing)
+        self.assertEqual(calls, [(2, "pr")])
+
+    def test_closing_refs_overflow_sets_the_incomplete_flag(self) -> None:
+        source = GraphQLSource(*SRC)
+        node = {
+            "databaseId": 1,
+            "baseRefName": "main",
+            "headRefName": "feat/1",
+            "mergeCommit": {"oid": "abc"},
+            "closingIssuesReferences": {
+                "totalCount": 5,
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {"number": 1, "repository": {"nameWithOwner": "ZaxbyHub/zaxbygraph"}}
+                ],
+            },
+        }
+        child = source._children_from_node(node)
+        self.assertTrue(child["closing_refs_incomplete"])
+        self.assertEqual(
+            child["pull"]["closing_issues_references"],
+            [{"number": 1, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
+
+    def test_pull_section_survives_a_masked_files_section(self) -> None:
+        """PRR-008: the pull block is gated on its own fields, not on
+        `files`, so a masked files connection no longer silently drops
+        mergedBy / closing refs."""
+        source = GraphQLSource(*SRC)
+        node = {
+            "databaseId": 1,
+            "baseRefName": "main",
+            "headRefName": "feat/1",
+            "mergedAt": "2026-01-01T00:00:00Z",
+            "mergeCommit": {"oid": "abc"},
+            "mergedBy": {"login": "zaxbysauce"},
+            "closingIssuesReferences": {
+                "totalCount": 1,
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {"number": 5, "repository": {"nameWithOwner": "ZaxbyHub/zaxbygraph"}}
+                ],
+            },
+            # deliberately NO "files" key
+        }
+        child = source._children_from_node(node)
+        self.assertNotIn("files", child)
+        self.assertEqual(child["pull"]["merged_by"], "zaxbysauce")
+        self.assertEqual(
+            child["pull"]["closing_issues_references"],
+            [{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
 
 
 class FakeTimelineSource:
@@ -262,6 +347,11 @@ class SyncTrailTests(TempDBTest):
         child = _child_with_timeline([_closed_event()] * 3, cursor="c1")
         child["timeline_incomplete"] = True
         child["closing_refs_incomplete"] = True
+        child["pull"] = {
+            "closing_issues_references": [
+                {"number": 9, "repo": "ZaxbyHub/zaxbygraph"},
+            ],
+        }
         source = FakeTimelineSource(child, [1, 2])
         result = sync_repo(self.conn, source, REPO)
         self.assertIsNone(result["last_error"])
@@ -269,13 +359,15 @@ class SyncTrailTests(TempDBTest):
             "SELECT resource_id, note FROM fetch_log "
             "WHERE note LIKE 'timeline truncated%' OR note LIKE 'closing references truncated%'"
         )
+        # Note counts are DERIVED from what was actually retained (the review
+        # round 2 fix), not hardcoded constants.
         self.assertEqual(
             sorted(notes),
             [
-                ("1", "closing references truncated: retained first 100"),
-                ("1", "timeline truncated: retained newest 500 events"),
-                ("2", "closing references truncated: retained first 100"),
-                ("2", "timeline truncated: retained newest 500 events"),
+                ("1", "closing references truncated: retained first 1"),
+                ("1", "timeline truncated: retained newest 3 events"),
+                ("2", "closing references truncated: retained first 1"),
+                ("2", "timeline truncated: retained newest 3 events"),
             ],
         )
         # The events became timeline edges: items 1 and 2 each closed by

@@ -507,6 +507,26 @@ def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo, src_type, src_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(repo, dst_type, dst_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel)")
+    # The merge-commit lookup (issue #6's symmetric closes derivation) runs
+    # once per commit-closed timeline event; without this index each lookup
+    # scans every item row in the repo. Fresh databases get the same index
+    # from schema.sql. IF NOT EXISTS keeps the no-op guard honest for
+    # databases that already ran a schema.sql which included it.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_repo_merge ON items(repo, merge_commit)"
+    )
+    # Carry the AUTOINCREMENT high-water mark across the rebuild so ids once
+    # issued to since-deleted edges are never re-issued (the docstring's "ids
+    # are preserved" promise extends to the sequence).
+    old_seq = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'edges_v4'"
+    ).fetchone()
+    if old_seq is not None:
+        conn.execute(
+            "INSERT INTO sqlite_sequence(name, seq) VALUES ('edges', ?) "
+            "ON CONFLICT(name) DO UPDATE SET seq = MAX(seq, excluded.seq)",
+            (old_seq["seq"],),
+        )
 
 
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by

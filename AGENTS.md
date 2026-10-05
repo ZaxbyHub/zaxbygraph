@@ -45,7 +45,8 @@ shouldn't.
 - **Mentions and closes from comments roll up to the owning item**, so the graph
   never has a comment as an endpoint.
 - **A `closes_keyword` reference is not also a `mentions` reference.** The two
-  are mutually exclusive for a given pair.
+  are mutually exclusive within a single text payload; across payloads one
+  pair can carry both (per-payload suppression only).
 - **Cross-repo keyword references are dropped, never localized; timeline
   cross-references are kept repo-qualified.** A `#5` in another repo's URL
   must not attach to local item 5, and a foreign cross-reference is stored as

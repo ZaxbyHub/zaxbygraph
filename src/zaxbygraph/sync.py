@@ -502,16 +502,24 @@ def sync_repo(
                                     repo,
                                     "item",
                                     str(number),
-                                    note="timeline truncated: retained newest 500 events",
+                                    note=(
+                                        f"timeline truncated: retained newest {len(timeline)} events"
+                                    ),
                                     status=None,
                                 )
                             if flags.get("closing_refs_incomplete"):
+                                closing_refs = (pull_raw or {}).get(
+                                    "closing_issues_references"
+                                ) or []
                                 log_fetch(
                                     conn,
                                     repo,
                                     "item",
                                     str(number),
-                                    note="closing references truncated: retained first 100",
+                                    note=(
+                                        "closing references truncated: retained "
+                                        f"first {len(closing_refs)}"
+                                    ),
                                     status=None,
                                 )
                             if len(files) >= 3000:
@@ -539,6 +547,15 @@ def sync_repo(
                             _write_jsonl(jsonl_handle, "review", rec)
                         for rec in files:
                             _write_jsonl(jsonl_handle, "pr_file", rec)
+                        for rec in timeline:
+                            # Timeline events have no id of their own; the
+                            # record carries the owning item number so the
+                            # sidecar can reproduce the timeline edges (#6).
+                            _write_jsonl(
+                                jsonl_handle,
+                                "timeline_event",
+                                {"number": number, "event": rec},
+                            )
                 break
             except GitHubError as exc:
                 window = _rate_attrs(exc)
