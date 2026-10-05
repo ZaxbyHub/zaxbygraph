@@ -324,31 +324,21 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
             (r, n),
         ).fetchall()
     ]
-    if _edges_source_available(conn):
-        rec["edges"] = [
-            _row_to_dict(x)
-            for x in conn.execute(
-                "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source "
-                "FROM edges WHERE repo = ? AND ("
-                "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
-                ")",
-                (r, str(n), str(n)),
-            ).fetchall()
-        ]
-    else:
-        # Pre-v5 database: return edges without provenance and flag the
-        # staleness rather than crashing on the missing column.
-        rec["edges"] = [
-            _row_to_dict(x)
-            for x in conn.execute(
-                "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence "
-                "FROM edges WHERE repo = ? AND ("
-                "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
-                ")",
-                (r, str(n), str(n)),
-            ).fetchall()
-        ]
-        rec["index_stale"] = True
+    source_available = _edges_source_available(conn)
+    source_col = ", source" if source_available else ""
+    rec["edges"] = [
+        _row_to_dict(x)
+        for x in conn.execute(
+            f"SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence{source_col} "
+            "FROM edges WHERE repo = ? AND ("
+            "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
+            ")",
+            (r, str(n), str(n)),
+        ).fetchall()
+    ]
+    # Mirrors search(): a pre-v5 database returns edges without provenance
+    # and is flagged, on both polarities, so consumers get a stable envelope.
+    rec["index_stale"] = not source_available
     return rec
 
 
@@ -368,6 +358,7 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
         if source_available
         else "src_type, src_id, rel, dst_type, dst_id, confidence, evidence"
     )
+    index_stale = not source_available
     for _ in range(max(1, depth)):
         nxt: set[str] = set()
         for nid in frontier:
@@ -410,7 +401,13 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
             nodes.append(_row_to_dict(it))
         else:
             nodes.append({"number": number_value, "kind": None, "title": None, "state": None})
-    return {"number": number, "repo": repo, "nodes": nodes, "edges": seen_edges}
+    return {
+        "number": number,
+        "repo": repo,
+        "nodes": nodes,
+        "edges": seen_edges,
+        "index_stale": index_stale,
+    }
 
 
 def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) -> list[dict]:

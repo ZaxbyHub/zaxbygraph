@@ -169,6 +169,94 @@ class ForeignClosingRefDropTests(TempDBTest):
         )
 
 
+class PreV5ReadDegradeTests(unittest.TestCase):
+    """PRR-001 regression pin: a pre-v5 database opened read-only (the way
+    every read command opens it — reads NEVER migrate) must return item and
+    related results WITHOUT the source column and WITH index_stale, instead
+    of raising `no such column: source`. On the pre-fix code these calls
+    raise OperationalError, so this test fails without the fix."""
+
+    def build_v4_db(self):
+        import tempfile
+        from pathlib import Path
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "history.db"
+        v4 = sqlite3.connect(str(db_path))
+        try:
+            v4.executescript(V4_SCHEMA_SQL)
+            v4.execute("PRAGMA user_version = 4")
+            v4.execute(
+                "INSERT INTO items(id, repo, number, kind, title, body, state,"
+                " author, created_at, updated_at, raw_json)"
+                " VALUES (30000, ?, 7, 'issue', 'issue seven', '', 'open',"
+                " 'alice', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}')",
+                (REPO,),
+            )
+            v4.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence)"
+                " VALUES (?, 'item', '7', 'mentions', 'item', '8',"
+                " 'EXTRACTED', 'body #N')",
+                (REPO,),
+            )
+            v4.commit()
+        finally:
+            v4.close()
+        return db_path
+
+    def test_item_and_related_degrade_on_a_prev5_database(self) -> None:
+        from zaxbygraph import query
+        from zaxbygraph.db import open_existing
+
+        conn = open_existing(self.build_v4_db())
+        try:
+            rec = query.item(conn, 7, repo=REPO)
+            self.assertIsNotNone(rec)
+            self.assertNotIn("source", rec["edges"][0])
+            self.assertIs(rec["index_stale"], True)
+            rel = query.related(conn, 7, repo=REPO)
+            self.assertNotIn("source", rel["edges"][0])
+            self.assertIs(rel["index_stale"], True)
+        finally:
+            conn.close()
+
+    def test_v5_item_and_related_carry_source_without_the_flag(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from zaxbygraph.store import ingest_item
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        conn = connect(Path(td.name) / "history.db")
+        try:
+            init_schema(conn)
+            conn.execute("BEGIN")
+            ingest_item(
+                conn,
+                REPO,
+                issue(7, title="issue seven", body="see #8"),
+                pull_raw=None,
+                issue_comments=[],
+                review_comments=[],
+                reviews=[],
+                files=[],
+                include_patches=False,
+            )
+            conn.commit()
+            from zaxbygraph import query
+
+            rec = query.item(conn, 7, repo=REPO)
+            self.assertIs(rec["index_stale"], False)
+            self.assertIn("source", rec["edges"][0])
+            rel = query.related(conn, 7, repo=REPO)
+            self.assertIs(rel["index_stale"], False)
+        finally:
+            conn.close()
+
+
 class TitleRevertReversePassTests(TempDBTest):
     """PRR-007: the title-only revert edge is order-independent — the target's
     ingest completes a revert PR that ingested first, mirroring the
