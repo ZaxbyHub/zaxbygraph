@@ -21,7 +21,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, TempDBTest, issue, pr_file, pull, scrubbed_env
+from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pr_file, pull, scrubbed_env
 from test_mcp import (
     McpSession,
     _BlockingRunner,
@@ -303,38 +303,73 @@ class McpOverlapDedupeTests(TempDBTest):
 
 
 class McpStdinEncodingTests(unittest.TestCase):
-    """Review finding 5: MCP frames are UTF-8; a piped stdin on a
-    non-UTF-8 Windows locale must still decode them (the U+4E01 frame
-    byte 0x81 is undefined in cp1252, so a locale stdin crashes)."""
+    """Review finding 5: MCP frames are UTF-8, so a piped stdin on a
+    non-UTF-8 Windows locale must decode them faithfully.
+
+    The pre-fix failure mode is SILENT MOJIBAKE, not a crash: a
+    locale stdin decodes with cp1252+surrogateescape, so a non-ASCII
+    tool argument never raises - it round-trips corrupted and returns
+    confidently wrong results. The oracle therefore asserts fidelity:
+    a non-ASCII sentinel sent through a tools/call statement must
+    come back intact (verified RED on revert by mutation)."""
+
+    _SENTINEL = "丁"
 
     def test_stdin_decodes_utf8_frames_under_cp1252_locale(self) -> None:
+        db = _REPO_ROOT / ".zcode" / "fb6-stdin.db"
+        self.addCleanup(lambda: db.unlink(missing_ok=True))
+        conn = connect(db)
+        try:
+            init_schema(conn)
+            src = FakeGitHubSource()
+            src.add_issue(issue(1, title="sentinel probe", body="needle"))
+            sync_repo(conn, src, REPO)
+        finally:
+            conn.close()
+
         env = scrubbed_env()
         env.pop("PYTHONUTF8", None)
         env.pop("PYTHONIOENCODING", None)
-        frame = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {},
-                    "clientInfo": {"name": "\u4e01", "version": "0"},
+        env["ZAXBYGRAPH_DB"] = str(db)
+        statement = f"SELECT '{self._SENTINEL}' AS echo"
+        frames = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "probe", "version": "0"},
+                    },
+                }
+            )
+            + "\n"
+            + json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "sql",
+                        "arguments": {"repo": REPO, "statement": statement},
+                    },
                 },
-            },
-            ensure_ascii=False,
-        ) + "\n"
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
         proc = subprocess.run(
             [sys.executable, "-X", "utf8=0", "-m", "zaxbygraph", "mcp"],
-            input=frame.encode("utf-8"),
+            input=frames.encode("utf-8"),
             capture_output=True,
             env=env,
             cwd=str(_REPO_ROOT),
             timeout=120,
         )
         out = proc.stdout.decode("utf-8", "replace")
-        self.assertNotEqual(proc.returncode, 120, "FB6: the server must not time out")
-        answered = None
+        echo = None
         for line in out.splitlines():
             line = line.strip()
             if not line:
@@ -343,15 +378,23 @@ class McpStdinEncodingTests(unittest.TestCase):
                 obj = json.loads(line)
             except ValueError:
                 continue
-            if obj.get("id") == 1 and isinstance(obj.get("result"), dict):
-                answered = obj["result"]
+            if obj.get("id") == 2 and isinstance(obj.get("result"), dict):
+                env_payload = json.loads(obj["result"]["content"][0]["text"])
+                rows = (env_payload.get("data") or {}).get("rows") or []
+                if rows:
+                    echo = rows[0][0]
                 break
         self.assertIsNotNone(
-            answered,
-            "FB6: initialize must answer with UTF-8 stdin decoding; "
-            f"stderr: {proc.stderr.decode('utf-8', 'replace')[-400:]}",
+            echo,
+            "FB6: the sql echo must answer; stderr: "
+            + proc.stderr.decode("utf-8", "replace")[-400:],
         )
-        self.assertIsInstance(answered.get("protocolVersion"), str)
+        self.assertEqual(
+            echo,
+            self._SENTINEL,
+            "FB6: a non-ASCII sentinel must survive the stdin round trip "
+            f"byte-faithfully (locale mojibake would corrupt it); got {echo!r}",
+        )
 
 
 if __name__ == "__main__":

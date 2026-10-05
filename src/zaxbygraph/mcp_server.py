@@ -256,9 +256,13 @@ def _roots_slugs(ctx) -> list[tuple[str, str]]:
         try:
             msg = json.loads(line)
         except ValueError:
+            _error(ctx.stdout, None, _JSONRPC_PARSE_ERROR, "Parse error (line is not JSON)")
             continue
-        if not isinstance(msg, dict) or msg.get("id") != req_id:
-            if isinstance(msg, dict) and "method" in msg:
+        if not isinstance(msg, dict):
+            _error(ctx.stdout, None, _JSONRPC_INVALID_REQUEST, "Invalid Request (line is not an object)")
+            continue
+        if msg.get("id") != req_id:
+            if "method" in msg:
                 # A pipelined client request or notification: never drop
                 # it - buffer and process after this handshake.
                 ctx.deferred.append(msg)
@@ -437,6 +441,21 @@ def _page(items: list, offset: int, limit: int) -> tuple[list, bool, str | None]
     return page, truncated, next_cursor
 
 
+def _int_arg(arguments: dict, key: str, default: int) -> int:
+    """A typed optional integer argument; a wrong type is a structured
+    bad_request, never a protocol-frame internal error."""
+    value = arguments.get(key, default)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ToolError(
+            "bad_request",
+            f"{key} must be an integer",
+            hint=f"pass {key} as an integer",
+        )
+    return value
+
+
 def _int_cursor(raw) -> int:
     try:
         value = int(raw)
@@ -471,7 +490,7 @@ def _tool_search(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(arguments.get("limit", 20))
+        limit = _clamp_limit(_int_arg(arguments, "limit", 20))
         offset = _int_cursor(arguments.get("cursor"))
         result = search(conn, query, limit=limit + offset, repo=slug)
         items = result.get("items") or []
@@ -567,7 +586,7 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(arguments.get("limit", 30))
+        limit = _clamp_limit(_int_arg(arguments, "limit", 30))
         offset = _int_cursor(arguments.get("cursor"))
         result = file_history(conn, path, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
@@ -601,7 +620,7 @@ def _tool_open_items(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = _clamp_limit(arguments.get("limit", 50))
+        limit = _clamp_limit(_int_arg(arguments, "limit", 50))
         offset = _int_cursor(arguments.get("cursor"))
         rows = open_items(conn, repo=slug)
         page, truncated, next_cursor = _page(rows, offset, limit)
@@ -643,7 +662,7 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         ) from None
     finally:
         conn.close()
-    limit = _clamp_limit(arguments.get("limit", 200))
+    limit = _clamp_limit(_int_arg(arguments, "limit", 200))
     try:
         data = run_sql(guarded, statement, limit=limit, repo=slug)
     except ValueError as exc:
