@@ -46,7 +46,9 @@ def _seed(db_path: Path) -> None:
 
 def _guardrail_commands() -> list[list[str]]:
     """One success-path invocation per envelope-covered subcommand. `sync`
-    is excluded (network write; its envelope is pinned by test_sync.py)."""
+    is excluded (network write; its envelope is pinned by test_sync.py);
+    `mcp` is excluded too (a long-running stdio server with no envelope —
+    its contract is pinned by tests/test_mcp.py)."""
     return [
         ["status"],
         ["search", "needle"],
@@ -61,6 +63,11 @@ def _guardrail_commands() -> list[list[str]]:
         ["where"],
         ["export-graph"],
         ["doctor"],
+        # issue #7 product queries against the seed corpus (issue 1, issue
+        # 2, PR 10 touching src/store.py): all exit 0.
+        ["overlap", "10", "1"],
+        ["file-history", "src/store.py"],
+        ["what-closed", "1"],
     ]
 
 
@@ -343,7 +350,7 @@ class EnvelopeContractTests(unittest.TestCase):
             missing = [k for k in required if k not in payload]
             if missing:
                 problems.append(f"{name} missing {','.join(missing)}")
-        uncovered = registered - seen - {"sync"}
+        uncovered = registered - seen - {"sync", "mcp"}
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"
         )

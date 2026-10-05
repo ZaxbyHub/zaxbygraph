@@ -56,6 +56,27 @@ Check the result before trusting the DB:
 - `ok: false` → read `error`. Sync reports failure as a **result object on
   stdout**, not on stderr, so don't infer success from a silent stderr.
 
+## MCP surface (prefer when configured)
+
+When an MCP client (Claude Code, opencode, ...) has `zaxbygraph mcp` registered,
+prefer its typed tools over shelling out to the CLI: same data, same envelope,
+no cwd/column/shape guessing. `claude mcp add zaxbygraph -- zaxbygraph mcp`
+registers it.
+
+- Tools: `graph_status`, `search`, `get_item`, `related`, `path`, `pr_overlap`,
+  `file_history`, `what_closed`, `open_items`, `sql`, `sync`. Each tool result's
+  text parses to the same JSON envelope the CLI prints; errors arrive as
+  `isError: true` with the `error{code, message, hint}` object.
+- Resource `zaxbygraph://schema` carries the DDL + column notes.
+- Repo resolution: explicit `repo` argument, then client roots, then the
+  server cwd's git origin — the same slug-keyed store the CLI resolves, so a
+  worktree and its main checkout share one graph. Pass `repo` explicitly when
+  your roots span more than one checkout.
+- Stale reads (default threshold 15 minutes) answer immediately and start one
+  background sync; `freshness.refreshing: true` tells you new data is landing.
+  Use `graph_status` for sync progress.
+- The CLI remains the fallback surface (and the only writer: `zaxbygraph sync`).
+
 ## Which command answers which question
 
 | You want to know | Use |

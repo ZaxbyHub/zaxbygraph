@@ -28,13 +28,16 @@ from zaxbygraph.query import (
     assert_read_sql,
     churn,
     export_graph,
+    file_history,
     item,
     open_items,
     path_between,
+    pr_overlap,
     related,
     run_sql,
     search,
     status,
+    what_closed,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
 from zaxbygraph.schema_notes import describe_schema
@@ -656,6 +659,75 @@ def cmd_path(args: argparse.Namespace) -> int:
     return _run_read(args, path_between, args.a, args.b)
 
 
+def _run_read_promote_truncated(
+    args: argparse.Namespace, query_fn, *extra
+) -> int:
+    """_run_read for the product queries (issue #7): a data-level
+    `truncated` key (file_history's over-fetch evidence) is promoted to
+    the envelope's truncated flag instead of hiding inside data."""
+    repo: str | None = None
+    db_path: Path | None = None
+    try:
+        conn, repo, db_path = _open_for_read(args)
+    except _ReadFailure as exc:
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
+    try:
+        data = query_fn(conn, *extra, repo=repo)
+        truncated = False
+        if isinstance(data, dict) and "truncated" in data:
+            truncated = bool(data.pop("truncated"))
+        fresh = _freshness(conn, repo)
+        line = _identity_line(conn, repo, db_path)
+    except LookupError as exc:
+        return emit_failure(
+            args,
+            1,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="not_found",
+        )
+    finally:
+        conn.close()
+    emit_result(
+        args,
+        data,
+        slug=repo,
+        db_path=db_path,
+        truncated=truncated,
+        freshness=fresh,
+        identity_line=line,
+    )
+    return 0
+
+
+def cmd_overlap(args: argparse.Namespace) -> int:
+    return _run_read_promote_truncated(args, pr_overlap, args.numbers)
+
+
+def cmd_file_history(args: argparse.Namespace) -> int:
+    return _run_read_promote_truncated(args, file_history, args.path, args.limit)
+
+
+def cmd_what_closed(args: argparse.Namespace) -> int:
+    return _run_read_promote_truncated(args, what_closed, args.number)
+
+
+def cmd_mcp(args: argparse.Namespace) -> int:
+    # Deferred import: mcp_server imports this module's helpers, so the
+    # dependency only ever points one way at import time.
+    from zaxbygraph.mcp_server import serve
+
+    serve(sys.stdin, sys.stdout, stale_after_s=args.stale_seconds)
+    return 0
+
+
 _NO_SUCH_RE = re.compile(r"^(no such column|no such table)", re.IGNORECASE)
 _TABLE_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
 
@@ -1140,6 +1212,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Adopt the freshest complete corpus into the store (copies, never deletes)",
     )
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser(
+        "overlap",
+        help="Shared files for each pair of PRs (the collision check)",
+    )
+    add_common(sp)
+    sp.add_argument("numbers", type=int, nargs="+", metavar="NUMBER")
+    sp.set_defaults(func=cmd_overlap)
+
+    sp = sub.add_parser(
+        "file-history",
+        help="PRs that touched a path, newest first, with the issues they closed",
+    )
+    add_common(sp)
+    sp.add_argument("path")
+    sp.add_argument("--limit", type=int, default=30)
+    sp.set_defaults(func=cmd_file_history)
+
+    sp = sub.add_parser(
+        "what-closed",
+        help="Closing PRs and commits for an issue, with edge provenance",
+    )
+    add_common(sp)
+    sp.add_argument("number", type=int)
+    sp.set_defaults(func=cmd_what_closed)
+
+    sp = sub.add_parser(
+        "mcp", help="Run the stdio MCP server (typed tools over JSON-RPC 2.0)"
+    )
+    add_common(sp)
+    sp.add_argument(
+        "--stale-seconds",
+        type=int,
+        default=None,
+        dest="stale_seconds",
+        help=(
+            "Freshness age that triggers a background refresh on reads "
+            "(default 900; env ZAXBYGRAPH_MCP_STALE_SECONDS)"
+        ),
+    )
+    sp.set_defaults(func=cmd_mcp)
     return p
 
 
