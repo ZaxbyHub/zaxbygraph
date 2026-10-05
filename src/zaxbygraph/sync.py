@@ -138,11 +138,14 @@ def _resolve_children(
     kind: str,
     include_patches: bool,
     provided: dict | None = None,
-) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict]]:
+) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict], list[dict], dict]:
     """Children for one item: inline or bulk-provided payload where present
     and complete, per-item REST fallback where flagged incomplete or absent
     (issue #5). `provided` is what the source's fetch_children bulk call
-    returned for this item; inline payload keys take precedence.
+    returned for this item; inline payload keys take precedence. Returns the
+    five legacy sections plus the GraphQL-only timeline event list and a
+    flags dict (timeline_incomplete / closing_refs_incomplete) for sync to
+    record in fetch_log (#6).
 
     The absent-everywhere path keeps the legacy rules (comments only when the
     count is nonzero, pull details only for PRs, files via changed_files),
@@ -195,12 +198,29 @@ def _resolve_children(
                 sections[name] = list(getattr(source, fallback_name)(number))
         else:
             sections[name] = []
+    # Timeline events ride only the GraphQL bulk payload (issue #6): there is
+    # deliberately NO per-item REST fallback, so a plain REST source yields
+    # none and previously stored timeline edges survive via the delete-owned
+    # exemption in store.delete_owned_edges. The same is true of closing
+    # references, which ride the pull section of the GraphQL payload only.
+    timeline: list[dict] = []
+    flags: dict[str, bool] = {}
+    if provided is not None:
+        provided_timeline = provided.get("timeline")
+        if isinstance(provided_timeline, list):
+            timeline = list(provided_timeline)
+        if provided.get("timeline_incomplete"):
+            flags["timeline_incomplete"] = True
+        if provided.get("closing_refs_incomplete"):
+            flags["closing_refs_incomplete"] = True
     return (
         pull_raw,
         sections["issue_comments"],
         sections["review_comments"],
         sections["reviews"],
         sections["files"],
+        timeline,
+        flags,
     )
 
 
@@ -404,9 +424,11 @@ def sync_repo(
                         seen_numbers.add(number)
                         kind = item_kind(list_raw)
                         try:
-                            pull_raw, issue_comments, review_comments, reviews, files = _resolve_children(
-                                source, list_raw, kind, include_patches,
-                                provided=provided_map.get(number),
+                            pull_raw, issue_comments, review_comments, reviews, files, timeline, flags = (
+                                _resolve_children(
+                                    source, list_raw, kind, include_patches,
+                                    provided=provided_map.get(number),
+                                )
                             )
                         except GitHubError as exc:
                             if exc.status in (404, 410):
@@ -472,7 +494,34 @@ def sync_repo(
                                 reviews=reviews,
                                 files=files,
                                 include_patches=include_patches,
+                                timeline=timeline,
                             )
+                            if flags.get("timeline_incomplete"):
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note=(
+                                        f"timeline truncated: retained newest {len(timeline)} events"
+                                    ),
+                                    status=None,
+                                )
+                            if flags.get("closing_refs_incomplete"):
+                                closing_refs = (pull_raw or {}).get(
+                                    "closing_issues_references"
+                                ) or []
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note=(
+                                        "closing references truncated: retained "
+                                        f"first {len(closing_refs)}"
+                                    ),
+                                    status=None,
+                                )
                             if len(files) >= 3000:
                                 log_fetch(
                                     conn,
@@ -498,6 +547,15 @@ def sync_repo(
                             _write_jsonl(jsonl_handle, "review", rec)
                         for rec in files:
                             _write_jsonl(jsonl_handle, "pr_file", rec)
+                        for rec in timeline:
+                            # Timeline events have no id of their own; the
+                            # record carries the owning item number so the
+                            # sidecar can reproduce the timeline edges (#6).
+                            _write_jsonl(
+                                jsonl_handle,
+                                "timeline_event",
+                                {"number": number, "event": rec},
+                            )
                 break
             except GitHubError as exc:
                 window = _rate_attrs(exc)

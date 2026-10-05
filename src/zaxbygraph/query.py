@@ -270,6 +270,16 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     }
 
 
+def _edges_source_available(conn: sqlite3.Connection) -> bool:
+    """True when the `edges` table carries the v5 `source` column.
+
+    Read commands open existing databases read-only and never migrate
+    (mirrors search's index_stale contract): a pre-v5 database has no
+    `source` column, so edge projections must degrade instead of raising
+    `no such column` on the upgrade-then-query path."""
+    return any(row[1] == "source" for row in conn.execute("PRAGMA table_info(edges)"))
+
+
 def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict | None:
     repo = _fold_repo(repo)
     if repo:
@@ -314,16 +324,21 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
             (r, n),
         ).fetchall()
     ]
+    source_available = _edges_source_available(conn)
+    source_col = ", source" if source_available else ""
     rec["edges"] = [
         _row_to_dict(x)
         for x in conn.execute(
-            "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence "
+            f"SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence{source_col} "
             "FROM edges WHERE repo = ? AND ("
             "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
             ")",
             (r, str(n), str(n)),
         ).fetchall()
     ]
+    # Mirrors search(): a pre-v5 database returns edges without provenance
+    # and is flagged, on both polarities, so consumers get a stable envelope.
+    rec["index_stale"] = not source_available
     return rec
 
 
@@ -337,11 +352,18 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
     seen_edges: list[dict] = []
     frontier = {str(number)}
     visited = set(frontier)
+    source_available = _edges_source_available(conn)
+    edge_columns = (
+        "src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source"
+        if source_available
+        else "src_type, src_id, rel, dst_type, dst_id, confidence, evidence"
+    )
+    index_stale = not source_available
     for _ in range(max(1, depth)):
         nxt: set[str] = set()
         for nid in frontier:
             rows = conn.execute(
-                "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence "
+                f"SELECT {edge_columns} "
                 "FROM edges WHERE repo = ? AND ("
                 "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
                 ")",
@@ -351,21 +373,41 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
                 rec = _row_to_dict(row)
                 seen_edges.append(rec)
                 for typ, ident in ((rec["src_type"], rec["src_id"]), (rec["dst_type"], rec["dst_id"])):
-                    if typ == "item" and ident not in visited:
+                    # Foreign repo-qualified ids are frontier dead ends: they
+                    # carry no local edges of their own beyond the mirror row,
+                    # and expanding them at depth >= 2 would connect unrelated
+                    # local items through a third-party hub.
+                    if typ == "item" and ident not in visited and ident.isdigit():
                         nxt.add(ident)
                         visited.add(ident)
         frontier = nxt
     nodes = []
     for nid in visited:
+        # Repo-qualified foreign cross-reference ids (owner/repo#N, issue #6)
+        # have no local items row and are not numeric: surface them as
+        # unresolved placeholder nodes instead of crashing on int().
+        try:
+            number_value = int(nid)
+        except ValueError:
+            nodes.append(
+                {"number": None, "id": nid, "kind": None, "title": None, "state": None}
+            )
+            continue
         it = conn.execute(
             "SELECT number, kind, title, state FROM items WHERE repo = ? AND number = ?",
-            (repo, int(nid)),
+            (repo, number_value),
         ).fetchone()
         if it:
             nodes.append(_row_to_dict(it))
         else:
-            nodes.append({"number": int(nid), "kind": None, "title": None, "state": None})
-    return {"number": number, "repo": repo, "nodes": nodes, "edges": seen_edges}
+            nodes.append({"number": number_value, "kind": None, "title": None, "state": None})
+    return {
+        "number": number,
+        "repo": repo,
+        "nodes": nodes,
+        "edges": seen_edges,
+        "index_stale": index_stale,
+    }
 
 
 def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) -> list[dict]:
@@ -398,8 +440,36 @@ def open_items(conn: sqlite3.Connection, repo: str | None = None) -> list[dict]:
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+#: Relations the `path` BFS traverses. Every relation the extractors emit
+#: (extract.RELATIONS) is either structural here or in PATH_EXCLUDED_RELATIONS
+#: — the Phase 4.2 guardrail test (tests/test_relation_registry.py) pins that
+#: partition so a new relation cannot ship silently unhandled. `merged_by` is
+#: excluded like the other actor relations: one login hub would join
+#: unrelated items.
+STRUCTURAL = frozenset(
+    {
+        "touches",
+        "closes",
+        "closes_keyword",
+        "mentions",
+        "cross_referenced",
+        "closed_by_commit",
+        "merged_commit",
+        "reverts",
+    }
+)
+PATH_EXCLUDED_RELATIONS = frozenset(
+    {"authored", "has_label", "commented", "reviewed", "merged_by"}
+)
+
+
 def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = None) -> dict:
-    """Undirected BFS over item↔item and item↔file edges."""
+    """Undirected BFS over the structural relations (see STRUCTURAL).
+
+    Traverses item, file, and commit nodes. Note the `path` CLI endpoint
+    grammar parses any non-digit argument as a file, so commit and foreign
+    item endpoints are reachable only as intermediate hops, not as `path`
+    arguments."""
     repo = _fold_repo(repo)
     if repo is None:
         row = conn.execute("SELECT repo FROM items LIMIT 1").fetchone()
@@ -420,7 +490,6 @@ def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = No
     start = node_key(start_t, start_id)
     goal = node_key(goal_t, goal_id)
 
-    STRUCTURAL = {"touches", "closes", "mentions"}
     adj: dict[str, list[tuple[str, str]]] = defaultdict(list)
     rows = conn.execute(
         "SELECT src_type, src_id, rel, dst_type, dst_id FROM edges WHERE repo = ?",
@@ -637,7 +706,7 @@ def export_graph(conn: sqlite3.Connection, repo: str | None = None) -> dict:
         )
         seen.add(nid)
     edge_rows = conn.execute(
-        "SELECT src_type, src_id, rel, dst_type, dst_id, confidence FROM edges"
+        "SELECT src_type, src_id, rel, dst_type, dst_id, confidence, source FROM edges"
         + (" WHERE repo = ?" if repo else ""),
         (repo,) if repo else (),
     ).fetchall()
@@ -657,6 +726,9 @@ def export_graph(conn: sqlite3.Connection, repo: str | None = None) -> dict:
                 "target": dst,
                 "rel": row["rel"],
                 "confidence": row["confidence"],
+                # Provenance stream of the edge itself (the "source" key above
+                # is the source ENDPOINT — different concept).
+                "provenance": row["source"],
             }
         )
     return {"nodes": nodes, "edges": edges}

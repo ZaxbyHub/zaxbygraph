@@ -279,7 +279,8 @@ zaxbygraph related N [--depth 1]
 
 Returns `{number, repo, nodes, edges}`. `nodes` are the items reachable within
 `--depth` hops; `edges` carry `src_type`/`src_id`/`rel`/`dst_type`/`dst_id`
-plus `confidence` and `evidence`. Raising `--depth` grows results quickly.
+plus `confidence`, `evidence`, and `source` (the provenance stream). Raising
+`--depth` grows results quickly.
 
 ### `churn` — files ranked by PR touches
 
@@ -303,8 +304,13 @@ Returns the open items under `data` (an array), newest first.
 zaxbygraph path A B
 ```
 
-`A` and `B` are item numbers or file paths. Undirected breadth-first search over
-`touches`, `closes`, and `mentions`. The `data` payload:
+`A` and `B` are item numbers or file paths. Undirected breadth-first search
+over `touches`, `closes`, `closes_keyword`, `mentions`, `cross_referenced`,
+`closed_by_commit`, `merged_commit`, and `reverts` — not the actor relations
+(`authored`, `commented`, `reviewed`, `merged_by`, `has_label`), because one
+actor hub would join unrelated items. Commit endpoints are not addressable as
+arguments (a non-digit argument parses as a file); commit joins flow through
+the BFS. The `data` payload:
 
 ```json
 {"a": "14", "b": "11", "repo": "acme/forgegate",
@@ -344,9 +350,13 @@ million rows does not materialize a million rows.
 ### `export-graph` — Graphify-shaped JSON
 
 Returns `{nodes, edges}` with `id` values namespaced by type (`item:14`,
-`file:src/…`, `actor:alice`, `label:bug`) and edges as
-`{source, target, rel, confidence}`. Intended for handing to a graph
-viewer or joining with a code graph on `file:` nodes.
+`file:src/…`, `actor:alice`, `label:bug`; a foreign cross-reference appears
+as `item:owner/repo#N` — repo-qualified, with no `items` row behind it) and
+edges as `{source, target, rel, confidence, provenance}` — that `source`
+names the src *endpoint* and is unrelated to the `edges.source` provenance
+column, which export-graph emits under the `provenance` key instead.
+Intended for handing to a graph viewer or joining with a code
+graph on `file:` nodes.
 
 ## Output and error contract
 
@@ -429,20 +439,28 @@ Schema versions are forward-only (`PRAGMA user_version`). A v2 database is
 rebuilt in place — both FTS tables drop and re-create with the porter
 tokenizer, no resync — by the next `sync` that opens it (sync is the one
 command that resolves to and writes a legacy database in place); v3 gains
-the `sync_state` rate-limit columns (v4) the same way, additively. Reads never
+the `sync_state` rate-limit columns (v4) the same way, additively, and a v4
+database has its `edges` table rebuilt in place with the `source` provenance
+column, the widened unique key, and the `closes_keyword` rename (v5,
+issue #6). Reads never
 migrate a database, and plain `doctor` never writes one either: it reads
 legacy files through migrated temp copies, and `doctor --consolidate`
 migrates the destination store it adopts into (creating it if needed), not
 the source. Two consequences worth knowing: a v2 database keeps the old
 tokenizer (search reports `index_stale: true`) until that first in-place
-`sync`, and once v3 is stamped, older zaxbygraph builds refuse it on the
+`sync`, and once v4/v5 is stamped, older zaxbygraph builds refuse it on the
 write path (`sync`, `doctor --consolidate` — the forward-only check runs in
-`init_schema`); older builds' read commands still open a v3 file fine. See
+`init_schema`); older builds' read commands still open the file fine. See
 [`docs/schema.md`](docs/schema.md) for the full migration reference.
 
 Edge relationships: `authored`, `has_label`, `commented`, `reviewed`, `touches`,
-`closes`, `mentions`. Node types are only `actor`, `item`, `label`, `file` — an
-issue and a PR are both `item`, distinguished by `items.kind`.
+`closes_keyword`, `mentions`, `closes`, `cross_referenced`, `closed_by_commit`,
+`merged_by`, `merged_commit`, `reverts`. Every edge carries a `source`
+provenance stream: `keyword` (text patterns), `timeline` (closed /
+cross-referenced events), `closing_ref` (PR closingIssuesReferences), or
+`payload` (structured fields). Node types are only `actor`, `item`, `label`,
+`file`, `commit` — an issue and a PR are both `item`, distinguished by
+`items.kind`; a commit endpoint's id is the sha, joining the graph to `git log`.
 
 Actor `commented`/`reviewed` edges are **collapsed** to one per actor×item; the
 full history lives in the `comments` and `reviews` tables.
@@ -451,16 +469,31 @@ Full column-level reference: [`docs/schema.md`](docs/schema.md).
 
 ### What `closes` means
 
-`closes` edges come from **closing keywords in bodies and comments** —
+There are two closing relations, and they answer different questions.
+
+`closes_keyword` edges come from **closing keywords in bodies, comments, and
+review bodies** —
 `close`/`closes`/`closed`, `fix`/`fixes`/`fixed`,
 `resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
-same-repo GitHub URL. Cross-repo references are ignored rather than attached to
-a same-numbered local item.
+same-repo GitHub URL. A missing `closes_keyword` edge means *no keyword said
+so*, not that the items are unrelated. Cross-repo keyword references are
+dropped rather than attached to a same-numbered local item.
 
-This is **not** GitHub's connected-issue graph. Auto-close from merge-commit
-messages, links made in the GitHub UI, and anything visible only through the
-timeline API are out of scope for v0.1. Treat a missing `closes` edge as "no
-keyword said so", not as "these are unrelated".
+`closes` edges are **GitHub's own reports**: `closed` timeline events —
+merge-commit auto-close lands here as a closed event with a commit closer,
+which always yields `closed_by_commit` and yields `closes` only when the sha
+is a stored PR's merge commit (or the closer is the PR itself) — and a PR's
+`closingIssuesReferences`. Keyword regexes never write it. Edges
+mirror the timeline as reported, so after reopen/re-close cycles multiple
+closers coexist; evidence timestamps order them, and `items.state` is
+authoritative for current open/closed. `cross_referenced` is stored as
+carried: GitHub reports every reference on both items' timelines, so the
+same linkage can appear in either direction.
+
+Timeline and closing-reference data rides the GraphQL page query only: a
+REST-only sync (`--source rest`) captures none of it (keyword edges still
+derive from bodies), and a GraphQL-degraded re-ingest never retracts a
+timeline- or closing-ref-backed edge once written.
 
 ## Troubleshooting
 

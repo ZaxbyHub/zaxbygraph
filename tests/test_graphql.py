@@ -104,10 +104,42 @@ def _pull_node(number: int, *, comments_overflow: bool = False) -> dict:
     return node
 
 
-def _graphql_payload(chunk_index: int) -> dict:
+def _graphql_payloads_for_listing(count: int) -> list[dict]:
+    """Canned responses covering every size-bounded chunk a listing of
+    `count` items produces under the source's batching rule."""
+    return [_graphql_payload_for(r) for r in _chunk_ranges(count)]
+
+
+def _chunk_ranges(count: int) -> list[list[int]]:
+    """Chunk boundaries the source's size-bounded batching rule produces for
+    `count` listing items (numbers >25 are PRs). Mirrors
+    GraphQLSource._chunk_query_len's documented formula: flush at
+    GRAPHQL_CHILDREN_PAGE numbers or at _MAX_QUERY_CHARS rendered chars."""
+    from zaxbygraph.graphql import _ISSUE_FIELDS, _MAX_QUERY_CHARS, _PULL_FIELDS
+
+    ranges: list[list[int]] = []
+    chunk: list[int] = []
+
+    def rendered(numbers: list[int]) -> int:
+        total = 120
+        for n in numbers:
+            fields = _PULL_FIELDS if n > 25 else _ISSUE_FIELDS
+            total += len(fields) + 80
+        return total
+
+    for n in range(1, count + 1):
+        chunk.append(n)
+        if len(chunk) >= GRAPHQL_CHILDREN_PAGE or rendered(chunk) >= _MAX_QUERY_CHARS:
+            ranges.append(chunk)
+            chunk = []
+    if chunk:
+        ranges.append(chunk)
+    return ranges
+
+
+def _graphql_payload_for(numbers: list[int]) -> dict:
     repository: dict = {}
-    for i in range(_CHUNK1_ITEMS * chunk_index, min(_CHUNK1_ITEMS * (chunk_index + 1), 50)):
-        n = i + 1
+    for n in numbers:
         alias = "p" if n > 25 else "i"
         node = _pull_node(n) if n > 25 else _issue_node(n)
         repository[f"{alias}{n}"] = node
@@ -204,16 +236,18 @@ def _listing_items(count: int) -> list[dict]:
 
 class GraphQLChildrenTests(unittest.TestCase):
     def test_fetch_children_batches_and_maps_rest_shapes(self) -> None:
+        ranges = _chunk_ranges(50)
+        self.assertGreaterEqual(len(ranges), 2, "50 items must batch")
         host = _FakeGraphQLHost()
-        host.write_graphql_responses([_graphql_payload(0), _graphql_payload(1)])
+        host.write_graphql_responses([_graphql_payload_for(r) for r in ranges])
         with host:
             src = host.source()
             children = src.fetch_children(_listing_items(50))
             graphql_calls = [c for c in host.graphql_calls() if c[0] == "graphql"]
         self.assertEqual(
             len(graphql_calls),
-            -(-50 // GRAPHQL_CHILDREN_PAGE),
-            "one aliased query per children page",
+            len(ranges),
+            "one size-bounded aliased query per children chunk",
         )
         self.assertEqual(src.rate_limit_remaining, 4321)
         self.assertEqual(src.rate_limit_reset_at, "2026-10-03T13:00:00Z")
@@ -269,7 +303,7 @@ class GraphQLChildrenTests(unittest.TestCase):
 
     def test_overflowing_connection_is_flagged_for_rest_fallback(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         node = payload["data"]["repository"]["i1"]
         node["comments"]["pageInfo"]["hasNextPage"] = True
         host.write_graphql_responses([payload])
@@ -346,7 +380,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_sent_query_carries_the_pinned_shape(self) -> None:
         host = _FakeGraphQLHost()
-        host.write_graphql_responses([_graphql_payload(0)])
+        host.write_graphql_responses(_graphql_payloads_for_listing(1))
         with host:
             src = host.source()
             src.fetch_children(_listing_items(26))  # 26 is a PR in the fixture
@@ -358,7 +392,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_null_section_is_omitted_not_empty(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         node = payload["data"]["repository"]["i1"]
         del node["comments"]  # permission mask / partial error shape
         host.write_graphql_responses([payload])
@@ -369,7 +403,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_not_found_errors_degrade_to_partial_data(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         payload["errors"] = [
             {"type": "NOT_FOUND",
              "message": "Could not resolve to an issue with the number of 99."}
@@ -382,7 +416,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_non_not_found_errors_still_raise(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         payload["errors"] = [{"type": "SOME_OTHER", "message": "boom"}]
         host.write_graphql_responses([payload])
         with host:
@@ -396,7 +430,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
         sync's bounded sleep-retry sees it, instead of failing fast on the
         NOT_FOUND's None status."""
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         payload["errors"] = [
             {"type": "NOT_FOUND",
              "message": "Could not resolve to an issue with the number of 1."},
@@ -413,13 +447,13 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
         """The degrade path with the error on a REQUESTED alias: the nulled
         item is omitted (per-item REST fallback) while its sibling survives."""
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
-        payload["data"]["repository"]["i1"] = None  # requested alias nulled
-        payload["errors"] = [
+        payloads = _graphql_payloads_for_listing(2)
+        payloads[0]["data"]["repository"]["i1"] = None  # requested alias nulled
+        payloads[0]["errors"] = [
             {"type": "NOT_FOUND",
              "message": "Could not resolve to an issue with the number of 1."}
         ]
-        host.write_graphql_responses([payload])
+        host.write_graphql_responses(payloads)
         with host:
             src = host.source()
             children = src.fetch_children(_listing_items(2))
@@ -428,10 +462,14 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_reviews_over_first_page_flags_review_comments_incomplete(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
-        node = payload["data"]["repository"]["p26"]
+        payloads = _graphql_payloads_for_listing(26)
+        node = next(
+            p["data"]["repository"]["p26"]
+            for p in payloads
+            if "p26" in p["data"]["repository"]
+        )
         node["reviews"]["pageInfo"]["hasNextPage"] = True
-        host.write_graphql_responses([payload])
+        host.write_graphql_responses(payloads)
         with host:
             src = host.source()
             children = src.fetch_children(_listing_items(26))
@@ -440,7 +478,7 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
 
     def test_totalcount_overflow_flags_incomplete_without_hasnextpage(self) -> None:
         host = _FakeGraphQLHost()
-        payload = _graphql_payload(0)
+        payload = _graphql_payloads_for_listing(1)[0]
         node = payload["data"]["repository"]["i1"]
         node["comments"]["totalCount"] = 5  # hasNextPage stays False
         host.write_graphql_responses([payload])

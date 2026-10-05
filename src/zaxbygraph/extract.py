@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 _CLOSE_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -89,25 +89,27 @@ def _label_name(label: object) -> str | None:
 
 
 def edges_from_item(repo: str, raw: dict) -> list[tuple]:
-    """EXTRACTED edge tuples: (src_type, src_id, rel, dst_type, dst_id, evidence)."""
+    """EXTRACTED edge tuples: (src_type, src_id, rel, dst_type, dst_id, evidence, source)."""
     number = int(raw["number"])
     item_id = str(number)
     edges: list[tuple] = []
     author = _login(raw)
     if author:
-        edges.append(("actor", author, "authored", "item", item_id, "user.login"))
+        edges.append(("actor", author, "authored", "item", item_id, "user.login", "payload"))
     for label in raw.get("labels") or []:
         name = _label_name(label)
         if name:
-            edges.append(("item", item_id, "has_label", "label", name, "labels[]"))
+            edges.append(("item", item_id, "has_label", "label", name, "labels[]", "payload"))
     body = raw.get("body") or ""
     closed = parse_closing_numbers(body, repo)
     for n in closed:
         if n != number:
-            edges.append(("item", item_id, "closes", "item", str(n), "body closing keyword"))
+            edges.append(
+                ("item", item_id, "closes_keyword", "item", str(n), "body closing keyword", "keyword")
+            )
     for n in parse_mentioned_numbers(body, repo):
         if n != number and n not in closed:
-            edges.append(("item", item_id, "mentions", "item", str(n), "body #N"))
+            edges.append(("item", item_id, "mentions", "item", str(n), "body #N", "keyword"))
     return edges
 
 
@@ -116,17 +118,25 @@ def edges_from_comment(repo: str, number: int, raw: dict) -> list[tuple]:
     cid = str(raw.get("id") or raw.get("github_id") or "")
     author = _login(raw)
     if author:
-        edges.append(("actor", author, "commented", "item", str(number), f"comment:{cid}"))
+        edges.append(("actor", author, "commented", "item", str(number), f"comment:{cid}", "payload"))
     body = raw.get("body") or ""
     closed = parse_closing_numbers(body, repo)
     for n in closed:
         if n != number:
             edges.append(
-                ("item", str(number), "closes", "item", str(n), f"comment:{cid} closing keyword")
+                (
+                    "item",
+                    str(number),
+                    "closes_keyword",
+                    "item",
+                    str(n),
+                    f"comment:{cid} closing keyword",
+                    "keyword",
+                )
             )
     for n in parse_mentioned_numbers(body, repo):
         if n != number and n not in closed:
-            edges.append(("item", str(number), "mentions", "item", str(n), f"comment:{cid} #N"))
+            edges.append(("item", str(number), "mentions", "item", str(n), f"comment:{cid} #N", "keyword"))
     return edges
 
 
@@ -136,17 +146,27 @@ def edges_from_review(repo: str, number: int, raw: dict) -> list[tuple]:
     author = _login(raw)
     state = raw.get("state") or ""
     if author:
-        edges.append(("actor", author, "reviewed", "item", str(number), f"review:{rid}:{state}"))
+        edges.append(
+            ("actor", author, "reviewed", "item", str(number), f"review:{rid}:{state}", "payload")
+        )
     body = raw.get("body") or ""
     closed = parse_closing_numbers(body, repo)
     for n in closed:
         if n != number:
             edges.append(
-                ("item", str(number), "closes", "item", str(n), f"review:{rid} closing keyword")
+                (
+                    "item",
+                    str(number),
+                    "closes_keyword",
+                    "item",
+                    str(n),
+                    f"review:{rid} closing keyword",
+                    "keyword",
+                )
             )
     for n in parse_mentioned_numbers(body, repo):
         if n != number and n not in closed:
-            edges.append(("item", str(number), "mentions", "item", str(n), f"review:{rid} #N"))
+            edges.append(("item", str(number), "mentions", "item", str(n), f"review:{rid} #N", "keyword"))
     return edges
 
 
@@ -155,15 +175,208 @@ def edges_from_files(number: int, files: Iterable[dict]) -> list[tuple]:
     for rec in files:
         path = rec.get("filename") or rec.get("path")
         if path:
-            edges.append(("item", str(number), "touches", "file", str(path), "pulls.files"))
+            edges.append(("item", str(number), "touches", "file", str(path), "pulls.files", "payload"))
     return edges
 
 
 def collapse_edges(edges: Iterable[tuple]) -> list[tuple]:
-    """Last-write-wins on the unique key (repo-less). Actor rels collapse."""
+    """Last-write-wins on the unique key (repo-less). Provenance source is
+    part of the key: the same pair reported by two streams is two facts."""
     by_key: dict[tuple, tuple] = {}
     for edge in edges:
-        src_type, src_id, rel, dst_type, dst_id, evidence = edge
-        key = (src_type, src_id, rel, dst_type, dst_id)
+        src_type, src_id, rel, dst_type, dst_id, evidence, source = edge
+        key = (src_type, src_id, rel, dst_type, dst_id, source)
         by_key[key] = edge
     return list(by_key.values())
+
+
+#: Relations any edges_from_* emitter can produce. The Phase 4.2 guardrail
+#: (tests/test_relation_registry.py) pins this set against query.py's
+#: structural set and the documented relationships table, so a new relation
+#: cannot ship undocumented or unhandled by `path`.
+RELATIONS = frozenset(
+    {
+        "authored",
+        "has_label",
+        "commented",
+        "reviewed",
+        "touches",
+        "closes_keyword",
+        "mentions",
+        "closes",
+        "cross_referenced",
+        "closed_by_commit",
+        "merged_by",
+        "merged_commit",
+        "reverts",
+    }
+)
+
+_TIMELINE_EVIDENCE = {
+    "closed": "timeline closed event",
+    "cross_referenced": "timeline cross-referenced event",
+}
+
+
+def edges_from_timeline(
+    repo: str,
+    number: int,
+    events: Iterable[dict],
+    merge_commit_lookup: Callable[[str], int | None],
+) -> list[tuple]:
+    """EXTRACTED timeline edges (issue #6): closed and cross-referenced
+    events, source='timeline'.
+
+    `merge_commit_lookup(sha)` resolves a commit sha to a stored PR number
+    (or None) so a closed event committed by a known merge commit also yields
+    `item:<pr> closes item:<issue>`. Cross-references are stored as carried:
+    the edge runs from the event's source to the ingested item, same-repo
+    sources as bare numbers, foreign sources as repo-qualified ids that can
+    never attach to a same-numbered local item.
+    """
+    nid = str(number)
+    edges: list[tuple] = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        evidence = _TIMELINE_EVIDENCE.get(etype, "timeline event")
+        created = event.get("created_at")
+        if created:
+            evidence = f"{evidence} {created}"
+        if etype == "closed":
+            sha = event.get("commit_id")
+            if isinstance(sha, str) and sha.strip():
+                sha = sha.strip()
+                edges.append(("item", nid, "closed_by_commit", "commit", sha, evidence, "timeline"))
+                closer = merge_commit_lookup(sha)
+                if isinstance(closer, int) and closer != number:
+                    edges.append(
+                        ("item", str(closer), "closes", "item", nid, evidence, "timeline")
+                    )
+            closer_type = event.get("closer_type")
+            closer_number = event.get("closer_number")
+            if closer_type == "pull_request" and isinstance(closer_number, int):
+                if closer_number != number:
+                    edges.append(
+                        ("item", str(closer_number), "closes", "item", nid, evidence, "timeline")
+                    )
+        elif etype == "cross_referenced":
+            src_number = event.get("source_number")
+            src_repo = event.get("source_repo")
+            if not isinstance(src_number, int) or not isinstance(src_repo, str) or not src_repo:
+                continue
+            if src_repo.lower() == repo.lower():
+                if src_number != number:
+                    edges.append(
+                        ("item", str(src_number), "cross_referenced", "item", nid, evidence, "timeline")
+                    )
+            else:
+                edges.append(
+                    (
+                        "item",
+                        f"{src_repo}#{src_number}",
+                        "cross_referenced",
+                        "item",
+                        nid,
+                        evidence,
+                        "timeline",
+                    )
+                )
+    return edges
+
+
+_REVERT_SHA_RE = re.compile(r"(?i)\bThis reverts commit ([0-9a-f]{7,40})\b")
+_REVERT_TITLE_PREFIX = 'Revert "'
+
+
+def edges_from_pr_state(
+    repo: str, raw: dict, title_lookup: Callable[[str], list[int]] | None = None
+) -> list[tuple]:
+    """EXTRACTED PR-structural edges (issue #6): merged_by, merged_commit,
+    closingIssueReferences closes edges, and reverts.
+
+    `merged_by` accepts either a bare login string (the GraphQL mapping) or a
+    `{"login": ...}` object (the raw REST pulls payload). Closing references
+    for other repos are dropped, never localized. A title-only revert resolves
+    its destination through `title_lookup` (stored item titles): exactly one
+    match other than the PR itself becomes an item-targeted reverts edge;
+    zero or multiple matches produce nothing, because a fabricated
+    destination is worse than a missing one.
+    """
+    number = int(raw["number"])
+    nid = str(number)
+    edges: list[tuple] = []
+    is_pr = raw.get("pull_request") is not None or raw.get("merged_at") is not None
+    merged = bool(raw.get("merged_at") or raw.get("merged"))
+    merged_by = raw.get("merged_by")
+    login: str | None = None
+    if isinstance(merged_by, str):
+        login = merged_by or None
+    elif isinstance(merged_by, dict):
+        value = merged_by.get("login")
+        login = str(value) if value else None
+    if is_pr and login and merged:
+        edges.append(("item", nid, "merged_by", "actor", login, "pull mergedBy", "payload"))
+    merge_sha = raw.get("merge_commit_sha")
+    # GitHub keeps a speculative test-merge oid in merge_commit_sha while a PR
+    # is open (REST); a merged_commit edge to a commit that does not exist in
+    # the repository would be a false fact, so gate on the merged state like
+    # merged_by above.
+    if is_pr and merged and isinstance(merge_sha, str) and merge_sha.strip():
+        edges.append(
+            ("item", nid, "merged_commit", "commit", merge_sha.strip(), "pull mergeCommit", "payload")
+        )
+    for ref in raw.get("closing_issues_references") or []:
+        if not isinstance(ref, dict):
+            continue
+        ref_number = ref.get("number")
+        ref_repo = ref.get("repo")
+        if not isinstance(ref_number, int) or not isinstance(ref_repo, str) or not ref_repo:
+            continue
+        if ref_repo.lower() != repo.lower() or ref_number == number:
+            continue
+        edges.append(
+            ("item", nid, "closes", "item", str(ref_number), "closingIssuesReferences", "closing_ref")
+        )
+    body = raw.get("body") or ""
+    # Revert edges describe a PR reverting earlier work; an issue whose body
+    # merely quotes "This reverts commit <sha>" (how-tos, templates) must not
+    # fabricate one, so both revert branches gate on the item being a PR.
+    if is_pr:
+        revert = _REVERT_SHA_RE.search(body)
+        if revert:
+            edges.append(
+                ("item", nid, "reverts", "commit", revert.group(1), "body reverts commit sha", "keyword")
+            )
+        elif title_lookup is not None:
+            title = raw.get("title") or ""
+            if title.startswith(_REVERT_TITLE_PREFIX):
+                span = title[len(_REVERT_TITLE_PREFIX) :]
+                if span.endswith('"'):
+                    span = span[:-1]
+                span = span.strip()
+                if span:
+                    matches = {int(n) for n in title_lookup(span) if int(n) != number}
+                    if len(matches) == 1:
+                        edges.append(
+                            (
+                                "item",
+                                nid,
+                                "reverts",
+                                "item",
+                                str(matches.pop()),
+                                "title reverts quoted item title",
+                                "keyword",
+                            )
+                        )
+    return edges
+
+
+def revert_title_variants(target_title: str) -> tuple[str, str]:
+    """The two revert-PR titles that the title-only revert rule maps to
+    `target_title`: with and without the closing quote (a hand-edited title
+    may drop it). Used by the store's reverse pass so a title-only revert
+    edge is order-independent, mirroring the merge-close symmetry."""
+    quoted = f'{_REVERT_TITLE_PREFIX}{target_title}"'
+    return quoted, f"{_REVERT_TITLE_PREFIX}{target_title}"

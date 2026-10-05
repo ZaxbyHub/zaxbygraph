@@ -13,9 +13,10 @@ import sqlite3
 # are the caveats a caller must know before writing SQL against this DB.
 COLUMN_NOTES: dict[str, dict[str, str]] = {
     "edges": {
-        "src_id": "TEXT-typed even for item numbers - filter with src_id = '10', not 10",
-        "dst_id": "TEXT-typed even for item numbers - use dst_id = '10' in SQL filters",
-        "evidence": "Provenance payload; never part of an edge's identity",
+        "src_id": "TEXT-typed even for item numbers - filter with src_id = '10', not 10; a foreign cross-referenced source is a repo-qualified id (`owner/repo#N`), never a bare number",
+        "dst_id": "TEXT-typed even for item numbers - use dst_id = '10' in SQL filters; a commit endpoint carries the sha so the graph joins to `git log`",
+        "evidence": "Provenance payload; never part of an edge's identity - `source` IS part of the key because the same pair reported by two streams is two facts",
+        "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced events), 'closing_ref' (PR closingIssuesReferences), 'payload' (structured fields)",
     },
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",
