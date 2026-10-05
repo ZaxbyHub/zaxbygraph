@@ -411,9 +411,10 @@ zaxbygraph mcp [--stale-seconds N]
   returns a job id and `graph_status` reports progress.
 - **Resource**: `zaxbygraph://schema` serves the same DDL and column notes as
   the `schema` command.
-- **Repo resolution**: explicit `repo` argument, then the client's MCP roots,
-  then the server cwd's git origin — resolving to the same slug-keyed store as
-  the CLI, so a worktree and its main checkout share one graph.
+- **Repo resolution**: explicit `repo` argument, then a server pin
+  (`zaxbygraph mcp --repo OWNER/REPO [--db PATH]`), then the client's MCP
+  roots, then the server cwd's git origin — resolving to the same slug-keyed
+  store as the CLI, so a worktree and its main checkout share one graph.
 - **Staleness**: when a read answers and `freshness.age_s` exceeds the
   threshold (`--stale-seconds`, default 900, env
   `ZAXBYGRAPH_MCP_STALE_SECONDS`), the answer still comes from current data

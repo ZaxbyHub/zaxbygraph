@@ -13,12 +13,13 @@ background jobs (daemon threads; the whole-run sync lock's same-host
 dead-PID takeover recovers abandoned locks).
 
 Disclosed boundaries:
-- The server serializes requests; a client request arriving while the
-  server awaits its own `roots/list` reply is skipped rather than queued.
+- Requests are serialized; messages that arrive while the server awaits
+  its own `roots/list` reply are buffered and processed after it, so
+  every identified request still gets exactly one response.
 - Repo resolution asks the client for roots on every resolution that has
-  no explicit repo argument; a client that never answers the roots
-  request stalls that call (spec-conformant clients answer, with an
-  error result at worst).
+  no explicit repo argument (or server --repo pin); a client that never
+  answers the roots request stalls that call (spec-conformant clients
+  answer, with an error result at worst).
 - A failed background refresh is retried on the next stale read; there
   is no backoff.
 """
@@ -150,6 +151,9 @@ def _start_job(db_path: Path, slug: str, sync_runner) -> tuple[str, bool]:
         for job_id, job in _JOBS.items():
             if job["db_path"] == key and job["state"] == "running":
                 return job_id, False
+        finished = [k for k, v in _JOBS.items() if v["state"] != "running"]
+        while len(finished) > 50:  # bound the ledger in a long-lived server
+            _JOBS.pop(finished.pop(0), None)
         job_id = f"sync-{next(_JOB_SEQ)}"
         _JOBS[job_id] = {
             "id": job_id,
@@ -254,7 +258,11 @@ def _roots_slugs(ctx) -> list[tuple[str, str]]:
         except ValueError:
             continue
         if not isinstance(msg, dict) or msg.get("id") != req_id:
-            continue  # not the reply we are waiting for
+            if isinstance(msg, dict) and "method" in msg:
+                # A pipelined client request or notification: never drop
+                # it - buffer and process after this handshake.
+                ctx.deferred.append(msg)
+            continue
         result = msg.get("result")
         if not isinstance(result, dict):
             return []  # client answered with an error: no roots
@@ -278,7 +286,11 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
     uses, so a linked worktree and its main checkout resolve one DB and
     nothing is ever created."""
     repo_arg = arguments.get("repo")
+    if repo_arg is None:
+        repo_arg = ctx.default_repo
     db_arg = arguments.get("db")
+    if db_arg is None:
+        db_arg = ctx.default_db
     if repo_arg is not None:
         try:
             slug = validate_slug(str(repo_arg))
@@ -415,7 +427,10 @@ def _read_envelope(conn, slug, db_path, data, truncated, ctx) -> dict:
 
 
 def _page(items: list, offset: int, limit: int) -> tuple[list, bool, str | None]:
-    """Slice one page and derive the envelope's truncated flag + cursor."""
+    """Slice one page of an in-memory list and derive truncated + cursor.
+
+    Only correct when `items` holds the FULL result (open_items); capped
+    fetches judge truncation against their own source instead."""
     page = items[offset : offset + limit]
     truncated = offset + len(page) < len(items)
     next_cursor = str(offset + len(page)) if truncated else None
@@ -460,13 +475,13 @@ def _tool_search(arguments: dict, ctx) -> dict:
         offset = _int_cursor(arguments.get("cursor"))
         result = search(conn, query, limit=limit + offset, repo=slug)
         items = result.get("items") or []
-        page, truncated, next_cursor = _page(items, offset, limit)
-        result["items"] = page
+        result["items"] = items[offset : offset + limit]
         total = result.get("total_matches")
-        if isinstance(total, int):
-            truncated = offset + len(page) < total
+        # Truncation is judged against the source's own match count, not
+        # the capped fetch (the fetch can never exceed offset+limit).
+        truncated = isinstance(total, int) and offset + len(result["items"]) < total
         if truncated:
-            result["next_cursor"] = next_cursor
+            result["next_cursor"] = str(offset + len(result["items"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
         conn.close()
@@ -556,15 +571,12 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
         offset = _int_cursor(arguments.get("cursor"))
         result = file_history(conn, path, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
-        # file_history over-fetches to set its own truncated flag; that
-        # flag already describes the post-offset window.
+        result["entries"] = entries[offset : offset + limit]
+        # file_history over-fetches limit+1 at the window size, so its own
+        # truncated flag is the post-offset more-exist evidence.
         truncated = bool(result.get("truncated"))
-        page, _sliced_trunc, next_cursor = _page(entries, offset, limit)
-        result["entries"] = page
-        if truncated and next_cursor:
-            result["next_cursor"] = next_cursor
-        elif not truncated:
-            result.pop("next_cursor", None)
+        if truncated:
+            result["next_cursor"] = str(offset + len(result["entries"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
         conn.close()
@@ -631,20 +643,15 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         ) from None
     finally:
         conn.close()
+    limit = _clamp_limit(arguments.get("limit", 200))
     try:
-        limit = _clamp_limit(arguments.get("limit", 200))
         data = run_sql(guarded, statement, limit=limit, repo=slug)
-        # run_sql's own shape: positional row arrays (a deliberate
-        # divergence from the CLI's objects default — consumers index
-        # columns positionally alongside the returned columns list).
-        return build_envelope(
-            data,
-            conn=guarded,
-            slug=slug,
-            db_path=db_path,
-            truncated=bool(data.get("truncated")),
-        )
-    except sqlite3.Error as exc:
+    except ValueError as exc:
+        # run_sql converts execution-time sqlite failures (no such
+        # column/table, malformed expressions) to ValueError — the single
+        # most common failure of an sql tool. It must answer as the
+        # envelope error object, never escape the protocol frame.
+        guarded.close()
         raise ToolError(
             "runtime",
             str(exc),
@@ -652,6 +659,21 @@ def _tool_sql(arguments: dict, ctx) -> dict:
             slug=slug,
             db_path=db_path,
         ) from exc
+    except sqlite3.Error as exc:  # defensive: run_sql converts these today
+        guarded.close()
+        raise ToolError(
+            "runtime",
+            str(exc),
+            hint="check column names with the zaxbygraph://schema resource",
+            slug=slug,
+            db_path=db_path,
+        ) from exc
+    # run_sql's own shape: positional row arrays (a deliberate divergence
+    # from the CLI's objects default — consumers index columns
+    # positionally alongside the returned columns list). Same staleness
+    # contract as every other read tool (issue AC5).
+    try:
+        return _read_envelope(guarded, slug, db_path, data, bool(data.get("truncated")), ctx)
     finally:
         guarded.close()
 
@@ -806,28 +828,62 @@ def _error(stdout, req_id, code: int, message: str) -> None:
 
 
 class _Context:
-    """Per-serve state: resolution inputs, the sync seam, and the id
-    counter for server-originated requests."""
+    """Per-serve state: resolution inputs, the sync seam, the id counter
+    for server-originated requests, and the deferred-message buffer used
+    while the inline roots handshake holds the read loop."""
 
-    __slots__ = ("root", "stale_after_s", "sync_runner", "stdin", "stdout", "server_seq")
+    __slots__ = (
+        "root",
+        "stale_after_s",
+        "sync_runner",
+        "stdin",
+        "stdout",
+        "server_seq",
+        "deferred",
+        "default_repo",
+        "default_db",
+    )
 
-    def __init__(self, stdin, stdout, root: Path, stale_after_s: int, sync_runner) -> None:
+    def __init__(
+        self,
+        stdin,
+        stdout,
+        root: Path,
+        stale_after_s: int,
+        sync_runner,
+        default_repo: str | None = None,
+        default_db: str | None = None,
+    ) -> None:
         self.stdin = stdin
         self.stdout = stdout
         self.root = root
         self.stale_after_s = stale_after_s
         self.sync_runner = sync_runner
         self.server_seq = 0
+        self.deferred: list[dict] = []
+        self.default_repo = default_repo
+        self.default_db = default_db
 
 
-def serve(stdin=None, stdout=None, *, cwd=None, stale_after_s=None, sync_runner=None) -> None:
+def serve(
+    stdin=None,
+    stdout=None,
+    *,
+    cwd=None,
+    stale_after_s=None,
+    sync_runner=None,
+    repo=None,
+    db=None,
+) -> None:
     """Serve MCP over the given TEXT streams until stdin EOF.
 
     cwd is the resolution root (default Path.cwd()); stale_after_s is the
-    freshness threshold that kicks a background refresh (0 disables
-    nothing — any positive age goes stale — use a huge value to disable);
-    sync_runner(db_path, repo) replaces the background sync body (tests
-    inject; the default runs the real locked incremental sync)."""
+    freshness threshold that kicks a background refresh (any positive age
+    above it goes stale — use a huge value to disable); repo/db pin the
+    resolution for a server started with --repo/--db (the per-call tool
+    arguments still win); sync_runner(db_path, repo) replaces the
+    background sync body (tests inject; the default runs the real locked
+    incremental sync)."""
     stdin = sys.stdin if stdin is None else stdin
     stdout = sys.stdout if stdout is None else stdout
     root = Path(cwd) if cwd is not None else Path.cwd()
@@ -835,7 +891,15 @@ def serve(stdin=None, stdout=None, *, cwd=None, stale_after_s=None, sync_runner=
         stale_after_s = _default_stale_after_s()
     if sync_runner is None:
         sync_runner = _default_sync_runner
-    ctx = _Context(stdin, stdout, root, int(stale_after_s), sync_runner)
+    ctx = _Context(
+        stdin,
+        stdout,
+        root,
+        int(stale_after_s),
+        sync_runner,
+        default_repo=repo,
+        default_db=db,
+    )
 
     while True:
         line = stdin.readline()
@@ -852,33 +916,43 @@ def serve(stdin=None, stdout=None, *, cwd=None, stale_after_s=None, sync_runner=
         if not isinstance(msg, dict):
             _error(stdout, None, _JSONRPC_INVALID_REQUEST, "Invalid Request (line is not an object)")
             continue
-        method = msg.get("method")
-        if method is None:
-            # A reply to a server-originated request that is no longer
-            # awaited (roots replies are consumed inline); ignore.
-            continue
-        has_id = "id" in msg
-        req_id = msg.get("id")
-        try:
-            _dispatch(msg, method, has_id, req_id, ctx)
-        except ToolError as exc:
-            if method == "tools/call":
-                env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)
-                _result(
-                    stdout,
-                    req_id,
-                    {
-                        "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
-                        "isError": True,
-                    },
-                )
-            else:
-                message = exc.message + (f" (hint: {exc.hint})" if exc.hint else "")
-                _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, message)
-        except Exception as exc:  # never let one fault kill the session
-            _log(traceback.format_exc())
-            if has_id:
-                _error(stdout, req_id, _JSONRPC_INTERNAL_ERROR, f"Internal error: {exc}")
+        _process(msg, ctx)
+        # Messages that arrived while a roots handshake held the read
+        # loop: every identified request gets exactly one response.
+        while ctx.deferred:
+            _process(ctx.deferred.pop(0), ctx)
+
+
+def _process(msg: dict, ctx: "_Context") -> None:
+    """Handle one inbound message: dispatch it with full error containment."""
+    method = msg.get("method")
+    if method is None:
+        # A reply to a server-originated request that is no longer
+        # awaited (roots replies are consumed inline); ignore.
+        return
+    stdout = ctx.stdout
+    has_id = "id" in msg
+    req_id = msg.get("id")
+    try:
+        _dispatch(msg, method, has_id, req_id, ctx)
+    except ToolError as exc:
+        if method == "tools/call":
+            env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)
+            _result(
+                stdout,
+                req_id,
+                {
+                    "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
+                    "isError": True,
+                },
+            )
+        else:
+            message = exc.message + (f" (hint: {exc.hint})" if exc.hint else "")
+            _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, message)
+    except Exception as exc:  # never let one fault kill the session
+        _log(traceback.format_exc())
+        if has_id:
+            _error(stdout, req_id, _JSONRPC_INTERNAL_ERROR, f"Internal error: {exc}")
 
 
 def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> None:

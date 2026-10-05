@@ -58,11 +58,15 @@ def _force_utf8_streams() -> None:
     emoji, leaving truncated JSON on a zero-exit-looking pipe. `replace`
     keeps a lone surrogate in legacy garbled rows from crashing output.
     """
-    for stream in (sys.stdout, sys.stderr):
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is None:
             continue
         try:
+            # stdin included: the MCP server decodes protocol frames from
+            # it, and MCP stdio frames are UTF-8 by spec — a piped stdin
+            # left on the Windows locale encoding would mojibake (or
+            # crash decoding) non-ASCII frames.
             reconfigure(encoding="utf-8", errors="replace")
         except (ValueError, OSError):
             pass
@@ -724,7 +728,13 @@ def cmd_mcp(args: argparse.Namespace) -> int:
     # dependency only ever points one way at import time.
     from zaxbygraph.mcp_server import serve
 
-    serve(sys.stdin, sys.stdout, stale_after_s=args.stale_seconds)
+    serve(
+        sys.stdin,
+        sys.stdout,
+        stale_after_s=args.stale_seconds,
+        repo=getattr(args, "repo", None) or None,
+        db=getattr(args, "db", None) or None,
+    )
     return 0
 
 

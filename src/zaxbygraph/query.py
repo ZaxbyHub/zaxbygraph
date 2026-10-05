@@ -758,6 +758,9 @@ def pr_overlap(conn: sqlite3.Connection, numbers, repo: str | None = None) -> di
     raise LookupError; an existing issue simply contributes an empty file
     set."""
     numbers = [int(n) for n in numbers]
+    # Order-preserving dedupe: a repeated number must not produce a
+    # self-pair whose "shared" is that PR's whole file set.
+    numbers = list(dict.fromkeys(numbers))
     repo = _fold_repo(repo)
     paths: dict[int, set[str]] = {}
     for n in numbers:
@@ -858,7 +861,8 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
     if repo:
         pr_rows = conn.execute(
             f"SELECT src_id, evidence{source_col} FROM edges "
-            "WHERE repo = ? AND rel = 'closes' AND dst_type = 'item' AND dst_id = ?",
+            "WHERE repo = ? AND src_type = 'item' AND rel = 'closes' "
+            "AND dst_type = 'item' AND dst_id = ?",
             (repo, str(number)),
         ).fetchall()
         commit_rows = conn.execute(
@@ -869,7 +873,8 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
     else:
         pr_rows = conn.execute(
             f"SELECT src_id, evidence{source_col} FROM edges "
-            "WHERE rel = 'closes' AND dst_type = 'item' AND dst_id = ?",
+            "WHERE src_type = 'item' AND rel = 'closes' "
+            "AND dst_type = 'item' AND dst_id = ?",
             (str(number),),
         ).fetchall()
         commit_rows = conn.execute(
