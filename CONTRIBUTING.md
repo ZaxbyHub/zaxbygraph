@@ -109,7 +109,7 @@ This section covers work found during a PR review or a PR-feedback round that th
 | `ABSORB` | An open issue already covers it. Comment on that issue with the new evidence instead of opening a new one. |
 | `FILE` | It passes the necessity gate (step 2) and is Priority, or the maintainer approved it. |
 | `RECORD` | It fails gate 1 or gate 2, or the maintainer declined it. Add a row to the PR body's "Considered, not filed" table (inside `## Summary`) with: the item, the reason, which gate test failed, and a re-evaluation trigger. This is a complete closure. |
-| `ASK` | It needs a product or maintainer decision, it fails only gate 3, or it is an Improvement item awaiting approval. Ask before filing anything; a decline makes it `RECORD` (quote it); an approval makes a gate-3 or Improvement item `FILE`, lands a gate-4 fix in the PR, and sends an unverified item back to investigation. |
+| `ASK` | It needs a product or maintainer decision, it fails only gate 3, it fails gate 4 but is fixable in the PR, it is an unverified item claiming a wedge, fail-open gate, security, or data-loss consequence, or it is an Improvement item awaiting approval. Ask before filing anything; a decline makes it `RECORD` (quote it); an approval makes a gate-3 or Improvement item `FILE`, lands a gate-4 fix in the PR, and sends an unverified item back to investigation. |
 
 `ASK` takes precedence over fixing in the PR when the fix itself needs a product or compatibility decision. `ABSORB` takes precedence over `RECORD` when an open issue already covers the item.
 
