@@ -3,6 +3,7 @@ checks: title-only reverts, merged_by shapes, degraded re-ingest survival,
 both-orders merge-close convergence, and same-pair/two-stream coexistence."""
 from __future__ import annotations
 
+import sqlite3
 import unittest
 
 from fixtures import TempDBTest, issue, pull
@@ -295,44 +296,152 @@ class MergeCloseConvergenceTests(ExtraEdgeIngestTest):
 
 
 class SamePairTwoStreamsTests(ExtraEdgeIngestTest):
-    def test_timeline_and_closing_ref_rows_coexist_for_one_pair(self) -> None:
-        closed = {
-            "type": "closed",
-            "created_at": "2026-01-02T00:00:00Z",
-            "actor_login": "amy",
-            "commit_id": None,
-            "closer_type": "pull_request",
-            "closer_number": 8,
-        }
+    """One closes row per (repo, dst, src) pair (issue #19): the two
+    GitHub-reported streams corroborate one closure fact and merge."""
+
+    CLOSED = {
+        "type": "closed",
+        "created_at": "2026-01-02T00:00:00Z",
+        "actor_login": "amy",
+        "commit_id": None,
+        "closer_type": "pull_request",
+        "closer_number": 8,
+    }
+    PAIR_WHERE = "rel = 'closes' AND src_id = '8' AND dst_id = '5'"
+
+    def _merged_pair_state(self) -> tuple:
+        rows = self.rows(
+            "SELECT source, evidence FROM edges WHERE " + self.PAIR_WHERE
+        )
+        self.assertEqual(
+            len(rows), 1, "exactly one closes row must survive for the pair"
+        )
+        source, evidence = rows[0]
+        self.assertIn(
+            source, ("closing_ref", "timeline"),
+            "the surviving source is one of the two GitHub-reported streams",
+        )
+        self.assertIn("closingIssuesReferences", evidence)
+        self.assertIn("timeline closed event", evidence)
+        return rows[0]
+
+    @staticmethod
+    def _parts(evidence: str) -> set:
+        return set(evidence.split("; "))
+
+    def test_timeline_and_closing_ref_streams_merge_for_one_pair(self) -> None:
         pr8 = issue(8, title="pr eight", kind="pr")
         pull8 = dict(
             pull(8, merged=True),
             closing_issues_references=[{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
         )
         # The closed event lives on ISSUE 5's timeline (closer: PR 8); the
-        # closing reference rides PR 8's own payload. One ingest each; the
-        # pair (8 -> 5) then exists under two provenance streams.
-        self.ingest(issue(5, title="issue five"), timeline=[closed])
+        # closing reference rides PR 8's own payload. Either ingest order
+        # converges on one row carrying both provenances (order-independent
+        # up to evidence part order).
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
         self.ingest(pr8, pull_raw=pull8)
-        self.assertEqual(
-            self.rows(
-                "SELECT source, COUNT(*) FROM edges "
-                "WHERE rel = 'closes' AND src_id = '8' AND dst_id = '5' "
-                "GROUP BY source ORDER BY source"
-            ),
-            [("closing_ref", 1), ("timeline", 1)],
-        )
-        # Degraded re-ingests on either side keep both rows.
+        self._merged_pair_state()
+        # Degraded re-ingests on either side still leave the single merged
+        # row, and re-ingesting one stream alone must not drop the other
+        # stream's provenance from the evidence payload.
         self.ingest(issue(5, title="issue five"), timeline=None)
+        self._merged_pair_state()
         self.ingest(pr8, pull_raw=pull(8, merged=True))
+        state = self._merged_pair_state()
+        # ...and re-ingesting the timeline stream alone keeps one row with
+        # both provenances and no churn.
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        final = self._merged_pair_state()
         self.assertEqual(
-            self.rows(
-                "SELECT source, COUNT(*) FROM edges "
-                "WHERE rel = 'closes' AND src_id = '8' AND dst_id = '5' "
-                "GROUP BY source ORDER BY source"
-            ),
-            [("closing_ref", 1), ("timeline", 1)],
+            self._parts(final[1]), self._parts(state[1]),
+            "re-ingest must not churn the evidence payload",
         )
+
+    def test_both_ingest_orders_converge_up_to_part_order(self) -> None:
+        pr8 = issue(8, title="pr eight", kind="pr")
+        pull8 = dict(
+            pull(8, merged=True),
+            closing_issues_references=[{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        self.ingest(pr8, pull_raw=pull8)
+        issue_first = self.rows(
+            "SELECT source, evidence FROM edges WHERE " + self.PAIR_WHERE
+        )
+        # PR-first order on a fresh DB converges on the same row content
+        # (part-set equality: the evidence string is first-seen ordered).
+        self.tearDown()
+        self.setUp()
+        self.ingest(pr8, pull_raw=pull8)
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        pr_first = self.rows(
+            "SELECT source, evidence FROM edges WHERE " + self.PAIR_WHERE
+        )
+        self.assertEqual(len(pr_first), 1)
+        self.assertEqual(len(issue_first), 1)
+        self.assertEqual(pr_first[0][0], issue_first[0][0])
+        self.assertEqual(self._parts(pr_first[0][1]), self._parts(issue_first[0][1]))
+
+    def test_same_source_refresh_preserves_merged_evidence(self) -> None:
+        pr8 = issue(8, title="pr eight", kind="pr")
+        pull8 = dict(
+            pull(8, merged=True),
+            closing_issues_references=[{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        self.ingest(pr8, pull_raw=pull8)
+        merged = self.rows(
+            "SELECT evidence FROM edges WHERE " + self.PAIR_WHERE
+        )[0][0]
+        # A later re-ingest of ONLY the closing PR (a comment bumped
+        # updated_at; the payload re-carries the closing reference) hits the
+        # same-source refresh path — it must union, never replace.
+        self.ingest(pr8, pull_raw=pull8)
+        after = self.rows(
+            "SELECT evidence FROM edges WHERE " + self.PAIR_WHERE
+        )[0][0]
+        self.assertIn("closingIssuesReferences", after)
+        self.assertIn("timeline closed event", after)
+        self.assertEqual(self._parts(after), self._parts(merged))
+
+    def test_what_closed_reports_one_entry_for_a_merged_pair(self) -> None:
+        from zaxbygraph import query
+
+        pr8 = issue(8, title="pr eight", kind="pr")
+        pull8 = dict(
+            pull(8, merged=True),
+            closing_issues_references=[{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        self.ingest(pr8, pull_raw=pull8)
+        closed = query.what_closed(self.conn, 5, repo=REPO)
+        self.assertEqual(
+            [p["number"] for p in closed["prs"]], [8],
+            "the merged pair must read back as ONE closing PR",
+        )
+        self.assertIn("closingIssuesReferences", closed["prs"][0]["evidence"])
+        self.assertIn("timeline closed event", closed["prs"][0]["evidence"])
+
+    def test_partial_index_fires_on_bypassing_writers(self) -> None:
+        pr8 = issue(8, title="pr eight", kind="pr")
+        pull8 = dict(
+            pull(8, merged=True),
+            closing_issues_references=[{"number": 5, "repo": "ZaxbyHub/zaxbygraph"}],
+        )
+        self.ingest(issue(5, title="issue five"), timeline=[self.CLOSED])
+        self.ingest(pr8, pull_raw=pull8)
+        # After the merge the pair holds one row. A writer that bypasses
+        # insert_edge's merge (the index is the schema-level guardrail) must
+        # fail loudly rather than resurrect the duplicate.
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES (?, 'item', '8', 'closes', 'item', '5',"
+                " 'EXTRACTED', 'timeline closed event 2026-02-02T00:00:00Z', 'timeline')",
+                (REPO,),
+            )
 
 
 class SelfCloseExclusionTests(ExtraEdgeIngestTest):

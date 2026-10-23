@@ -112,16 +112,20 @@ Every command's JSON output is one self-describing **envelope** (v0.2):
 `{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
 plus `error:{code, message, hint?}` on failures. The per-command payload lives
 under `data`; `ok` is at the root. Errors answer on **stdout** in JSON mode
-(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; a
-successful read that resolves a repo also writes exactly one identity line
-(`sync`/`doctor` never do; slug-less reads print none; `synced=0` means "no
-recorded sync age"):
+(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; in text
+mode a successful read that resolves a repo also writes exactly one identity
+line (`sync`/`doctor` never do; slug-less reads print none; `synced=0` means
+"no recorded sync age"):
 `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
+Machine formats (`json`/`compact`/`jsonl`) print no identity line at all —
+the envelope already carries `db`/`repo`/`freshness`, so stdout+stderr
+merged strict-parses as one JSON document.
 
 **Formats:** `--format json` (pretty, default when piped) and `compact` (one
 line) always carry the envelope · `jsonl` (one object per line for list
-payloads — rows only, identity on the stderr line; any `head -n` prefix
-parses) · `text` (default on a TTY, renders the payload only).
+payloads — rows only, identity inside the envelope; any `head -n` prefix
+parses) · `text` (default on a TTY, renders the payload only; the only
+format with the stderr identity line — never merge streams when parsing it).
 `--fields repo,number` projects rows to those keys that exist (unknown keys
 are omitted) — applies to list payloads and `sql` rows in both row modes, not
 to nested arrays inside dict payloads. `sql` rows are objects keyed by column

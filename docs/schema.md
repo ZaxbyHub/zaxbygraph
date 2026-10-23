@@ -1,4 +1,4 @@
-# Schema reference (schema version 5, `PRAGMA user_version` = 5)
+# Schema reference (schema version 6, `PRAGMA user_version` = 6)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -148,9 +148,23 @@ The graph itself. One row per relationship.
 | `dst_id` | TEXT | A commit endpoint carries the sha, so the graph joins to `git log`. |
 | `confidence` | TEXT | Always `'EXTRACTED'`, enforced by a CHECK constraint. |
 | `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is**. |
-| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts. |
+| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. |
 
 Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
+
+**`closes` holds at most one row per `(repo, src_type, src_id, dst_type,
+dst_id)` pair** (schema v6, issue #19): the `closing_ref` and `timeline`
+streams corroborate ONE GitHub-reported closure, so ingest merges them
+instead of storing both — the `closing_ref` source survives when present,
+and `evidence` carries both provenance strings (`'; '`-joined, first-seen
+first, capped at 512 chars). Ingest-time merge lives in `store.insert_edge`;
+the physical backstop is the partial unique index `ux_edges_closes_pair`
+`ON edges(repo, src_type, src_id, rel, dst_type, dst_id) WHERE rel='closes'`,
+created by migration v6 — deliberately **not** in `schema.sql`, because
+`init_schema` runs the script before the migration chain and a UNIQUE index
+there would fail against a v5 store's not-yet-collapsed duplicates (fresh
+databases get the index when the forward chain runs). Every other relation
+keeps two-rows-are-two-facts.
 
 `src_id` and `dst_id` are `TEXT` even for item numbers, so compare with
 `dst_id = '10'` or `CAST(dst_id AS INTEGER) = 10` — not `dst_id = 10`.
@@ -281,8 +295,12 @@ One row per repo. What `zaxbygraph status` reads.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `5`). The
-`meta.schema_version` row is informational only. On open, `init_schema`:
+`PRAGMA user_version` is the authoritative schema state (currently `6`). The
+`meta.schema_version` row is informational only. On open of a WRITABLE
+connection — a `sync`, an MCP-triggered sync, or `doctor --consolidate`
+(adoption migrates its temp copy first) — `init_schema`: read commands open
+read-only and never migrate, so healing of an old cache happens on the next
+sync, not on reads.
 
 - refuses loudly when `user_version` is newer than the build (a database from
   a future zaxbygraph),
@@ -302,6 +320,16 @@ renamed to `closes_keyword`, and a mechanism-honest backfill (legacy `closes`
 → `closes_keyword` + 'keyword', legacy `mentions` → 'keyword', everything
 else → 'payload'). Ids and row counts are preserved and the migration is
 idempotent; older builds refuse a v5 database.
+
+Migration 5→6 collapses duplicate `closes` pairs and installs
+`ux_edges_closes_pair` (issue #19): since #6 shipped, a PR that closed an
+issue was stored once per provenance stream — `closing_ref` from the PR's
+`closingIssuesReferences` and `timeline` from the closed event — so joins
+and `what-closed` double-counted the pair. The migration keeps the
+`closing_ref` row (the structured declaration) with both evidence strings
+merged and deletes the other; existing caches heal on the next writable
+open (sync / `doctor --consolidate` / MCP sync — reads never migrate). The
+index then makes the invariant physical; see the `edges` section above.
 
 Migration 1→2 adds `sync_state.full_sync_pending` and folds repo slugs to
 lowercase across every repo-keyed table, merging case-split duplicates

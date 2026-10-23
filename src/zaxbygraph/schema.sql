@@ -134,6 +134,13 @@ CREATE TABLE IF NOT EXISTS edges (
     UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source)
 );
 
+-- The v6 closes-pair index (at most one `closes` row per
+-- (repo, src_type, src_id, dst_type, dst_id); issue #19) is created by
+-- db.migrate_v5_to_v6, NOT here: init_schema runs this script BEFORE the
+-- migration chain, and a UNIQUE index here would fail against a v5 store's
+-- not-yet-collapsed duplicate pairs. Fresh databases get the index anyway —
+-- they enter the forward chain at user_version 0.
+
 CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(repo, src_type, src_id);
 CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(repo, dst_type, dst_id);
 CREATE INDEX IF NOT EXISTS idx_edges_rel ON edges(rel);

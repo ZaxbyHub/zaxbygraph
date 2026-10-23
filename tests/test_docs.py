@@ -56,5 +56,28 @@ class SkillDocTests(unittest.TestCase):
         )
 
 
+class MachineModeSilenceDocTests(unittest.TestCase):
+    """Issue #17 AC4's cheap content pin: both doc surfaces must state the
+    machine-mode silence rule and the capture hazard (the criterion itself is
+    NON-EXECUTABLE in the frozen acceptance table; this pin keeps the two
+    statements from drifting while the rendered diff remains the substitute
+    evidence)."""
+
+    def test_readme_states_machine_mode_silence(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("machine formats", readme)
+        self.assertIn("strict-parses", readme)
+        self.assertIn("merged", readme)
+        # the jsonl bullet no longer points at the stderr line
+        self.assertNotIn("identity is on the stderr line", readme)
+
+    def test_skill_states_machine_mode_silence(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+        self.assertIn("Machine formats", skill)
+        self.assertIn("strict-parses", skill)
+        self.assertIn("identity line", skill)
+        self.assertNotIn("identity on the stderr line", skill)
+
+
 if __name__ == "__main__":
     unittest.main()

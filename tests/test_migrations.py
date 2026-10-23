@@ -1120,14 +1120,14 @@ class MigrationTests(unittest.TestCase):
 
         self.assertEqual(
             conn.execute("PRAGMA user_version").fetchone()[0],
-            5,
-            "v4 database must migrate to user_version 5",
+            6,
+            "v4 database must migrate to user_version 6",
         )
         self.assertEqual(
             conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()[0],
-            "5",
+            "6",
         )
         # exact backfill: no reliance on a column DEFAULT. Order is SQLite
         # binary collation on src_id TEXT: digits before letters.
@@ -1168,6 +1168,131 @@ class MigrationTests(unittest.TestCase):
             " 'EXTRACTED', 'timeline: closed', 'timeline')"
         )
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], 5)
+
+
+class MigrateV5ToV6Tests(unittest.TestCase):
+    """v6 heals a v5 store's duplicate closes pairs and installs the
+    closes-pair index (issue #19). The v5-shape edges table is built by
+    hand so the store starts exactly where pre-v6 caches are."""
+
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        self.db_path = Path(td.name) / "history.db"
+
+    def _seed_v5(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS edges (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo       TEXT NOT NULL,
+                src_type   TEXT NOT NULL,
+                src_id     TEXT NOT NULL,
+                rel        TEXT NOT NULL,
+                dst_type   TEXT NOT NULL,
+                dst_id     TEXT NOT NULL,
+                confidence TEXT NOT NULL CHECK (confidence IN ('EXTRACTED')),
+                evidence   TEXT,
+                source     TEXT NOT NULL,
+                UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source)
+            );
+            """
+        )
+        rows = [
+            # the duplicated pair: two provenance streams, one closure fact
+            ("item", "14", "closes", "item", "6", "closingIssuesReferences", "closing_ref"),
+            ("item", "14", "closes", "item", "6", "timeline closed event 2026-10-05T07:18:55Z", "timeline"),
+            # an unduplicated pair survives untouched
+            ("item", "12", "closes", "item", "4", "closingIssuesReferences", "closing_ref"),
+        ]
+        for src_type, src_id, rel, dst_type, dst_id, evidence, source in rows:
+            conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES ('zaxbyhub/zaxbygraph', 'item', ?, ?, ?, ?, 'EXTRACTED', ?, ?)",
+                (src_id, rel, dst_type, dst_id, evidence, source),
+            )
+        conn.commit()
+
+    def _open(self) -> sqlite3.Connection:
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        self._seed_v5(conn)
+        conn.execute("PRAGMA user_version = 5")
+        init_schema(conn)
+        return conn
+
+    def test_duplicates_collapse_and_index_installs(self) -> None:
+        conn = self._open()
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        rows = conn.execute(
+            "SELECT source, evidence FROM edges"
+            " WHERE rel = 'closes' AND src_id = '14' AND dst_id = '6'"
+        ).fetchall()
+        self.assertEqual(len(rows), 1, "exactly one row survives for the pair")
+        self.assertEqual(rows[0][0], "closing_ref")
+        self.assertIn("closingIssuesReferences", rows[0][1])
+        self.assertIn("timeline closed event", rows[0][1])
+        # the unduplicated pair is untouched
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE rel = 'closes' AND src_id = '12'"
+            ).fetchone()[0],
+            1,
+        )
+        # the closes-pair index exists and is UNIQUE over the 6-column key
+        names = [
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                " AND tbl_name = 'edges'"
+            ).fetchall()
+        ]
+        self.assertTrue(
+            any(
+                name.startswith("ux_edges_closes_pair")
+                for name in names
+            ),
+            names,
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES ('zaxbyhub/zaxbygraph', 'item', '12', 'closes', 'item', '4',"
+                " 'EXTRACTED', 'timeline closed event 2026-01-01T00:00:00Z', 'timeline')"
+            )
+
+    def test_fresh_database_born_with_the_index(self) -> None:
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        # a closes pair still inserts once from either stream...
+        conn.execute(
+            "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+            " confidence, evidence, source)"
+            " VALUES ('a/b', 'item', '1', 'closes', 'item', '2',"
+            " 'EXTRACTED', 'closingIssuesReferences', 'closing_ref')"
+        )
+        # ...and the index rejects a second row for the same pair
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES ('a/b', 'item', '1', 'closes', 'item', '2',"
+                " 'EXTRACTED', 'timeline closed event', 'timeline')"
+            )
+
+    def test_reopen_is_idempotent(self) -> None:
+        conn = self._open()
+        count = conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0]
+        init_schema(conn)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], count)
 
 
 if __name__ == "__main__":

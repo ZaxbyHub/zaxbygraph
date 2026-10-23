@@ -190,6 +190,41 @@ def collapse_edges(edges: Iterable[tuple]) -> list[tuple]:
     return list(by_key.values())
 
 
+#: Evidence is a payload (AGENTS), so merged `closes` rows carry every
+#: provenance string. The cap bounds one pathological store's growth;
+#: newest parts are dropped first so the earliest-seen provenances (the two
+#: streams the merge exists to unite) survive truncation.
+EVIDENCE_SEP = "; "
+EVIDENCE_CAP = 512
+
+
+def merge_evidence(*parts: str | None) -> str | None:
+    """Union distinct provenance strings, first-seen first, '; '-joined.
+
+    None/empty inputs contribute nothing; the result is None only when
+    everything is empty. Splitting on the separator keeps `merge_evidence`
+    idempotent on its own output, and keeps the two closes streams
+    (`closingIssuesReferences`, `timeline closed event ...`) distinguishable
+    after any number of re-ingests (issue #19).
+    """
+    seen: list[str] = []
+    known: set[str] = set()
+    for part in parts:
+        for piece in (part or "").split(EVIDENCE_SEP):
+            piece = piece.strip()
+            if piece and piece not in known:
+                known.add(piece)
+                seen.append(piece)
+    while seen:
+        length = sum(len(p) for p in seen) + (len(seen) - 1) * len(EVIDENCE_SEP)
+        if length <= EVIDENCE_CAP:
+            break
+        seen.pop()
+    if not seen:
+        return None
+    return EVIDENCE_SEP.join(seen)
+
+
 #: Relations any edges_from_* emitter can produce. The Phase 4.2 guardrail
 #: (tests/test_relation_registry.py) pins this set against query.py's
 #: structural set and the documented relationships table, so a new relation

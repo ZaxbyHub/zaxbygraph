@@ -39,6 +39,11 @@ shouldn't.
   `evidence` to that key would let the same relationship appear many times
   with different provenance strings; `source` **is** in the key because the
   same pair reported by two provenance streams is two distinct facts.
+  Exception (issue #19): for `rel='closes'` the `closing_ref` and `timeline`
+  streams corroborate ONE GitHub-reported closure, so they collapse to one
+  row whose evidence carries both provenances, enforced at ingest
+  (store.insert_edge) and by the migration-created partial index
+  `ux_edges_closes_pair`. Every other relation keeps two-rows-are-two-facts.
 - **Actor `commented`/`reviewed` edges collapse** to one per actor×item. Full
   history lives in the `comments` and `reviews` tables; the graph stays
   item-centric rather than growing an edge per comment.

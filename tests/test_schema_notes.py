@@ -138,9 +138,13 @@ class EnvelopeContractTests(unittest.TestCase):
             self.assertNotIn(banned, out)
 
     def test_where_identity_line_matches_payload(self) -> None:
-        """4.5 review finding 1 (HIGH): `where`'s stderr identity line must
-        report the same items/synced/complete facts its envelope payload
-        does — not zeros from a closed connection.
+        """4.5 review finding 1 (HIGH), re-homed to text mode by issue #17:
+        `where`'s stderr identity line must report the same
+        items/synced/complete facts its payload does — not zeros from a
+        closed connection. In JSON mode the line is suppressed entirely
+        (machine-mode silence, issue #17): the envelope itself carries the
+        identity fields, and a merged stderr+stdout capture must
+        strict-parse.
 
         The fixture seeds the USER-LEVEL STORE (store_db_path under the
         pinned ZAXBYGRAPH_HOME), because that is the file cmd_where's
@@ -158,6 +162,18 @@ class EnvelopeContractTests(unittest.TestCase):
         data = json.loads(out)["data"]
         self.assertTrue(data["exists"], "store-exists branch must be taken")
         self.assertGreater(data["items"], 0, "store corpus must be nonzero")
+        # Machine-mode silence (issue #17): no non-JSON bytes on stderr.
+        self.assertEqual(
+            [line for line in err.splitlines() if line.strip()],
+            [],
+            err,
+        )
+        # The payload still carries the identity fields the text-mode line
+        # echoes (the line is redundant with the envelope by design).
+        self.assertEqual(json.loads(out)["repo"], REPO)
+        # Text mode keeps the one identity line, still matching the payload.
+        code, out, err = self._run(["where", "--format", "text"])
+        self.assertEqual(code, 0, err)
         lines = [line for line in err.splitlines() if line.strip()]
         self.assertEqual(len(lines), 1, err)
         match = re.match(

@@ -6,6 +6,7 @@ from zaxbygraph.extract import (
     collapse_edges,
     edges_from_item,
     edges_from_review,
+    merge_evidence,
     parse_closing_numbers,
     parse_mentioned_numbers,
 )
@@ -98,6 +99,33 @@ class CollapseTests(unittest.TestCase):
         # under two different sources survives as two distinct edges
         close_sources = sorted(e[6] for e in out if e[2] == "closes")
         self.assertEqual(close_sources, ["keyword", "timeline"])
+
+
+class MergeEvidenceTests(unittest.TestCase):
+    def test_none_and_empty_contribute_nothing(self) -> None:
+        self.assertIsNone(merge_evidence(None, None))
+        self.assertIsNone(merge_evidence("", ""))
+        self.assertEqual(merge_evidence(None, "a"), "a")
+        self.assertEqual(merge_evidence("a", None), "a")
+
+    def test_dedupes_first_seen_order(self) -> None:
+        self.assertEqual(merge_evidence("a; b", "b; c"), "a; b; c")
+        # idempotent on its own output
+        self.assertEqual(merge_evidence("a; b; c", "b"), "a; b; c")
+        # whitespace-only variants of a kept part do not duplicate it
+        self.assertEqual(merge_evidence("a", " a "), "a")
+
+    def test_cap_drops_newest_parts_keeps_first_seen(self) -> None:
+        long_part = "x" * 200
+        out = merge_evidence(long_part, "y" * 200, "z" * 200)
+        self.assertLessEqual(len(out), 512)
+        self.assertTrue(out.startswith(long_part))
+        self.assertNotIn("z" * 200, out)
+
+    def test_parts_are_split_on_the_separator_only(self) -> None:
+        # the payload format is the '; '-joined list: an existing merged
+        # string re-splitting on the separator dedupes against itself
+        self.assertEqual(merge_evidence("a; b", "a; b"), "a; b")
 
 
 if __name__ == "__main__":
