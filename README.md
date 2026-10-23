@@ -132,7 +132,7 @@ Every command accepts:
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
 | `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. |
-| `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; identity is inside the envelope); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
+| `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
@@ -455,17 +455,20 @@ Machine-readable rules, worth knowing before scripting against this:
   `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`
   (`synced=0` means "no recorded sync age"; `synced=<age>` is whole seconds).
   In **machine formats** (`json`/`compact`/`jsonl`) the line is suppressed —
-  the envelope already carries every identity field, so a successful
-  machine-format read keeps both streams silent and a merged
-  `stdout+stderr` capture strict-parses as one JSON document. Never merge
-  streams when parsing text mode, and never strip a preamble before the
-  first `{`: pre-0.5 builds printed the line in machine mode too, so legacy
+  a successful machine-format read keeps both streams silent and a merged
+  `stdout+stderr` capture strict-parses as JSON. `json` and `compact` carry
+  the full envelope, whose `db`/`repo`/`freshness` fields are the identity
+  data the line used to print; **`jsonl` list payloads print rows only, with
+  no envelope, so that surface carries no identity fields at all — use
+  `json` or `compact` when you need them.** Never merge streams when
+  parsing text mode, and never strip a preamble before the first `{`:
+  pre-0.5 builds printed the line in machine mode too, so legacy
   strip-before-first-`{` recipes are vestigial.
 - **Formats and rows.** `--format json` (pretty, default when piped) and
   `compact` (one line) always carry the envelope; `jsonl` prints one JSON
-  object per line for list payloads (rows only — the envelope identity is
-  inside the envelope; stderr stays silent) and the whole envelope for
-  single-payload commands, so any `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
+  object per line for list payloads (rows only — no envelope, so no
+  identity fields on that surface; stderr stays silent) and the whole
+  envelope for single-payload commands, so any `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
   never envelope keys. `--fields repo,number` projects rows to exactly those
   keys that exist (unknown keys are omitted) — it applies to list payloads and
   to `sql` rows in both modes (objects: keys; `--rows array`: positions), not

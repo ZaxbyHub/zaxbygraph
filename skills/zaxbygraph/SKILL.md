@@ -118,12 +118,14 @@ line (`sync`/`doctor` never do; slug-less reads print none; `synced=0` means
 "no recorded sync age"):
 `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
 Machine formats (`json`/`compact`/`jsonl`) print no identity line at all —
-the envelope already carries `db`/`repo`/`freshness`, so stdout+stderr
-merged strict-parses as one JSON document.
+stdout+stderr merged strict-parses as JSON. `json` and `compact` carry the
+full envelope (`db`/`repo`/`freshness` are the identity fields); **`jsonl`
+list payloads print rows only, no envelope — that surface carries no
+identity fields, use `json`/`compact` when you need them.**
 
 **Formats:** `--format json` (pretty, default when piped) and `compact` (one
 line) always carry the envelope · `jsonl` (one object per line for list
-payloads — rows only, identity inside the envelope; any `head -n` prefix
+payloads — rows only, no envelope, no identity fields; any `head -n` prefix
 parses) · `text` (default on a TTY, renders the payload only; the only
 format with the stderr identity line — never merge streams when parsing it).
 `--fields repo,number` projects rows to those keys that exist (unknown keys

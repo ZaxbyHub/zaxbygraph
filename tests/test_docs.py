@@ -70,6 +70,9 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         self.assertIn("merged", readme)
         # the jsonl bullet no longer points at the stderr line
         self.assertNotIn("identity is on the stderr line", readme)
+        self.assertNotIn("identity is inside the envelope", readme)
+        self.assertIn("no identity fields", readme)
+        self.assertIn("`json` or `compact` when you need them", readme)
 
     def test_skill_states_machine_mode_silence(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
@@ -77,6 +80,9 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         self.assertIn("strict-parses", skill)
         self.assertIn("identity line", skill)
         self.assertNotIn("identity on the stderr line", skill)
+        self.assertNotIn("identity inside the envelope", skill)
+        self.assertIn("no identity fields", skill)
+        self.assertIn("`json`/`compact` when you need them", skill)
 
 
 if __name__ == "__main__":
