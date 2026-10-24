@@ -454,12 +454,21 @@ class SamePairTwoStreamsTests(ExtraEdgeIngestTest):
         self.assertLessEqual(len(evidence), 512)
         self.assertIn("closingIssuesReferences", evidence)
         self.assertEqual(source, "closing_ref")
-        # the first-insert path is bounded by the same cap
-        self.ingest(pr8, pull_raw=None)
-        bounded = self.rows(
-            "SELECT length(evidence) FROM edges WHERE " + self.PAIR_WHERE
-        )[0][0]
-        self.assertLessEqual(bounded, 512)
+        # the FIRST-INSERT branch is bounded by the same cap: a fresh pair
+        # with no prior closes row, inserted oversized directly
+        fresh_big = "closingIssuesReferences " + "c" * 600
+        self.conn.execute("BEGIN")
+        insert_edge(
+            self.conn, REPO,
+            ("item", "9", "closes", "item", "7", fresh_big, "closing_ref"),
+        )
+        self.conn.commit()
+        fresh = self.rows(
+            "SELECT length(evidence), evidence IS NULL FROM edges"
+            " WHERE rel = 'closes' AND src_id = '9' AND dst_id = '7'"
+        )[0]
+        self.assertLessEqual(fresh[0], 512, "first insert must be cap-bounded")
+        self.assertFalse(fresh[1], "first insert must never store NULL")
 
     def test_other_relations_keep_two_rows_per_pair(self) -> None:
         # the documented invariant: the closes exception is closes-only —

@@ -77,7 +77,7 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         # word "merged" (which matches unrelated merged_commit/merged_by text)
         self.assertIn("a merged", readme)
         self.assertIn("parse line by line", readme)
-        self.assertIn("error:", readme)
+        self.assertIn("the `error:` echo still", readme)
         # the jsonl bullet no longer points at the stderr line
         self.assertNotIn("identity is on the stderr line", readme)
         self.assertNotIn("identity is inside the envelope", readme)
@@ -88,7 +88,7 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         skill = self._flat(SKILL.read_text(encoding="utf-8"))
         self.assertIn("On a successful read", skill)
         self.assertIn("parse line by line", skill)
-        self.assertIn("error:", skill)
+        self.assertIn("On a failure the `error:` echo still", skill)
         self.assertNotIn("identity on the stderr line", skill)
         self.assertNotIn("identity inside the envelope", skill)
         self.assertIn("no identity fields", skill)

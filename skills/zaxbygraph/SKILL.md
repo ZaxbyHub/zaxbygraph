@@ -123,7 +123,8 @@ identity line and stderr stays silent, so a merged capture parses cleanly:
 (`db`/`repo`/`freshness` are the identity fields); **`jsonl` list payloads
 print rows only — parse line by line, no envelope, no identity fields; use
 `json`/`compact` when you need them.** On a failure the `error:` echo still
-goes to stderr in every format, so only the stdout envelope answers.
+goes to stderr in every format; in json/compact/jsonl the stdout envelope
+carries the failure, while text mode prints nothing to stdout.
 
 **Formats:** `--format json` (pretty, default when piped) and `compact` (one
 line) always carry the envelope · `jsonl` (one object per line for list

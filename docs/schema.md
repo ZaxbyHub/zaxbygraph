@@ -299,11 +299,12 @@ One row per repo. What `zaxbygraph status` reads.
 ### Schema versions and migrations
 
 `PRAGMA user_version` is the authoritative schema state (currently `6`). The
-`meta.schema_version` row is informational only. On open of a WRITABLE
-connection — a `sync`, an MCP-triggered sync, or `doctor --consolidate`
-(adoption migrates its temp copy first) — `init_schema`: read commands open
-read-only and never migrate, so healing of an old cache happens on the next
-sync, not on reads.
+`meta.schema_version` row is informational only. `init_schema` (which runs
+the migration chain) executes only on a WRITABLE open: a `sync`, an
+MCP-triggered sync, or `doctor --consolidate` (adoption migrates its temp
+copy first). Read commands open the database read-only and never migrate,
+so healing of an old cache happens on the next writable open, not on
+reads. `init_schema` then:
 
 - refuses loudly when `user_version` is newer than the build (a database from
   a future zaxbygraph),
