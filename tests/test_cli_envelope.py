@@ -193,6 +193,12 @@ class EnvelopeTests(unittest.TestCase):
             if code != 0:
                 problems.append(argv[0] + " exited " + str(code))
                 continue
+            # Machine-mode silence (issue #17) for every command surface.
+            noisy = [line for line in err.splitlines() if line.strip()]
+            if noisy:
+                problems.append(
+                    argv[0] + " wrote to stderr in json mode: " + noisy[0][:60]
+                )
             try:
                 payload = json.loads(out)
             except ValueError:
@@ -493,6 +499,10 @@ class FormatTests(unittest.TestCase):
             )
 
     def test_stderr_identity_line(self) -> None:
+        # Issue #17 flipped the json-mode half of this pin: machine formats
+        # emit NO stderr line (the envelope carries every identity field, and
+        # a merged stderr+stdout capture must strict-parse). Text mode keeps
+        # the AC7 contract: exactly one identity line.
         code, out, err = run_cli(
             ["status", "--repo", REPO, "--db", self.db, "--format", "json"]
         )
@@ -500,10 +510,22 @@ class FormatTests(unittest.TestCase):
             code == 0,
             "IDENT: status must succeed for the identity-line check",
         )
+        self.assertEqual(
+            [line for line in err.splitlines() if line.strip()],
+            [],
+            "IDENT: machine formats must keep stderr silent, got: " + err,
+        )
+        code, out, err = run_cli(
+            ["status", "--repo", REPO, "--db", self.db, "--format", "text"]
+        )
+        self.assertTrue(
+            code == 0,
+            "IDENT: text-mode status must succeed",
+        )
         lines = [line for line in err.splitlines() if line.strip()]
         self.assertTrue(
             len(lines) == 1,
-            "IDENT: stderr must carry exactly one non-empty identity line, got "
+            "IDENT: text-mode stderr must carry exactly one identity line, got "
             + str(len(lines)),
         )
         self.assertTrue(

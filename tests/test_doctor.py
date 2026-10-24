@@ -320,5 +320,98 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(wm, [("2026-08-09T00:00:00Z",)])
 
 
+        """Issue #19 healing trigger end-to-end: a v5 candidate holding the
+        duplicate closes pair adopts through doctor --consolidate, and the
+        adopted store comes out collapsed (one row, both provenances) at
+        user_version 6 with the partial index installed. The candidate is
+        built at the true v5 shape (current tables, index dropped, version
+        stamped back to 5) so _MigratedCopy exercises the real v5->v6 path."""
+    def test_consolidate_collapses_v5_duplicate_closes_pairs(self) -> None:
+        """Issue #19 healing trigger end-to-end: a v5 candidate holding the
+        duplicate closes pair adopts through doctor --consolidate, and the
+        adopted store comes out collapsed (one row, both provenances) at
+        user_version 6 with the partial index installed. The candidate is
+        built at the true v5 shape (current tables, index dropped, version
+        stamped back to 5) so _MigratedCopy exercises the real v5->v6 path."""
+        legacy = self.scan_a / "v5dup" / "history.db"
+        legacy.parent.mkdir(parents=True)
+        self._seed_complete(legacy, [(6, "closed issue", "2026-10-05T00:00:00Z")])
+        conn = sqlite3.connect(str(legacy))
+        try:
+            conn.execute("DROP INDEX IF EXISTS ux_edges_closes_pair")
+            conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES (?, 'item', '14', 'closes', 'item', '6',"
+                " 'EXTRACTED', 'closingIssuesReferences', 'closing_ref')",
+                (SLUG,),
+            )
+            conn.execute(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES (?, 'item', '14', 'closes', 'item', '6',"
+                " 'EXTRACTED', 'timeline closed event 2026-10-05T07:18:55Z', 'timeline')",
+                (SLUG,),
+            )
+            conn.execute("PRAGMA user_version = 5")
+            conn.commit()
+        finally:
+            conn.close()
+
+        os.chdir(self.checkout)
+        code, out, err = run_cmd(
+            ["doctor", "--consolidate", "--repo", SLUG, "--scan", str(self.scan_a),
+             "--format", "json"]
+        )
+        self.assertEqual(code, 0, err)
+        report = json.loads(out)["data"]
+        self.assertIs(json.loads(out)["ok"], True)
+        self.assertEqual(str(Path(report["adopted"])), str(legacy))
+
+        store = self.home / "github.com" / "acme" / "widget" / "history.db"
+        self.assertTrue(store.exists())
+        self.assertEqual(int(read_only_rows(store, "PRAGMA user_version")[0][0]), 6)
+        rows = read_only_rows(
+            store,
+            "SELECT source, evidence FROM edges"
+            " WHERE rel = 'closes' AND src_id = '14' AND dst_id = '6'",
+        )
+        self.assertEqual(len(rows), 1, "exactly one closes row adopts for the pair")
+        self.assertEqual(rows[0][0], "closing_ref")
+        self.assertIn("closingIssuesReferences", rows[0][1])
+        self.assertIn("timeline closed event", rows[0][1])
+        index_names = [
+            r[0]
+            for r in read_only_rows(
+                store,
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+                " AND tbl_name = 'edges'",
+            )
+        ]
+        self.assertTrue(
+            any(str(n).startswith("ux_edges_closes_pair") for n in index_names),
+            index_names,
+        )
+
+        # The ORIGINAL v5 candidate is untouched: adoption migrates its temp
+        # copy, never the user's file (the module's own documented rule) —
+        # with v6 now collapsing rows on the copy, an in-place regression
+        # would destroy the only pre-v6 backup this file holds.
+        self.assertEqual(
+            int(read_only_rows(legacy, "PRAGMA user_version")[0][0]),
+            5,
+            "original candidate must still be at user_version 5",
+        )
+        self.assertEqual(
+            len(read_only_rows(
+                legacy,
+                "SELECT * FROM edges WHERE rel = 'closes'"
+                " AND src_id = '14' AND dst_id = '6'",
+            )),
+            2,
+            "original candidate must still hold both duplicate rows",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,7 @@ class UniqueKeyDiscriminatorTests(unittest.TestCase):
             )
             conn.commit()
             init_schema(conn)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
             # Sanity: the backfilled row really is closes_keyword/keyword.
             self.assertEqual(
                 tuple(

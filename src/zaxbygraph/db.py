@@ -4,14 +4,16 @@ import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
+from zaxbygraph.extract import CLOSES_REF_MARKER, merge_evidence
+
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 5
+CURRENT_USER_VERSION = 6
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -529,6 +531,66 @@ def migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
         )
 
 
+def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
+    """v5 -> v6: at most one `closes` edge per (repo, dst, src) pair (issue #19).
+
+    The two GitHub-reported closes streams — closingIssuesReferences
+    (source='closing_ref') and the timeline closed event (source='timeline')
+    — corroborate ONE closure fact, so stored pairs carrying both rows
+    collapse: the closing_ref row survives when present (the structured
+    declaration over the event stream), evidence merged first-seen via
+    extract.merge_evidence, the other rows deleted. The partial UNIQUE
+    index then makes the invariant physical: any writer that bypasses the
+    ingest-time merge (store.insert_edge) fails loudly.
+
+    The index is created HERE, not in schema.sql: init_schema runs
+    executescript(schema.sql) BEFORE the migration chain, so a UNIQUE index
+    in the script would IntegrityError against a v5 store's
+    not-yet-collapsed duplicates. Fresh databases get the index anyway —
+    they enter init_schema at user_version 0 and this chain runs in full.
+    Idempotent: a store with no duplicate pairs just gains (or already
+    has) the index.
+    """
+    dupes = conn.execute(
+        """
+        SELECT repo, src_type, src_id, dst_type, dst_id
+        FROM edges WHERE rel = 'closes'
+        GROUP BY repo, src_type, src_id, dst_type, dst_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for pair in dupes:
+        rows = conn.execute(
+            """
+            SELECT id, source, evidence FROM edges
+            WHERE repo = ? AND src_type = ? AND src_id = ? AND rel = 'closes'
+            AND dst_type = ? AND dst_id = ?
+            ORDER BY (source = 'closing_ref') DESC, id
+            """,
+            (
+                pair["repo"],
+                pair["src_type"],
+                pair["src_id"],
+                pair["dst_type"],
+                pair["dst_id"],
+            ),
+        ).fetchall()
+        survivor = rows[0]
+        merged = merge_evidence(
+            *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
+        )
+        conn.execute(
+            "UPDATE edges SET evidence = ?, source = ? WHERE id = ?",
+            (merged, survivor["source"], survivor["id"]),
+        )
+        for other in rows[1:]:
+            conn.execute("DELETE FROM edges WHERE id = ?", (other["id"],))
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_edges_closes_pair "
+        "ON edges(repo, src_type, src_id, rel, dst_type, dst_id) WHERE rel = 'closes'"
+    )
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -536,6 +598,7 @@ MIGRATIONS = [
     (3, migrate_v2_to_v3),
     (4, migrate_v3_to_v4),
     (5, migrate_v4_to_v5),
+    (6, migrate_v5_to_v6),
 ]
 
 

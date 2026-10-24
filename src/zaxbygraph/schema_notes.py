@@ -15,8 +15,8 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "edges": {
         "src_id": "TEXT-typed even for item numbers - filter with src_id = '10', not 10; a foreign cross-referenced source is a repo-qualified id (`owner/repo#N`), never a bare number",
         "dst_id": "TEXT-typed even for item numbers - use dst_id = '10' in SQL filters; a commit endpoint carries the sha so the graph joins to `git log`",
-        "evidence": "Provenance payload; never part of an edge's identity - `source` IS part of the key because the same pair reported by two streams is two facts",
-        "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced events), 'closing_ref' (PR closingIssuesReferences), 'payload' (structured fields)",
+        "evidence": "Provenance payload; never part of an edge's identity - `source` is part of the key because the same pair reported by two streams is two facts, with the closes exception: rel='closes' holds one row per pair whose evidence carries each stream that reported it - both when both streams did (schema v6)",
+        "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced events), 'closing_ref' (PR closingIssuesReferences), 'payload' (structured fields). Part of the unique key except for rel='closes', where GitHub-reported streams merge into one row (closing_ref preferred when present, each reporting stream's evidence kept)",
     },
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",

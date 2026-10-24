@@ -6,6 +6,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from zaxbygraph.extract import (
+    CLOSES_REF_MARKER,
+    EVIDENCE_CAP,
     collapse_edges,
     edges_from_comment,
     edges_from_files,
@@ -14,6 +16,7 @@ from zaxbygraph.extract import (
     edges_from_review,
     edges_from_timeline,
     item_kind,
+    merge_evidence,
     revert_title_variants,
 )
 
@@ -92,6 +95,47 @@ def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None
 
 def insert_edge(conn: sqlite3.Connection, repo: str, edge: tuple) -> None:
     src_type, src_id, rel, dst_type, dst_id, evidence, source = edge
+    if rel == "closes":
+        # One closes row per (repo, dst, src) pair (issue #19). The two
+        # GitHub-reported streams — closingIssuesReferences (closing_ref)
+        # and the timeline closed event (timeline) — corroborate ONE
+        # closure fact, so they merge instead of each inserting. A
+        # same-source refresh also unions evidence: re-ingesting one
+        # stream must never drop the provenance the other stream merged
+        # in. Evidence stays a payload (AGENTS): the surviving row carries
+        # both strings, and the reserve keeps each stream's marker intact
+        # even at the cap. The first insert is bounded by the same cap so
+        # an oversized payload can never poison later merges into NULL.
+        if evidence:
+            evidence = merge_evidence(
+                evidence, reserve=(CLOSES_REF_MARKER,)
+            )
+        row = conn.execute(
+            "SELECT id, source, evidence FROM edges "
+            "WHERE repo = ? AND src_type = ? AND src_id = ? AND rel = 'closes' "
+            "AND dst_type = ? AND dst_id = ? LIMIT 1",
+            (repo, src_type, src_id, dst_type, dst_id),
+        ).fetchone()
+        if row is not None:
+            merged = merge_evidence(
+                row["evidence"], evidence, reserve=(CLOSES_REF_MARKER,)
+            )
+            if row["source"] == source:
+                conn.execute(
+                    "UPDATE edges SET evidence = ? WHERE id = ?",
+                    (merged, row["id"]),
+                )
+            else:
+                survivor = (
+                    "closing_ref"
+                    if "closing_ref" in (source, row["source"])
+                    else row["source"]
+                )
+                conn.execute(
+                    "UPDATE edges SET evidence = ?, source = ? WHERE id = ?",
+                    (merged, survivor, row["id"]),
+                )
+            return
     conn.execute(
         "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source) "
         "VALUES (?, ?, ?, ?, ?, ?, 'EXTRACTED', ?, ?) "

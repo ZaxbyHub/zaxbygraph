@@ -112,16 +112,25 @@ Every command's JSON output is one self-describing **envelope** (v0.2):
 `{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
 plus `error:{code, message, hint?}` on failures. The per-command payload lives
 under `data`; `ok` is at the root. Errors answer on **stdout** in JSON mode
-(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; a
-successful read that resolves a repo also writes exactly one identity line
-(`sync`/`doctor` never do; slug-less reads print none; `synced=0` means "no
-recorded sync age"):
+(exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; in text
+mode a successful read that resolves a repo also writes exactly one identity
+line (`sync`/`doctor` never do; slug-less reads print none; `synced=0` means
+"no recorded sync age"):
 `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
+On a successful read, machine formats (`json`/`compact`/`jsonl`) print no
+identity line and stderr stays silent, so a merged capture parses cleanly:
+`json`/`compact` yield one JSON document carrying the full envelope
+(`db`/`repo`/`freshness` are the identity fields); **`jsonl` list payloads
+print rows only — parse line by line, no envelope, no identity fields; use
+`json`/`compact` when you need them.** On a failure the `error:` echo still
+goes to stderr in every format; in json/compact/jsonl the stdout envelope
+carries the failure, while text mode prints nothing to stdout.
 
 **Formats:** `--format json` (pretty, default when piped) and `compact` (one
 line) always carry the envelope · `jsonl` (one object per line for list
-payloads — rows only, identity on the stderr line; any `head -n` prefix
-parses) · `text` (default on a TTY, renders the payload only).
+payloads — rows only, no envelope, no identity fields; any `head -n` prefix
+parses) · `text` (default on a TTY, renders the payload only; the only
+format with the stderr identity line — never merge streams when parsing it).
 `--fields repo,number` projects rows to those keys that exist (unknown keys
 are omitted) — applies to list payloads and `sql` rows in both row modes, not
 to nested arrays inside dict payloads. `sql` rows are objects keyed by column

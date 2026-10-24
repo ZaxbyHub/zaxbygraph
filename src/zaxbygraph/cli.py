@@ -219,9 +219,13 @@ def emit_result(
     echo: bool = True,
 ) -> None:
     """The single output owner (issue #3): envelope assembly, all formats,
-    --fields projection, the stderr identity line on success, and the
-    one-line stderr error echo on failure (the human contract the error-
-    channel tests pin; the structured envelope goes to stdout)."""
+    --fields projection, the stderr identity line on text-mode success
+    (machine formats stay silent on stderr; the json/compact envelope keeps
+    db, repo and freshness - not the line's items count - while jsonl list
+    payloads print rows only with no envelope at all - issue #17), and the
+    one-line stderr error echo on
+    failure (the human contract the error-channel tests pin; the structured
+    envelope goes to stdout)."""
     fields = _fields_of(args)
     payload = data
     columns: list[str] | None = None
@@ -279,7 +283,12 @@ def emit_result(
         _render_json(env, indent=2)
     if identity_line is None and identity and error is None and slug:
         identity_line = _identity_line(conn, slug, db_path)
-    if identity_line:
+    if identity_line and fmt == "text":
+        # Text mode only (issue #17): machine formats must stay strict-parse
+        # safe under merged-stream captures. The json/compact envelope still
+        # carries db, repo and freshness (not the items count the line
+        # printed); jsonl list payloads print rows only, so on that surface
+        # the identity data is simply absent.
         print(identity_line, file=sys.stderr)
 
 

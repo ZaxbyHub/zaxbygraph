@@ -56,5 +56,44 @@ class SkillDocTests(unittest.TestCase):
         )
 
 
+class MachineModeSilenceDocTests(unittest.TestCase):
+    """Issue #17 AC4's cheap content pin: both doc surfaces must state the
+    machine-mode silence rule and the capture hazard (the criterion itself is
+    NON-EXECUTABLE in the frozen acceptance table; this pin keeps the two
+    statements from drifting while the rendered diff remains the substitute
+    evidence)."""
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        # markdown line wraps must not defeat multi-word pins
+        return re.sub(r"\s+", " ", text)
+
+    def test_readme_states_machine_mode_silence(self) -> None:
+        readme = self._flat(
+            (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        )
+        self.assertIn("machine formats", readme)
+        # the capture-hazard pin must be the actual hazard sentence, not the
+        # word "merged" (which matches unrelated merged_commit/merged_by text)
+        self.assertIn("a merged", readme)
+        self.assertIn("parse line by line", readme)
+        self.assertIn("the `error:` echo still", readme)
+        # the jsonl bullet no longer points at the stderr line
+        self.assertNotIn("identity is on the stderr line", readme)
+        self.assertNotIn("identity is inside the envelope", readme)
+        self.assertIn("no identity fields", readme)
+        self.assertIn("`json` or `compact` when you need them", readme)
+
+    def test_skill_states_machine_mode_silence(self) -> None:
+        skill = self._flat(SKILL.read_text(encoding="utf-8"))
+        self.assertIn("On a successful read", skill)
+        self.assertIn("parse line by line", skill)
+        self.assertIn("On a failure the `error:` echo still", skill)
+        self.assertNotIn("identity on the stderr line", skill)
+        self.assertNotIn("identity inside the envelope", skill)
+        self.assertIn("no identity fields", skill)
+        self.assertIn("`json`/`compact` when you need them", skill)
+
+
 if __name__ == "__main__":
     unittest.main()
