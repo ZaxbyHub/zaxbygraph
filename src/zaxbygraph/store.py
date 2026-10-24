@@ -6,6 +6,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from zaxbygraph.extract import (
+    CLOSES_REF_MARKER,
+    EVIDENCE_CAP,
     collapse_edges,
     edges_from_comment,
     edges_from_files,
@@ -101,7 +103,13 @@ def insert_edge(conn: sqlite3.Connection, repo: str, edge: tuple) -> None:
         # same-source refresh also unions evidence: re-ingesting one
         # stream must never drop the provenance the other stream merged
         # in. Evidence stays a payload (AGENTS): the surviving row carries
-        # both strings, first-seen first.
+        # both strings, and the reserve keeps each stream's marker intact
+        # even at the cap. The first insert is bounded by the same cap so
+        # an oversized payload can never poison later merges into NULL.
+        if evidence:
+            evidence = merge_evidence(
+                evidence, reserve=(CLOSES_REF_MARKER,)
+            )
         row = conn.execute(
             "SELECT id, source, evidence FROM edges "
             "WHERE repo = ? AND src_type = ? AND src_id = ? AND rel = 'closes' "
@@ -109,7 +117,9 @@ def insert_edge(conn: sqlite3.Connection, repo: str, edge: tuple) -> None:
             (repo, src_type, src_id, dst_type, dst_id),
         ).fetchone()
         if row is not None:
-            merged = merge_evidence(row["evidence"], evidence)
+            merged = merge_evidence(
+                row["evidence"], evidence, reserve=(CLOSES_REF_MARKER,)
+            )
             if row["source"] == source:
                 conn.execute(
                     "UPDATE edges SET evidence = ? WHERE id = ?",

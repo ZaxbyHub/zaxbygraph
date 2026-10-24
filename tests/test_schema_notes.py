@@ -358,6 +358,12 @@ class EnvelopeContractTests(unittest.TestCase):
             if code != 0:
                 problems.append(f"{name} exited {code}: {err.strip()[:80]}")
                 continue
+            # Machine-mode silence (issue #17): a successful json read must
+            # keep stderr empty for EVERY command, not only the few surfaces
+            # with dedicated silence tests.
+            noisy = [line for line in err.splitlines() if line.strip()]
+            if noisy:
+                problems.append(f"{name} wrote to stderr in json mode: {noisy[0][:60]}")
             try:
                 payload = json.loads(out)
             except ValueError:

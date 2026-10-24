@@ -193,6 +193,12 @@ class EnvelopeTests(unittest.TestCase):
             if code != 0:
                 problems.append(argv[0] + " exited " + str(code))
                 continue
+            # Machine-mode silence (issue #17) for every command surface.
+            noisy = [line for line in err.splitlines() if line.strip()]
+            if noisy:
+                problems.append(
+                    argv[0] + " wrote to stderr in json mode: " + noisy[0][:60]
+                )
             try:
                 payload = json.loads(out)
             except ValueError:

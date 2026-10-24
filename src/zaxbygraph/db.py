@@ -4,7 +4,7 @@ import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
-from zaxbygraph.extract import merge_evidence
+from zaxbygraph.extract import CLOSES_REF_MARKER, merge_evidence
 
 SCHEMA_NAME = "schema.sql"
 SCHEMA_VERSION = "6"
@@ -576,7 +576,9 @@ def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
             ),
         ).fetchall()
         survivor = rows[0]
-        merged = merge_evidence(*[r["evidence"] for r in rows])
+        merged = merge_evidence(
+            *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
+        )
         conn.execute(
             "UPDATE edges SET evidence = ?, source = ? WHERE id = ?",
             (merged, survivor["source"], survivor["id"]),

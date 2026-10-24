@@ -117,11 +117,13 @@ mode a successful read that resolves a repo also writes exactly one identity
 line (`sync`/`doctor` never do; slug-less reads print none; `synced=0` means
 "no recorded sync age"):
 `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`.
-Machine formats (`json`/`compact`/`jsonl`) print no identity line at all —
-stdout+stderr merged strict-parses as JSON. `json` and `compact` carry the
-full envelope (`db`/`repo`/`freshness` are the identity fields); **`jsonl`
-list payloads print rows only, no envelope — that surface carries no
-identity fields, use `json`/`compact` when you need them.**
+On a successful read, machine formats (`json`/`compact`/`jsonl`) print no
+identity line and stderr stays silent, so a merged capture parses cleanly:
+`json`/`compact` yield one JSON document carrying the full envelope
+(`db`/`repo`/`freshness` are the identity fields); **`jsonl` list payloads
+print rows only — parse line by line, no envelope, no identity fields; use
+`json`/`compact` when you need them.** On a failure the `error:` echo still
+goes to stderr in every format, so only the stdout envelope answers.
 
 **Formats:** `--format json` (pretty, default when piped) and `compact` (one
 line) always carry the envelope · `jsonl` (one object per line for list

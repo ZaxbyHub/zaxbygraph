@@ -191,21 +191,30 @@ def collapse_edges(edges: Iterable[tuple]) -> list[tuple]:
 
 
 #: Evidence is a payload (AGENTS), so merged `closes` rows carry every
-#: provenance string. The cap bounds one pathological store's growth;
-#: newest parts are dropped first so the earliest-seen provenances (the two
-#: streams the merge exists to unite) survive truncation.
+#: provenance string. The cap bounds one pathological store's growth.
+#: Trimming protects the parts a consumer cannot afford to lose — the
+#: arriving stream's marker and the closing_ref stream's canonical string —
+#: and a lone over-cap part is HARD-TRUNCATED, never dropped: merged
+#: evidence must never silently become NULL, because callers write it
+#: straight into the survivor row (issue #19 feedback round).
 EVIDENCE_SEP = "; "
 EVIDENCE_CAP = 512
+CLOSES_REF_MARKER = "closingIssuesReferences"
 
 
-def merge_evidence(*parts: str | None) -> str | None:
+def merge_evidence(*parts: str | None, reserve: tuple[str, ...] = ()) -> str | None:
     """Union distinct provenance strings, first-seen first, '; '-joined.
 
     None/empty inputs contribute nothing; the result is None only when
-    everything is empty. Splitting on the separator keeps `merge_evidence`
-    idempotent on its own output, and keeps the two closes streams
-    (`closingIssuesReferences`, `timeline closed event ...`) distinguishable
-    after any number of re-ingests (issue #19).
+    EVERY input is empty — content is never dropped on the floor (an
+    over-cap part is truncated to keep the payload present and bounded).
+    Splitting on the separator keeps `merge_evidence` idempotent on its
+    own output. Trimming over the cap drops newest-unprotected parts
+    first; a part is protected when it contains any `reserve` substring
+    or is the most recently seen part, so the stream that just arrived
+    and the reserved markers (e.g. the closing_ref stream's canonical
+    string) survive even in a pathological full-cap store (issue #19
+    feedback round).
     """
     seen: list[str] = []
     known: set[str] = set()
@@ -215,14 +224,26 @@ def merge_evidence(*parts: str | None) -> str | None:
             if piece and piece not in known:
                 known.add(piece)
                 seen.append(piece)
-    while seen:
-        length = sum(len(p) for p in seen) + (len(seen) - 1) * len(EVIDENCE_SEP)
-        if length <= EVIDENCE_CAP:
-            break
-        seen.pop()
     if not seen:
         return None
-    return EVIDENCE_SEP.join(seen)
+
+    def _length(items: list[str]) -> int:
+        return sum(len(p) for p in items) + (len(items) - 1) * len(EVIDENCE_SEP)
+
+    protected = {i for i, p in enumerate(seen) if any(r in p for r in reserve)}
+    protected.add(len(seen) - 1)
+    for i in range(len(seen) - 1, -1, -1):
+        if _length(seen) <= EVIDENCE_CAP:
+            break
+        if i in protected:
+            continue
+        del seen[i]
+    out = EVIDENCE_SEP.join(seen)
+    if len(out) > EVIDENCE_CAP:
+        # Last resort (protected parts alone exceed the cap): hard-truncate.
+        # Bounded beats absent — callers persist this verbatim.
+        out = out[:EVIDENCE_CAP]
+    return out
 
 
 #: Relations any edges_from_* emitter can produce. The Phase 4.2 guardrail

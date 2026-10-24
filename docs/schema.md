@@ -147,7 +147,7 @@ The graph itself. One row per relationship.
 | `dst_type` | TEXT | Same domain as `src_type`. |
 | `dst_id` | TEXT | A commit endpoint carries the sha, so the graph joins to `git log`. |
 | `confidence` | TEXT | Always `'EXTRACTED'`, enforced by a CHECK constraint. |
-| `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is**. |
+| `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is** — with the `closes` exception below. |
 | `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. |
 
 Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
@@ -156,8 +156,11 @@ Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 dst_id)` pair** (schema v6, issue #19): the `closing_ref` and `timeline`
 streams corroborate ONE GitHub-reported closure, so ingest merges them
 instead of storing both — the `closing_ref` source survives when present,
-and `evidence` carries both provenance strings (`'; '`-joined, first-seen
-first, capped at 512 chars). Ingest-time merge lives in `store.insert_edge`;
+and `evidence` carries both provenance strings (`'; '`-joined, capped at
+512 chars: over the cap the arriving stream's marker and the
+closing-ref string are protected while older details trim first, and a
+lone over-cap part is truncated, never dropped — merged evidence never
+becomes NULL). Ingest-time merge lives in `store.insert_edge`;
 the physical backstop is the partial unique index `ux_edges_closes_pair`
 `ON edges(repo, src_type, src_id, rel, dst_type, dst_id) WHERE rel='closes'`,
 created by migration v6 — deliberately **not** in `schema.sql`, because
@@ -315,7 +318,8 @@ reported reset and reports the window instead of aborting).
 Migration 4→5 rebuilds `edges` for timeline provenance (issue #6): a
 `source TEXT NOT NULL` column after `evidence`, the unique key widened to
 `(repo, src_type, src_id, rel, dst_type, dst_id, source)` — the same pair
-reported by two provenance streams is two facts — keyword `closes` rows
+reported by two provenance streams is two facts (amended by v6 for
+`rel='closes'`, below) — keyword `closes` rows
 renamed to `closes_keyword`, and a mechanism-honest backfill (legacy `closes`
 → `closes_keyword` + 'keyword', legacy `mentions` → 'keyword', everything
 else → 'payload'). Ids and row counts are preserved and the migration is

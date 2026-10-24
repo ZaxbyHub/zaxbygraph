@@ -220,9 +220,11 @@ def emit_result(
 ) -> None:
     """The single output owner (issue #3): envelope assembly, all formats,
     --fields projection, the stderr identity line on text-mode success
-    (machine formats carry identity inside the envelope only, issue #17),
-    and the one-line stderr error echo on failure (the human contract the
-    error-channel tests pin; the structured envelope goes to stdout)."""
+    (machine formats stay silent on stderr; json/compact carry the identity
+    fields in the envelope, jsonl list payloads print rows only with no
+    envelope at all - issue #17), and the one-line stderr error echo on
+    failure (the human contract the error-channel tests pin; the structured
+    envelope goes to stdout)."""
     fields = _fields_of(args)
     payload = data
     columns: list[str] | None = None
@@ -282,8 +284,9 @@ def emit_result(
         identity_line = _identity_line(conn, slug, db_path)
     if identity_line and fmt == "text":
         # Text mode only (issue #17): machine formats must stay strict-parse
-        # safe under merged-stream captures, and the envelope already carries
-        # every identity field the line repeats.
+        # safe under merged-stream captures. json/compact repeat the identity
+        # fields inside the envelope; jsonl list payloads print rows only, so
+        # on that surface the identity fields are simply absent.
         print(identity_line, file=sys.stderr)
 
 

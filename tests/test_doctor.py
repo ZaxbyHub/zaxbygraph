@@ -320,7 +320,12 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(wm, [("2026-08-09T00:00:00Z",)])
 
 
-class DoctorConsolidateV6CollapseTests(DoctorTests):
+        """Issue #19 healing trigger end-to-end: a v5 candidate holding the
+        duplicate closes pair adopts through doctor --consolidate, and the
+        adopted store comes out collapsed (one row, both provenances) at
+        user_version 6 with the partial index installed. The candidate is
+        built at the true v5 shape (current tables, index dropped, version
+        stamped back to 5) so _MigratedCopy exercises the real v5->v6 path."""
     def test_consolidate_collapses_v5_duplicate_closes_pairs(self) -> None:
         """Issue #19 healing trigger end-to-end: a v5 candidate holding the
         duplicate closes pair adopts through doctor --consolidate, and the
@@ -386,6 +391,25 @@ class DoctorConsolidateV6CollapseTests(DoctorTests):
         self.assertTrue(
             any(str(n).startswith("ux_edges_closes_pair") for n in index_names),
             index_names,
+        )
+
+        # The ORIGINAL v5 candidate is untouched: adoption migrates its temp
+        # copy, never the user's file (the module's own documented rule) —
+        # with v6 now collapsing rows on the copy, an in-place regression
+        # would destroy the only pre-v6 backup this file holds.
+        self.assertEqual(
+            int(read_only_rows(legacy, "PRAGMA user_version")[0][0]),
+            5,
+            "original candidate must still be at user_version 5",
+        )
+        self.assertEqual(
+            len(read_only_rows(
+                legacy,
+                "SELECT * FROM edges WHERE rel = 'closes'"
+                " AND src_id = '14' AND dst_id = '6'",
+            )),
+            2,
+            "original candidate must still hold both duplicate rows",
         )
 
 

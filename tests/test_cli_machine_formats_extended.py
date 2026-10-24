@@ -45,7 +45,11 @@ class JsonlMergedCaptureTests(_SeededCliTestCase):
         lines = [line for line in text.splitlines() if line.strip()]
         self.assertTrue(lines, "JSONL1: jsonl list output must not be empty")
         for line in lines:
-            json.loads(line)  # raises on the identity line interleaving
+            row = json.loads(line)  # raises on the identity line interleaving
+            # rows-only contract: no envelope keys on the jsonl list surface
+            self.assertNotIn("ok", row)
+            self.assertNotIn("freshness", row)
+            self.assertNotIn("truncated", row)
 
     def test_jsonl_list_payload_keeps_stderr_clean(self) -> None:
         proc = self.run_cli(

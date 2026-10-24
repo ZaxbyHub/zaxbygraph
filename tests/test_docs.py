@@ -63,11 +63,21 @@ class MachineModeSilenceDocTests(unittest.TestCase):
     statements from drifting while the rendered diff remains the substitute
     evidence)."""
 
+    @staticmethod
+    def _flat(text: str) -> str:
+        # markdown line wraps must not defeat multi-word pins
+        return re.sub(r"\s+", " ", text)
+
     def test_readme_states_machine_mode_silence(self) -> None:
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        readme = self._flat(
+            (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        )
         self.assertIn("machine formats", readme)
-        self.assertIn("strict-parses", readme)
-        self.assertIn("merged", readme)
+        # the capture-hazard pin must be the actual hazard sentence, not the
+        # word "merged" (which matches unrelated merged_commit/merged_by text)
+        self.assertIn("a merged", readme)
+        self.assertIn("parse line by line", readme)
+        self.assertIn("error:", readme)
         # the jsonl bullet no longer points at the stderr line
         self.assertNotIn("identity is on the stderr line", readme)
         self.assertNotIn("identity is inside the envelope", readme)
@@ -75,10 +85,10 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         self.assertIn("`json` or `compact` when you need them", readme)
 
     def test_skill_states_machine_mode_silence(self) -> None:
-        skill = SKILL.read_text(encoding="utf-8")
-        self.assertIn("Machine formats", skill)
-        self.assertIn("strict-parses", skill)
-        self.assertIn("identity line", skill)
+        skill = self._flat(SKILL.read_text(encoding="utf-8"))
+        self.assertIn("On a successful read", skill)
+        self.assertIn("parse line by line", skill)
+        self.assertIn("error:", skill)
         self.assertNotIn("identity on the stderr line", skill)
         self.assertNotIn("identity inside the envelope", skill)
         self.assertIn("no identity fields", skill)

@@ -7,7 +7,7 @@ import sqlite3
 import unittest
 
 from fixtures import TempDBTest, issue, pull
-from zaxbygraph.store import ingest_item
+from zaxbygraph.store import ingest_item, insert_edge
 
 REPO = "zaxbyhub/zaxbygraph"
 
@@ -422,6 +422,59 @@ class SamePairTwoStreamsTests(ExtraEdgeIngestTest):
         )
         self.assertIn("closingIssuesReferences", closed["prs"][0]["evidence"])
         self.assertIn("timeline closed event", closed["prs"][0]["evidence"])
+
+    def test_overcap_evidence_never_nulls_and_first_insert_is_bounded(self) -> None:
+        # feedback round: an over-cap part must hard-truncate, never erase —
+        # merge_evidence used to return None and insert_edge wrote NULL,
+        # destroying both provenances on the survivor row
+        big = "timeline closed event " + "t" * 600
+        pr8 = issue(8, title="pr eight", kind="pr")
+        self.ingest(issue(5, title="issue five"), timeline=[dict(self.CLOSED)])
+        # simulate the pathological oversized evidence by inserting directly
+        # through the store (the extractor caps event strings naturally)
+        self.conn.execute("BEGIN")
+        insert_edge(
+            self.conn, REPO,
+            ("item", "8", "closes", "item", "5", big, "timeline"),
+        )
+        self.conn.commit()
+        self.ingest(
+            pr8,
+            pull_raw=dict(
+                pull(8, merged=True),
+                closing_issues_references=[{"number": 5, "repo": REPO}],
+            ),
+        )
+        rows = self.rows(
+            "SELECT source, evidence FROM edges WHERE " + self.PAIR_WHERE
+        )
+        self.assertEqual(len(rows), 1)
+        source, evidence = rows[0]
+        self.assertIsNotNone(evidence, "merged evidence must never become NULL")
+        self.assertLessEqual(len(evidence), 512)
+        self.assertIn("closingIssuesReferences", evidence)
+        self.assertEqual(source, "closing_ref")
+        # the first-insert path is bounded by the same cap
+        self.ingest(pr8, pull_raw=None)
+        bounded = self.rows(
+            "SELECT length(evidence) FROM edges WHERE " + self.PAIR_WHERE
+        )[0][0]
+        self.assertLessEqual(bounded, 512)
+
+    def test_other_relations_keep_two_rows_per_pair(self) -> None:
+        # the documented invariant: the closes exception is closes-only —
+        # another relation reported by two streams is still two facts
+        mentions_a = ("item", "8", "mentions", "item", "5", "body #5", "keyword")
+        mentions_b = ("item", "8", "mentions", "item", "5", "comment #5", "payload")
+        self.conn.execute("BEGIN")
+        insert_edge(self.conn, REPO, mentions_a)
+        insert_edge(self.conn, REPO, mentions_b)
+        self.conn.commit()
+        self.assertEqual(
+            self.edge_count("rel = 'mentions' AND src_id = '8' AND dst_id = '5'"),
+            2,
+            "non-closes relations keep two-rows-are-two-facts",
+        )
 
     def test_partial_index_fires_on_bypassing_writers(self) -> None:
         pr8 = issue(8, title="pr eight", kind="pr")

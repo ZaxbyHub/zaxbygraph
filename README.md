@@ -455,15 +455,19 @@ Machine-readable rules, worth knowing before scripting against this:
   `# db=<path> repo=<slug> items=<n> synced=<age> complete=<yes|no>`
   (`synced=0` means "no recorded sync age"; `synced=<age>` is whole seconds).
   In **machine formats** (`json`/`compact`/`jsonl`) the line is suppressed —
-  a successful machine-format read keeps both streams silent and a merged
-  `stdout+stderr` capture strict-parses as JSON. `json` and `compact` carry
-  the full envelope, whose `db`/`repo`/`freshness` fields are the identity
-  data the line used to print; **`jsonl` list payloads print rows only, with
-  no envelope, so that surface carries no identity fields at all — use
-  `json` or `compact` when you need them.** Never merge streams when
-  parsing text mode, and never strip a preamble before the first `{`:
-  pre-0.5 builds printed the line in machine mode too, so legacy
-  strip-before-first-`{` recipes are vestigial.
+  a successful machine-format read keeps **stderr** silent, so a merged
+  `stdout+stderr` capture parses: `json` and `compact` yield one JSON
+  document (the full envelope, whose `db`/`repo`/`freshness` fields are the
+  identity data the line used to print), while **`jsonl` list payloads print
+  rows only — parse line by line, not as one document; that surface carries
+  no envelope and no identity fields at all, so use `json` or `compact` when
+  you need them.** Failures are different by design: the `error:` echo still
+  goes to stderr in every format, so a failed command's merged capture is
+  not parseable — check `ok` in the stdout envelope instead. Never merge
+  streams when parsing text mode, and never strip a preamble before the
+  first `{`: builds before this fix printed the line in machine mode too,
+  so legacy strip-before-first-`{` recipes are dead weight on current
+  builds.
 - **Formats and rows.** `--format json` (pretty, default when piped) and
   `compact` (one line) always carry the envelope; `jsonl` prints one JSON
   object per line for list payloads (rows only — no envelope, so no
