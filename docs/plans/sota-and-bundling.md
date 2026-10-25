@@ -3,7 +3,7 @@
 **Status.** Proposal only. Nothing in this document is implemented.
 
 **Anchor.** Every code claim was checked at
-`b47913e4b4b1c7ad06a07aeb3b1a3a91ac5e0f2c` (current `main`, schema v6, 310
+`b47913eeeb90095b8a15998eae34413523853fa5` (current `main`, schema v6, 310
 tests green). Before filing, re-verify each claim at that commit and expand
 each file:line reference to a full-SHA permalink, as CONTRIBUTING:92
 requires.
