@@ -1,5 +1,7 @@
-# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 5)
+# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 6)
 
+> **Rev 6** adds §12 (edit history and corpus export), folded in by owner decision.
+>
 > **Rev 5** adds §11, a review of the comparable tools gitcrawl and ghcrawl.
 >
 > **Rev 4** adds §10, a claim-by-claim reconciliation with two independent plans
@@ -922,17 +924,7 @@ not adopted.
 
 ### 11.2 Worth considering later, not yet
 
-- **Edit history: revisions and tombstones.** gitcrawl keeps immutable
-  revisions of edited comments and threads. ZaxbyGraph overwrites `body` and
-  deletes children on re-ingest (`store.py:63-67`, `:161-170`). Revisions
-  would cure the residual eval leakage in §6 (body edits after close), and
-  they make "what did the issue say when it was filed" answerable. The cost
-  is significant storage growth and a new append-only table family. Defer
-  until §6 shows that leakage materially distorts results.
-- **Deterministic corpus export.** gitcrawl `capture` emits a
-  schema-versioned JSON snapshot with per-thread `content_hash`. A
-  zaxbygraph `export-corpus` would also generate the "recorded real corpus"
-  fixture that §6 needs. Adopt when that fixture is built.
+- **Edit history** and **deterministic corpus export** were moved into the plan in rev 6. See §12.
 - **Portable or shared stores.** gitcrawl publishes a verified SQLite
   snapshot (manifest, sha256, `quick_check`) through git. That fits teams
   with many machines. With one primary machine, `doctor --consolidate`
@@ -961,6 +953,247 @@ not adopted.
 | G2 (`--max-age`), G7 (batch `item`) | The §5.8 surface PR (row 6) |
 | G3 (PR commits) | A2 (row 8), behind the capability gate |
 | G6 (time-scoped retrieval) | Rows 5 and 7 together with §6 |
+
+## 12. Edit history and corpus export (rev 6)
+
+The owner decided both belong in the plan. This section specifies them
+against the current ingest path. Claims about code are VERIFIED at
+`b47913e`.
+
+### 12.1 Why both matter for the stated workflow
+
+- **Edit history.** The store keeps only current text. `upsert_item_row`
+  overwrites `title`/`body` (`store.py:161-170`), and `replace_item_children`
+  deletes every comment and review before reinserting the current set
+  (`store.py:63-67`). Three consequences:
+  - An agent cannot see what an issue said when it was filed, or what a
+    comment said before someone edited in "fixed by #N".
+  - A comment deleted upstream disappears without trace.
+  - §6's evaluation has a residual leakage it can only report, never remove:
+    body edits made after the fix.
+- **Corpus export.** No deterministic, hash-stamped, schema-versioned snapshot
+  of the corpus exists. The `sync --jsonl` sidecar (`sync.py:297-302`,
+  `:539-558`) is an append-only log of *fetched resources*, and README:152
+  warns that it "may duplicate lines". It is not a snapshot. Without a
+  snapshot, there is no stable artifact to:
+  - diff the corpus between two syncs;
+  - hand a reviewer the exact evidence a bundle was built from;
+  - pin an evaluation run to.
+
+### 12.2 Edit history: observed revisions (Workstream A, migration v7)
+
+#### Table
+
+```sql
+revisions(
+  id INTEGER PRIMARY KEY,
+  repo TEXT NOT NULL,
+  entity TEXT NOT NULL CHECK (entity IN ('item','issue_comment','review_comment','review')),
+  entity_id TEXT NOT NULL,          -- item number, or the comment/review GitHub id
+  number INTEGER NOT NULL,          -- owning item, for per-item reads
+  content_hash TEXT NOT NULL,       -- sha256 of canonical JSON {title?, body}
+  title TEXT, body TEXT,
+  source_updated_at TEXT,           -- GitHub updated_at carried by the payload
+  observed_at TEXT NOT NULL,        -- sync wall clock
+  origin TEXT NOT NULL CHECK (origin IN ('baseline','observed','edit_history','deleted')),
+  UNIQUE (repo, entity, entity_id, content_hash, origin)
+)
+```
+
+It has one index, `(repo, number, entity, entity_id, id)`.
+
+#### Write rule (inside `ingest_item`, same transaction)
+
+1. **Snapshot what is about to be replaced.** For the item and for each
+   comment or review **about to be replaced**, compare the new content hash
+   with that entity's latest revision row. Insert a revision only when the
+   hash differs. Re-ingesting unchanged content writes nothing, so
+   idempotence holds. The `UNIQUE` key covers the constraint that fires on a
+   duplicate page, as AGENTS requires.
+2. **Tombstones.** A comment or review present in the previous set but absent
+   from the new one gets an `origin='deleted'` row, but **only when that
+   section was fetched complete**:
+   - not `*_incomplete`;
+   - not the 404 path, which already preserves children (`sync.py:445-482`);
+   - not a section the source did not answer.
+
+   This is the same presence discipline as §4 A2's `link` stream. An
+   incomplete or overflowed comment page must never mint tombstones.
+3. **Not item-owned children.** `revisions` is never touched by
+   `replace_item_children`, `delete_owned_edges`, or `_mark_gone`. It is
+   append-only, like the timeline stream.
+
+#### Honest naming
+
+These are **observed** revisions. Edits that happen between two syncs and are
+overwritten before the next sync are never seen. Every read surface labels
+them `origin: observed`. They are never presented as complete edit history.
+
+#### Migration v7 baseline
+
+Migration v7 seeds one `origin='baseline'` row per existing item, comment and
+review, with `observed_at` set to the migration time. The baseline is the
+content **as of the first sync that stored it**, not as authored. Reads must
+say so.
+
+#### Optional true edit history (Workstream A2, behind the capability gate)
+
+GitHub GraphQL exposes edit history on `UserContentEditable` objects:
+`userContentEdits(first: N) { nodes { editedAt deletedAt editor { login } diff } }`.
+
+INFERENCE: field and argument names must be confirmed against the official
+schema file before filing.
+
+An opt-in `sync --edit-history` fetches it for **issues and their comments
+only**. Pull-request review threads are excluded for cost. The fetch is capped
+per entity, and overflow is logged to `fetch_log`. Results are stored as
+`origin='edit_history'` rows keyed by `editedAt`.
+
+Off by default. It adds GraphQL cost proportional to edit counts, and
+`diff`-only payloads may not reconstruct full prior text. Whether they can is
+INFERENCE, to be checked against real payloads before any "as authored"
+reconstruction is promised.
+
+#### Read surfaces
+
+- `item N --history` adds a `revisions[]` list for the item and its comments.
+- `item N --as-of T` returns, for each entity, the latest revision with
+  `observed_at <= T`. If T predates the baseline, the response carries
+  `as_of_exact: false`.
+- `item` without these flags is byte-identical to today.
+
+#### Storage control
+
+`status.coverage` (§11 G9) reports `revision_rows` and `revision_bytes`. A
+`doctor --compact-revisions` maintenance command is **not** proposed. Pruning
+history would contradict the evidence role. Growth is bounded by real edit
+volume and is measured from the start.
+
+#### What it buys the plan
+
+1. **§6 leakage.** Comments and bodies "as of the fix PR's creation" become
+   `--as-of` reads wherever revisions exist. The `with_leakage` flag then
+   applies only to items with no revision coverage, not to all items.
+2. **Triage features.**
+   - "edited after a linked PR appeared": counts of `observed` revisions
+     after the first linked-PR edge;
+   - "maintainer deleted comments": `deleted` tombstones.
+
+   Both are raw counts, so they stay EXTRACTED.
+
+### 12.3 Deterministic corpus export (read-only command)
+
+#### Command
+
+```bash
+zaxbygraph export-corpus [--out PATH] [--format jsonl|json] [--as-of T] [--include raw,patches,revisions]
+```
+
+`export-corpus` is a read command. It uses `open_existing` (`mode=ro`) and
+never writes the store.
+
+#### Contract: `zaxbygraph.corpus.v1`
+
+**Line 1 is a manifest:**
+
+- `schema`, `producer_version`;
+- `repo`, the store's `user_version`;
+- the `sync_state` row: watermark, `complete`, `last_full_sync_at`, counts;
+- the `--as-of` value if any;
+- the `include` set;
+- `corpus_sha256`.
+
+`corpus_sha256` is the hash of the sorted concatenation of item
+`content_hash` values plus the release hashes. It does not depend on
+wall-clock time.
+
+**Then one line per item, ordered by `(number)`**, carrying:
+
+- all `items` columns except `raw_json` (which comes only with
+  `include=raw`);
+- `labels` sorted by name;
+- `comments` sorted by `(created_at, kind, github_id)`;
+- `reviews` sorted by `(submitted_at, id)`;
+- `files` sorted by path;
+- **outbound** edges sorted by the full unique key;
+- with `include=revisions`, that item's revisions;
+- the item's `content_hash`: sha256 over the canonical serialization
+  (`json.dumps(..., sort_keys=True, separators=(",",":"), ensure_ascii=False)`)
+  of everything above.
+
+**Then one line per release, sorted by `tag_name`.**
+
+#### Properties, each one an acceptance criterion
+
+1. **Deterministic.** Two exports of the same DB are byte-identical, and so
+   are an export taken before and after a no-op sync. The manifest carries no
+   wall-clock field.
+2. **Streamed.** Rows are fetched incrementally and written as they go, never
+   materialized all at once. This is the same property AGENTS requires of
+   `sql`.
+3. **Honest.**
+   - `complete: false` or a non-null `last_error` is copied into the manifest.
+   - With `--require-complete`, such a store exits non-zero.
+4. **Edges exported once.** Inbound edges are not duplicated: each edge
+   appears once, under its `src` item. Edges whose `src` is an `actor` (the
+   `authored`/`commented`/`reviewed` relations) or a foreign
+   `owner/repo#N` id are emitted under the item they point at, so every edge
+   still appears exactly once.
+5. **`--as-of T`** emits the revision-resolved text (§12.2) and filters out
+   items created after T. Edges cannot be time-filtered, because they carry
+   no timestamp. Their evidence strings carry one for timeline rows only.
+   The manifest therefore states `edges_as_of: "unfiltered"`.
+
+   Making edges time-correct is the §6 snapshot builder's job. Its
+   exclusions are applied by the evaluation, not by the export.
+6. **Untrusted content.** The manifest carries `content_trust` as in §5. The
+   README warns that an export contains GitHub user content and author
+   logins, so sharing it is the user's decision.
+
+#### Uses
+
+- **Change detection.** Comparing two exports gives a per-item diff by
+  `content_hash`.
+- **Pinning.** A bundle payload carries the `corpus_sha256` it was computed
+  from, so a reviewer can reproduce it from the same export.
+- **Evaluation.** §6 records `corpus_sha256` with every evaluation result.
+
+#### Fixtures
+
+Real-repo regression fixtures come from the `--jsonl` **sidecar**, not from
+the export. The sidecar holds raw fetched payloads, timeline events included,
+which a replaying `FakeGitHubSource` can feed through the real `ingest_item`.
+The export holds post-ingest state, which cannot be replayed through ingest.
+
+So §6's "recorded real corpus" is captured as follows:
+
+1. Sync a public repo with `--jsonl` and dedupe by `(resource, payload.id)`.
+2. Commit the result as a fixture.
+3. Replay it in CI.
+4. Check the re-ingested DB's `export-corpus` hash against a stored
+   `corpus_sha256`.
+
+This one check covers both the sync path and export determinism.
+
+### 12.4 Invariant check
+
+| Invariant | How it holds |
+|---|---|
+| EXTRACTED only | Revisions are verbatim GitHub text plus observation metadata. Tombstones record an observed absence in a complete fetch. Nothing is inferred. |
+| One item, one transaction | Revision and tombstone writes are inside `ingest_item`'s `BEGIN IMMEDIATE`. |
+| Idempotence | The hash-diff rule plus the `UNIQUE` key means a re-fetched page writes nothing new. |
+| Ownership on re-ingest | `revisions` sits outside the replaced-children set and outside edge ownership. |
+| Read-only reads | Export, `--history` and `--as-of` use `mode=ro`. |
+| SQLite floor | `sha256` is computed in Python (`hashlib`). No SQLite JSON or crypto functions are used. |
+| Portability | Export writes text with `newline="\n"` and UTF-8 explicitly, so hashes match on Windows and Linux. A cross-platform hash test runs on both CI legs. |
+
+### 12.5 Sequencing
+
+| Row | Change |
+|---|---|
+| 3 (A1 / v7) | The `revisions` table, the hash-diff write rule, tombstones, and baseline seeding |
+| 5b (new, after row 3, before the evaluation rows) | `export-corpus`, `item --history`, `item --as-of`, and the jsonl-replay fixture harness. Row 5's evaluation consumes `--as-of` and `corpus_sha256`. |
+| 8 (A2) | Opt-in `sync --edit-history`, behind the capability gate |
 
 ## Sources
 
