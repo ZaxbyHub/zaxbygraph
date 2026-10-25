@@ -1,5 +1,7 @@
-# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 4)
+# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 5)
 
+> **Rev 5** adds §11, a review of the comparable tools gitcrawl and ghcrawl.
+>
 > **Rev 4** adds §10, a claim-by-claim reconciliation with two independent plans
 > produced from the same prompt by other models (GLM 5.3, Mimo v2.6 Pro). The
 > adopted items are listed there and take precedence over the earlier sections
@@ -881,7 +883,89 @@ paths, which are O(E) per call (§2.2).
   possible-duplicate flag, and label priors join rows 5 and 7.
 - R7 and the §10.2 hygiene items are independent PRs that can land anywhere.
 
+## 11. Comparable tools: gitcrawl and ghcrawl (rev 5)
+
+**Sources.** I read each project's README, its docs (gitcrawl: clustering,
+governance, sync, search, capture, automation, maintainer-archive,
+portable-stores, gh-shim), and ghcrawl's `SPEC.md`. All were fetched from
+`raw.githubusercontent.com` on 2026-10-25. The capability claims below come
+from their documentation, not from running either tool.
+
+**What the two tools are.**
+
+| | `openclaw/gitcrawl` | `pwrdrvr/ghcrawl` |
+|---|---|---|
+| Language | Go | Node |
+| Mirror | SQLite | SQLite |
+| Ranking | FTS plus **OpenAI embeddings** for semantic and hybrid search, kNN clustering | exact cosine over **OpenAI embeddings**; optional LLM summaries before embedding; clustering |
+| Credentials | GitHub token plus `OPENAI_API_KEY` | GitHub token (PAT) plus `OPENAI_API_KEY` |
+| Sync scope | full archive, revision history, maintainer overrides, git-backed shared stores | **open items only**, by spec |
+
+Both depend on a hosted model and a second credential. ZaxbyGraph's contract
+rules both out: EXTRACTED-only data, `gh` as the only credential, no runtime
+dependencies. That contract is the differentiator, so their core approach is
+not adopted.
+
+### 11.1 Fold in: closes a real gap in zaxbygraph
+
+| # | Capability | Their implementation | Gap in zaxbygraph (VERIFIED at `b47913e`) | Adoption |
+|---|---|---|---|---|
+| G1 | **Targeted refresh of exact items** | gitcrawl `sync --numbers 123,456` "bypasses list ordering and the updated-time window" | `sync` accepts only `--force`, `--include-patches`, `--source`, `--wait`, `--jsonl` (`cli.py:1132-1156`). Refreshing one stale item means a full `--force`. | Add `sync --numbers N,...`. It refetches those items through the same bulk children path and `ingest_item` transaction, **without bumping the watermark**: a targeted fetch says nothing about the items between watermark positions. This is the clean fix for §4 A2.6's volatile-signal problem and for review-only drift (§2.8). Before an agent starts work, `bundle` prints `zaxbygraph sync --numbers <members>` as the refresh step. |
+| G2 | **Bounded-staleness reads on the CLI** | gitcrawl `search --sync-if-stale 5m` | The MCP server auto-refreshes stale reads (`mcp_server._read_envelope`); the CLI never does. Agents that shell out get no staleness bound. | Add a `--max-age DURATION` opt-in to CLI reads. When the store is older, it runs the locked incremental sync first and reports `freshness.refreshed: true`. The default stays read-only. |
+| G3 | **PR commit list**, including commit messages | gitcrawl `pull_request_commits` | Commits exist only as edge endpoints. There is no commit-message text, so "fixes #N" written in a commit (common for squash-less merges) is invisible. | Add a GraphQL `commits(first: 100) { nodes { commit { oid messageHeadline messageBody } } }` child section behind the §4 A2 capability gate. A `pr_commits` child table holds it. `closes_keyword` and `mentions` gain a commit-message origin (`evidence: commit:<sha>`), with the same per-payload suppression rule. This was the critic's deferred item; it is now scheduled. |
+| G4 | **Changed paths in the searchable document** | gitcrawl: "Hydrated PR changed paths and commit subjects are included in thread keyword … documents" | `search "delete_owned_edges"` or `search "sync.py"` cannot match a PR by the files it touched; `items_fts` holds only title, body, and labels. | In migration v7, add a `paths_text` column to `items_fts`, populated from `pr_files.path` with path separators tokenized. This means an FTS rebuild, which is already priced into v7 (R4). Search weight is low (0.5). |
+| G5 | **Lead-weighted references** | gitcrawl: refs in the title or first ~240 body chars are "deterministic … score 0.94"; later body refs are weak; single-digit `#N` "in prose are ignored as ambiguous" | `parse_mentioned_numbers` treats every `#N` alike (`extract.py:57-73`), so `step #2` in prose becomes a `mentions` edge to item 2. | **Do not drop** single-digit references at ingest. The text did say `#2`, and the rows are evidence. Instead, record the **position** in `evidence` (`body#N@offset` / `title #N`). The derived tier then treats lead and title references as strong and late or single-digit ones as weak. §6 measures the difference. |
+| G6 | **Time-scoped retrieval** | gitcrawl `neighbors --open-at T`, `--created-after`, `--merged-after` | No read command filters candidates by point-in-time state. | Add `similar --open-at / --created-after / --merged-after`. They reuse exactly the snapshot predicates §6 needs for leakage control, so they are built once. |
+| G7 | **Batch item fetch** | ghcrawl `threads --numbers 42,43,44` ("instead of paying process startup overhead repeatedly") | `item` takes a single `number` (`cli.py:1177`); MCP `get_item` takes one. | `item N [N ...]` and MCP `get_item.numbers[]`, capped at 20 and honoring `--max-body-chars`. `bundle --briefs` already covers the main use. |
+| G8 | **Cluster size cap and per-kind guard** | gitcrawl `--max-cluster-size 40`, higher issue↔PR threshold | Already covered: `bundle --size` caps size, and triage pools are issues only (§5.4). | No change. This confirms the design. |
+| G9 | **Coverage report** | gitcrawl `coverage --json`: per-family hydrated, missing, stale counts | `status` reports only counts and `complete`. Truncations live in `fetch_log` notes that nobody reads. | `status` gains `coverage`: counts of `fetch_log` truncation notes by kind (timeline, closing refs, files at 3000), capability-dropped fields (§4 A2), and rows with NULL A1 columns. Agents can then tell "absent upstream" from "not fetched". |
+
+### 11.2 Worth considering later, not yet
+
+- **Edit history: revisions and tombstones.** gitcrawl keeps immutable
+  revisions of edited comments and threads. ZaxbyGraph overwrites `body` and
+  deletes children on re-ingest (`store.py:63-67`, `:161-170`). Revisions
+  would cure the residual eval leakage in §6 (body edits after close), and
+  they make "what did the issue say when it was filed" answerable. The cost
+  is significant storage growth and a new append-only table family. Defer
+  until §6 shows that leakage materially distorts results.
+- **Deterministic corpus export.** gitcrawl `capture` emits a
+  schema-versioned JSON snapshot with per-thread `content_hash`. A
+  zaxbygraph `export-corpus` would also generate the "recorded real corpus"
+  fixture that §6 needs. Adopt when that fixture is built.
+- **Portable or shared stores.** gitcrawl publishes a verified SQLite
+  snapshot (manifest, sha256, `quick_check`) through git. That fits teams
+  with many machines. With one primary machine, `doctor --consolidate`
+  covers the need. Revisit if several machines must share one corpus.
+- **Machine-readable progress file.** gitcrawl `--progress-file`. Low
+  priority, because MCP `graph_status` already reports job progress.
+
+### 11.3 Do not fold in
+
+| Capability | Reason |
+|---|---|
+| OpenAI embeddings, hybrid semantic search, LLM summaries | A second credential, network spend, and a non-EXTRACTED pipeline. ghcrawl's own data does show that summary-based embeddings improved non-solo cluster membership by about 50% on `openclaw/openclaw`. That is a hint that raw bodies are noisy. **Adopted equivalent:** weight the title and first paragraph above the full body in §5.2 term selection, then measure in §6. |
+| Persisted clusters and maintainer governance (local close, exclude member, set canonical) | These persist judgments, which the approved derived-tier rule forbids. They also split truth between GitHub and a local overlay. For multi-agent coordination, GitHub itself is the shared state: assign or label the issue through `gh`, and triage's assignee gate already excludes it. **Adopted equivalent:** stateless `bundle --exclude N,...` for in-session claims. |
+| Open-items-only sync (ghcrawl) | ZaxbyGraph's full history powers analogs, localization, co-change, and evaluation. It is an advantage to keep. |
+| Per-item failure ledger with continue-on-error (gitcrawl `sync-failures`) | ZaxbyGraph has one monotonic watermark. Skipping a failed item and continuing would advance the watermark past it and lose the item forever. Fail-fast plus resume is the correct semantics for this design. Keep it. |
+| `gh search`-compatible CLI surface; local HTTP API; TUI | Different audience. Agents here use the CLI envelope and MCP. |
+| Octopool-style pooled `gh` relay | Multi-tenant org infrastructure, out of scope. |
+
+### 11.4 Sequencing deltas
+
+| Item | Goes into |
+|---|---|
+| G5 (evidence position) | A3 (row 4), since it is the same extractor work |
+| G4 (`paths_text`), G9 (coverage) | A1 / v7 (row 3) |
+| G1 (`sync --numbers`) | A0b's neighborhood (row 2b); independent and small |
+| G2 (`--max-age`), G7 (batch `item`) | The §5.8 surface PR (row 6) |
+| G3 (PR commits) | A2 (row 8), behind the capability gate |
+| G6 (time-scoped retrieval) | Rows 5 and 7 together with §6 |
+
 ## Sources
+
+- gitcrawl README and docs — https://github.com/openclaw/gitcrawl (docs/clustering.md, governance.md, sync.md, search.md, capture.md, automation.md, portable-stores.md)
+- ghcrawl README and SPEC — https://github.com/pwrdrvr/ghcrawl
 
 - GitHub GraphQL official schema (`github/docs`, `src/graphql/data/fpt/schema.docs.graphql`), read by the critic pass.
 - GitHub REST issue dependencies — https://docs.github.com/en/rest/issues/issue-dependencies
