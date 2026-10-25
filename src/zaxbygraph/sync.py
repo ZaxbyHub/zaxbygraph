@@ -598,6 +598,11 @@ def sync_repo(
         except Exception:
             conn.rollback()
             raise
+        # Advisory planner maintenance (issue #22): lets SQLite refresh its
+        # optimizer statistics for tables this run wrote. Advisory only —
+        # correctness never depends on sqlite_stat1 (hot read paths use
+        # forced indexes or explicit UNION ALL equality seeks).
+        conn.execute("PRAGMA optimize")
         for rec in releases:
             _write_jsonl(jsonl_handle, "release", rec)
     except BaseException as exc:

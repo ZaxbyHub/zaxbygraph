@@ -68,6 +68,16 @@ A closed PR that was merged has both `state='closed'` and a non-null
 `merged_at`; a closed PR that was rejected has `state='closed'` and
 `merged_at IS NULL`. There is no separate `'merged'` state.
 
+Items indexes: `idx_items_repo_number (repo, number)` and
+`idx_items_repo_merge (repo, merge_commit)` (merge-commit lookups during
+ingest) are joined by `idx_items_repo_title (repo, title)` for the
+revert-title lookups. The title index is added by a plain
+`CREATE INDEX IF NOT EXISTS` in the schema script, which runs on every
+write-open — existing stores gain it on their next sync (or `doctor
+--consolidate`) with no `user_version` bump, and read-only opens never
+create it. `idx_items_repo_merge` is still required: merge-commit lookups
+plan on it.
+
 ## comments
 
 Issue comments and PR review comments.
@@ -295,6 +305,10 @@ One row per repo. What `zaxbygraph status` reads.
 | `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
+
+The three counts are recomputed once when a sync run finishes, not per
+ingested item: values are exact after every completed run, and may lag
+inside a run or after an interrupted one until the next successful finish.
 
 ### Schema versions and migrations
 

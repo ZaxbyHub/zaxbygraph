@@ -280,6 +280,31 @@ def _edges_source_available(conn: sqlite3.Connection) -> bool:
     return any(row[1] == "source" for row in conn.execute("PRAGMA table_info(edges)"))
 
 
+def _item_edge_rows(conn: sqlite3.Connection, repo: str, number: int) -> list[sqlite3.Row]:
+    """Edges incident to one item, as two indexed equality seeks.
+
+    The historic single OR predicate is served by a repo-prefix scan of
+    `edges`; the UNION ALL of the two equality arms plans as full-key
+    searches on idx_edges_src / idx_edges_dst. The dst arm excludes rows the
+    src arm already returned — a self-incident edge with src = dst = number
+    would otherwise appear twice — so the row multiset matches the old OR
+    query exactly. No result order is promised beyond UNION ALL's
+    arm-then-arm emission."""
+    cols = "src_type, src_id, rel, dst_type, dst_id, confidence, evidence"
+    if _edges_source_available(conn):
+        cols += ", source"
+    nid = str(number)
+    return conn.execute(
+        f"SELECT {cols} FROM edges "
+        "WHERE repo = ? AND src_type = 'item' AND src_id = ? "
+        "UNION ALL "
+        f"SELECT {cols} FROM edges "
+        "WHERE repo = ? AND dst_type = 'item' AND dst_id = ? "
+        "AND NOT (src_type = 'item' AND src_id = ?)",
+        (repo, nid, repo, nid, nid),
+    ).fetchall()
+
+
 def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict | None:
     repo = _fold_repo(repo)
     if repo:
@@ -325,17 +350,7 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
         ).fetchall()
     ]
     source_available = _edges_source_available(conn)
-    source_col = ", source" if source_available else ""
-    rec["edges"] = [
-        _row_to_dict(x)
-        for x in conn.execute(
-            f"SELECT src_type, src_id, rel, dst_type, dst_id, confidence, evidence{source_col} "
-            "FROM edges WHERE repo = ? AND ("
-            "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
-            ")",
-            (r, str(n), str(n)),
-        ).fetchall()
-    ]
+    rec["edges"] = [_row_to_dict(x) for x in _item_edge_rows(conn, r, n)]
     # Mirrors search(): a pre-v5 database returns edges without provenance
     # and is flagged, on both polarities, so consumers get a stable envelope.
     rec["index_stale"] = not source_available
@@ -353,22 +368,11 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
     frontier = {str(number)}
     visited = set(frontier)
     source_available = _edges_source_available(conn)
-    edge_columns = (
-        "src_type, src_id, rel, dst_type, dst_id, confidence, evidence, source"
-        if source_available
-        else "src_type, src_id, rel, dst_type, dst_id, confidence, evidence"
-    )
     index_stale = not source_available
     for _ in range(max(1, depth)):
         nxt: set[str] = set()
         for nid in frontier:
-            rows = conn.execute(
-                f"SELECT {edge_columns} "
-                "FROM edges WHERE repo = ? AND ("
-                "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?)"
-                ")",
-                (repo, nid, nid),
-            ).fetchall()
+            rows = _item_edge_rows(conn, repo, nid)
             for row in rows:
                 rec = _row_to_dict(row)
                 seen_edges.append(rec)
@@ -892,8 +896,11 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
     source_available = _edges_source_available(conn)
     source_col = ", source" if source_available else ""
     if repo:
+        # INDEXED BY pins the (repo, dst_type, dst_id) seek so the plan cannot
+        # drift back toward a repo-prefix scan on another SQLite build or
+        # after sqlite_stat1 appears (issue #22).
         pr_rows = conn.execute(
-            f"SELECT src_id, evidence{source_col} FROM edges "
+            f"SELECT src_id, evidence{source_col} FROM edges INDEXED BY idx_edges_dst "
             "WHERE repo = ? AND src_type = 'item' AND rel = 'closes' "
             "AND dst_type = 'item' AND dst_id = ?",
             (repo, str(number)),
