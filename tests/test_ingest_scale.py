@@ -4,12 +4,20 @@ Phase 2.5 frozen checks, authored at arm's length from the acceptance
 criteria and the verified root cause only (no fix plan consulted). Every
 check here is DISCRIMINATING: RED at base, GREEN after the fix.
 
-Plan assertions run on fresh, never-ANALYZEd databases so no check depends
-on sqlite_stat1. Cost assertions count deterministic VDBE steps (progress
-handler), never wall time. The fixture pattern is copied in miniature from
-tests/fixtures.py on purpose: this module must stay self-contained so
-discovery of this one file reproduces each check without importing the
-shared fixtures.
+Plan assertions are stats-independent BY CONSTRUCTION (round 3): the
+shipped finish-time PRAGMA optimize populates sqlite_stat1, and a connection
+that has loaded statistics keeps planning the UNPINNED actor DELETE full-key
+on idx_edges_dst even after the stat1 rows are deleted (SQLite 3.45.1 caches
+them per connection - verified), so AC1 clears sqlite_stat1 and EXPLAINs on
+a FRESH connection, which plans from heuristics alone; an INDEXED
+BY-pinned statement seeks full-key regardless of statistics, so only the
+shipped pin can flip AC1. AC5's fixture never runs a sync, so no statistics
+exist on its database, and even under statistics the OR-shaped edge read
+stays a repo-only scan on this build (verified). Cost assertions count
+deterministic VDBE steps (progress handler), never wall time. The fixture
+pattern is copied in miniature from tests/fixtures.py on purpose: this
+module must stay self-contained so discovery of this one file reproduces
+each check without importing the shared fixtures.
 
 Amended after plan-critic round 1 (all checks still RED at base, GREEN
 after the fix): AC1 now captures the runtime DELETE from a real ingest
@@ -23,6 +31,7 @@ ALL row multiplicity and provenance via an equivalence leg.
 from __future__ import annotations
 
 import re
+import sqlite3
 import tempfile
 import unittest
 from copy import deepcopy
@@ -236,11 +245,13 @@ class IngestScaleChecks(unittest.TestCase):
         real ingest path executes (store.delete_owned_edges, reached through
         sync_repo) must plan a full-key SEARCH on idx_edges_dst binding
         repo, dst_type AND dst_id. The statement is captured from the
-        connection trace of a real small ingest and EXPLAIN QUERY PLAN'd on
-        the same connection, so only a change to the runtime statement (for
-        example an INDEXED BY pin) can flip this check - an ad-hoc copy of
-        the SQL text could keep passing while the shipped DELETE keeps
-        scanning the repo's edges."""
+        connection trace of a real small ingest, so only the shipped
+        runtime statement can satisfy this check; and the EXPLAIN runs as a
+        stats-independent oracle: any sqlite_stat1 the shipped finish-time
+        PRAGMA optimize created is cleared first and the plan is read on a
+        FRESH connection, because the sync's own connection has the stats
+        cached and would plan the UNPINNED delete full-key too (a vacuous
+        pass - round 3 implementation-review finding)."""
         src = FakeSource()
         src.pages = [[issue(1), issue(2)]]
         captured: list[str] = []
@@ -260,10 +271,19 @@ class IngestScaleChecks(unittest.TestCase):
             deletes,
             "ACTOR-DELETE-PLAN: no runtime actor DELETE captured from the ingest trace",
         )
-        details = [
-            row[3].strip()
-            for row in self.conn.execute("EXPLAIN QUERY PLAN " + deletes[0])
-        ]
+        if self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone() is not None:
+            self.conn.execute("DELETE FROM sqlite_stat1")
+            self.conn.commit()
+        plan_conn = sqlite3.connect(str(self.db_path))
+        try:
+            details = [
+                row[3].strip()
+                for row in plan_conn.execute("EXPLAIN QUERY PLAN " + deletes[0])
+            ]
+        finally:
+            plan_conn.close()
         ok = any(
             "idx_edges_dst" in d and "dst_type=?" in d and "dst_id=?" in d
             for d in details
