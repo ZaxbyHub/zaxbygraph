@@ -86,8 +86,14 @@ def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None
         "AND source NOT IN ('timeline', 'closing_ref')",
         (repo, nid),
     )
+    # INDEXED BY is a plan hint, not a predicate change: the rel IN (...) term
+    # otherwise flips the planner to the repo-only unique-index scan, making
+    # every item ingest visit the repo's whole edge set. The hint keeps the
+    # (repo, dst_type, dst_id) seek on idx_edges_dst; the deleted row set is
+    # identical either way.
     conn.execute(
-        "DELETE FROM edges WHERE repo = ? AND dst_type = 'item' AND dst_id = ? "
+        "DELETE FROM edges INDEXED BY idx_edges_dst "
+        "WHERE repo = ? AND dst_type = 'item' AND dst_id = ? "
         "AND rel IN ('authored', 'commented', 'reviewed')",
         (repo, nid),
     )
@@ -629,5 +635,4 @@ def ingest_item(
         timeline=timeline,
     )
     bump_watermark(conn, repo, list_raw.get("updated_at"))
-    recount(conn, repo)
     log_fetch(conn, repo, "item", str(number))

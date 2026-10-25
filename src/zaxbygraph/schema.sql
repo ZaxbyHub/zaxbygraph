@@ -48,6 +48,11 @@ CREATE INDEX IF NOT EXISTS idx_items_updated ON items(updated_at);
 CREATE INDEX IF NOT EXISTS idx_items_author ON items(author);
 CREATE INDEX IF NOT EXISTS idx_items_repo_number ON items(repo, number);
 CREATE INDEX IF NOT EXISTS idx_items_repo_merge ON items(repo, merge_commit);
+-- Revert-title lookups during ingest (store.title_lookup and the reverse
+-- revert pass) seek on (repo, title); without it they ride the merge index's
+-- repo prefix and read every items row. Additive: init_schema re-runs this
+-- script on every write-open, so existing stores gain it with no version bump.
+CREATE INDEX IF NOT EXISTS idx_items_repo_title ON items(repo, title);
 
 CREATE TABLE IF NOT EXISTS labels (
     repo   TEXT NOT NULL,
