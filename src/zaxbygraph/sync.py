@@ -598,13 +598,22 @@ def sync_repo(
         except Exception:
             conn.rollback()
             raise
-        # Advisory planner maintenance (issue #22): lets SQLite refresh its
-        # optimizer statistics for tables this run wrote. Advisory only —
-        # correctness never depends on sqlite_stat1 (hot read paths use
-        # forced indexes or explicit UNION ALL equality seeks).
-        conn.execute("PRAGMA optimize")
         for rec in releases:
             _write_jsonl(jsonl_handle, "release", rec)
+        # Best-effort planner maintenance (issue #22): SQLite decides what to
+        # analyze (observed: the FTS shadow tables on this schema). The data,
+        # counts, and finish stamps above are already durably committed, and
+        # the hot read paths use forced indexes or explicit UNION ALL equality
+        # seeks in the per-item/per-call paths — so a maintenance failure must
+        # never turn a committed sync into a reported one. Only lock
+        # contention is swallowed: disk-full or corruption during the ANALYZE
+        # write is a storage fault and still propagates, per the
+        # report-don't-swallow rule.
+        try:
+            conn.execute("PRAGMA optimize")
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
     except BaseException as exc:
         # Every failure leaves a truthful trail. A BaseException (decode
         # error, AttributeError on a dead reader thread, KeyboardInterrupt)

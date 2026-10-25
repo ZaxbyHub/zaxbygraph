@@ -280,7 +280,9 @@ def _edges_source_available(conn: sqlite3.Connection) -> bool:
     return any(row[1] == "source" for row in conn.execute("PRAGMA table_info(edges)"))
 
 
-def _item_edge_rows(conn: sqlite3.Connection, repo: str, number: int) -> list[sqlite3.Row]:
+def _item_edge_rows(
+    conn: sqlite3.Connection, repo: str, number: int | str, source_available: bool
+) -> list[sqlite3.Row]:
     """Edges incident to one item, as two indexed equality seeks.
 
     The historic single OR predicate is served by a repo-prefix scan of
@@ -289,9 +291,11 @@ def _item_edge_rows(conn: sqlite3.Connection, repo: str, number: int) -> list[sq
     src arm already returned — a self-incident edge with src = dst = number
     would otherwise appear twice — so the row multiset matches the old OR
     query exactly. No result order is promised beyond UNION ALL's
-    arm-then-arm emission."""
+    arm-then-arm emission. Callers pass `source_available` (whether the
+    edges table carries the v5 `source` column) so this probe is not
+    re-run per frontier node on the related() BFS."""
     cols = "src_type, src_id, rel, dst_type, dst_id, confidence, evidence"
-    if _edges_source_available(conn):
+    if source_available:
         cols += ", source"
     nid = str(number)
     return conn.execute(
@@ -350,7 +354,9 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
         ).fetchall()
     ]
     source_available = _edges_source_available(conn)
-    rec["edges"] = [_row_to_dict(x) for x in _item_edge_rows(conn, r, n)]
+    rec["edges"] = [
+        _row_to_dict(x) for x in _item_edge_rows(conn, r, n, source_available)
+    ]
     # Mirrors search(): a pre-v5 database returns edges without provenance
     # and is flagged, on both polarities, so consumers get a stable envelope.
     rec["index_stale"] = not source_available
@@ -372,7 +378,7 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
     for _ in range(max(1, depth)):
         nxt: set[str] = set()
         for nid in frontier:
-            rows = _item_edge_rows(conn, repo, nid)
+            rows = _item_edge_rows(conn, repo, nid, source_available)
             for row in rows:
                 rec = _row_to_dict(row)
                 seen_edges.append(rec)

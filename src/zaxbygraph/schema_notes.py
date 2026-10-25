@@ -27,6 +27,9 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "sync_state": {
         "issues_since": "Watermark passed back verbatim and inclusive; never adjusted",
         "last_error": "Non-null means the last sync stopped early - re-run sync",
+        "item_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",
+        "comment_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",
+        "edge_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",
     },
 }
 

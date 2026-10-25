@@ -68,15 +68,21 @@ A closed PR that was merged has both `state='closed'` and a non-null
 `merged_at`; a closed PR that was rejected has `state='closed'` and
 `merged_at IS NULL`. There is no separate `'merged'` state.
 
-Items indexes: `idx_items_repo_number (repo, number)` and
-`idx_items_repo_merge (repo, merge_commit)` (merge-commit lookups during
-ingest) are joined by `idx_items_repo_title (repo, title)` for the
-revert-title lookups. The title index is added by a plain
-`CREATE INDEX IF NOT EXISTS` in the schema script, which runs on every
-write-open — existing stores gain it on their next sync (or `doctor
---consolidate`) with no `user_version` bump, and read-only opens never
-create it. `idx_items_repo_merge` is still required: merge-commit lookups
-plan on it.
+Items indexes: items carries six non-unique indexes. `idx_items_repo_number
+(repo, number)` and `idx_items_repo_merge (repo, merge_commit)` (merge-commit
+lookups during ingest) are joined by `idx_items_repo_title (repo, title)` for
+the revert-title lookups; `idx_items_kind_state`, `idx_items_updated` and
+`idx_items_author` serve their name-sake filters. The title index is added by
+a plain `CREATE INDEX IF NOT EXISTS` in the schema script, which runs on
+every write-open — any store that opens for a write gains it, including a
+`sync`, an MCP-triggered sync, or `doctor --consolidate` — with no
+`user_version` bump, and read-only opens never create it (so can a
+hand-built store that never opens for writing).
+`idx_items_repo_merge` keeps merge-commit lookups on a seek; dropping it
+would be a performance change, not a correctness one. The finish-time
+`PRAGMA optimize` (below, [sync_state](#sync_state)) can also create a
+`sqlite_stat1` table inside the store; it is planner bookkeeping, hidden
+from `zaxbygraph schema`, and safe to delete.
 
 ## comments
 
@@ -306,9 +312,14 @@ One row per repo. What `zaxbygraph status` reads.
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
 
-The three counts are recomputed once when a sync run finishes, not per
-ingested item: values are exact after every completed run, and may lag
-inside a run or after an interrupted one until the next successful finish.
+The three counts are recomputed when a sync run finishes (and by
+`doctor --consolidate` and the schema migrations), not per ingested item:
+values are exact after every completed run, and may lag inside a run or
+after an interrupted one until the next such refresh. Two visible
+consequences: the stderr identity line's `items=N` reads the stored
+`item_count` while `where`'s `items` payload is a live `COUNT(*)`, so the
+two can disagree after an interrupted run; and `status`'s `repos[]` counts
+can disagree with its live `counts[]` for the same reason.
 
 ### Schema versions and migrations
 
