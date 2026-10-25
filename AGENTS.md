@@ -26,6 +26,13 @@ shouldn't.
 
 ### Integrity of the data
 
+- **The derived read tier may score and group at query time; it may never
+  persist, and its output is a heuristic, not evidence.** Commands such as
+  `similar`, `triage`, and `bundle` compute from stored EXTRACTED rows on a
+  read-only connection (temp objects only, never `main`), are deterministic,
+  return every score with its per-signal evidence and the weights in effect,
+  and mark their payload `derived: true`. Nothing they compute is written to
+  `edges`, `items`, or any persisted table, and nothing they compute feeds sync.
 - **Every edge is `confidence='EXTRACTED'`.** Nothing in the sync path may ask a
   model what an item means. No INFERRED edges, no "purpose" field, no
   clustering, no summarization. A CHECK constraint enforces the column value;
@@ -125,7 +132,10 @@ existed to save.
 
 Collectors may run read commands and paste **truncated** JSON. They do not
 cluster, rank, assign severity, or propose fixes — that separation is the point
-of the audit program in `skills/frontier-audit-enhance/`.
+of the audit program in `skills/frontier-audit-enhance/`. Collectors may run the
+derived commands (`similar`, `triage`, `bundle`, `brief`) and paste their output
+verbatim; the ranking in that output is the tool's labeled heuristic, and the
+collector adds no judgment of its own.
 
 If `status` reports a non-null `last_error`, re-run `sync`; the watermark makes
 it resume. Use `--force` only when you suspect updates that never bumped

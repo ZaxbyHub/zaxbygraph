@@ -1,4 +1,10 @@
-# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 3)
+# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 4)
+
+> **Rev 4** adds §10, a claim-by-claim reconciliation with two independent plans
+> produced from the same prompt by other models (GLM 5.3, Mimo v2.6 Pro). The
+> adopted items are listed there and take precedence over the earlier sections
+> where they conflict. The `AGENTS.md` amendment from §3 is approved and
+> applied.
 
 **Status.** Proposal only. Nothing in this document is implemented.
 
@@ -270,7 +276,7 @@ the code only shows that the listing filters on issue `updated_at`
 
 ---
 
-## 3. Owner decision (unchanged)
+## 3. Owner decision (APPROVED 2026-10-25; `AGENTS.md` amended on this branch)
 
 Bundling ranks issues, and `AGENTS.md` forbids ranking in the sync path and by
 collectors. The plan adds a **derived read tier** that works under these rules:
@@ -769,6 +775,111 @@ Rows 1–7 deliver measured bundling without changing the GraphQL selection.
 | SQLite floor | 3.35 still holds: `fts5vocab` predates it, and backfill uses Python, not JSON1. |
 | Storage faults are reported | The capability probe turns field errors into logged section absences. Real faults still record `last_error`. |
 | Portability | `git` is opt-in and guarded. Every new test runs on the Windows leg. |
+
+## 10. Cross-model reconciliation (rev 4)
+
+Two other plans were produced from the same prompt by GLM 5.3 and Mimo v2.6
+Pro. Each distinctive claim in them was re-checked against `b47913e` before
+anything was adopted.
+
+### 10.1 Adopted: verified gaps this plan had missed
+
+| # | Item | Origin | Verification | Lands in |
+|---|---|---|---|---|
+| R1 | `file-history` and `what-closed` query only `rel = 'closes'`. On a REST-only corpus, where no `closes` edges exist, a PR that said "fixes #N" reports `closed_issues: []` and the issue reports no closers. **Correction:** add a separate `keyword_closes` field fed by `closes_keyword` edges. Never merge it into `closed_issues`/`prs`; AGENTS keeps the two relations' meanings distinct. | GLM | VERIFIED: `query.py:846`, `:853`, `:897`, `:909` | New PR **A0c**, after A0; regression test first |
+| R2 | The SQLite floor is checked only on the write path. `assert_sqlite_supported` has one caller, `db.connect` (`db.py:36`), and `open_existing` skips it. FTS5 is never probed, so a build without FTS5 fails with a bare `no such module: fts5`. **Correction:** call the floor check from `open_existing`, and add an FTS5 probe with an explicit message to both paths. | GLM | VERIFIED by grep | **A0c** |
+| R3 | `open` on the CLI is unbounded: `cmd_open` passes no limit (`cli.py:667-668`), while MCP paginates. **Correction:** add `--limit`/`--offset` to the CLI, on top of §5.8's filters. | GLM | VERIFIED | §5.8 PR (row 6) |
+| R4 | Review bodies are not full-text indexed. `search` covers `items_fts` and `comments_fts` only, so text that appears only in a review is unsearchable. **Correction:** add a `reviews_fts` external-content table and triggers in migration v7, and merge its hits into the parent item like comment hits. | GLM | VERIFIED: `schema.sql` FTS section; `query.py:112-135` | **A1** |
+| R5 | **Pair affinity must be symmetric.** §5.2 normalizes bm25 by N's own self-match score, which makes `lexical(A→B) ≠ lexical(B→A)`, and §5.5's greedy bundler consumes that pairwise. **Correction:** compute bundle affinity from symmetric components only. `lexical_sym(A,B)` is the mean of the two directional scores, and a no-hit direction scores 0. Every other component is already symmetric. A property test pins `affinity(A,B) == affinity(B,A)`. `similar N` may still *rank* by the directional score, but it reports both. | GLM | VERIFIED by reading §5.2 against §5.5 | §5.2 / §5.5 (rows 5, 7) |
+| R6 | `item N` truncates each comment and review body (`_truncate_bodies`, `cli.py:636-656`) but returns **every** comment. One very long thread still floods context. **Correction:** add `item --max-comments K`, keeping the first, last, and maintainer comments, and report `comments_omitted`. | Mimo (its claim that truncation covers "item bodies only" is wrong; this narrower defect is real) | VERIFIED | §5.8 PR |
+| R7 | CI covers only 3.11/3.12 (`.github/workflows` matrix). **Correction:** add 3.13 and 3.14 legs. | Mimo | VERIFIED | Hygiene |
+
+### 10.2 Adopted: design ideas that fit the plan's constraints
+
+These are refinements, not defects. Each fits the derived-tier rules.
+
+- **`explain A B`.** Dumps one pair's full affinity breakdown. It is the audit
+  surface before anyone trusts a bundle, and it is cheap because the
+  components already exist. (Mimo)
+- **"Related, not bundleable."** Pairs with high lexical or context affinity
+  but no anchor signal (§5.5) are reported in their own list, never dropped
+  silently. (Mimo)
+- **Cross-bundle file-conflict warnings.** When `bundle --count > 1`, it
+  reports file-set intersections *between* bundles, so parallel agents do not
+  collide. Uses `pr_overlap` semantics. (Mimo)
+- **Possible-duplicate flag.** A pair with `title` ≥ 0.9 and `lexical_sym` in
+  the top percentile is flagged `possible_duplicate` and offered as a merge
+  candidate, not a bundle member. (Mimo, re-thresholded because the 0.97
+  figure was unsupported)
+- **Label→file priors.** P(file | label) is computed from merged PRs that
+  closed issues carrying that label, with minimum support 3 and the support
+  count shown as evidence. It is a **non-anchor** signal with the same weight
+  class as analog files: it can raise a bundle edge's score but never create
+  one. (Mimo)
+- **Maintainer-engagement feature.** Triage records whether the latest comment
+  is by an actor holding a `merged_by` edge, which is derivable today. (Mimo)
+- **A version stamp in `skills/zaxbygraph/SKILL.md`,** checked against
+  `zaxbygraph --version` by a doc test, so installed copies of the skill
+  cannot silently drift from the CLI. (GLM)
+- **A backticked-path origin flag.** Paths inside backticks get a
+  high-confidence marker in `item_path_refs`. Resolution can then prefer
+  them, and the evaluation (§6) measures whether that helps. (GLM)
+- **`duplicate_keyword` relation, a low-priority stream.** It parses
+  "duplicate of #N" from bodies and comments, matching how `closes_keyword`
+  works. It gives REST-only corpora duplicate coverage. It never writes
+  `duplicate_of`, which stays reserved for GitHub's `Issue.duplicateOf`, the
+  same keyword-vs-reported split as `closes_keyword`/`closes`. (Mimo,
+  narrowed)
+- **Distribution and positioning, on the hygiene track:**
+  - publish to PyPI;
+  - publish the MCP server to the MCP Registry;
+  - write a README positioning section. Comparable local mirrors exist:
+    `openclaw/gitcrawl` and `pwrdrvr/ghcrawl`, both SQLite plus
+    OpenAI-embedding clustering. The differentiator is the EXTRACTED-only,
+    provenance-per-edge evidence contract and no network model dependency.
+    (Mimo; the projects' existence was verified by web search, but
+    "Octopool" was not found)
+- **Smaller hygiene items:**
+  - `jsonl` opt-in manifest line;
+  - DB size field in `status`;
+  - CLI `search --offset`. (Mimo)
+
+### 10.3 Rejected, with reasons
+
+| Proposal | Origin | Why it is rejected |
+|---|---|---|
+| `mentions_file` / `mentions_path` **edges** resolved at ingest against known paths | both | Resolution depends on a path vocabulary that grows as later PRs ingest. An issue ingested before the PR that adds `src/x.py` never gains the edge, unless something rewrites edges outside the owning item's transaction, which breaks the ownership model (`store.delete_owned_edges`). GLM's v7 backfill fixes only the starting state. §4 A3 (raw strings in a child table, resolved at read time) has no order dependence. |
+| `sub_issue` edges with `source='payload'` | Mimo | A degraded re-ingest (REST source or fallback) deletes payload edges and cannot rebuild them (`store.py:84-88`). Hierarchy uses the presence-gated `link` stream (§4 A2). |
+| Widening the GraphQL selection to fetch reactions | Mimo | Unnecessary. The REST listing already carries `reactions`, and it is stored in `raw_json` (live-verified, §2.4). Mimo's claim that reactions are "never fetched" is wrong. |
+| `derived.db` sidecar that persists scores | Mimo | Conflicts with the approved rule that the derived tier never persists. Every command here computes on demand within the stated bounds. A persisted cache brings staleness and fingerprint management with no measured need. Revisit only if embeddings are adopted. |
+| Reciprocal-rank fusion for affinity | Mimo | RRF fuses per-query *rankings*. It is not a symmetric pairwise magnitude, and it discards the per-signal values that `explain` and the anchor guard need. The weighted sum of normalized symmetric components stays. |
+| "Sibling-heat" triage feature | Mimo | Self-reinforcing, as its own critic noted. It double-counts bundle affinity inside importance. |
+| Phase 7 local embeddings (`[semantic]` extra) | Mimo | Deferred, not rejected. A runtime dependency is a design change under AGENTS. Adopt only if the §6 harness shows lexical plus structural recall below a floor set in advance, and only after license and Windows-wheel checks. |
+| `bundle` dependency-ordering output | GLM (struck) | Superseded: after A2, `blocked_by` exists and §5.5 derives in-pool order from it. Before A2, no order is emitted. |
+| Machine-local fixes: console script on PATH, stale `~/.zcode` skill copies, rewiring `issue-triage`/`issue-tracer` | GLM | Outside this repository and unverifiable from this session. They belong on the user's machine checklist. The version stamp (§10.2) prevents the drift from recurring. |
+
+### 10.4 What the other plans did not find
+
+Neither plan identified any of these:
+
+- quadratic ingest (§2.1);
+- the GraphQL field-error abort that would turn any new field into a
+  fleet-wide sync failure (§2.5);
+- the presence-gating and retraction design for link edges;
+- eval leakage controls;
+- the symmetric-anchor guard against lexical-only bundles.
+
+Both still assume `similar` can build on the existing `related`/`path` read
+paths, which are O(E) per call (§2.2).
+
+### 10.5 Sequencing deltas
+
+- **A0c** (R1, R2) slots in as row 1b, independent of A0.
+- R4 joins A1.
+- R3 and R6 join the §5.8 surface-fixes PR (row 6).
+- R5, `explain`, related-not-bundleable, cross-bundle conflicts, the
+  possible-duplicate flag, and label priors join rows 5 and 7.
+- R7 and the §10.2 hygiene items are independent PRs that can land anywhere.
 
 ## Sources
 
