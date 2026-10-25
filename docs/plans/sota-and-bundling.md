@@ -1,5 +1,7 @@
-# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 6)
+# ZaxbyGraph: state-of-the-art gap review and the bundling plan (rev 7)
 
+> **Rev 7** adds §13, the Fable 5.1 critic dispositions. §13 overrides earlier sections where they conflict, and its §13.5 sequencing replaces §8.
+>
 > **Rev 6** adds §12 (edit history and corpus export), folded in by owner decision.
 >
 > **Rev 5** adds §11, a review of the comparable tools gitcrawl and ghcrawl.
@@ -126,7 +128,7 @@ the synthetic run.
 **The fix (A0):**
 
 1. Add `INDEXED BY` on T1.
-2. Add an `items(repo, title)` index. It needs migration v7, so A0 is a schema
+2. Add an `items(repo, title)` index. **CORRECTED (rev 7, §13 B8):** it needs no migration. A non-unique `CREATE INDEX IF NOT EXISTS` in `schema.sql` reaches every store on its next write-open, the same precedent as `idx_items_repo_merge`. ~~It needs migration v7, so A0 is a schema~~
    change.
 3. Stop recounting inside each item's transaction. `sync_state` counts come
    from covering-index COUNTs at `status` read time, or from per-item deltas.
@@ -312,7 +314,7 @@ the migration**, not in `schema.sql`.
 
 - **Why the migration and not `schema.sql`.** `init_schema` runs
   `executescript(schema.sql)` before the migration chain (`db.py:614`). It is
-  the same trap that the v6 partial index documents (`schema.sql:113-118`,
+  the same trap that the v6 partial index documents (`schema.sql:137-142` — CORRECTED rev 7, the earlier `113-118` pointed at `releases`,
   `db.py:546-550`).
 - **Read paths.** A0 also rewrites the O(E) read paths from §2.2.
 
@@ -912,7 +914,7 @@ not adopted.
 
 | # | Capability | Their implementation | Gap in zaxbygraph (VERIFIED at `b47913e`) | Adoption |
 |---|---|---|---|---|
-| G1 | **Targeted refresh of exact items** | gitcrawl `sync --numbers 123,456` "bypasses list ordering and the updated-time window" | `sync` accepts only `--force`, `--include-patches`, `--source`, `--wait`, `--jsonl` (`cli.py:1132-1156`). Refreshing one stale item means a full `--force`. | Add `sync --numbers N,...`. It refetches those items through the same bulk children path and `ingest_item` transaction, **without bumping the watermark**: a targeted fetch says nothing about the items between watermark positions. This is the clean fix for §4 A2.6's volatile-signal problem and for review-only drift (§2.8). Before an agent starts work, `bundle` prints `zaxbygraph sync --numbers <members>` as the refresh step. |
+| G1 | **Targeted refresh of exact items** | gitcrawl `sync --numbers 123,456` "bypasses list ordering and the updated-time window" | `sync` accepts only `--force`, `--include-patches`, `--source`, `--wait`, `--jsonl` (`cli.py:1132-1156`). Refreshing one stale item means a full `--force`. | Add `sync --numbers N,...`. It refetches those items through the same bulk children path and `ingest_item` transaction, **without bumping the watermark**: a targeted fetch says nothing about the items between watermark positions. **CORRECTED (rev 7, §13 B3/B9):** this needs a new `advance_watermark` parameter on `ingest_item`, because today it bumps the watermark unconditionally (`store.py:631`). It also needs a single-item fetch method on both sources (`github.py:47-54`), so it is not small. It refreshes *stored* fields (state, labels, assignees, reactions, edges); volatile PR state stays live-only per §4 A2.6. It also fixes review-only drift (§2.8). Before an agent starts work, `bundle` prints `zaxbygraph sync --numbers <members>` as the refresh step. |
 | G2 | **Bounded-staleness reads on the CLI** | gitcrawl `search --sync-if-stale 5m` | The MCP server auto-refreshes stale reads (`mcp_server._read_envelope`); the CLI never does. Agents that shell out get no staleness bound. | Add a `--max-age DURATION` opt-in to CLI reads. When the store is older, it runs the locked incremental sync first and reports `freshness.refreshed: true`. The default stays read-only. |
 | G3 | **PR commit list**, including commit messages | gitcrawl `pull_request_commits` | Commits exist only as edge endpoints. There is no commit-message text, so "fixes #N" written in a commit (common for squash-less merges) is invisible. | Add a GraphQL `commits(first: 100) { nodes { commit { oid messageHeadline messageBody } } }` child section behind the §4 A2 capability gate. A `pr_commits` child table holds it. `closes_keyword` and `mentions` gain a commit-message origin (`evidence: commit:<sha>`), with the same per-payload suppression rule. This was the critic's deferred item; it is now scheduled. |
 | G4 | **Changed paths in the searchable document** | gitcrawl: "Hydrated PR changed paths and commit subjects are included in thread keyword … documents" | `search "delete_owned_edges"` or `search "sync.py"` cannot match a PR by the files it touched; `items_fts` holds only title, body, and labels. | In migration v7, add a `paths_text` column to `items_fts`, populated from `pr_files.path` with path separators tokenized. This means an FTS rebuild, which is already priced into v7 (R4). Search weight is low (0.5). |
@@ -996,7 +998,7 @@ revisions(
   source_updated_at TEXT,           -- GitHub updated_at carried by the payload
   observed_at TEXT NOT NULL,        -- sync wall clock
   origin TEXT NOT NULL CHECK (origin IN ('baseline','observed','edit_history','deleted')),
-  UNIQUE (repo, entity, entity_id, content_hash, origin)
+  UNIQUE (repo, entity, entity_id, content_hash, origin)  -- WRONG, superseded by §13 B1: wedges sync on an A→B→A edit
 )
 ```
 
@@ -1004,7 +1006,7 @@ It has one index, `(repo, number, entity, entity_id, id)`.
 
 #### Write rule (inside `ingest_item`, same transaction)
 
-1. **Snapshot what is about to be replaced.** For the item and for each
+1. **Snapshot what is about to be replaced.** *(Superseded by §13 B1/B4/B5: pre-image semantics, sequence key, GitHub-time validity.)* For the item and for each
    comment or review **about to be replaced**, compare the new content hash
    with that entity's latest revision row. Insert a revision only when the
    hash differs. Re-ingesting unchanged content writes nothing, so
@@ -1029,7 +1031,7 @@ These are **observed** revisions. Edits that happen between two syncs and are
 overwritten before the next sync are never seen. Every read surface labels
 them `origin: observed`. They are never presented as complete edit history.
 
-#### Migration v7 baseline
+#### Migration v7 baseline (WITHDRAWN rev 7, §13 B4: pre-image semantics need no baseline)
 
 Migration v7 seeds one `origin='baseline'` row per existing item, comment and
 review, with `observed_at` set to the migration time. The baseline is the
@@ -1139,7 +1141,7 @@ wall-clock time.
    `authored`/`commented`/`reviewed` relations) or a foreign
    `owner/repo#N` id are emitted under the item they point at, so every edge
    still appears exactly once.
-5. **`--as-of T`** emits the revision-resolved text (§12.2) and filters out
+5. **WITHDRAWN (rev 7, §13 E3):** export `--as-of` is cut, because edges cannot be time-filtered, which makes it a half-snapshot. Original text, kept for the record: **`--as-of T`** emits the revision-resolved text (§12.2) and filters out
    items created after T. Edges cannot be time-filtered, because they carry
    no timestamp. Their evidence strings carry one for timeline rows only.
    The manifest therefore states `edges_as_of: "unfiltered"`.
@@ -1195,7 +1197,235 @@ This one check covers both the sync path and export determinism.
 | 5b (new, after row 3, before the evaluation rows) | `export-corpus`, `item --history`, `item --as-of`, and the jsonl-replay fixture harness. Row 5's evaluation consumes `--as-of` and `corpus_sha256`. |
 | 8 (A2) | Opt-in `sync --edit-history`, behind the capability gate |
 
+## 13. Rev 7: Fable 5.1 critic dispositions
+
+The critic re-verified 40+ code claims against the source, reproduced the
+query plans and the batch timings (3.63 → 13.67 s per 1,000 items), fetched
+the official GraphQL schema and the MCP changelogs, and ran one live REST
+call. Its new research citations were spot-checked in this session by web
+search. All four exist, with the cited figures:
+
+- CooperBench, arXiv 2601.13295;
+- AgenticFlict, 2604.03551;
+- Co-Coder, 2606.00953;
+- ChainSWE, 2607.02606.
+
+Every finding is accepted unless stated otherwise. Where an earlier section
+conflicts with this one, this one wins.
+
+### 13.1 Blocking findings
+
+**B1: the revision key and write rule are replaced.**
+
+- **The defect.** `UNIQUE(..., content_hash, origin)` raises an
+  IntegrityError when an edit is reverted (A→B→A). The error aborts the
+  item, `last_error` is recorded, and every re-run hits the same item again.
+  The critic reproduced this, and it violates the AGENTS idempotence rule.
+- **The correction.** `revisions` is an ordered **sequence**: key `id` and
+  index `(repo, entity, entity_id, id)`. It has no uniqueness on content.
+- **New write rule.** Write a row only when the incoming hash differs from
+  the entity's current stored content.
+- **Idempotence.** A re-fetched identical page compares equal and writes
+  nothing.
+- **Regression test.** The A→B→A test lands first.
+
+**B4: pre-image semantics.** A `revisions` row stores the **old** content at
+the moment it is replaced. Current text stays where it is today, in
+`items`/`comments`/`reviews`.
+
+- A first ingest writes no revision, so storage grows only with real edit
+  volume.
+- The v7 baseline seeding is withdrawn.
+- A tombstone is the pre-image of a comment or review that is absent from a
+  complete fetch (`origin='deleted'`).
+
+**B5: validity uses GitHub time.** Each pre-image carries:
+
+- `valid_from`: the replaced content's own `updated_at`, or `created_at`
+  when it was never edited;
+- `valid_to`: the incoming content's `updated_at`.
+
+`item --as-of T` returns the version whose `[valid_from, valid_to)` contains
+T, else the current row. It reports `as_of_basis: "github_time"`, or
+`"observed"` when a timestamp is missing and `observed_at` has to be used.
+
+**B12: tombstone precondition.** `*_incomplete` flags never reach
+`ingest_item`, because they are resolved by REST fallback first
+(`sync.py:172-180`). The real precondition is a new
+`children_complete: dict[str, bool]` argument to `ingest_item`, set by
+`_resolve_children`. It is False for:
+
+- the 404 path;
+- a section the source did not answer;
+- a section truncated at a cap (comments, or files at 3000).
+
+Tombstones are written only for sections marked True.
+
+**B2: the jsonl sidecar becomes replayable.** Today's child records carry no
+owning number. GraphQL comments, reviews and `pull` have none, and `pr_file`
+and `timeline_event` have no `id` (`graphql.py:560-668`). As a result,
+`(resource, payload.id)` dedup collapses records.
+
+- **Sidecar change** (with G1, row 2b): write one
+  `{"resource":"item_bundle","number":N,"item":…,"pull":…,"issue_comments":[…],"review_comments":[…],"reviews":[…],"files":[…],"timeline":[…]}`
+  per ingested item. Dedup is by `(number, item.updated_at)`. README:152 is
+  corrected at the same time.
+- **Replay.** A bulk-shaped `JsonlReplaySource`, modelled on
+  `tests/fixtures_bulk.PageShapedBulkSource`, replays the bundles in
+  `(updated_at, number)` order. `FakeGitHubSource` cannot replay them: it has
+  no `fetch_children`, and timeline events have no REST fallback.
+- **Deterministic order.** A fixed order matters because `closes` evidence
+  merges first-seen-first (`store.py:109-137`), so a different order would
+  change `content_hash`.
+
+**B3/B9: G1 (`sync --numbers`) is real work.** It needs three things:
+
+- an `advance_watermark=False` path through `ingest_item`
+  (`store.py:631`, which currently bumps the watermark unconditionally);
+- a `get_issues(numbers)` method on both sources;
+- the bulk children fetch for those numbers.
+
+It refreshes stored fields only. It leaves row 2b and becomes its own row
+(see §13.5).
+
+### 13.2 Major findings
+
+**B6: export determinism, specified.**
+
+1. **Two hash domains.**
+   - `corpus_sha256` covers **content only**: item and child content, edge
+     keys and evidence.
+   - It **excludes** every surrogate key or sync-time column: `comments.pk`,
+     `edges.id`, `revisions.id`, `observed_at`, `fetch_log`,
+     `last_*_sync_at`, `rate_limit_*`.
+2. **Two acceptance criteria.**
+   - Two exports of one DB are byte-identical.
+   - Exports before and after a no-op sync have equal `corpus_sha256`.
+3. **Manifest layout.** Sync timestamps move to a `provenance` block that is
+   outside the hashed domain. This resolves the contradiction between "no
+   wall-clock field" and `last_full_sync_at`.
+4. **Output encoding.** Output is written as UTF-8 bytes with `\n` to
+   `--out`, or to `sys.stdout.buffer`, so Windows text-mode translation never
+   alters the hash.
+5. **Orphan edges.** An `orphan_edges` trailer holds every edge whose
+   endpoint item has no `items` row, so "every edge exactly once" holds.
+
+**B7: two separate GraphQL error paths.**
+
+- **A field the schema lacks.** That is a validation error that rejects the
+  whole query, so only the §4 A2.1 capability probe can prevent it.
+- **Runtime per-field errors** (FORBIDDEN, partial `data`). These are
+  dropped section by section, as `graphql.py:553-557` already does for
+  NOT_FOUND aliases.
+
+**B8: A0.**
+
+- Use `INDEXED BY idx_edges_dst` on T1, so the plan never depends on
+  statistics. Statistics are absent on fresh, consolidated or never-analyzed
+  stores.
+- Add the `items(repo, title)` index in `schema.sql`, which needs no
+  migration.
+- Remove the per-item `recount`.
+- **Also** run `PRAGMA optimize` at the end of `sync_repo`. It is cheap, it
+  helps every other query, and the critic showed it fixes the §2.2 OR plan.
+- The §2.2 `UNION ALL` rewrites stay in A0. They are the deterministic
+  guarantee for `mode=ro` readers, which cannot write statistics.
+
+**B15: degraded behaviour before A2.** Before row 8 lands:
+
+- triage's inbound-`duplicate_of`, reopen-count and blocked-edge features
+  are reported as `null`, with `requires: "A2"`;
+- bundle's duplicate collapse uses only the `duplicate_keyword` stream;
+- the blocked gate uses `blocked_by_open` from REST (A1).
+
+### 13.3 Minor findings
+
+- **B10.** Line references corrected inline: `schema.sql:137-142`;
+  `cli.py:666-667` (`cmd_open`); `cli.py:1174` (`item`).
+- **B11.** Now settled:
+  - the `closedByPullRequestsReferences` arguments (`first`,
+    `includeClosedPrs`, `excludeUserLinked`, `orderByState`);
+  - the `UserContentEdit` fields (`editedAt`, `deletedAt`, `editor`,
+    `diff` — the latter documented as "a summary of the changes").
+
+  Both are **VERIFIED** against the official schema file.
+- **B13.** §7 adds two items:
+  - 2026-07-28 `CacheableResult` (`ttlMs`/`cacheScope` on `tools/list`);
+  - the 2025-11-25 rule that input-validation failures are tool-execution
+    errors (`isError: true`), not JSON-RPC `-32602`
+    (`mcp_server.py:1060`, `:1125`, `:1173`).
+- **B14.** The derived tier opens with `open_existing`, never
+  `connect_readonly_query`, whose authorizer denies temp objects.
+
+### 13.4 State-of-the-art changes
+
+- **Bundles are for one agent, worked sequentially.** CooperBench reports
+  about 30% lower success when agents split coupled work.
+- **Bundles run in parallel must not share files.** Cross-bundle file
+  disjointness becomes a **hard constraint by default**
+  (`--allow-shared-files` overrides it). AgenticFlict finds 27.67% of 107K
+  agent PRs conflict. Co-Coder isolates hub files and reports gains from
+  cohesion-aware partitioning.
+- **Hub-file penalty.** Files whose `touches` degree is in the top
+  percentile count less toward affinity, and are named in `why_not_bigger`.
+- **Size cap 3, dependency order kept.** ChainSWE reports per-bug success
+  falling by up to 70% along dependent chains. That supports the size cap of
+  3 and in-bundle `blocked_by` ordering, and both are kept.
+- **Duplicate detection.**
+  - The withdrawn 2504.14797 citation is replaced by CUPID (2308.10022;
+    retrieval proposes, the caller judges).
+  - The §6 floor uses a **realistic temporal split**: candidates are limited
+    to items that existed when the target was created.
+  - Per the critic, this follows TOSEM 2022, "How Far Are We?", which this
+    session did not retrieve.
+- **Localization.** `eval localize` reports Acc@5, so it is comparable with
+  RepoMem (2510.01003), with history depth recorded as a covariate.
+- **Triage wording.** §5.4 states that triage is an explainable activity and
+  impact heuristic, not a predicted priority.
+
+### 13.5 Sequencing (replaces §8 where they differ)
+
+Migration v7 is split, so the one-issue-one-PR rule holds.
+
+| # | PR |
+|---|---|
+| 1 | A0: `INDEXED BY` + title index in `schema.sql` + recount removal + `PRAGMA optimize` + `UNION ALL` read paths. **Ready to file.** |
+| 1b | A0c: R1 `keyword_closes` + R2 read-path SQLite floor and FTS5 probe. **Ready to file.** |
+| 2 | A0b: GraphQL over stdin |
+| 3a | v7a: A1 columns, `assignees`, `issue_field_values`, comment `author_association`, Python backfill, COALESCE on source-specific columns |
+| 3b | v7b: `reviews_fts` (R4) + `paths_text` (G4) + `status.coverage` (G9) |
+| 3c | v7c: `revisions` (B1/B4/B5/B12) + `children_complete` plumbing |
+| 4 | Sidecar `item_bundle` format (B2) + `JsonlReplaySource` + README:152 fix |
+| 4b | G1 `sync --numbers` (B3) |
+| 5 | A3: `item_path_refs`, `item_signatures`, `branch_ref`, G5 positions |
+| 6 | `export-corpus` (B6) + `item --history` / `--as-of` |
+| 7 | `similar` + `coupling` + C fixtures (replayed through 4) + `eval localize` / `eval bundle` |
+| 8 | `triage` + config + §5.8 surface fixes |
+| 9 | `bundle` + `brief`, including the §13.4 constraints |
+| 10 | A2: capability probe (B7) + link stream + new fields + PR commits (G3), then `eval similar` |
+| 11 | D: MCP structured output, annotations, new tools, 2025-11-25 (B13) |
+| 12 | D: MCP 2026-07-28 |
+
+### 13.6 Cut or deferred (accepting the critic's §E)
+
+- **`sync --edit-history`:** deferred. `diff` is documented as a summary, so
+  nothing can be reconstructed until a real payload has been inspected.
+- **Export `--as-of`:** cut. The §6 snapshot builder owns time-correctness.
+- **G6 public time filters:** kept internal to §6.
+- **G7 batch `item`:** cut, because `bundle --briefs` covers the use.
+- **Label→file priors:** deferred until §6 shows anchor signals are
+  insufficient.
+- **PyPI and MCP Registry publication:** moved to a separate hygiene tracker.
+- **"Measured from the start" revision-growth promise:** replaced by the
+  pre-image rule (B4). `revision_bytes` stays in `status.coverage`.
+
 ## Sources
+
+- CooperBench — https://arxiv.org/abs/2601.13295
+- AgenticFlict — https://arxiv.org/abs/2604.03551
+- Co-Coder (cohesion-aware partitioning) — https://arxiv.org/abs/2606.00953
+- ChainSWE — https://arxiv.org/abs/2607.02606
+- CUPID — https://arxiv.org/abs/2308.10022
 
 - gitcrawl README and docs — https://github.com/openclaw/gitcrawl (docs/clustering.md, governance.md, sync.md, search.md, capture.md, automation.md, portable-stores.md)
 - ghcrawl README and SPEC — https://github.com/pwrdrvr/ghcrawl
@@ -1205,5 +1435,5 @@ This one check covers both the sync path and export determinism.
 - GitHub REST sub-issues — https://docs.github.com/en/rest/issues/sub-issues
 - Issue fields GA (2026-07-02) — https://github.blog/changelog/2026-07-02-issue-fields-are-now-generally-available
 - MCP 2026-07-28 changelog — https://modelcontextprotocol.io/specification/2026-07-28/changelog
-- Duplicate detection at scale, lexical vs learned — https://arxiv.org/abs/2504.14797 (not re-verified in rev 3; arXiv was unreachable from the sandbox)
+- ~~Duplicate detection at scale, lexical vs learned — arXiv 2504.14797~~ **CORRECTED (rev 7):** 2504.14797 is "Automated Duplicate Bug Report Detection in Large Open Bug Repositories", a six-method study on one Eclipse dataset, not a lexical-vs-learned comparison at scale. The claim it was cited for is withdrawn.
 - RepoMem, history-informed localization — https://arxiv.org/abs/2510.01003 (not re-verified in rev 3)
