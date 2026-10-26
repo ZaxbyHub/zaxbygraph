@@ -175,12 +175,17 @@ class GenuineV6MigrationTests(unittest.TestCase):
         WITHOUT any re-ingest (mutant: reviews_fts created but never
         populated; or backfill that only works on pre-created columns)."""
         raw = _signals(issue(301, title="Genuine v6 row", body="historical body"))
-        self.conn.execute(
-            "INSERT INTO items(id, repo, number, kind, title, body, state,"
-            " author, created_at, updated_at, html_url, api_url, raw_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            _v6_item(301, "Genuine v6 row", raw),
-        )
+        raw["merge_commit_sha"] = "cafe123"
+        raw["merged_at"] = "2026-01-03T00:00:00Z"
+        raw["merged_by"] = {"login": "merger"}
+        lean = issue(302, title="Lean v6 row", body="no pull keys")
+        for number, rec in ((301, raw), (302, lean)):
+            self.conn.execute(
+                "INSERT INTO items(id, repo, number, kind, title, body, state,"
+                " author, created_at, updated_at, html_url, api_url, raw_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _v6_item(number, rec["title"], rec),
+            )
         self.conn.execute(
             "INSERT INTO reviews(id, repo, number, author, state, submitted_at,"
             " body, html_url, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -227,13 +232,25 @@ class GenuineV6MigrationTests(unittest.TestCase):
         )
         row = self.conn.execute(
             "SELECT reactions_total, milestone, item_type, author_association,"
-            " comment_count FROM items WHERE number = 301"
+            " comment_count, merged_by, merge_commit, merged_at"
+            " FROM items WHERE number = 301"
         ).fetchone()
         self.assertEqual(
             tuple(row),
-            (3, "v1.0", "Bug", "MEMBER", 1),
-            "supp-v7: genuine-v6 backfill did not populate from raw_json",
+            (3, "v1.0", "Bug", "MEMBER", 1, "merger", "cafe123",
+             "2026-01-03T00:00:00Z"),
+            "supp-v7: genuine-v6 backfill did not populate from raw_json "
+            "(listing signals AND the pull trio)",
         )
+        lean_cols = self.conn.execute(
+            "SELECT merged_by, merge_commit, merged_at FROM items"
+            " WHERE number = 302"
+        ).fetchone()
+        if lean_cols is not None:
+            self.assertEqual(
+                tuple(lean_cols), (None, None, None),
+                "supp-v7: pull-trio keys absent from an old payload must stay NULL",
+            )
         assoc = self.conn.execute(
             "SELECT author_association FROM comments WHERE github_id = 70301"
         ).fetchone()[0]
@@ -753,6 +770,43 @@ class MergeSemanticsTests(unittest.TestCase):
             conn.close()
         self.assertEqual(
             total, 5, "supp-v7: pull payload overwrote a listing-owned column"
+        )
+
+    def test_listing_carried_pull_keys_cannot_overwrite(self) -> None:
+        """A LISTING payload carrying pull-named keys (merged_by /
+        merge_commit_sha / merged_at) cannot overwrite the stored pull trio
+        when no pull section is ingested: pull_raw=None means preserve
+        (mutant: the pre-critical-fix fallback that extracted the trio from
+        the merged listing payload — executed probe stored 'imposter')."""
+        listing = issue(74, title="pull key injection", body="", kind="pr")
+        listing["merge_commit_sha"] = "EVIL999"
+        listing["merged_at"] = "2020-01-01T00:00:00Z"
+        listing["merged_by"] = {"login": "imposter"}
+        pull_payload = pull(74, merged=True)
+        pull_payload["merge_commit_sha"] = "abc123"
+        pull_payload["merged_by"] = {"login": "merger"}
+        with tempfile.TemporaryDirectory() as td:
+            conn = db.connect(Path(td) / "t.db")
+            try:
+                db.init_schema(conn)
+                conn.execute("BEGIN")
+                ingest_item(conn, REPO, listing, pull_raw=pull_payload,
+                            issue_comments=[], review_comments=[], reviews=[],
+                            files=[], include_patches=False)
+                conn.commit()
+                conn.execute("BEGIN")
+                ingest_item(conn, REPO, listing, pull_raw=None,
+                            issue_comments=[], review_comments=[], reviews=[],
+                            files=[], include_patches=False)
+                conn.commit()
+                row = conn.execute(
+                    "SELECT merge_commit, merged_by FROM items WHERE number = 74"
+                ).fetchone()
+            finally:
+                conn.close()
+        self.assertEqual(
+            tuple(row), ("abc123", "merger"),
+            "supp-v7: listing-carried pull keys overwrote the pull trio",
         )
 
     def test_id_conflict_arm_preserves_pull_values(self) -> None:

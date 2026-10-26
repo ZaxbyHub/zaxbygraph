@@ -6,8 +6,10 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 
 from zaxbygraph.extract import (
+    ABSENT,
     CLOSES_REF_MARKER,
     EVIDENCE_CAP,
+    PULL_OWNED_EXTRACTIONS,
     collapse_edges,
     edges_from_comment,
     edges_from_files,
@@ -214,14 +216,21 @@ def upsert_item_row(
     base = raw.get("base") if isinstance(raw.get("base"), dict) else {}
     head = raw.get("head") if isinstance(raw.get("head"), dict) else {}
     # Source-owned extraction (issue #24): listing signals come from the
-    # listing payload only, the pull trio from the pull payload only, so a
-    # sibling source can never overwrite — or, via ABSENT-merge, null — the
-    # other's values. A key present even with JSON null clears the column;
-    # an absent key preserves the stored value; first sight stores None.
+    # listing payload only, the pull trio from the pull payload ONLY — a
+    # pull_raw of None means "no pull section this ingest", which must
+    # preserve the stored trio rather than re-read it from the listing, so
+    # even a listing payload carrying pull-named keys can never overwrite
+    # (or, via ABSENT-merge, null) the pull source's values. A key present
+    # even with JSON null clears the column; an absent key preserves the
+    # stored value; first sight stores None.
     listing_source = raw if list_raw is None else list_raw
-    pull_source = raw if pull_raw is None else pull_raw
     extracted = extract_listing_signals(listing_source)
-    extracted.update(extract_pull_owned(pull_source))
+    if pull_raw is None:
+        extracted.update(
+            {column: ABSENT for column, _, _ in PULL_OWNED_EXTRACTIONS}
+        )
+    else:
+        extracted.update(extract_pull_owned(pull_raw))
     existing = conn.execute(
         "SELECT {} FROM items WHERE repo = ? AND number = ?".format(
             ", ".join(_V7_MERGEABLE_COLUMNS)

@@ -1178,7 +1178,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "search",
-        help="relevance-ranked FTS search over titles, bodies, labels, comments",
+        help="relevance-ranked FTS search over titles, bodies, labels, comments, review bodies, and PR touched paths",
     )
     add_common(sp)
     sp.add_argument("query")
