@@ -29,11 +29,15 @@ _STOPWORDS = frozenset(
     "this those to was were what when where which who will with you your".split()
 )
 
-#: bm25 weights for items_fts columns (title, body, labels_text): the title
-#: dominates; labels_text outranks body because a label is a short curated
-#: topic tag, while a term appearing in body prose is often incidental.
+#: bm25 weights for items_fts columns. v7 (title, body, labels_text,
+#: paths_text): the title dominates; labels_text outranks body because a
+#: label is a short curated topic tag, while a term appearing in body prose
+#: is often incidental; touched-path text ranks below all three (issue #24
+#: AC5). The legacy weights apply to pre-v7 stores, whose items_fts has no
+#: paths_text column (reads never migrate; see search's index_stale).
 #: Lower (more negative) bm25 output ranks first, so ORDER BY ... ASC.
-_ITEM_BM25 = "bm25(items_fts, 10.0, 1.0, 3.0)"
+_ITEM_BM25 = "bm25(items_fts, 10.0, 1.0, 3.0, 0.5)"
+_ITEM_BM25_LEGACY = "bm25(items_fts, 10.0, 1.0, 3.0)"
 
 
 def _quote_token(token: str) -> str:
@@ -82,8 +86,67 @@ def _fold_repo(repo: str | None) -> str | None:
     return validate_slug(repo) if repo else None
 
 
+#: items columns whose NULL marks an un-populated v7 signal (the derived pair
+#: comment_count/paths_text are NOT NULL by schema and never contribute).
+_NULLABLE_V7_COLUMNS = (
+    "reactions_total",
+    "milestone",
+    "item_type",
+    "sub_issues_total",
+    "sub_issues_completed",
+    "dependencies_blocked_by",
+    "dependencies_blocking",
+    "dependencies_total_blocked_by",
+    "dependencies_total_blocking",
+    "author_association",
+    "merged_by",
+    "merge_commit",
+    "merged_at",
+)
+
+
+def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> dict:
+    """The status coverage block (issue #24 AC6): how much of the corpus the
+    sync actually captured. The three derived counts follow status(repo)'s
+    repo scoping; store_bytes is database-global. ``null_v7_rows`` is null on
+    a pre-v7 store (reads never migrate, so the columns may not exist)."""
+    repo_filter = " AND repo = ?" if repo else ""
+    repo_params: tuple = (repo,) if repo else ()
+    truncation_notes = {
+        row["resource"]: row["n"]
+        for row in conn.execute(
+            "SELECT resource, COUNT(*) AS n FROM fetch_log"
+            " WHERE note LIKE '%truncated%'" + repo_filter + " GROUP BY resource",
+            repo_params,
+        ).fetchall()
+    }
+    dropped_fields = conn.execute(
+        "SELECT COUNT(*) FROM fetch_log WHERE note LIKE 'omitted %'" + repo_filter,
+        repo_params,
+    ).fetchone()[0]
+    if user_version >= CURRENT_USER_VERSION:
+        null_v7_rows = conn.execute(
+            "SELECT COUNT(*) FROM items WHERE ("
+            + " OR ".join(f"{column} IS NULL" for column in _NULLABLE_V7_COLUMNS)
+            + ")"
+            + (" AND repo = ?" if repo else ""),
+            (repo,) if repo else (),
+        ).fetchone()[0]
+    else:
+        null_v7_rows = None
+    page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+    page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+    return {
+        "truncation_notes": truncation_notes,
+        "dropped_fields": dropped_fields,
+        "null_v7_rows": null_v7_rows,
+        "store_bytes": page_size * page_count,
+    }
+
+
 def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
     repo = _fold_repo(repo)
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if repo:
         state = conn.execute("SELECT * FROM sync_state WHERE repo = ?", (repo,)).fetchone()
         states = [] if state is None else [_row_to_dict(state)]
@@ -100,6 +163,7 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
     return {
         "repos": states,
         "counts": [dict(r) for r in items],
+        "coverage": _coverage(conn, repo, user_version),
     }
 
 
@@ -112,6 +176,7 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
 _SEARCH_MERGED = """
     SELECT hit_key, MIN(score) AS score, MAX(src) AS has_item_hit,
            SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments,
+           SUM(CASE WHEN src = 2 THEN 1 ELSE 0 END) AS matching_reviews,
            MAX(upd) AS updated_at
     FROM (
         SELECT items.repo || '#' || items.number AS hit_key,
@@ -129,22 +194,49 @@ _SEARCH_MERGED = """
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
         JOIN items ON items.repo = comments.repo AND items.number = comments.number
-        WHERE comments_fts MATCH :match{comment_repo}
+        WHERE comments_fts MATCH :match{comment_repo}{reviews_arm}
     )
     GROUP BY hit_key
 """
 
+#: Review-body hits (issue #24 AC4) merge into the owning item like comment
+#: hits, with src = 2: MAX(src) stays truthy for the item-hit flag and the
+#: matching_comments count still tracks src = 0 only. Spliced into
+#: _SEARCH_MERGED only on v7 stores; a pre-v7 store has no reviews_fts and
+#: reads never migrate.
+_REVIEWS_ARM = """
+        UNION ALL
+        SELECT reviews.repo || '#' || reviews.number AS hit_key,
+               bm25(reviews_fts) AS score,
+               2 AS src,
+               items.updated_at AS upd
+        FROM reviews_fts
+        JOIN reviews ON reviews.id = reviews_fts.rowid
+        JOIN items ON items.repo = reviews.repo AND items.number = reviews.number
+        WHERE reviews_fts MATCH :match{review_repo}
+"""
+
 
 def _run_search_pass(
-    conn: sqlite3.Connection, match: str, repo: str | None, limit: int
+    conn: sqlite3.Connection,
+    match: str,
+    repo: str | None,
+    limit: int,
+    *,
+    legacy: bool = False,
 ) -> tuple[int, list[sqlite3.Row]]:
-    """One MATCH pass over items+comments: returns (total distinct items,
-    top-`limit` rows by best score). Total is computed pre-limit so the
-    fallback decision and `total_matches` are honest for any limit."""
+    """One MATCH pass over items+comments (+reviews on v7 stores): returns
+    (total distinct items, top-`limit` rows by best score). Total is computed
+    pre-limit so the fallback decision and `total_matches` are honest for any
+    limit."""
     item_repo = " AND items.repo = :repo" if repo else ""
     comment_repo = " AND comments.repo = :repo" if repo else ""
+    review_repo = " AND reviews.repo = :repo" if repo else ""
     merged = _SEARCH_MERGED.format(
-        item_bm25=_ITEM_BM25, item_repo=item_repo, comment_repo=comment_repo
+        item_bm25=_ITEM_BM25_LEGACY if legacy else _ITEM_BM25,
+        item_repo=item_repo,
+        comment_repo=comment_repo,
+        reviews_arm="" if legacy else _REVIEWS_ARM.format(review_repo=review_repo),
     )
     params: dict[str, object] = {"match": match}
     if repo:
@@ -196,6 +288,18 @@ def _hydrate_search_hit(
         ).fetchone()
         comment_snippet = found[0] if found else ""
     rec["comment_snippet"] = comment_snippet
+    rec["matching_reviews"] = int(hit["matching_reviews"] or 0)
+    review_snippet: str = ""
+    if rec["matching_reviews"]:
+        found = conn.execute(
+            "SELECT snippet(reviews_fts, -1, '«', '»', '…', 12) "
+            "FROM reviews_fts JOIN reviews ON reviews.id = reviews_fts.rowid "
+            "WHERE reviews_fts MATCH ? AND reviews.repo = ? AND reviews.number = ? "
+            "ORDER BY bm25(reviews_fts) ASC LIMIT 1",
+            (match, repo, number),
+        ).fetchone()
+        review_snippet = found[0] if found else ""
+    rec["review_snippet"] = review_snippet
     return rec
 
 
@@ -235,7 +339,11 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
         }
     mode = "all"
     match = all_query
-    total, page = _run_search_pass(conn, match, repo, limit)
+    # A pre-v7 store (index_stale) has no paths_text/reviews_fts objects;
+    # reads never migrate, so search runs the legacy arms there (issue #6
+    # degrade contract, extended by #24).
+    legacy = index_stale
+    total, page = _run_search_pass(conn, match, repo, limit, legacy=legacy)
     # Blocks keep the page honest under the fallback: the strict pass's page
     # is kept whole (its rows hydrated against the all-tokens match, so their
     # snippets show every term), and the broadened pass fills the remaining
@@ -245,7 +353,7 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
     blocks: list[tuple[str, list[sqlite3.Row]]] = [(match, page)]
     if total < limit and any_query != all_query:
         match = any_query
-        total, or_page = _run_search_pass(conn, match, repo, limit)
+        total, or_page = _run_search_pass(conn, match, repo, limit, legacy=legacy)
         seen = {row["hit_key"] for row in page}
         extra = [
             row

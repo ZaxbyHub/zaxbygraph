@@ -62,6 +62,7 @@ comments(first: 100) {
     createdAt
     updatedAt
     url
+    authorAssociation
     author { login url }
   }
 }
@@ -103,6 +104,7 @@ reviews(first: 50) {
         createdAt
         updatedAt
         url
+        authorAssociation
         replyTo { databaseId }
         author { login url }
       }
@@ -258,6 +260,28 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     return out, incomplete
 
 
+def _comment_payload(node: dict, *, in_reply_to_id=None) -> dict:
+    """One comment node -> the REST-shaped dict ingest consumes. When the
+    selection carried `authorAssociation` the key is mapped through; when the
+    selection lacked it the key stays ABSENT so the store's snapshot fallback
+    preserves a REST-native value instead of clearing it (issue #24 AC7)."""
+    payload = {
+        "id": node.get("databaseId"),
+        "body": node.get("body"),
+        "user": {
+            "login": (node.get("author") or {}).get("login"),
+            "html_url": (node.get("author") or {}).get("url"),
+        },
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+        "html_url": node.get("url"),
+        "in_reply_to_id": in_reply_to_id,
+    }
+    if "authorAssociation" in node:
+        payload["author_association"] = node.get("authorAssociation")
+    return payload
+
+
 def _timeline_event(node: dict) -> dict:
     """One timelineItems node -> the normalized event dict the extract layer
     consumes (transport-agnostic shape; #6). Sub-objects are hardening
@@ -356,11 +380,19 @@ class GraphQLSource(GhApiSource):
         query = (
             "query { rateLimit { remaining resetAt } "
             'i: __type(name: "Issue") { fields(includeDeprecated: true) { name } } '
-            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } }'
+            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } '
+            'ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
+            'rc: __type(name: "PullRequestReviewComment") '
+            "{ fields(includeDeprecated: true) { name } } }"
         )
         payload = self._graphql(query)
         caps: dict[str, set[str]] = {}
-        for alias, type_name in (("i", "Issue"), ("p", "PullRequest")):
+        for alias, type_name in (
+            ("i", "Issue"),
+            ("p", "PullRequest"),
+            ("ic", "IssueComment"),
+            ("rc", "PullRequestReviewComment"),
+        ):
             node = payload.get(alias)
             names: set[str] = set()
             if isinstance(node, dict) and isinstance(node.get("fields"), list):
@@ -380,12 +412,13 @@ class GraphQLSource(GhApiSource):
         """Activate a PERSISTED capability map (never introspects).
 
         Accepts the JSON round-trip shape {"Issue": [...], "PullRequest":
-        [...]}; malformed or EMPTY entries are ignored — an empty field set
+        [...], "IssueComment": [...], "PullRequestReviewComment": [...]};
+        malformed or EMPTY entries are ignored — an empty field set
         means "unknown", never "the type has no fields", so a corrupt meta
         row degrades to no-capabilities (full field set) rather than
         stripping the query down to databaseId alone."""
         parsed: dict[str, set[str]] = {}
-        for type_name in ("Issue", "PullRequest"):
+        for type_name in ("Issue", "PullRequest", "IssueComment", "PullRequestReviewComment"):
             fields = caps.get(type_name) if isinstance(caps, dict) else None
             # The probe path passes sets, the meta-cache path passes lists
             # (JSON round-trip): accept any non-string collection, but every
@@ -402,7 +435,10 @@ class GraphQLSource(GhApiSource):
 
         Without capabilities the full historical field set is rendered. With
         them, every block whose lead field the schema lacks is dropped and
-        its name recorded in omitted_fields."""
+        its name recorded in omitted_fields. Comment-scope fields
+        (authorAssociation, issue #24) are gated per COMMENT type: a probe
+        that knows the comment type and lacks the field strips the line from
+        the comment blocks; an unknown comment type fails open."""
         if kind == "pr":
             blocks, lead = _PULL_TYPE_BLOCKS, _PULL_FIELDS
         else:
@@ -415,9 +451,23 @@ class GraphQLSource(GhApiSource):
             # The probe reported nothing for this type: unknown, not absent —
             # fail open to the full selection (issue #23).
             return lead
+        issue_comment_caps = caps.get("IssueComment")
+        strip_issue = (
+            issue_comment_caps is not None
+            and "authorAssociation" not in issue_comment_caps
+        )
+        review_comment_caps = caps.get("PullRequestReviewComment")
+        strip_review = (
+            review_comment_caps is not None
+            and "authorAssociation" not in review_comment_caps
+        )
         parts = ["databaseId"]
         for field, block in blocks:
             if field in present:
+                if strip_issue and block is _ISSUE_COMMENT_NODES:
+                    block = block.replace("    authorAssociation\n", "")
+                elif strip_review and block is _REVIEW_NODES:
+                    block = block.replace("        authorAssociation\n", "")
                 parts.append(block)
             else:
                 self.omitted_fields.append(field)
@@ -743,21 +793,7 @@ class GraphQLSource(GhApiSource):
         # writing [] would present a silently empty page as complete.
         if node.get("comments") is not None:
             comments, comments_more = _connection(node.get("comments"))
-            children["issue_comments"] = [
-                {
-                    "id": c.get("databaseId"),
-                    "body": c.get("body"),
-                    "user": {
-                        "login": (c.get("author") or {}).get("login"),
-                        "html_url": (c.get("author") or {}).get("url"),
-                    },
-                    "created_at": c.get("createdAt"),
-                    "updated_at": c.get("updatedAt"),
-                    "html_url": c.get("url"),
-                    "in_reply_to_id": None,
-                }
-                for c in comments
-            ]
+            children["issue_comments"] = [_comment_payload(c) for c in comments]
             if comments_more:
                 children["issue_comments_incomplete"] = True
 
@@ -781,18 +817,9 @@ class GraphQLSource(GhApiSource):
             review_payloads = [_connection(r.get("comments")) for r in review_nodes]
             review_comments = [c for payload, _ in review_payloads for c in payload]
             children["review_comments"] = [
-                {
-                    "id": c.get("databaseId"),
-                    "body": c.get("body"),
-                    "user": {
-                        "login": (c.get("author") or {}).get("login"),
-                        "html_url": (c.get("author") or {}).get("url"),
-                    },
-                    "created_at": c.get("createdAt"),
-                    "updated_at": c.get("updatedAt"),
-                    "html_url": c.get("url"),
-                    "in_reply_to_id": ((c.get("replyTo") or {}).get("databaseId")),
-                }
+                _comment_payload(
+                    c, in_reply_to_id=(c.get("replyTo") or {}).get("databaseId")
+                )
                 for c in review_comments
             ]
             # Reviews beyond the first page never had their comments
@@ -836,7 +863,7 @@ class GraphQLSource(GhApiSource):
                 merged_by.get("login") if isinstance(merged_by, dict) else None
             )
             closing_refs, closing_more = _connection(node.get("closingIssuesReferences"))
-            children["pull"] = {
+            pull_payload = {
                 "additions": node.get("additions"),
                 "deletions": node.get("deletions"),
                 "changed_files": node.get("changedFiles"),
@@ -855,6 +882,19 @@ class GraphQLSource(GhApiSource):
                     for ref in closing_refs
                 ],
             }
+            # Presence-preserving emission (issue #24): the pull-owned
+            # ABSENT-merge columns must only see a key the node actually
+            # carried. A capability-masked selection leaves the field out of
+            # the node; emitting the REST key with null here would convert
+            # "unknown" into explicit-null clearing of a stored value.
+            for graphql_field, rest_key in (
+                ("mergedAt", "merged_at"),
+                ("mergeCommit", "merge_commit_sha"),
+                ("mergedBy", "merged_by"),
+            ):
+                if graphql_field not in node:
+                    pull_payload.pop(rest_key, None)
+            children["pull"] = pull_payload
             if closing_more:
                 children["closing_refs_incomplete"] = True
 

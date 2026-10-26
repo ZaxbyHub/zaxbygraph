@@ -21,8 +21,31 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",
     },
+    "assignees": {
+        "login": "One row per listing-payload assignee; item-scoped, replaced with the other children on every re-ingest",
+    },
+    "issue_field_values": {
+        "field_name": "One row per listing-payload custom field entry ({name, value}); item-scoped, replaced with the other children on every re-ingest",
+        "value": "Stringified payload value; NULL when the entry carried an explicit null",
+    },
     "items": {
         "id": "Comes from the issues-list payload; never overwritten by the /pulls merge",
+        "reactions_total": "v7, listing-owned (reactions.total_count). Re-ingest from a source without the key preserves the stored value; a key present with JSON null clears it. NULL on rows whose last payload predated v7 (see status coverage null_v7_rows)",
+        "milestone": "v7, listing-owned (milestone.title); same ABSENT/present-null rule as reactions_total",
+        "item_type": "v7, listing-owned (type.name); same ABSENT/present-null rule",
+        "sub_issues_total": "v7, listing-owned (sub_issues_summary.total); PR rows never carry the summaries in the listing payload, so this stays NULL for them",
+        "sub_issues_completed": "v7, listing-owned (sub_issues_summary.completed)",
+        "dependencies_blocked_by": "v7, listing-owned (issue_dependencies_summary.blocked_by) - the OPEN count; the link relations themselves are issue #27's scope",
+        "dependencies_blocking": "v7, listing-owned (issue_dependencies_summary.blocking) - the OPEN count",
+        "dependencies_total_blocked_by": "v7, listing-owned (issue_dependencies_summary.total_blocked_by) - kept distinct from the open count",
+        "dependencies_total_blocking": "v7, listing-owned (issue_dependencies_summary.total_blocking)",
+        "author_association": "v7, listing-owned (the item row's own author_association)",
+        "merged_by": "v7, pull-owned (/pulls merged_by login). A listing-only re-ingest preserves it - the AC3 COALESCE-on-absent rule reproduced on merge_commit before v7",
+        "comment_count": "v7, DERIVED: the stored-row count of comments for the item, recomputed on every ingest and by the migration - not a payload field",
+        "paths_text": "v7, DERIVED: space-joined pr_files paths (ORDER BY path), recomputed on every ingest - the search surface for touched paths, weighted below title/body",
+    },
+    "comments": {
+        "author_association": "v7. REST supplies it natively; GraphQL maps authorAssociation when the capability probe reports the field. A probe-degraded re-ingest preserves the stored value via the pre-replacement snapshot",
     },
     "sync_state": {
         "issues_since": "Watermark passed back verbatim and inclusive; never adjusted",

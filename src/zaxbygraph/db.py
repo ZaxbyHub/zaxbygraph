@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
 
-from zaxbygraph.extract import CLOSES_REF_MARKER, merge_evidence
+from zaxbygraph.extract import (
+    CLOSES_REF_MARKER,
+    merge_evidence,
+)
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 6
+CURRENT_USER_VERSION = 7
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -591,6 +595,262 @@ def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
     )
 
 
+#: v7 FTS objects (issue #24): items_fts gains the paths_text column,
+#: reviews_fts is new. Kept as individual statements — NEVER `executescript`
+#: (see _FTS_PORTER_STATEMENTS for the implicit-COMMIT rationale). The v3
+#: tuple above stays untouched at the v3 shape because migrate_v2_to_v3 runs
+#: before v7 on the migration chain.
+_V7_FTS_STATEMENTS = (
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
+        title,
+        body,
+        labels_text,
+        paths_text,
+        tokenize = 'porter unicode61',
+        content='items',
+        content_rowid='id'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
+        INSERT INTO items_fts(rowid, title, body, labels_text, paths_text)
+        VALUES (new.id, new.title, new.body, new.labels_text, new.paths_text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, body, labels_text, paths_text)
+        VALUES ('delete', old.id, old.title, old.body, old.labels_text, old.paths_text);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
+        INSERT INTO items_fts(items_fts, rowid, title, body, labels_text, paths_text)
+        VALUES ('delete', old.id, old.title, old.body, old.labels_text, old.paths_text);
+        INSERT INTO items_fts(rowid, title, body, labels_text, paths_text)
+        VALUES (new.id, new.title, new.body, new.labels_text, new.paths_text);
+    END
+    """,
+    """
+    CREATE VIRTUAL TABLE IF NOT EXISTS reviews_fts USING fts5(
+        body,
+        tokenize = 'porter unicode61',
+        content='reviews',
+        content_rowid='id'
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS reviews_ai AFTER INSERT ON reviews BEGIN
+        INSERT INTO reviews_fts(rowid, body) VALUES (new.id, new.body);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS reviews_ad AFTER DELETE ON reviews BEGIN
+        INSERT INTO reviews_fts(reviews_fts, rowid, body)
+        VALUES ('delete', old.id, old.body);
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS reviews_au AFTER UPDATE ON reviews BEGIN
+        INSERT INTO reviews_fts(reviews_fts, rowid, body)
+        VALUES ('delete', old.id, old.body);
+        INSERT INTO reviews_fts(rowid, body) VALUES (new.id, new.body);
+    END
+    """,
+)
+
+#: (table, column, ALTER suffix) for the v7 payload-signal columns. The
+#: derived pair carry NOT NULL DEFAULTs so the guarded ALTER is legal on a
+#: populated v6 table; the backfill fills them from stored state.
+_V7_ITEM_COLUMNS = (
+    ("reactions_total", "INTEGER"),
+    ("milestone", "TEXT"),
+    ("item_type", "TEXT"),
+    ("sub_issues_total", "INTEGER"),
+    ("sub_issues_completed", "INTEGER"),
+    ("dependencies_blocked_by", "INTEGER"),
+    ("dependencies_blocking", "INTEGER"),
+    ("dependencies_total_blocked_by", "INTEGER"),
+    ("dependencies_total_blocking", "INTEGER"),
+    ("author_association", "TEXT"),
+    ("merged_by", "TEXT"),
+    ("merge_commit", None),
+    ("merged_at", None),
+    ("comment_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("paths_text", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _existing_row_v7(conn: sqlite3.Connection, repo: str, number: int, item_id: int):
+    """The stored row's ABSENT-mergeable columns as a dict, resolving both
+    conflict identities: (repo, number) first, then id (upsert_item_row
+    carries two ON CONFLICT arms)."""
+    row = conn.execute(
+        "SELECT merged_by, merge_commit, merged_at FROM items"
+        " WHERE repo = ? AND number = ?",
+        (repo, number),
+    ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT merged_by, merge_commit, merged_at FROM items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+    return None if row is None else {k: row[k] for k in row.keys()}
+
+
+def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
+    """v6 -> v7: payload signals become queryable columns, review bodies and
+    changed paths join search (issue #24).
+
+    Guarded ALTERs (fresh databases already carry the columns via
+    schema.sql), new child tables, a Python-`json` backfill from stored
+    `raw_json` (no SQLite JSON functions: the supported floor 3.35 predates
+    guaranteed JSON1), and full rebuilds of items_fts (4 columns) and
+    reviews_fts — creating an external-content FTS never indexes rows the
+    store already holds. Every statement is per-statement `execute` (see
+    _FTS_PORTER_STATEMENTS for why executescript is forbidden). No-op-safe
+    on a fresh database.
+    """
+    from zaxbygraph.extract import (
+        extract_listing_signals,
+        extract_pull_owned,
+        merge_absent,
+    )
+
+    for column, suffix in _V7_ITEM_COLUMNS:
+        if column in ("merge_commit", "merged_at"):
+            continue  # pre-existing columns; nothing to ALTER
+        if not _column_exists(conn, "items", column):
+            conn.execute(f"ALTER TABLE items ADD COLUMN {column} {suffix}")
+    if not _column_exists(conn, "comments", "author_association"):
+        conn.execute("ALTER TABLE comments ADD COLUMN author_association TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS assignees ("
+        "repo TEXT NOT NULL, number INTEGER NOT NULL, login TEXT NOT NULL,"
+        " PRIMARY KEY (repo, number, login))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS issue_field_values ("
+        "repo TEXT NOT NULL, number INTEGER NOT NULL, field_name TEXT NOT NULL,"
+        " value TEXT, PRIMARY KEY (repo, number, field_name))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assignees_item ON assignees(repo, number)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_issue_field_values_item"
+        " ON issue_field_values(repo, number)"
+    )
+
+    # Backfill items from the stored (merged) payload. Keys absent from an
+    # old payload stay NULL (AC2); the pull-owned trio uses the same
+    # ABSENT-merge rule as ingest so a stored value never regresses.
+    for row in conn.execute(
+        "SELECT repo, number, id, raw_json FROM items"
+    ).fetchall():
+        raw = json.loads(row["raw_json"])
+        values = merge_absent(extract_listing_signals(raw), {})
+        pull_values = merge_absent(
+            extract_pull_owned(raw),
+            _existing_row_v7(conn, row["repo"], row["number"], row["id"]) or {},
+        )
+        values.update(pull_values)
+        conn.execute(
+            "UPDATE items SET reactions_total = ?, milestone = ?, item_type = ?,"
+            " sub_issues_total = ?, sub_issues_completed = ?,"
+            " dependencies_blocked_by = ?, dependencies_blocking = ?,"
+            " dependencies_total_blocked_by = ?, dependencies_total_blocking = ?,"
+            " author_association = ?, merged_by = ? WHERE id = ?",
+            (
+                values["reactions_total"],
+                values["milestone"],
+                values["item_type"],
+                values["sub_issues_total"],
+                values["sub_issues_completed"],
+                values["dependencies_blocked_by"],
+                values["dependencies_blocking"],
+                values["dependencies_total_blocked_by"],
+                values["dependencies_total_blocking"],
+                values["author_association"],
+                values["merged_by"],
+                row["id"],
+            ),
+        )
+        for assignee in raw.get("assignees") or []:
+            login = assignee.get("login") if isinstance(assignee, dict) else assignee
+            if login:
+                conn.execute(
+                    "INSERT OR IGNORE INTO assignees(repo, number, login)"
+                    " VALUES (?, ?, ?)",
+                    (row["repo"], row["number"], str(login)),
+                )
+        for field in raw.get("issue_field_values") or []:
+            if isinstance(field, dict) and field.get("name") is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO issue_field_values"
+                    "(repo, number, field_name, value) VALUES (?, ?, ?, ?)",
+                    (
+                        row["repo"],
+                        row["number"],
+                        str(field["name"]),
+                        None if field.get("value") is None else str(field["value"]),
+                    ),
+                )
+
+    # Derived columns and comment provenance (table-derived, not payload).
+    for assignee_row in conn.execute(
+        "SELECT repo, number, COUNT(*) AS n FROM comments GROUP BY repo, number"
+    ).fetchall():
+        conn.execute(
+            "UPDATE items SET comment_count = ? WHERE repo = ? AND number = ?",
+            (assignee_row["n"], assignee_row["repo"], assignee_row["number"]),
+        )
+    for comment_row in conn.execute(
+        "SELECT pk, raw_json FROM comments WHERE author_association IS NULL"
+    ).fetchall():
+        raw = json.loads(comment_row["raw_json"])
+        value = raw.get("author_association")
+        if value is not None:
+            conn.execute(
+                "UPDATE comments SET author_association = ? WHERE pk = ?",
+                (value, comment_row["pk"]),
+            )
+    for item_row in conn.execute(
+        "SELECT repo, number, kind FROM items WHERE kind = 'pr'"
+    ).fetchall():
+        paths = [
+            r["path"]
+            for r in conn.execute(
+                "SELECT path FROM pr_files WHERE repo = ? AND number = ?"
+                " ORDER BY path",
+                (item_row["repo"], item_row["number"]),
+            ).fetchall()
+        ]
+        conn.execute(
+            "UPDATE items SET paths_text = ? WHERE repo = ? AND number = ?",
+            (" ".join(paths), item_row["repo"], item_row["number"]),
+        )
+
+    # Full FTS rebuilds: drop-and-recreate, then the 'rebuild' command
+    # repopulates each external-content index from its content table.
+    for trigger in (
+        "items_ai",
+        "items_ad",
+        "items_au",
+        "reviews_ai",
+        "reviews_ad",
+        "reviews_au",
+    ):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    conn.execute("DROP TABLE IF EXISTS items_fts")
+    conn.execute("DROP TABLE IF EXISTS reviews_fts")
+    for statement in _V7_FTS_STATEMENTS:
+        conn.execute(statement)
+    conn.execute("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
+    conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -599,6 +859,7 @@ MIGRATIONS = [
     (4, migrate_v3_to_v4),
     (5, migrate_v4_to_v5),
     (6, migrate_v5_to_v6),
+    (7, migrate_v6_to_v7),
 ]
 
 

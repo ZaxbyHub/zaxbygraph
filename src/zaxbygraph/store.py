@@ -15,7 +15,10 @@ from zaxbygraph.extract import (
     edges_from_pr_state,
     edges_from_review,
     edges_from_timeline,
+    extract_listing_signals,
+    extract_pull_owned,
     item_kind,
+    merge_absent,
     merge_evidence,
     revert_title_variants,
 )
@@ -65,6 +68,30 @@ def replace_item_children(conn: sqlite3.Connection, repo: str, number: int) -> N
     conn.execute("DELETE FROM comments WHERE repo = ? AND number = ?", (repo, number))
     conn.execute("DELETE FROM reviews WHERE repo = ? AND number = ?", (repo, number))
     conn.execute("DELETE FROM pr_files WHERE repo = ? AND number = ?", (repo, number))
+    conn.execute("DELETE FROM assignees WHERE repo = ? AND number = ?", (repo, number))
+    conn.execute(
+        "DELETE FROM issue_field_values WHERE repo = ? AND number = ?", (repo, number)
+    )
+
+
+def snapshot_comment_associations(
+    conn: sqlite3.Connection, repo: str, number: int
+) -> tuple[dict, dict]:
+    """Per-kind `{github_id: author_association}` maps for this item's stored
+    comments, taken BEFORE replace_item_children deletes them. The two comment
+    kinds have separate ID spaces (UNIQUE(repo, kind, github_id)), so one map
+    per kind; a probe-degraded re-ingest resolves absent payload keys against
+    the map instead of losing the REST-native value."""
+    maps: tuple[dict, dict] = ({}, {})
+    for index, kind in enumerate(("issue_comment", "review_comment")):
+        for row in conn.execute(
+            "SELECT github_id, author_association FROM comments"
+            " WHERE repo = ? AND number = ? AND kind = ?"
+            " AND author_association IS NOT NULL",
+            (repo, number, kind),
+        ):
+            maps[index][row["github_id"]] = row["author_association"]
+    return maps
 
 
 def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None:
@@ -151,19 +178,76 @@ def insert_edge(conn: sqlite3.Connection, repo: str, edge: tuple) -> None:
     )
 
 
-def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -> None:
+#: The v7 payload-sourced columns written from source-owned extraction. Both
+#: ON CONFLICT arms receive the same Python-merged values, so these stay
+#: plain assignments (the ABSENT/present-null resolution happened above them,
+#: against the stored row).
+_V7_MERGEABLE_COLUMNS = (
+    "reactions_total",
+    "milestone",
+    "item_type",
+    "sub_issues_total",
+    "sub_issues_completed",
+    "dependencies_blocked_by",
+    "dependencies_blocking",
+    "dependencies_total_blocked_by",
+    "dependencies_total_blocking",
+    "author_association",
+    "merged_by",
+    "merge_commit",
+    "merged_at",
+)
+
+
+def upsert_item_row(
+    conn: sqlite3.Connection,
+    repo: str,
+    raw: dict,
+    kind: str,
+    *,
+    list_raw: dict | None = None,
+    pull_raw: dict | None = None,
+) -> None:
     user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
     author = user.get("login") if user else None
     upsert_actor(conn, author, user.get("html_url") if user else None)
     base = raw.get("base") if isinstance(raw.get("base"), dict) else {}
     head = raw.get("head") if isinstance(raw.get("head"), dict) else {}
+    # Source-owned extraction (issue #24): listing signals come from the
+    # listing payload only, the pull trio from the pull payload only, so a
+    # sibling source can never overwrite — or, via ABSENT-merge, null — the
+    # other's values. A key present even with JSON null clears the column;
+    # an absent key preserves the stored value; first sight stores None.
+    listing_source = raw if list_raw is None else list_raw
+    pull_source = raw if pull_raw is None else pull_raw
+    extracted = extract_listing_signals(listing_source)
+    extracted.update(extract_pull_owned(pull_source))
+    existing = conn.execute(
+        "SELECT {} FROM items WHERE repo = ? AND number = ?".format(
+            ", ".join(_V7_MERGEABLE_COLUMNS)
+        ),
+        (repo, int(raw["number"])),
+    ).fetchone()
+    if existing is None:
+        existing = conn.execute(
+            "SELECT {} FROM items WHERE id = ?".format(
+                ", ".join(_V7_MERGEABLE_COLUMNS)
+            ),
+            (int(raw["id"]),),
+        ).fetchone()
+    v7_values = merge_absent(
+        extracted, dict(zip(_V7_MERGEABLE_COLUMNS, tuple(existing))) if existing else {}
+    )
     conn.execute(
         """
         INSERT INTO items(
             id, repo, number, kind, node_id, title, body, labels_text, state, state_reason,
             author, created_at, updated_at, closed_at, merged_at, merge_commit, draft, locked,
-            base_ref, head_ref, additions, deletions, changed_files, commits, html_url, api_url, raw_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            base_ref, head_ref, additions, deletions, changed_files, commits, html_url, api_url,
+            reactions_total, milestone, item_type, sub_issues_total, sub_issues_completed,
+            dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by,
+            dependencies_total_blocking, author_association, merged_by, raw_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
             repo=excluded.repo, number=excluded.number, kind=excluded.kind, node_id=excluded.node_id,
             title=excluded.title, body=excluded.body, labels_text=excluded.labels_text,
@@ -173,7 +257,16 @@ def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -
             locked=excluded.locked, base_ref=excluded.base_ref, head_ref=excluded.head_ref,
             additions=excluded.additions, deletions=excluded.deletions,
             changed_files=excluded.changed_files, commits=excluded.commits,
-            html_url=excluded.html_url, api_url=excluded.api_url, raw_json=excluded.raw_json
+            html_url=excluded.html_url, api_url=excluded.api_url,
+            reactions_total=excluded.reactions_total, milestone=excluded.milestone,
+            item_type=excluded.item_type, sub_issues_total=excluded.sub_issues_total,
+            sub_issues_completed=excluded.sub_issues_completed,
+            dependencies_blocked_by=excluded.dependencies_blocked_by,
+            dependencies_blocking=excluded.dependencies_blocking,
+            dependencies_total_blocked_by=excluded.dependencies_total_blocked_by,
+            dependencies_total_blocking=excluded.dependencies_total_blocking,
+            author_association=excluded.author_association, merged_by=excluded.merged_by,
+            raw_json=excluded.raw_json
         ON CONFLICT(repo, number) DO UPDATE SET
             id=excluded.id, kind=excluded.kind, node_id=excluded.node_id,
             title=excluded.title, body=excluded.body, labels_text=excluded.labels_text,
@@ -183,7 +276,16 @@ def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -
             locked=excluded.locked, base_ref=excluded.base_ref, head_ref=excluded.head_ref,
             additions=excluded.additions, deletions=excluded.deletions,
             changed_files=excluded.changed_files, commits=excluded.commits,
-            html_url=excluded.html_url, api_url=excluded.api_url, raw_json=excluded.raw_json
+            html_url=excluded.html_url, api_url=excluded.api_url,
+            reactions_total=excluded.reactions_total, milestone=excluded.milestone,
+            item_type=excluded.item_type, sub_issues_total=excluded.sub_issues_total,
+            sub_issues_completed=excluded.sub_issues_completed,
+            dependencies_blocked_by=excluded.dependencies_blocked_by,
+            dependencies_blocking=excluded.dependencies_blocking,
+            dependencies_total_blocked_by=excluded.dependencies_total_blocked_by,
+            dependencies_total_blocking=excluded.dependencies_total_blocking,
+            author_association=excluded.author_association, merged_by=excluded.merged_by,
+            raw_json=excluded.raw_json
         """,
         (
             int(raw["id"]),
@@ -200,8 +302,8 @@ def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -
             raw.get("created_at"),
             raw.get("updated_at"),
             raw.get("closed_at"),
-            raw.get("merged_at"),
-            (raw.get("merge_commit_sha") or "").strip() or None,
+            v7_values["merged_at"],
+            v7_values["merge_commit"],
             1 if raw.get("draft") else 0,
             1 if raw.get("locked") else 0,
             base.get("ref") if base else None,
@@ -212,6 +314,17 @@ def upsert_item_row(conn: sqlite3.Connection, repo: str, raw: dict, kind: str) -
             raw.get("commits"),
             raw.get("html_url"),
             raw.get("url"),
+            v7_values["reactions_total"],
+            v7_values["milestone"],
+            v7_values["item_type"],
+            v7_values["sub_issues_total"],
+            v7_values["sub_issues_completed"],
+            v7_values["dependencies_blocked_by"],
+            v7_values["dependencies_blocking"],
+            v7_values["dependencies_total_blocked_by"],
+            v7_values["dependencies_total_blocking"],
+            v7_values["author_association"],
+            v7_values["merged_by"],
             _dumps(raw),
         ),
     )
@@ -240,7 +353,13 @@ def insert_comments(
     number: int,
     comments: Iterable[dict],
     kind: str,
+    associations: dict | None = None,
 ) -> None:
+    """Insert one comment kind. `associations` maps github_id -> a stored
+    author_association from the pre-replacement snapshot; a payload that
+    carries the key wins (even explicit null), an absent key falls back to
+    the snapshot so a probe-degraded re-ingest never loses the REST-native
+    value (issue #24 AC7 + critic round 1 blocker 3)."""
     for rec in comments:
         gid = rec.get("id")
         if gid is None:
@@ -251,14 +370,19 @@ def insert_comments(
             author,
             (rec.get("user") or {}).get("html_url") if isinstance(rec.get("user"), dict) else None,
         )
+        if "author_association" in rec:
+            association = rec.get("author_association")
+        else:
+            association = (associations or {}).get(int(gid))
         conn.execute(
             """
             INSERT INTO comments(
-                github_id, repo, number, kind, author, created_at, updated_at,
-                body, html_url, in_reply_to, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                github_id, repo, number, kind, author, author_association,
+                created_at, updated_at, body, html_url, in_reply_to, raw_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(repo, kind, github_id) DO UPDATE SET
                 number=excluded.number, author=excluded.author,
+                author_association=excluded.author_association,
                 created_at=excluded.created_at, updated_at=excluded.updated_at,
                 body=excluded.body, html_url=excluded.html_url,
                 in_reply_to=excluded.in_reply_to, raw_json=excluded.raw_json
@@ -269,12 +393,48 @@ def insert_comments(
                 number,
                 kind,
                 author,
+                association,
                 rec.get("created_at"),
                 rec.get("updated_at"),
                 rec.get("body"),
                 rec.get("html_url"),
                 rec.get("in_reply_to_id"),
                 _dumps(rec),
+            ),
+        )
+
+
+def insert_assignees(
+    conn: sqlite3.Connection, repo: str, number: int, raw: dict
+) -> None:
+    """Listing-payload assignees (issue #24 AC1); PK-dedup keeps duplicate
+    payload entries idempotent."""
+    for assignee in raw.get("assignees") or []:
+        login = assignee.get("login") if isinstance(assignee, dict) else assignee
+        if not login:
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO assignees(repo, number, login) VALUES (?, ?, ?)",
+            (repo, number, str(login)),
+        )
+
+
+def insert_issue_field_values(
+    conn: sqlite3.Connection, repo: str, number: int, raw: dict
+) -> None:
+    """Listing-payload custom issue field values (issue #24 AC1); the item
+    PK makes duplicate payload entries idempotent."""
+    for field in raw.get("issue_field_values") or []:
+        if not isinstance(field, dict) or field.get("name") is None:
+            continue
+        conn.execute(
+            "INSERT OR REPLACE INTO issue_field_values"
+            "(repo, number, field_name, value) VALUES (?, ?, ?, ?)",
+            (
+                repo,
+                number,
+                str(field["name"]),
+                None if field.get("value") is None else str(field["value"]),
             ),
         )
 
@@ -656,13 +816,42 @@ def ingest_item(
                 merged[key] = value
     kind = item_kind(merged)
     number = int(merged["number"])
+    # Snapshot before replacement: replace_item_children deletes the stored
+    # comment rows, and a probe-degraded re-ingest must not lose the
+    # REST-native author_association values (issue #24).
+    issue_associations, review_associations = snapshot_comment_associations(
+        conn, repo, number
+    )
     replace_item_children(conn, repo, number)
-    upsert_item_row(conn, repo, merged, kind)
+    upsert_item_row(conn, repo, merged, kind, list_raw=list_raw, pull_raw=pull_raw)
     insert_labels(conn, repo, number, merged)
-    insert_comments(conn, repo, number, issue_comments, "issue_comment")
-    insert_comments(conn, repo, number, review_comments, "review_comment")
+    insert_comments(
+        conn, repo, number, issue_comments, "issue_comment", issue_associations
+    )
+    insert_comments(
+        conn, repo, number, review_comments, "review_comment", review_associations
+    )
+    # Derived column: the stored-row count, immune to duplicate pagination
+    # collapse and ID-less skips (issue #24; maintained post-child).
+    conn.execute(
+        "UPDATE items SET comment_count ="
+        " (SELECT COUNT(*) FROM comments WHERE repo = ? AND number = ?)"
+        " WHERE repo = ? AND number = ?",
+        (repo, number, repo, number),
+    )
+    insert_assignees(conn, repo, number, list_raw)
+    insert_issue_field_values(conn, repo, number, list_raw)
     insert_reviews(conn, repo, number, reviews)
     insert_pr_files(conn, repo, number, files, include_patches)
+    # Derived column: paths_text mirrors pr_files truth exactly (issue #24
+    # AC5) — an emptied files section empties it too, deterministic order.
+    conn.execute(
+        "UPDATE items SET paths_text = COALESCE(("
+        "SELECT group_concat(path, ' ') FROM ("
+        "SELECT path FROM pr_files WHERE repo = ? AND number = ? ORDER BY path)"
+        "), '') WHERE repo = ? AND number = ?",
+        (repo, number, repo, number),
+    )
     rebuild_edges(
         conn,
         repo,

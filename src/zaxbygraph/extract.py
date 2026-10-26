@@ -436,3 +436,128 @@ def revert_title_variants(target_title: str) -> tuple[str, str]:
     edge is order-independent, mirroring the merge-close symmetry."""
     quoted = f'{_REVERT_TITLE_PREFIX}{target_title}"'
     return quoted, f"{_REVERT_TITLE_PREFIX}{target_title}"
+
+
+# ==== issue #24 payload-signal extraction ===================================
+#
+# The v7 columns are source-owned: the listing-owned signals extract from the
+# /issues listing payload only, the pull-owned ones from the /pulls payload
+# only. Extraction distinguishes ABSENT KEY (the source does not carry the
+# field -- a later re-ingest must preserve the stored value) from a key
+# present with JSON null (the source says the value is cleared).
+
+
+class _Absent:
+    """Marker for 'this payload does not carry the key' (never a value)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ABSENT"
+
+
+ABSENT = _Absent()
+
+
+def _object_field(value: object, field: str):
+    return value.get(field) if isinstance(value, dict) else None
+
+
+def _login_of(value: object):
+    if isinstance(value, dict):
+        return value.get("login")
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _merge_commit_of(value: object):
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+
+#: (column, payload key, optional value transform) for the listing-owned v7
+#: columns. Keyed by the live /issues listing payload shapes (02 P2 probe).
+LISTING_SIGNAL_EXTRACTIONS = (
+    ("reactions_total", "reactions", lambda v: _object_field(v, "total_count")),
+    ("milestone", "milestone", lambda v: _object_field(v, "title")),
+    ("item_type", "type", lambda v: _object_field(v, "name")),
+    ("sub_issues_total", "sub_issues_summary", lambda v: _object_field(v, "total")),
+    (
+        "sub_issues_completed",
+        "sub_issues_summary",
+        lambda v: _object_field(v, "completed"),
+    ),
+    (
+        "dependencies_blocked_by",
+        "issue_dependencies_summary",
+        lambda v: _object_field(v, "blocked_by"),
+    ),
+    (
+        "dependencies_blocking",
+        "issue_dependencies_summary",
+        lambda v: _object_field(v, "blocking"),
+    ),
+    (
+        "dependencies_total_blocked_by",
+        "issue_dependencies_summary",
+        lambda v: _object_field(v, "total_blocked_by"),
+    ),
+    (
+        "dependencies_total_blocking",
+        "issue_dependencies_summary",
+        lambda v: _object_field(v, "total_blocking"),
+    ),
+    ("author_association", "author_association", None),
+)
+
+#: Pull-owned v7 columns (issue #24 AC3: the reproduced defect was a listing
+#: re-ingest nulling pull-only values; merge_commit/merged_at join merged_by).
+PULL_OWNED_EXTRACTIONS = (
+    ("merged_by", "merged_by", _login_of),
+    ("merge_commit", "merge_commit_sha", _merge_commit_of),
+    ("merged_at", "merged_at", None),
+)
+
+
+def _signal(raw: dict, key: str, transform):
+    if key not in raw:
+        return ABSENT
+    value = raw[key]
+    if value is None:
+        return None
+    if transform is not None:
+        return transform(value)
+    return value
+
+
+def extract_listing_signals(raw: dict) -> dict:
+    """Listing-owned v7 column values; ABSENT when the payload lacks the key."""
+    return {
+        column: _signal(raw, key, transform)
+        for column, key, transform in LISTING_SIGNAL_EXTRACTIONS
+    }
+
+
+def extract_pull_owned(raw: dict) -> dict:
+    """Pull-owned v7 column values; ABSENT when the payload lacks the key."""
+    return {
+        column: _signal(raw, key, transform)
+        for column, key, transform in PULL_OWNED_EXTRACTIONS
+    }
+
+
+def merge_absent(extracted: dict, existing: dict) -> dict:
+    """Resolve ABSENT entries against the stored row (first sight -> None).
+
+    A key present in the payload wins even when its JSON value is null
+    (clearing); a key the payload does not carry keeps the stored value so a
+    narrower sibling source cannot null it (AC3 / claim 5)."""
+    resolved = {}
+    for column, value in extracted.items():
+        if value is ABSENT:
+            resolved[column] = existing.get(column) if existing else None
+        else:
+            resolved[column] = value
+    return resolved
