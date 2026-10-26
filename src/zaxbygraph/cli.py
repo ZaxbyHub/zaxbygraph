@@ -1172,7 +1172,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.set_defaults(func=_sync_entry)
 
-    sp = sub.add_parser("status", help="Counts and watermark (no bodies)")
+    sp = sub.add_parser(
+        "status",
+        help="Counts, watermark and corpus coverage (no bodies)",
+    )
     add_common(sp)
     sp.set_defaults(func=cmd_status)
 

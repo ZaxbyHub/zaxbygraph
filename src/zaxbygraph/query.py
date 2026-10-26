@@ -87,15 +87,17 @@ def _fold_repo(repo: str | None) -> str | None:
 
 
 #: items columns whose NULL marks a pre-v7 (stale-payload) row. Restricted to
-#: the signals every current-era listing payload carries: PR rows never carry
-#: the two summaries (issue #24 claim 2) and the pull trio is legitimately
-#: NULL for unmerged PRs, so counting those would mark every PR as uncovered
-#: (cubic review CUB-3). The derived pair comment_count/paths_text are NOT
-#: NULL by schema and never contribute.
+#: the two signals GitHub's listing payload ALWAYS carries with a non-null
+#: value (`reactions.total_count` is an object field, `author_association` a
+#: string — "NONE" among them), so their NULL unambiguously dates the payload
+#: to before v7. milestone/item_type are excluded because present-null is
+#: legitimate current state (unmilestoned/untyped issues); the dependency
+#: summaries are excluded because PR rows never carry them; the pull trio is
+#: excluded because it is NULL for unmerged PRs. Counting any of those would
+#: flag ordinary rows (cubic CUB-3 + review round 2). The derived pair
+#: comment_count/paths_text are NOT NULL by schema and never contribute.
 _COVERAGE_NULL_COLUMNS = (
     "reactions_total",
-    "milestone",
-    "item_type",
     "author_association",
 )
 
@@ -198,7 +200,8 @@ _SEARCH_MERGED = """
 """
 
 #: Review-body hits (issue #24 AC4) merge into the owning item like comment
-#: hits, with src = 2: MAX(src) stays truthy for the item-hit flag and the
+#: hits, with src = 2: has_item_hit is computed as MAX(CASE WHEN src = 1 …)
+#: so review-only hits skip the item-text snippet lookup, and the
 #: matching_comments count still tracks src = 0 only. Spliced into
 #: _SEARCH_MERGED only on v7 stores; a pre-v7 store has no reviews_fts and
 #: reads never migrate.

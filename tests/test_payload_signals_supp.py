@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, issue, pr_file, pull, review
+from fixtures import REPO, TempDBTest, issue, pr_file, pull, review
 from zaxbygraph import db, doctor
 from zaxbygraph import graphql as graphql_module
 from zaxbygraph.extract import extract_listing_signals, extract_pull_owned
@@ -949,6 +949,66 @@ class ConsolidationTests(unittest.TestCase):
         self.assertEqual(numbers, [91], "supp-v7: stale destination rows survived")
 
 
+class CoverageNullSemanticsTests(TempDBTest):
+    """null_v7_rows marks pre-v7 payloads, not ordinary current-era rows
+    (cubic CUB-3 + review round 2): the counting set is exactly the two
+    listing keys GitHub always carries with a non-null value."""
+
+    def _ingest(self, number, listing, pull_raw):
+        self.conn.execute("BEGIN")
+        ingest_item(
+            self.conn, REPO, listing, pull_raw=pull_raw,
+            issue_comments=[], review_comments=[], reviews=[], files=[],
+            include_patches=False,
+        )
+        self.conn.commit()
+
+    def test_ordinary_current_rows_are_not_flagged(self) -> None:
+        """An unmilestoned, untyped, unmerged PR — the most common ordinary
+        row, whose milestone/type/summaries/pull-trio are all legitimately
+        NULL — must not be counted (mutant: any broader counting set, incl.
+        the pre-CUB-3 set that counted the pull trio and the round-1 set
+        that counted milestone/item_type)."""
+        listing = issue(301, title="ordinary pr", body="", kind="pr")
+        listing["reactions"] = {"total_count": 0}
+        listing["author_association"] = "NONE"
+        # milestone/type/sub_issues_summary/issue_dependencies_summary and
+        # the pull trio are all absent-or-null exactly as GitHub ships them.
+        self.src.add_issue(listing)
+        self.src.add_pr(listing, pull(301), files=[])
+        self.sync()
+        self.assertEqual(
+            status(self.conn, REPO)["coverage"]["null_v7_rows"],
+            0,
+            "supp-v7: ordinary current-era row flagged as pre-v7",
+        )
+
+    def test_pre_v7_shaped_row_is_flagged(self) -> None:
+        """A row whose two marker columns are NULL (a payload that predated
+        v7, simulated directly) must be counted — the signal still bites
+        (mutant: an empty counting set)."""
+        listing = issue(302, title="current issue", body="", kind="issue")
+        listing["reactions"] = {"total_count": 2}
+        listing["author_association"] = "MEMBER"
+        self.src.add_issue(listing)
+        self.sync()
+        self.assertEqual(
+            status(self.conn, REPO)["coverage"]["null_v7_rows"],
+            0,
+            "supp-v7: current-era row miscounted",
+        )
+        self.conn.execute(
+            "UPDATE items SET reactions_total = NULL, author_association = NULL"
+            " WHERE number = 302"
+        )
+        self.conn.commit()
+        self.assertEqual(
+            status(self.conn, REPO)["coverage"]["null_v7_rows"],
+            1,
+            "supp-v7: pre-v7-shaped row not flagged",
+        )
+
+
 class VersionLiteralTests(unittest.TestCase):
     def test_version_literals_derive_from_constants(self) -> None:
         """The version-literal class is eradicated: the four files that
@@ -986,6 +1046,40 @@ class VersionLiteralTests(unittest.TestCase):
                 source,
                 f"supp-v7: {name} no longer references CURRENT_USER_VERSION",
             )
+
+    def test_version_literal_guard_detects_reintroduced_shapes(self) -> None:
+        """Self-test for the guard's own pattern (review round 2 finding 3):
+        the regex must match the two documented reintroduction shapes — the
+        int literal after a user_version fetch and the string literal "6"
+        after either fetch — and must NOT match the constant-derived shapes
+        (mutant: a pattern edit that silently loses detection, the exact
+        regression CUB-6 exposed)."""
+        pattern = re.compile(
+            r"(?:fetchone\(\)\[0\],\s*6\b"
+            r"|fetchone\(\)\[0\]\)\s*,\s*6\b"
+            r'|fetchone\(\)\[0\],\s*"6")'
+        )
+        self.assertIsNotNone(
+            pattern.search('self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)'),
+            "supp-v7: guard cannot detect the int-literal shape",
+        )
+        self.assertIsNotNone(
+            pattern.search(').fetchone()[0],\n            "6",'),
+            "supp-v7: guard cannot detect the string-literal shape",
+        )
+        self.assertIsNone(
+            pattern.search(
+                'self.assertEqual(\n'
+                '                conn.execute("PRAGMA user_version").fetchone()[0],\n'
+                "                CURRENT_USER_VERSION,\n"
+                "            )"
+            ),
+            "supp-v7: guard false-positives on the constant-derived shape",
+        )
+        self.assertIsNone(
+            pattern.search(").fetchone()[0],\n            SCHEMA_VERSION,\n"),
+            "supp-v7: guard false-positives on SCHEMA_VERSION",
+        )
 
 
 if __name__ == "__main__":

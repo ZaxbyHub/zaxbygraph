@@ -831,7 +831,7 @@ _CURSOR = {"type": "string", "description": "Opaque cursor from a previous trunc
 _TOOLS: list[dict] = [
     {
         "name": "graph_status",
-        "description": "Sync freshness, counts, and any running sync for the resolved repo (the status command, plus live sync progress)",
+        "description": "Sync freshness, counts, corpus coverage, and any running sync for the resolved repo (the status command, plus live sync progress)",
         "inputSchema": _schema(dict(_REPO_DB)),
     },
     {
