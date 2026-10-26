@@ -108,7 +108,9 @@ class ProbeTrailTests(TempDBTest):
                 "SELECT note FROM fetch_log WHERE resource = 'graphql_probe'"
             ).fetchall()
         ]
-        self.assertIn("omitted timelineItems", notes)
+        # exact: one row per omitted field, no spurious rows (a mutant that
+        # records omissions for fields it still selects would add rows here)
+        self.assertEqual(notes, ["omitted timelineItems"])
 
     def test_drop_note_recorded(self) -> None:
         """A section-scoped FORBIDDEN must leave a fetch_log note naming the
@@ -603,6 +605,88 @@ class ReplayFidelityTests(TempDBTest):
             self.assertEqual(items, 2)
         finally:
             replay_conn.close()
+
+
+class RestGetIssuesContractTests(unittest.TestCase):
+    """The PRODUCTION REST getter behind `sync --numbers` (final-critic MAJOR):
+    `GhApiSource.get_issues` payload/status mapping, mocked at `_api`."""
+
+    def _source(self):
+        from zaxbygraph.github import GhApiSource
+
+        return GhApiSource("acme", "forgegate")
+
+    def test_found_maps_to_payload_and_200(self) -> None:
+        payload = issue(7, title="seven", updated_at=ts(7))
+        with patch.object(type(self._source()), "_api", return_value=payload) as api:
+            out = self._source().get_issues([7])
+        api.assert_called_once_with("repos/acme/forgegate/issues/7")
+        self.assertEqual(out, {7: (payload, 200)})
+
+    def test_missing_maps_to_none_and_real_status(self) -> None:
+        from zaxbygraph.github import GitHubError
+
+        src = self._source()
+
+        def api(path):
+            raise GitHubError("HTTP 410 Gone", status=410)
+
+        with patch.object(type(src), "_api", side_effect=api):
+            out = src.get_issues([7])
+        self.assertEqual(out, {7: (None, 410)})
+
+    def test_non_dict_payload_is_unknown_not_404(self) -> None:
+        with patch.object(type(self._source()), "_api", return_value="null body"):
+            out = self._source().get_issues([7])
+        self.assertEqual(out, {7: (None, None)})
+
+    def test_other_errors_propagate(self) -> None:
+        from zaxbygraph.github import GitHubError
+
+        src = self._source()
+
+        def api(path):
+            raise GitHubError("HTTP 403 Forbidden (SSO)", status=403)
+
+        with patch.object(type(src), "_api", side_effect=api):
+            with self.assertRaises(GitHubError):
+                src.get_issues([7])
+
+
+class NumbersCliEdgeTests(TempDBTest):
+    """The `--numbers` parse edges at the real cmd_sync boundary
+    (final-critic MINOR 3): provided-but-empty, non-numeric, and the --force
+    combination all exit 2 before any store access."""
+
+    def _cmd(self, numbers, force=False):
+        from zaxbygraph.cli import cmd_sync
+
+        args = type(
+            "Args",
+            (),
+            {
+                "repo": REPO,
+                "db": str(self.db_path),
+                "force": force,
+                "include_patches": False,
+                "jsonl": None,
+                "jsonl_flag": False,
+                "format": "json",
+                "source": "graphql",
+                "wait": False,
+                "numbers": numbers,
+            },
+        )()
+        return cmd_sync(args)
+
+    def test_empty_string_exits_2(self) -> None:
+        self.assertEqual(self._cmd(""), 2)
+
+    def test_non_numeric_exits_2(self) -> None:
+        self.assertEqual(self._cmd("abc"), 2)
+
+    def test_force_combination_exits_2(self) -> None:
+        self.assertEqual(self._cmd("1,2", force=True), 2)
 
 
 if __name__ == "__main__":
