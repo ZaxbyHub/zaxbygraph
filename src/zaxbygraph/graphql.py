@@ -466,8 +466,16 @@ class GraphQLSource(GhApiSource):
             if field in present:
                 if strip_issue and block is _ISSUE_COMMENT_NODES:
                     block = block.replace("    authorAssociation\n", "")
+                    # Record the sub-block drop like #23 records block drops
+                    # (deduped): otherwise a host-side authorAssociation drop
+                    # is the one capability drop status coverage can never
+                    # see (issue #24 implementation review).
+                    if "authorAssociation" not in self.omitted_fields:
+                        self.omitted_fields.append("authorAssociation")
                 elif strip_review and block is _REVIEW_NODES:
                     block = block.replace("        authorAssociation\n", "")
+                    if "authorAssociation" not in self.omitted_fields:
+                        self.omitted_fields.append("authorAssociation")
                 parts.append(block)
             else:
                 self.omitted_fields.append(field)

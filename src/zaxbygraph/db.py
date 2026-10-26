@@ -761,7 +761,8 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
             " sub_issues_total = ?, sub_issues_completed = ?,"
             " dependencies_blocked_by = ?, dependencies_blocking = ?,"
             " dependencies_total_blocked_by = ?, dependencies_total_blocking = ?,"
-            " author_association = ?, merged_by = ? WHERE id = ?",
+            " author_association = ?, merged_by = ?, merge_commit = ?,"
+            " merged_at = ? WHERE id = ?",
             (
                 values["reactions_total"],
                 values["milestone"],
@@ -774,6 +775,8 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
                 values["dependencies_total_blocking"],
                 values["author_association"],
                 values["merged_by"],
+                values["merge_commit"],
+                values["merged_at"],
                 row["id"],
             ),
         )
@@ -799,12 +802,12 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
                 )
 
     # Derived columns and comment provenance (table-derived, not payload).
-    for assignee_row in conn.execute(
+    for comment_count_row in conn.execute(
         "SELECT repo, number, COUNT(*) AS n FROM comments GROUP BY repo, number"
     ).fetchall():
         conn.execute(
             "UPDATE items SET comment_count = ? WHERE repo = ? AND number = ?",
-            (assignee_row["n"], assignee_row["repo"], assignee_row["number"]),
+            (comment_count_row["n"], comment_count_row["repo"], comment_count_row["number"]),
         )
     for comment_row in conn.execute(
         "SELECT pk, raw_json FROM comments WHERE author_association IS NULL"

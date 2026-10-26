@@ -836,7 +836,7 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "search",
-        "description": "Relevance-ranked full-text search over titles, bodies, labels, and comments",
+        "description": "Relevance-ranked full-text search over titles, bodies, labels, comments, review bodies, and PR touched paths",
         "inputSchema": _schema({"query": {"type": "string"}, "limit": _LIMIT, "cursor": _CURSOR, **_REPO_DB}, ["query"]),
     },
     {

@@ -285,6 +285,82 @@ class MapperAbsenceTests(unittest.TestCase):
     def _source(self) -> object:
         return graphql_module.GraphQLSource(*REPO.split("/"))
 
+    def test_capability_gated_rendering_of_author_association(self) -> None:
+        """The capability machinery gates the authorAssociation line per
+        comment type (plan pin; implementation-review finding 2): a probe
+        that KNOWS the comment type and LACKS the field strips the line and
+        records the drop for fetch_log (finding 1); a probe that knows and
+        HAS the field keeps it; an unknown comment type fails open."""
+        cases = (
+            ("IssueComment", "_ISSUE_COMMENT_NODES"),
+            ("PullRequestReviewComment", "_REVIEW_NODES"),
+        )
+        for cap_type, block_attr in cases:
+            src = self._source()
+            # Both comment types carry the same state so a PR page's two
+            # comment blocks gate consistently; the case's own type is the
+            # one whose block text this leg asserts on.
+            caps = {
+                "Issue": {"databaseId", "comments", "timelineItems"},
+                "PullRequest": {
+                    "databaseId",
+                    "comments",
+                    "reviews",
+                    "files",
+                    "timelineItems",
+                },
+                "IssueComment": {"databaseId", "body"},
+                "PullRequestReviewComment": {"databaseId", "body"},
+            }
+            src.attach_capabilities(caps)
+            kind = "pr" if cap_type == "PullRequestReviewComment" else "issue"
+            rendered = src._fields_for(kind)
+            block = getattr(graphql_module, block_attr)
+            self.assertNotIn(
+                "authorAssociation",
+                rendered,
+                f"supp-v7: {cap_type} without the field kept the selection line",
+            )
+            self.assertIn(
+                "authorAssociation",
+                src.omitted_fields,
+                "supp-v7: comment-scope drop not recorded for fetch_log",
+            )
+            self.assertIn(
+                block.strip().splitlines()[0],
+                rendered,
+                f"supp-v7: {cap_type} strip dropped the whole block",
+            )
+            # probe knows the type and HAS the field: selected
+            src2 = self._source()
+            caps2 = dict(caps)
+            caps2["IssueComment"] = {"databaseId", "body", "authorAssociation"}
+            caps2["PullRequestReviewComment"] = {
+                "databaseId",
+                "body",
+                "authorAssociation",
+            }
+            src2.attach_capabilities(caps2)
+            self.assertIn(
+                "authorAssociation",
+                src2._fields_for(kind),
+                "supp-v7: known-and-present field was stripped",
+            )
+            # comment type UNKNOWN: fail open to the full selection
+            src3 = self._source()
+            src3.attach_capabilities(
+                {
+                    k: v
+                    for k, v in caps.items()
+                    if k not in ("IssueComment", "PullRequestReviewComment")
+                }
+            )
+            self.assertIn(
+                "authorAssociation",
+                src3._fields_for(kind),
+                "supp-v7: unknown comment type must fail open",
+            )
+
     def test_comment_association_absent_when_not_selected(self) -> None:
         """A node whose comment dict lacks authorAssociation maps to a
         payload WITHOUT the author_association key (mutant: .get() default
@@ -635,12 +711,25 @@ class MergeSemanticsTests(unittest.TestCase):
                     kept = conn.execute(
                         f"SELECT {column} FROM items WHERE number = 72"
                     ).fetchone()[0]
+                    cleared_pull = pull(72, merged=True)
+                    cleared_pull[key] = None
+                    conn.execute("BEGIN")
+                    ingest_item(conn, REPO, listing, pull_raw=cleared_pull,
+                                issue_comments=[], review_comments=[], reviews=[],
+                                files=[], include_patches=False)
+                    conn.commit()
+                    wiped = conn.execute(
+                        f"SELECT {column} FROM items WHERE number = 72"
+                    ).fetchone()[0]
                 finally:
                     conn.close()
             self.assertEqual(
                 kept, stored,
                 f"supp-v7: pull-owned {column} lost on listing-only re-ingest "
                 "(the original P5 defect shape)",
+            )
+            self.assertIsNone(
+                wiped, f"supp-v7: pull-owned {column} did not clear on explicit null"
             )
 
     def test_listing_owns_conflicting_keys_over_pull(self) -> None:
