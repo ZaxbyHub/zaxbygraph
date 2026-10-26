@@ -135,7 +135,7 @@ class SyncTests(TempDBTest):
         dest = Path(self._td.name) / "jsonl"
         self.sync(jsonl_path=dest)
         text = (dest / "events.jsonl").read_text(encoding="utf-8")
-        self.assertIn('"resource": "item"', text)
+        self.assertIn('"resource": "item_bundle"', text)
         self.assertTrue(dest.is_dir())
 
     def test_duplicate_comment_and_pr_file_from_pagination_do_not_raise(self) -> None:

@@ -184,6 +184,27 @@ class GhApiSource:
             raise GitHubError(f"unexpected pull payload for #{number}")
         return data
 
+    def get_issues(self, numbers: list[int]) -> dict[int, dict | None]:
+        """Issue-list payloads for exact numbers (sync --numbers, issue #23).
+
+        Same endpoint family as the listing (`GET /issues/{n}`), so the
+        payload identity the watermark contract depends on — issue-list `id`
+        and `updated_at`, the `pull_request` marker, labels — is preserved
+        verbatim. A 404 maps to a None entry so one missing number never
+        aborts the remaining ones; any other error propagates. GraphQLSource
+        inherits this unchanged: GraphQL stays confined to bulk children."""
+        out: dict[int, dict | None] = {}
+        for number in numbers:
+            try:
+                data = self._api(f"repos/{self.slug}/issues/{int(number)}")
+            except GitHubError as exc:
+                if exc.status in (404, 410):
+                    out[int(number)] = None
+                    continue
+                raise
+            out[int(number)] = data if isinstance(data, dict) else None
+        return out
+
     def list_issue_comments(self, number: int) -> list[dict]:
         data = self._api(
             f"repos/{self.slug}/issues/{int(number)}/comments?per_page=100",
