@@ -955,9 +955,13 @@ class VersionLiteralTests(unittest.TestCase):
         carried `== 6` / `"6"` schema assertions now import the constants
         (mutant: a future bump re-breaks the suite)."""
         tests_dir = Path(__file__).resolve().parent
+        # One pattern per reintroduction shape: int literal after the
+        # user_version fetch, and the string literal "6" after either fetch
+        # (the schema_version assertion's old shape, cubic CUB-6).
         literal = re.compile(
-            r"""(?:fetchone\(\)\[0\],\s*6\b|fetchone\(\)\[0\]\)\s*,\s*6\b|"
-            'schema_version'"\s*\)?\s*,?\s*\n?\s*"6")""",
+            r"(?:fetchone\(\)\[0\],\s*6\b"
+            r"|fetchone\(\)\[0\]\)\s*,\s*6\b"
+            r'|fetchone\(\)\[0\],\s*"6")'
         )
         for name in (
             "test_migrations.py",

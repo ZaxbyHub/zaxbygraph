@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import unittest
 
 from fixtures import REPO, TempDBTest, issue, pr_file, pull, review
 from zaxbygraph import db
@@ -576,30 +577,30 @@ class CommentAssociationTests(DirectIngestTest):
         }
         mapped = None
         source_cls = getattr(graphql_module, "GraphQLSource", None)
-        if source_cls is not None:
-            mapper = getattr(source_cls, "_children_from_node", None)
-            if mapper is not None:
-                children = mapper(source_cls(*REPO.split("/")), node)
-                mapped_comments = children.get("issue_comments") or []
-                if mapped_comments:
-                    mapped = mapped_comments[0]
-                    self.assertEqual(
-                        mapped.get("author_association"),
-                        "CONTRIBUTOR",
-                        "v7-missing:comment-association GraphQL mapping drops authorAssociation",
-                    )
-        if mapped is None:
-            # The mapping entry point moved: the ingest contract is still
-            # pinned on the REST-shaped payload the mapping produces.
-            mapped = {
-                "id": 4242,
-                "body": "ship it",
-                "user": {"login": "bob"},
-                "created_at": "2026-02-01T00:00:00Z",
-                "updated_at": "2026-02-01T00:00:00Z",
-                "html_url": f"https://github.com/{REPO}/issues/31#issuecomment-4242",
-                "author_association": "CONTRIBUTOR",
-            }
+        mapper = (
+            getattr(source_cls, "_children_from_node", None)
+            if source_cls is not None
+            else None
+        )
+        if mapper is None:
+            # No fabricated fallback (cubic CUB-1): a missing or renamed
+            # mapping entry point is a failure of this check, not a license
+            # to test a hand-built payload.
+            self.fail(
+                "v7-missing:comment-association GraphQL mapping entry point absent"
+            )
+        children = mapper(source_cls(*REPO.split("/")), node)
+        mapped_comments = children.get("issue_comments") or []
+        if not mapped_comments:
+            self.fail(
+                "v7-missing:comment-association mapper returned no issue comments"
+            )
+        mapped = mapped_comments[0]
+        self.assertEqual(
+            mapped.get("author_association"),
+            "CONTRIBUTOR",
+            "v7-missing:comment-association GraphQL mapping drops authorAssociation",
+        )
         self.ingest(
             issue(31, title="Provenance for comments", body="who said this"),
             issue_comments=[mapped],

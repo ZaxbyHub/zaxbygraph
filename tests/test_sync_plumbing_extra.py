@@ -39,7 +39,7 @@ def _capabilities_key(version: str | None = None) -> str:
     """The meta key sync derives, or an explicitly different one."""
     if version is None:
         version = _gh_version(sys.executable)
-    return f"capability_probe:{_gh_host()}:{version}"
+    return f"capability_probe:v2:{_gh_host()}:{version}"
 
 
 class _GoneBulkSource(PageShapedBulkSource):

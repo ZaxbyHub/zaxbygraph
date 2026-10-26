@@ -524,9 +524,14 @@ the same reason.
 fetched": `truncation_notes` maps `fetch_log.resource` to the count of that
 resource's notes containing `truncated`; `dropped_fields` counts
 capability-probe `omitted <field>` notes; `null_v7_rows` counts items rows
-with any `NULL` v7 column (`null` on pre-v7 stores); `store_bytes` is the
-database size in bytes (`PRAGMA page_size * page_count`, database-global).
-The three derived counts follow `status`'s repo scoping.
+where any always-present listing signal (`reactions_total`, `milestone`,
+`item_type`, `author_association`) is `NULL` — the mark of a payload that
+predated v7. Columns that are legitimately `NULL` in current payloads
+(unmerged PRs' pull trio; PR rows' missing summaries) are deliberately
+excluded so ordinary rows are not flagged. `null_v7_rows` is `null` on
+pre-v7 stores. `store_bytes` is the database size in bytes
+(`PRAGMA page_size * page_count`, database-global). The three derived counts
+follow `status`'s repo scoping.
 
 ## SQL access
 

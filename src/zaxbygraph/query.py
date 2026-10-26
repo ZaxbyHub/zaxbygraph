@@ -86,30 +86,27 @@ def _fold_repo(repo: str | None) -> str | None:
     return validate_slug(repo) if repo else None
 
 
-#: items columns whose NULL marks an un-populated v7 signal (the derived pair
-#: comment_count/paths_text are NOT NULL by schema and never contribute).
-_NULLABLE_V7_COLUMNS = (
+#: items columns whose NULL marks a pre-v7 (stale-payload) row. Restricted to
+#: the signals every current-era listing payload carries: PR rows never carry
+#: the two summaries (issue #24 claim 2) and the pull trio is legitimately
+#: NULL for unmerged PRs, so counting those would mark every PR as uncovered
+#: (cubic review CUB-3). The derived pair comment_count/paths_text are NOT
+#: NULL by schema and never contribute.
+_COVERAGE_NULL_COLUMNS = (
     "reactions_total",
     "milestone",
     "item_type",
-    "sub_issues_total",
-    "sub_issues_completed",
-    "dependencies_blocked_by",
-    "dependencies_blocking",
-    "dependencies_total_blocked_by",
-    "dependencies_total_blocking",
     "author_association",
-    "merged_by",
-    "merge_commit",
-    "merged_at",
 )
 
 
 def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> dict:
     """The status coverage block (issue #24 AC6): how much of the corpus the
     sync actually captured. The three derived counts follow status(repo)'s
-    repo scoping; store_bytes is database-global. ``null_v7_rows`` is null on
-    a pre-v7 store (reads never migrate, so the columns may not exist)."""
+    repo scoping; store_bytes is database-global. ``null_v7_rows`` counts
+    items rows where any always-present listing signal is NULL — the mark of
+    a payload that predated v7 — and is null on a pre-v7 store (reads never
+    migrate, so the columns may not exist)."""
     repo_filter = " AND repo = ?" if repo else ""
     repo_params: tuple = (repo,) if repo else ()
     truncation_notes = {
@@ -127,7 +124,7 @@ def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> 
     if user_version >= CURRENT_USER_VERSION:
         null_v7_rows = conn.execute(
             "SELECT COUNT(*) FROM items WHERE ("
-            + " OR ".join(f"{column} IS NULL" for column in _NULLABLE_V7_COLUMNS)
+            + " OR ".join(f"{column} IS NULL" for column in _COVERAGE_NULL_COLUMNS)
             + ")"
             + (" AND repo = ?" if repo else ""),
             (repo,) if repo else (),
@@ -174,7 +171,8 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
 #: page is `ORDER BY score ASC, updated_at DESC LIMIT ?` — recency breaks
 #: ties between equal bm25 scores.
 _SEARCH_MERGED = """
-    SELECT hit_key, MIN(score) AS score, MAX(src) AS has_item_hit,
+    SELECT hit_key, MIN(score) AS score,
+           MAX(CASE WHEN src = 1 THEN 1 ELSE 0 END) AS has_item_hit,
            SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments,
            SUM(CASE WHEN src = 2 THEN 1 ELSE 0 END) AS matching_reviews,
            MAX(upd) AS updated_at
