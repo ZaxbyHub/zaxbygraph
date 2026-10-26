@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import sqlite3
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,9 @@ from typing import TextIO
 
 from zaxbygraph.extract import item_kind
 from zaxbygraph.github import GitHubError, GitHubSource
+from zaxbygraph.graphql import GH_TIMEOUT_S
 from zaxbygraph.repo import validate_slug
+from zaxbygraph.db import get_meta, set_meta
 from zaxbygraph.store import (
     ISO_Z,
     bump_watermark,
@@ -138,14 +141,17 @@ def _resolve_children(
     kind: str,
     include_patches: bool,
     provided: dict | None = None,
-) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict], list[dict], dict]:
+) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict], list[dict], dict, dict[str, bool]]:
     """Children for one item: inline or bulk-provided payload where present
     and complete, per-item REST fallback where flagged incomplete or absent
     (issue #5). `provided` is what the source's fetch_children bulk call
     returned for this item; inline payload keys take precedence. Returns the
     five legacy sections plus the GraphQL-only timeline event list and a
     flags dict (timeline_incomplete / closing_refs_incomplete) for sync to
-    record in fetch_log (#6).
+    record in fetch_log (#6), and a per-section `children_complete` map
+    (issue #23): True where the bulk payload answered the section complete,
+    False where a REST fallback, a truncation cap, or an inline
+    `<name>_incomplete` flag produced it.
 
     The absent-everywhere path keeps the legacy rules (comments only when the
     count is nonzero, pull details only for PRs, files via changed_files),
@@ -163,23 +169,30 @@ def _resolve_children(
         pull_raw = source.get_pull(number)
 
     sections: dict[str, list[dict]] = {}
+    complete: dict[str, bool] = {}
     for name, fallback_name in _CHILD_FALLBACK.items():
         provided_section = provided.get(name) if provided is not None else None
         provided_flagged = bool(provided.get(f"{name}_incomplete")) if provided is not None else False
         if name in list_raw:
             if include_patches and name == "files":
                 sections[name] = list(source.list_pr_files(number))
+                complete[name] = False
             elif list_raw.get(f"{name}_incomplete"):
                 sections[name] = list(getattr(source, fallback_name)(number))
+                complete[name] = False
             else:
                 sections[name] = list(list_raw[name] or [])
+                complete[name] = True
         elif provided_section is not None or provided_flagged:
             if include_patches and name == "files":
                 sections[name] = list(source.list_pr_files(number))
+                complete[name] = False
             elif provided_flagged:
                 sections[name] = list(getattr(source, fallback_name)(number))
+                complete[name] = False
             else:
                 sections[name] = list(provided_section or [])
+                complete[name] = True
         elif kind == "pr" or name == "issue_comments":
             if name == "issue_comments":
                 if list_raw.get("comments"):
@@ -196,8 +209,15 @@ def _resolve_children(
                     sections[name] = []
             else:
                 sections[name] = list(getattr(source, fallback_name)(number))
+            complete[name] = False
         else:
             sections[name] = []
+            # Not applicable for this item kind (e.g. an issue's PR sections):
+            # nothing was requested and nothing is missing, so the section is
+            # complete — marking it False logged a permanent per-item note for
+            # structurally-N/A sections and drowned the real degradation
+            # signals (PR #37 review).
+            complete[name] = True
     # Timeline events ride only the GraphQL bulk payload (issue #6): there is
     # deliberately NO per-item REST fallback, so a plain REST source yields
     # none and previously stored timeline edges survive via the delete-owned
@@ -205,14 +225,21 @@ def _resolve_children(
     # references, which ride the pull section of the GraphQL payload only.
     timeline: list[dict] = []
     flags: dict[str, bool] = {}
+    # A source with no bulk context (plain REST) answers no timeline by
+    # design — that is not a degradation. Only a bulk payload that flagged
+    # truncation (or answered without the section) marks it incomplete.
+    timeline_complete = provided is None
     if provided is not None:
         provided_timeline = provided.get("timeline")
         if isinstance(provided_timeline, list):
             timeline = list(provided_timeline)
+            timeline_complete = not provided.get("timeline_incomplete")
         if provided.get("timeline_incomplete"):
             flags["timeline_incomplete"] = True
         if provided.get("closing_refs_incomplete"):
             flags["closing_refs_incomplete"] = True
+    complete["timeline"] = timeline_complete
+    complete["pull"] = (pull_raw is not None) or kind != "pr"
     return (
         pull_raw,
         sections["issue_comments"],
@@ -221,6 +248,7 @@ def _resolve_children(
         sections["files"],
         timeline,
         flags,
+        complete,
     )
 
 
@@ -244,8 +272,257 @@ def _mark_gone(
         raise
 
 
+def _gone_children_complete() -> dict[str, bool]:
+    """The all-False completeness map for a gone item (issue #23): no section
+    was answered — there is nothing behind a 404/410."""
+    return {**{name: False for name in _CHILD_FALLBACK}, "pull": False, "timeline": False}
+
+
+def _stored_list_raw(conn: sqlite3.Connection, repo: str, number: int) -> dict | None:
+    """The stored item's original issues-list payload, for recording a
+    deletion of an item whose fetch payload is not at hand (deletion oracle,
+    targeted refresh of a vanished number — PR #37 review)."""
+    row = conn.execute(
+        "SELECT raw_json FROM items WHERE repo = ? AND number = ?", (repo, number)
+    ).fetchone()
+    if row is None or not row["raw_json"]:
+        return None
+    try:
+        payload = json.loads(row["raw_json"])
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_gone_bundle(
+    jsonl_handle: TextIO | None,
+    number: int,
+    list_raw: dict | None,
+    gone_note: str,
+    verdict: str = "deleted",
+) -> None:
+    """Record a deletion in the sidecar so replay reproduces the final state
+    (PR #37 review: every real deletion shape must reach the replay). A
+    deletion with no recoverable payload (item never stored) has nothing to
+    resurrect and gets no record."""
+    if list_raw is None:
+        return
+    _write_jsonl(
+        jsonl_handle,
+        "item_bundle",
+        {
+            "number": number,
+            "item": list_raw,
+            "pull": None,
+            "issue_comments": [],
+            "review_comments": [],
+            "reviews": [],
+            "files": [],
+            "timeline": [],
+            "gone": True,
+            "gone_status": None,
+            "gone_note": gone_note,
+            "gone_verdict": verdict,
+        },
+    )
+
+
+def _ingest_and_mark_gone(
+    conn: sqlite3.Connection,
+    repo: str,
+    list_raw: dict,
+    number: int,
+    exc_status: int,
+    *,
+    include_patches: bool,
+    jsonl_handle: TextIO | None,
+    advance_watermark: bool,
+    note: str | None = None,
+    verdict: str = "deleted",
+) -> int:
+    """The first-sighting 404/410 path, shared by live per-item errors and
+    replayed gone bundles (issue #23) so both produce byte-identical
+    `state_reason` values.
+
+    A first-sighting 404 stores the listing payload so the marking is
+    truthful and the watermark advances past it. An item that was ALREADY
+    stored keeps its children and edges: ingest_item replaces child rows and
+    rebuilt edges from scratch, so re-ingesting with empty children would
+    destroy the last local copy of a deleted item's discussion. This matches
+    the oracle path, which marks without touching children. Returns 1 when a
+    first-sighting ingest happened, 0 otherwise."""
+    exists = conn.execute(
+        "SELECT 1 FROM items WHERE repo = ? AND number = ?",
+        (repo, number),
+    ).fetchone() is not None
+    gone_note = note or f"GitHub returned HTTP {exc_status} while fetching item data"
+    if not exists:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ingest_item(
+                conn, repo, list_raw,
+                pull_raw=None,
+                issue_comments=[], review_comments=[],
+                reviews=[], files=[],
+                include_patches=include_patches,
+                children_complete=_gone_children_complete(),
+                advance_watermark=advance_watermark,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        _write_gone_bundle(jsonl_handle, number, list_raw, gone_note)
+        ingested_here = 1
+    else:
+        ingested_here = 0
+        if advance_watermark:
+            # Advance the watermark past the marked item without re-ingesting:
+            # otherwise every later run re-lists it until its updated_at ages
+            # past the watermark. Targeted runs never advance it.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                bump_watermark(conn, repo, list_raw.get("updated_at"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+    if ingested_here == 0:
+        # An already-stored deletion must reach the sidecar too, or replay
+        # resurrects the deleted item (PR #37 review): the listing payload in
+        # hand IS the item's last recorded list payload.
+        _write_gone_bundle(jsonl_handle, number, list_raw, gone_note)
+    _mark_gone(conn, repo, number, verdict, gone_note)
+    return ingested_here
+
+
+def _number_of(raw: object) -> int | None:
+    if isinstance(raw, dict) and "number" in raw:
+        try:
+            return int(raw["number"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _numbered_payloads(
+    conn: sqlite3.Connection,
+    source: GitHubSource,
+    repo: str,
+    wanted: set[int],
+    include_patches: bool,
+    jsonl_handle: TextIO | None,
+):
+    """Listing payloads for a targeted refresh (issue #23).
+
+    A source with `get_issues` fetches exactly those items (same endpoint
+    family as the listing, so payload identity is preserved); a number that
+    404s goes through the same ingest-and-mark path as a live per-item 404 -
+    or, when never stored, only leaves a fetch_log note. A source WITHOUT
+    `get_issues` (test fakes, replay) falls back to an UNFILTERED listing -
+    the stored watermark is ignored, so explicitly requested items older than
+    it are still found - filtered per page to the requested numbers."""
+    getter = getattr(source, "get_issues", None)
+    if callable(getter):
+        results = _call_with_rate_retry(getter, sorted(wanted)) or {}
+        shells: list[dict] = []
+        for n in sorted(wanted):
+            entry = results.get(n)
+            payload = entry[0] if isinstance(entry, tuple) and len(entry) > 1 else (
+                entry if isinstance(entry, dict) else None
+            )
+            if isinstance(payload, dict):
+                shells.append(payload)
+        if shells:
+            yield shells
+        for n in sorted(wanted):
+            entry = results.get(n)
+            payload = entry[0] if isinstance(entry, tuple) and len(entry) > 1 else (
+                entry if isinstance(entry, dict) else None
+            )
+            status = entry[1] if isinstance(entry, tuple) and len(entry) > 1 else None
+            if isinstance(payload, dict):
+                continue
+            exists = conn.execute(
+                "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, n)
+            ).fetchone() is not None
+            if exists and status in (404, 410):
+                # The recorded reason carries the REAL status the source
+                # reported — never a hardcoded one (issue #23 review).
+                gone_note = f"GitHub returned HTTP {status} while fetching item data"
+                _write_gone_bundle(
+                    jsonl_handle, n, _stored_list_raw(conn, repo, n), gone_note
+                )
+                _mark_gone(conn, repo, n, "deleted", gone_note)
+            elif exists:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    log_fetch(conn, repo, "item", str(n),
+                              note="skipped missing number: stored, but the source "
+                                   "returned no usable payload this run")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+            else:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    log_fetch(conn, repo, "item", str(n),
+                              note="skipped missing number: not found and never stored")
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+        return
+    found: set[int] = set()
+    malformed_seen = False
+    for page in source.list_issues(None):
+        batch = [raw for raw in _batch(page) if _number_of(raw) in wanted]
+        if any(_number_of(raw) is None and isinstance(raw, dict) for raw in _batch(page)):
+            # A listing shell we cannot match could be a requested number:
+            # absence evidence is then incomplete, so no deletion verdict is
+            # drawn this run (PR #37 review — false-deletion guard).
+            malformed_seen = True
+        found.update(n for n in (_number_of(raw) for raw in batch) if n is not None)
+        if batch:
+            yield batch
+    for n in sorted(wanted - found):
+        exists = conn.execute(
+            "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, n)
+        ).fetchone() is not None
+        if exists and not malformed_seen:
+            gone_note = "absent from the full listing during a requested refresh"
+            _write_gone_bundle(
+                jsonl_handle, n, _stored_list_raw(conn, repo, n), gone_note
+            )
+            _mark_gone(conn, repo, n, "deleted", gone_note)
+        elif exists:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                log_fetch(conn, repo, "item", str(n),
+                          note="skipped missing number: listing contained entries "
+                               "this refresh could not match")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        else:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                log_fetch(conn, repo, "item", str(n),
+                          note="skipped missing number: not found and never stored")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+
 def _deletion_pass(
-    conn: sqlite3.Connection, source: GitHubSource, repo: str, seen_numbers: set[int]
+    conn: sqlite3.Connection,
+    source: GitHubSource,
+    repo: str,
+    seen_numbers: set[int],
+    jsonl_handle: TextIO | None = None,
 ) -> None:
     """Consult the source's deletion oracle after a drained full listing.
 
@@ -283,10 +560,16 @@ def _deletion_pass(
         if number in allowed and text in ("deleted", "transferred"):
             clean[number] = text
     for number, verdict in sorted(clean.items()):
-        _mark_gone(
-            conn, repo, number, verdict,
-            "reported by source deletion check after a completed full listing",
+        gone_note = "reported by source deletion check after a completed full listing"
+        # Oracle deletions must reach the sidecar too, or replay resurrects
+        # the deleted item (PR #37 review): the stored payload is the item's
+        # last recorded list payload. The verdict travels with the bundle so
+        # replay reproduces 'transferred' as well as 'deleted'.
+        _write_gone_bundle(
+            jsonl_handle, number, _stored_list_raw(conn, repo, number), gone_note,
+            verdict=verdict,
         )
+        _mark_gone(conn, repo, number, verdict, gone_note)
 
 
 def _error_text(exc: BaseException) -> str:
@@ -314,6 +597,82 @@ def _ensure_state_row(conn: sqlite3.Connection, repo: str, include_patches: bool
     conn.commit()
 
 
+def _gh_version(gh_bin: str) -> str:
+    """First line of `gh --version`, cached per executable (issue #23): two
+    configured binaries in one process each report their own version."""
+    cached = _GH_VERSION_CACHE.get(gh_bin)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            [gh_bin, "--version"],
+            check=False,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_S,
+        )
+        version = (proc.stdout or "").strip().splitlines()[0] if (proc.stdout or "").strip() else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        version = "unknown"
+    _GH_VERSION_CACHE[gh_bin] = version
+    return version
+
+
+_GH_VERSION_CACHE: dict[str, str] = {}
+
+
+def _gh_host() -> str:
+    """Host for the capability-cache key: GH_HOST when set, else github.com
+    (gh's GraphQL endpoint follows the gh-configured/GH_HOST host)."""
+    return os.environ.get("GH_HOST") or "github.com"
+
+
+def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: str) -> None:
+    """Hydrate or run the capability probe for sources that support it
+    (issue #23). Duck-typed on BOTH members: every source without the probe
+    pair (fakes, REST-only, replay) skips the whole step - no meta I/O, no
+    subprocess. Meta reads/writes run OUTSIDE every per-item transaction. A
+    probe failure fails open: the sync proceeds with the full field set and
+    the failure is recorded in fetch_log."""
+    probe = getattr(source, "probe_capabilities", None)
+    attach = getattr(source, "attach_capabilities", None)
+    if not callable(probe) or not callable(attach):
+        return
+    # Omissions accumulate across every page query of this run; the list is
+    # reset here (once per sync), never per page (issue #23).
+    source.omitted_fields = []
+    source._capabilities_from_cache = False
+    key = f"capability_probe:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
+    cached = get_meta(conn, key)
+    if cached:
+        try:
+            attach(json.loads(cached))
+            # A cached map is a snapshot: if a later fatal error turns out to
+            # be schema drift the snapshot cannot see, sync_repo invalidates
+            # the row so the next run re-probes (PR #37 review — no
+            # failure-triggered re-probe otherwise exists).
+            source._capabilities_from_cache = True
+            source._capabilities_meta_key = key
+            return
+        except ValueError:
+            pass  # corrupt meta row: fall through to a fresh probe
+    try:
+        caps = probe()
+    except GitHubError as exc:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            log_fetch(conn, repo, "graphql_probe", None, note=f"probe failed: {exc}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return
+    attach(caps)
+    set_meta(conn, key, json.dumps({k: sorted(v) for k, v in caps.items()}, sort_keys=True))
+    conn.commit()
+
+
 def sync_repo(
     conn: sqlite3.Connection,
     source: GitHubSource,
@@ -322,8 +681,14 @@ def sync_repo(
     force: bool = False,
     include_patches: bool = False,
     jsonl_path: Path | None = None,
+    numbers: list[int] | None = None,
 ) -> dict:
-    """Incremental sync. Each item is one IMMEDIATE transaction."""
+    """Incremental sync. Each item is one IMMEDIATE transaction.
+
+    With `numbers` (sync --numbers, issue #23) this is a TARGETED refresh of
+    exactly those items: the watermark never moves, no full sync starts or
+    completes, the deletion oracle never runs, and a targeted finalizer
+    clears last_error without touching freshness stamps."""
     # Everything that touches the database lives inside the try: the recorder
     # must see prologue failures too (force reset, state-row ensure, pending
     # marker) — a lock or disk fault landing there is still a failed sync and
@@ -335,7 +700,7 @@ def sync_repo(
     last_number: int | None = None
     jsonl_handle: TextIO | None = None
     try:
-        if force:
+        if force and numbers is None:
             # The force reset runs first so the pending marker below is
             # computed from the watermark this run will actually use.
             conn.execute(
@@ -346,23 +711,38 @@ def sync_repo(
         _ensure_state_row(conn, repo, include_patches)
 
         row = conn.execute(
-            "SELECT issues_since, full_sync_pending FROM sync_state WHERE repo = ?", (repo,)
+            "SELECT issues_since, full_sync_pending, last_full_sync_at FROM sync_state WHERE repo = ?",
+            (repo,),
         ).fetchone()
         since = None if row is None else row["issues_since"]
         pending_at_start = bool(row is not None and row["full_sync_pending"])
-        if since is None:
-            # Beginning a full sync (fresh repo or --force): mark it pending
-            # so a crash mid-run leaves complete=false, and the resuming run
-            # can stamp last_full_sync_at when it drains the listing.
-            conn.execute(
-                "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
-            )
-            conn.commit()
-            pending_at_start = True
-        # "full" in the result means: this run completes a full sync (it
-        # started one, or it resumed an interrupted one to a clean finish).
-        full = since is None or pending_at_start
-        started_full = since is None
+        if numbers is not None:
+            # Targeted refresh (issue #23): never starts or completes a full
+            # sync, and the deletion oracle never runs. A corpus that has
+            # never completed a full sync stays incomplete - a numbers-only
+            # store must not read as a complete graph - while an interrupted
+            # full sync keeps its pending marker for the next real run.
+            if row is None or (row["last_full_sync_at"] is None and not pending_at_start):
+                conn.execute(
+                    "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
+                )
+                conn.commit()
+            full = False
+            started_full = False
+        else:
+            if since is None:
+                # Beginning a full sync (fresh repo or --force): mark it pending
+                # so a crash mid-run leaves complete=false, and the resuming run
+                # can stamp last_full_sync_at when it drains the listing.
+                conn.execute(
+                    "UPDATE sync_state SET full_sync_pending = 1 WHERE repo = ?", (repo,)
+                )
+                conn.commit()
+                pending_at_start = True
+            # "full" in the result means: this run completes a full sync (it
+            # started one, or it resumed an interrupted one to a clean finish).
+            full = since is None or pending_at_start
+            started_full = since is None
         seen_numbers: set[int] = set()
         rate_window: tuple[int, str] | None = None
 
@@ -372,6 +752,11 @@ def sync_repo(
         if jsonl_path is not None:
             jsonl_path.mkdir(parents=True, exist_ok=True)
             jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
+        # Capability probe (issue #23): hydrate the cached field map or run
+        # the introspection once per host+gh-version, so a schema drift never
+        # reaches the page query. Duck-typed: sources without the probe pair
+        # skip the whole step. Outside every per-item transaction.
+        _attach_capabilities(conn, source, repo)
         # The listing is consumed in pages and each item commits with its
         # own watermark bump, so everything delivered before a failure is
         # durable (issue #5 AC1). A rate-limit window is slept out on the
@@ -394,7 +779,16 @@ def sync_repo(
                     rate_window = floor
                     attempts += 1
                     _rate_sleep(_BudgetWindow(*floor))
-                for payload in source.list_issues(since):
+                if numbers is not None:
+                    # Targeted refresh (issue #23): exactly the requested
+                    # items, never the whole listing.
+                    payloads = _numbered_payloads(
+                        conn, source, repo, {int(n) for n in numbers}, include_patches,
+                        jsonl_handle,
+                    )
+                else:
+                    payloads = source.list_issues(since)
+                for payload in payloads:
                     batch = _batch(payload)
                     # One bulk children call per listing page when the source
                     # offers it (issue #5 AC2); items the source did not
@@ -423,62 +817,52 @@ def sync_repo(
                             continue
                         seen_numbers.add(number)
                         kind = item_kind(list_raw)
+                        provided = provided_map.get(number)
+                        if isinstance(provided, dict) and provided.get("gone"):
+                            # A recorded deletion replaying from a sidecar
+                            # (issue #23): the same first-sighting ingest-and-
+                            # mark path as a live 404, with the note carried
+                            # verbatim from the bundle (which recorded exactly
+                            # what the live run wrote) so state_reason
+                            # reproduces byte-identically for every deletion
+                            # shape — HTTP 404/410, the oracle, or a targeted
+                            # refresh.
+                            carried_note = provided.get("gone_note")
+                            carried_verdict = provided.get("gone_verdict")
+                            status = provided.get("gone_status")
+                            ingested += _ingest_and_mark_gone(
+                                conn, repo, list_raw, number,
+                                status if isinstance(status, int) else 404,
+                                include_patches=include_patches,
+                                jsonl_handle=jsonl_handle,
+                                advance_watermark=numbers is None,
+                                note=carried_note if isinstance(carried_note, str) else None,
+                                verdict=(
+                                    carried_verdict
+                                    if isinstance(carried_verdict, str)
+                                    and carried_verdict in ("deleted", "transferred")
+                                    else "deleted"
+                                ),
+                            )
+                            last_number = number
+                            continue
                         try:
-                            pull_raw, issue_comments, review_comments, reviews, files, timeline, flags = (
+                            (pull_raw, issue_comments, review_comments, reviews,
+                             files, timeline, flags, children_complete) = (
                                 _resolve_children(
                                     source, list_raw, kind, include_patches,
-                                    provided=provided_map.get(number),
+                                    provided=provided,
                                 )
                             )
                         except GitHubError as exc:
                             if exc.status in (404, 410):
-                                # A first-sighting 404 stores the listing
-                                # payload so the marking is truthful and the
-                                # watermark advances past it. An item that was
-                                # ALREADY stored keeps its children and edges:
-                                # ingest_item replaces child rows and rebuilt
-                                # edges from scratch, so re-ingesting with
-                                # empty children would destroy the last local
-                                # copy of a deleted item's discussion. This
-                                # matches the oracle path, which marks without
-                                # touching children.
-                                exists = conn.execute(
-                                    "SELECT 1 FROM items WHERE repo = ? AND number = ?",
-                                    (repo, number),
-                                ).fetchone() is not None
-                                if not exists:
-                                    conn.execute("BEGIN IMMEDIATE")
-                                    try:
-                                        ingest_item(
-                                            conn, repo, list_raw,
-                                            pull_raw=None,
-                                            issue_comments=[], review_comments=[],
-                                            reviews=[], files=[],
-                                            include_patches=include_patches,
-                                        )
-                                        conn.commit()
-                                    except Exception:
-                                        conn.rollback()
-                                        raise
-                                    ingested += 1
-                                    last_number = number
-                                    _write_jsonl(jsonl_handle, "item", list_raw)
-                                else:
-                                    # Advance the watermark past the marked
-                                    # item without re-ingesting: otherwise
-                                    # every later run re-lists it until its
-                                    # updated_at ages past the watermark.
-                                    conn.execute("BEGIN IMMEDIATE")
-                                    try:
-                                        bump_watermark(conn, repo, list_raw.get("updated_at"))
-                                        conn.commit()
-                                    except Exception:
-                                        conn.rollback()
-                                        raise
-                                _mark_gone(
-                                    conn, repo, number, "deleted",
-                                    f"GitHub returned HTTP {exc.status} while fetching item data",
+                                ingested += _ingest_and_mark_gone(
+                                    conn, repo, list_raw, number, exc.status,
+                                    include_patches=include_patches,
+                                    jsonl_handle=jsonl_handle,
+                                    advance_watermark=numbers is None,
                                 )
+                                last_number = number
                                 continue
                             raise
 
@@ -495,7 +879,32 @@ def sync_repo(
                                 files=files,
                                 include_patches=include_patches,
                                 timeline=timeline,
+                                children_complete=children_complete,
+                                advance_watermark=numbers is None,
                             )
+                            incomplete = sorted(
+                                s for s, ok in children_complete.items() if not ok
+                            )
+                            if incomplete:
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note="children incomplete: " + ", ".join(incomplete),
+                                    status=None,
+                                )
+                            for section, etype, emsg in (
+                                getattr(source, "last_fetch_drops", None) or {}
+                            ).get(number, []):
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note=f"dropped {section}: {etype} {emsg}",
+                                    status=None,
+                                )
                             if flags.get("timeline_incomplete"):
                                 log_fetch(
                                     conn,
@@ -536,26 +945,32 @@ def sync_repo(
                             raise
                         ingested += 1
                         last_number = number
-                        _write_jsonl(jsonl_handle, "item", list_raw)
-                        if pull_raw:
-                            _write_jsonl(jsonl_handle, "pull", pull_raw)
-                        for rec in issue_comments:
-                            _write_jsonl(jsonl_handle, "issue_comment", rec)
-                        for rec in review_comments:
-                            _write_jsonl(jsonl_handle, "review_comment", rec)
-                        for rec in reviews:
-                            _write_jsonl(jsonl_handle, "review", rec)
-                        for rec in files:
-                            _write_jsonl(jsonl_handle, "pr_file", rec)
-                        for rec in timeline:
-                            # Timeline events have no id of their own; the
-                            # record carries the owning item number so the
-                            # sidecar can reproduce the timeline edges (#6).
-                            _write_jsonl(
-                                jsonl_handle,
-                                "timeline_event",
-                                {"number": number, "event": rec},
-                            )
+                        # One replayable item_bundle per ingested item
+                        # (issue #23): the bundle carries the owning number
+                        # and the exact section lists ingest saw, so a replay
+                        # reproduces the store row for row. A pull payload
+                        # without its own number (GraphQL-shaped) is stamped
+                        # on the bundle copy only - the raw dicts stay
+                        # untouched so raw_json reproduces byte-identically.
+                        pull_for_bundle = pull_raw
+                        if isinstance(pull_for_bundle, dict) and "number" not in pull_for_bundle:
+                            pull_for_bundle = {**pull_for_bundle, "number": number}
+                        _write_jsonl(
+                            jsonl_handle,
+                            "item_bundle",
+                            {
+                                "number": number,
+                                "item": list_raw,
+                                "pull": pull_for_bundle,
+                                "issue_comments": issue_comments,
+                                "review_comments": review_comments,
+                                "reviews": reviews,
+                                "files": files,
+                                "timeline": timeline,
+                                "gone": False,
+                                "gone_status": None,
+                            },
+                        )
                 break
             except GitHubError as exc:
                 window = _rate_attrs(exc)
@@ -568,16 +983,36 @@ def sync_repo(
         # Deletion oracle: only a drained full listing may mark items gone
         # (issue #5 AC5). Incremental absence marks nothing. Runs under the
         # bounded retry so a window cannot fail an otherwise-complete run.
+        # A targeted refresh never runs it (issue #23): absence from its
+        # filtered view is meaningless for every other item.
         if started_full:
-            _deletion_pass(conn, source, repo, seen_numbers)
+            _deletion_pass(conn, source, repo, seen_numbers, jsonl_handle)
 
-        try:
-            releases = _call_with_rate_retry(source.list_releases)
-        except GitHubError as exc:
+        # Fields the capability probe dropped from the page queries
+        # (issue #23): one fetch_log row per distinct omitted field.
+        omitted_fields = sorted(set(getattr(source, "omitted_fields", None) or []))
+        if omitted_fields:
             conn.execute("BEGIN IMMEDIATE")
-            set_last_error(conn, repo, str(exc))
-            conn.commit()
-            raise SyncError(str(exc)) from exc
+            try:
+                for field in omitted_fields:
+                    log_fetch(conn, repo, "graphql_probe", None, note=f"omitted {field}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        if numbers is not None:
+            # Targeted refresh: releases are corpus-level, not item-level;
+            # a targeted run does not refresh them (issue #23).
+            releases: list[dict] = []
+        else:
+            try:
+                releases = _call_with_rate_retry(source.list_releases)
+            except GitHubError as exc:
+                conn.execute("BEGIN IMMEDIATE")
+                set_last_error(conn, repo, str(exc))
+                conn.commit()
+                raise SyncError(str(exc)) from exc
 
         if rate_window is None:
             # A clean run that slept no window still reports the last budget
@@ -586,12 +1021,15 @@ def sync_repo(
 
         conn.execute("BEGIN IMMEDIATE")
         try:
-            replace_releases(conn, repo, releases)
+            if numbers is None:
+                replace_releases(conn, repo, releases)
             mark_sync_finished(
                 conn,
                 repo,
                 rate_limit_remaining=None if rate_window is None else rate_window[0],
                 rate_limit_reset_at=None if rate_window is None else rate_window[1],
+                targeted=numbers is not None,
+                ingested_count=ingested,
             )
             recount(conn, repo)
             conn.commit()
@@ -622,6 +1060,24 @@ def sync_repo(
         # hit "cannot start a transaction within a transaction".
         if conn.in_transaction:
             conn.rollback()
+        if isinstance(exc, (GitHubError, SyncError)) and getattr(
+            source, "_capabilities_from_cache", False
+        ):
+            # Self-heal the capability cache (PR #37 review): a fatal error
+            # while running on a CACHED capability map may be server-side
+            # schema drift the snapshot cannot see, and nothing else
+            # invalidates the row. Drop it best-effort so the next sync
+            # re-probes; the current run still fails and reports.
+            try:
+                key = getattr(
+                    source, "_capabilities_meta_key",
+                    f"capability_probe:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}",
+                )
+                conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+                conn.commit()
+                source._capabilities_from_cache = False
+            except sqlite3.Error:
+                pass  # a dying database cannot heal its cache either
         try:
             conn.execute("BEGIN IMMEDIATE")
             set_last_error(conn, repo, _error_text(exc))

@@ -482,6 +482,8 @@ def mark_sync_finished(
     *,
     rate_limit_remaining: int | None = None,
     rate_limit_reset_at: str | None = None,
+    targeted: bool = False,
+    ingested_count: int = 0,
 ) -> None:
     """Stamp a clean finish.
 
@@ -492,11 +494,38 @@ def mark_sync_finished(
     bump in one transaction, so a run that drains the listing has covered
     everything at or below the watermark.
 
+    With `targeted=True` (sync --numbers, issue #23) this is a TARGETED
+    finish: only `last_error` clears and the rate columns update. Neither
+    freshness stamp moves — `last_incr_sync_at` means a drained incremental
+    listing whose coverage is bounded by the watermark, which a targeted
+    refresh is not — and `full_sync_pending` is preserved so a never- or
+    interrupted-full corpus still reads incomplete. A targeted run that
+    ingested NOTHING (ingested_count == 0) leaves a previous `last_error`
+    standing: a no-op refresh must not launder a failed sync's error into a
+    clean readiness verdict (PR #37 review).
+
     The rate-limit columns carry the window this run slept through (NULL when
     it saw none), verbatim as the source reported it (issue #5 AC4).
     """
     now = utcnow()
     conn.execute("INSERT OR IGNORE INTO sync_state(repo) VALUES (?)", (repo,))
+    if targeted:
+        conn.execute(
+            """
+            UPDATE sync_state SET
+                last_error = CASE WHEN :ingested > 0 THEN NULL ELSE last_error END,
+                rate_limit_remaining = :rate_remaining,
+                rate_limit_reset_at = :rate_reset_at
+            WHERE repo = :repo
+            """,
+            {
+                "ingested": ingested_count,
+                "repo": repo,
+                "rate_remaining": rate_limit_remaining,
+                "rate_reset_at": rate_limit_reset_at,
+            },
+        )
+        return
     conn.execute(
         """
         UPDATE sync_state SET
@@ -579,6 +608,8 @@ def ingest_item(
     files: list[dict],
     include_patches: bool,
     timeline: list[dict] | None = None,
+    children_complete: dict[str, bool] | None = None,
+    advance_watermark: bool = True,
 ) -> None:
     """One item, caller owns the transaction.
 
@@ -589,6 +620,15 @@ def ingest_item(
     cross-referenced); None means the source could not provide them, which
     leaves previously stored timeline edges untouched via the delete-owned
     exemption.
+
+    `children_complete` carries the per-section completeness map the sync
+    resolved (issue #23): True where the bulk payload answered the section
+    complete, False where a REST fallback, a truncation cap, or the 404 path
+    produced it. It is accepted here so the ingest boundary can never silently
+    present a fallback-resolved section as bulk-complete; the map is not
+    persisted (what to DO with completeness is #25's scope). With
+    `advance_watermark=False` (sync --numbers) the watermark is left exactly
+    as found: a targeted refresh says nothing about listing coverage.
     """
     merged = dict(list_raw)
     if pull_raw:
@@ -634,5 +674,6 @@ def ingest_item(
         files,
         timeline=timeline,
     )
-    bump_watermark(conn, repo, list_raw.get("updated_at"))
+    if advance_watermark:
+        bump_watermark(conn, repo, list_raw.get("updated_at"))
     log_fetch(conn, repo, "item", str(number))

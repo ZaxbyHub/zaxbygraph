@@ -74,7 +74,9 @@ shouldn't.
   lost forever.
 - **Each item is ingested in one `BEGIN IMMEDIATE` that includes its own
   watermark bump**, so an interrupted run resumes from the last fully committed
-  item rather than skipping or re-doing everything.
+  item rather than skipping or re-doing everything. (Exception: `sync
+  --numbers` passes `advance_watermark=False` — a targeted refresh says
+  nothing about listing coverage, so it never moves the watermark.)
 - **Ingest is idempotent.** Re-fetching the same row must upsert, not raise.
   GitHub's pagination can legitimately hand you the same record twice, so any
   write that can see a duplicate needs a conflict target covering the

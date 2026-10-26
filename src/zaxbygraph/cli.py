@@ -462,6 +462,17 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    numbers: list[int] | None = None
+    numbers_raw = getattr(args, "numbers", None)
+    if numbers_raw is not None:
+        try:
+            numbers = [int(x) for x in str(numbers_raw).replace(" ", "").split(",") if x != ""]
+        except ValueError:
+            return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
+        if not numbers:
+            return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
+        if getattr(args, "force", False):
+            return emit_failure(args, 2, "--numbers cannot be combined with --force")
     try:
         if args.repo:
             slug = validate_slug(args.repo)
@@ -542,6 +553,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             force=args.force,
             include_patches=args.include_patches,
             jsonl_path=jsonl,
+            numbers=numbers,
         )
     except SyncError as exc:
         emit_result(
@@ -1132,6 +1144,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("sync", help="Fetch issues/PRs into the local graph")
     add_common(sp)
     sp.add_argument("--force", action="store_true", help="Ignore watermark; full pull")
+    sp.add_argument(
+        "--numbers",
+        default=None,
+        metavar="N,M",
+        help="Refresh exactly these items; the watermark is untouched",
+    )
     sp.add_argument("--include-patches", action="store_true", help="Store pull file patches")
     sp.add_argument(
         "--source",

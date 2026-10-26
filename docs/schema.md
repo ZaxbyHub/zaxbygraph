@@ -308,7 +308,7 @@ One row per repo. What `zaxbygraph status` reads.
 | `comment_count` | INTEGER | |
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
-| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
 
@@ -429,7 +429,7 @@ Audit trail of HTTP fetches.
 | --- | --- | --- |
 | `id` | INTEGER | Primary key. |
 | `repo` | TEXT | |
-| `resource` | TEXT | e.g. `issues`, `pulls`, `comments`. |
+| `resource` | TEXT | `item` (one row per ingested item, and per deletion verdict), `pr_files`, or `graphql_probe` (capability-probe omissions and failures). |
 | `resource_id` | TEXT | |
 | `fetched_at` | TEXT | |
 | `http_status` | INTEGER | |
@@ -439,7 +439,7 @@ Audit trail of HTTP fetches.
 
 | Column | Type | Notes |
 | --- | --- | --- |
-| `key` | TEXT | Primary key. Includes `schema_version`. |
+| `key` | TEXT | Primary key. Includes `schema_version` and the capability-cache namespace `capability_probe:<host>:<gh-version>` (value: JSON `{"Issue": [...field names], "PullRequest": [...]}`, rewritten by every successful probe). |
 | `value` | TEXT | |
 
 ## Full-text search

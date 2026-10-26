@@ -39,13 +39,11 @@ _MAX_CONTINUATION_PAGES = 50
 #: the sync records the truncation in fetch_log (#6).
 _MAX_TIMELINE_EVENTS = 500
 
-#: Upper bound on the rendered query so the argv element stays well under
-#: Windows' 32767-char CreateProcessW limit (since the timeline selection
-#: joined the field sets, a 40-PR chunk renders ~68k chars and would fail
-#: with WinError 206, an OSError no GitHubError handler catches; chunks now
-#: flush at ~15 PRs / ~26 issues). Chunks flush early when the rendered query
-#: approaches this.
-_MAX_QUERY_CHARS = 24000
+#: Sanity bound on the rendered query. The query travels on stdin (issue
+#: #23), so Windows' argv limit no longer applies; this only keeps a runaway
+#: field set from producing an unbounded request. The binding chunk size is
+#: GRAPHQL_CHILDREN_PAGE.
+_MAX_QUERY_CHARS = 100_000
 
 #: Numbers per aliased existence probe.
 GRAPHQL_DELETED_PAGE = 50
@@ -113,6 +111,17 @@ reviews(first: 50) {
 }
 """
 
+_CLOSING_REFS_NODES = """
+closingIssuesReferences(first: 100) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    number
+    repository { nameWithOwner }
+  }
+}
+"""
+
 _PULL_SCALARS = """
 additions
 deletions
@@ -124,15 +133,7 @@ baseRefName
 headRefName
 isDraft
 mergedBy { login }
-closingIssuesReferences(first: 100) {
-  totalCount
-  pageInfo { hasNextPage }
-  nodes {
-    number
-    repository { nameWithOwner }
-  }
-}
-"""
+""" + _CLOSING_REFS_NODES
 
 #: Timeline events ride every page query (issue #6): closed events carry the
 #: closer union (commit sha or pull request number), cross-references carry
@@ -181,6 +182,37 @@ databaseId
 {_FILE_NODES}
 {_TIMELINE_NODES}
 """
+
+#: Field-selection fragments for the page query, each tagged with the exact
+#: schema field it renders. A capability probe drops every fragment whose
+#: field the host's schema no longer carries — PER FIELD, not per block, so
+#: drift on any single selected field degrades that selection instead of
+#: aborting the sync with a validation error (issue #23). Omitted names are
+#: recorded for fetch_log.
+_PULL_SCALAR_FRAGMENTS = (
+    ("additions", "additions"),
+    ("deletions", "deletions"),
+    ("changedFiles", "changedFiles"),
+    ("commits", "commits { totalCount }"),
+    ("mergedAt", "mergedAt"),
+    ("mergeCommit", "mergeCommit { oid }"),
+    ("baseRefName", "baseRefName"),
+    ("headRefName", "headRefName"),
+    ("isDraft", "isDraft"),
+    ("mergedBy", "mergedBy { login }"),
+)
+_ISSUE_TYPE_BLOCKS = (
+    ("comments", _ISSUE_COMMENT_NODES),
+    ("timelineItems", _TIMELINE_NODES),
+)
+_PULL_TYPE_BLOCKS = (
+    ("comments", _ISSUE_COMMENT_NODES),
+    *_PULL_SCALAR_FRAGMENTS,
+    ("reviews", _REVIEW_NODES),
+    ("files", _FILE_NODES),
+    ("timelineItems", _TIMELINE_NODES),
+    ("closingIssuesReferences", _CLOSING_REFS_NODES),
+)
 
 _CHANGE_TYPE_TO_STATUS = {
     "ADDED": "added",
@@ -297,11 +329,117 @@ class GraphQLSource(GhApiSource):
         #: Last budget observed from a page query (None until one succeeds).
         self.rate_limit_remaining: int | None = None
         self.rate_limit_reset_at: str | None = None
+        #: Active capability map {"Issue": {fields}, "PullRequest": {fields}}
+        #: once a probe ran or a persisted cache was attached (issue #23).
+        #: None means "no capability knowledge" - the full field set is sent.
+        self._capabilities: dict[str, set[str]] | None = None
+        #: Field names omitted from page queries by the active capabilities,
+        #: for sync to record in fetch_log.
+        self.omitted_fields: list[str] = []
+        #: Section-scoped runtime errors dropped by the last chunk query,
+        #: {number: [(section, error-type, message-head), ...]} (issue #23).
+        self.last_fetch_drops: dict[int, list[tuple[str, str, str]]] = {}
+
+    # -- capability probe ---------------------------------------------------
+
+    def probe_capabilities(self) -> dict[str, set[str]]:
+        """Introspect the Issue/PullRequest field sets once and ACTIVATE the
+        result for query building on this source (issue #23).
+
+        A second call costs no introspection. The page-query builder consults
+        the active map and omits absent fields; sync persists the map in the
+        `meta` table keyed by host and gh version and re-attaches it with
+        attach_capabilities on later runs. A probe failure propagates to the
+        caller, which fails open (sync proceeds with the full field set)."""
+        if self._capabilities is not None:
+            return self._capabilities
+        query = (
+            "query { rateLimit { remaining resetAt } "
+            'i: __type(name: "Issue") { fields(includeDeprecated: true) { name } } '
+            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } }'
+        )
+        payload = self._graphql(query)
+        caps: dict[str, set[str]] = {}
+        for alias, type_name in (("i", "Issue"), ("p", "PullRequest")):
+            node = payload.get(alias)
+            names: set[str] = set()
+            if isinstance(node, dict) and isinstance(node.get("fields"), list):
+                names = {
+                    str(f.get("name"))
+                    for f in node["fields"]
+                    if isinstance(f, dict) and f.get("name")
+                }
+            if names:
+                # An empty introspection answer means "unknown", not "the type
+                # has no fields" — omit it so the fail-open rule applies.
+                caps[type_name] = names
+        self._capabilities = caps
+        return caps
+
+    def attach_capabilities(self, caps: dict) -> None:
+        """Activate a PERSISTED capability map (never introspects).
+
+        Accepts the JSON round-trip shape {"Issue": [...], "PullRequest":
+        [...]}; malformed or EMPTY entries are ignored — an empty field set
+        means "unknown", never "the type has no fields", so a corrupt meta
+        row degrades to no-capabilities (full field set) rather than
+        stripping the query down to databaseId alone."""
+        parsed: dict[str, set[str]] = {}
+        for type_name in ("Issue", "PullRequest"):
+            fields = caps.get(type_name) if isinstance(caps, dict) else None
+            # The probe path passes sets, the meta-cache path passes lists
+            # (JSON round-trip): accept any non-string collection, but every
+            # entry must be a real field name — a corrupt row degrades to
+            # "unknown" (full field set), never to a stripped query.
+            if isinstance(fields, (list, set, tuple, frozenset)) and len(fields) > 0:
+                names = {f for f in fields if isinstance(f, str) and f}
+                if names:
+                    parsed[type_name] = names
+        self._capabilities = parsed or None
+
+    def _fields_for(self, kind: str) -> str:
+        """Field selection for one alias, honoring the active capability map.
+
+        Without capabilities the full historical field set is rendered. With
+        them, every block whose lead field the schema lacks is dropped and
+        its name recorded in omitted_fields."""
+        if kind == "pr":
+            blocks, lead = _PULL_TYPE_BLOCKS, _PULL_FIELDS
+        else:
+            blocks, lead = _ISSUE_TYPE_BLOCKS, _ISSUE_FIELDS
+        caps = self._capabilities
+        if caps is None:
+            return lead
+        present = caps.get("PullRequest" if kind == "pr" else "Issue")
+        if present is None:
+            # The probe reported nothing for this type: unknown, not absent —
+            # fail open to the full selection (issue #23).
+            return lead
+        parts = ["databaseId"]
+        for field, block in blocks:
+            if field in present:
+                parts.append(block)
+            else:
+                self.omitted_fields.append(field)
+        return "\n".join(parts)
 
     # -- transport ----------------------------------------------------------
 
-    def _graphql(self, query: str) -> dict:
-        cmd = [self.gh_bin, "api", "graphql", "-f", f"query={query}"]
+    def _graphql(self, query: str, aliases: dict[str, int] | None = None) -> dict:
+        """One GraphQL request. The query travels on stdin as the JSON
+        request body (`gh api graphql --input -`, issue #23): no argv element
+        carries query text, so Windows' CreateProcessW command-line limit can
+        never truncate a page query again.
+
+        `aliases` maps this query's item aliases to their numbers; errors
+        whose path scopes them to one alias's section
+        (["repository", <alias>, <section>, ...]) are then DROPPED rather
+        than raised - the section key is removed from that item's node so the
+        sync's per-item REST fallback answers it, and the drop is recorded on
+        last_fetch_drops for fetch_log. Validation errors (data null) and
+        anything not scoped to a known alias stay hard."""
+        self.last_dropped_sections: dict[int, list[tuple[str, str, str]]] = {}
+        cmd = [self.gh_bin, "api", "graphql", "--input", "-"]
         try:
             proc = subprocess.run(
                 cmd,
@@ -309,6 +447,7 @@ class GraphQLSource(GhApiSource):
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
+                input=json.dumps({"query": query}),
                 timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
@@ -353,15 +492,49 @@ class GraphQLSource(GhApiSource):
             # Per-alias NOT_FOUND errors ride alongside partial data when an
             # item was deleted between the listing and this query; the nulled
             # aliases then degrade to the per-item REST path below instead of
-            # aborting the whole run. Anything else fails closed.
-            hard = [
-                e
-                for e in (errors if isinstance(errors, list) else [])
-                if isinstance(e, dict)
-                and str(e.get("type", "")).upper() != "NOT_FOUND"
-                and "Could not resolve to an issue" not in str(e.get("message", ""))
-                and "Could not resolve to a pullRequest" not in str(e.get("message", ""))
-            ]
+            # aborting the whole run. A runtime per-field error scoped to one
+            # alias's section (FORBIDDEN on a connection, issue #23) likewise
+            # only drops that section: the errored key is removed from the
+            # item's node so the established absent-section REST fallback
+            # answers it. Validation errors (data null) and anything not
+            # scoped to a known alias fail closed.
+            hard = []
+            dropped: dict[int, list[tuple[str, str, str]]] = {}
+            for e in errors if isinstance(errors, list) else []:
+                if not isinstance(e, dict):
+                    continue
+                etype = str(e.get("type", "")).upper()
+                emsg = str(e.get("message", ""))
+                if (
+                    etype == "NOT_FOUND"
+                    or "Could not resolve to an issue" in emsg
+                    or "Could not resolve to a pullRequest" in emsg
+                ):
+                    continue
+                if "RATE_LIMIT" in etype or "rate limit" in emsg.lower():
+                    # A rate-limit error must always surface to the sleep/retry
+                    # ladder, even when GitHub scopes it to one section with a
+                    # path — dropping it would store partial data as a clean
+                    # run and keep hammering a throttled API (PR #37 review).
+                    hard.append(e)
+                    continue
+                path = e.get("path")
+                if (
+                    aliases is not None
+                    and isinstance(path, list)
+                    and len(path) >= 3
+                    and path[0] == "repository"
+                    and isinstance(path[1], str)
+                    and path[1] in aliases
+                    and isinstance(path[2], str)
+                ):
+                    number = aliases[path[1]]
+                    dropped.setdefault(number, []).append(
+                        (path[2], etype or "GRAPHQL_ERROR", emsg[:120])
+                    )
+                    continue
+                hard.append(e)
+            self.last_dropped_sections = dropped
             if hard or not isinstance(data.get("data"), dict):
                 raise self._with_rate_budget(GitHubError(message, status=status))
         payload = data.get("data")
@@ -397,6 +570,7 @@ class GraphQLSource(GhApiSource):
         children: dict[int, dict] = {}
         kinds: dict[int, str] = {}
         chunk: list[dict] = []
+        self.last_fetch_drops = {}
         for raw in items:
             if isinstance(raw, dict) and "number" in raw:
                 try:
@@ -427,7 +601,11 @@ class GraphQLSource(GhApiSource):
             f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
             f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args)} }} }} }}"
         )
-        payload = self._graphql(query)
+        # The alias map lets a section-scoped runtime error degrade the same
+        # way the page query degrades: the timeline section drops and the
+        # retained-set/truncation flag rules apply, instead of aborting the
+        # whole sync (issue #23 review round 2).
+        payload = self._graphql(query, aliases={alias: number})
         repo_payload = payload.get("repository")
         if not isinstance(repo_payload, dict):
             raise GitHubError("unexpected graphql repository payload")
@@ -523,14 +701,16 @@ class GraphQLSource(GhApiSource):
     def _fetch_children_chunk(self, chunk: list[dict]) -> dict[int, dict]:
         aliases: list[str] = []
         wanted: list[tuple[int, str]] = []
+        alias_numbers: dict[str, int] = {}
         for raw in chunk:
             if not isinstance(raw, dict) or "number" not in raw:
                 continue
             number = int(raw["number"])
             alias = ("p" if "pull_request" in raw else "i") + str(number)
-            fields = _PULL_FIELDS if "pull_request" in raw else _ISSUE_FIELDS
+            fields = self._fields_for("pr" if "pull_request" in raw else "issue")
             aliases.append(f"{alias}: {'pullRequest' if 'pull_request' in raw else 'issue'}(number: {number}) {{{fields}}}")
             wanted.append((number, alias))
+            alias_numbers[alias] = number
         if not aliases:
             return {}
         query = (
@@ -538,15 +718,21 @@ class GraphQLSource(GhApiSource):
             f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
             + " ".join(aliases) + " } }"
         )
-        payload = self._graphql(query)
+        payload = self._graphql(query, aliases=alias_numbers)
         repo = payload.get("repository")
         if not isinstance(repo, dict):
             raise GitHubError("unexpected graphql repository payload")
+        for number, drops in self.last_dropped_sections.items():
+            self.last_fetch_drops.setdefault(number, []).extend(drops)
         out: dict[int, dict] = {}
         for number, alias in wanted:
             node = repo.get(alias)
             if not isinstance(node, dict):
                 continue
+            for section, _, _ in self.last_dropped_sections.get(number, []):
+                # The errored section must read as ABSENT (not empty) so the
+                # sync's per-item REST fallback answers it (issue #23).
+                node.pop(section, None)
             out[number] = self._children_from_node(node)
         return out
 
@@ -555,7 +741,7 @@ class GraphQLSource(GhApiSource):
         # A section the node does not carry (permission mask, partial error)
         # must stay ABSENT so the sync's per-item REST fallback runs for it;
         # writing [] would present a silently empty page as complete.
-        if "comments" in node:
+        if node.get("comments") is not None:
             comments, comments_more = _connection(node.get("comments"))
             children["issue_comments"] = [
                 {
@@ -575,7 +761,7 @@ class GraphQLSource(GhApiSource):
             if comments_more:
                 children["issue_comments_incomplete"] = True
 
-        if "reviews" in node:
+        if node.get("reviews") is not None:
             reviews, reviews_more = _connection(node.get("reviews"))
             review_nodes = [r for r in reviews]
             children["reviews"] = [
@@ -615,7 +801,7 @@ class GraphQLSource(GhApiSource):
             if rc_more:
                 children["review_comments_incomplete"] = True
 
-        if "files" in node:
+        if node.get("files") is not None:
             files, files_more = _connection(node.get("files"))
             children["files"] = [
                 {
@@ -637,10 +823,13 @@ class GraphQLSource(GhApiSource):
             if files_more:
                 children["files_incomplete"] = True
 
-        if "baseRefName" in node or "mergedAt" in node:
+        if node.get("baseRefName") is not None or node.get("mergedAt") is not None:
             # The pull section is gated on its OWN fields, not on `files`:
             # a node whose files connection is masked must not silently lose
             # mergedBy / closingIssuesReferences (issue #6 review round 2).
+            # Presence alone is not enough: a permission-masked field comes
+            # back null WITH the key present, and treating it as complete
+            # would present an unanswered pull as real (issue #23).
             merge_commit = node.get("mergeCommit") or {}
             merged_by = node.get("mergedBy")
             merged_by_login = (
@@ -669,7 +858,7 @@ class GraphQLSource(GhApiSource):
             if closing_more:
                 children["closing_refs_incomplete"] = True
 
-        if "timelineItems" in node:
+        if node.get("timelineItems") is not None:
             events, timeline_more = _connection(node.get("timelineItems"))
             children["timeline"] = [_timeline_event(e) for e in events]
             # Retained for fetch_children's continuation; _resolve_children
