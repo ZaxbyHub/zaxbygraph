@@ -86,10 +86,19 @@ class JsonlReplaySource:
             if bundle is None:
                 continue
             if bundle.get("gone"):
-                out[number] = {
+                served = {
                     "gone": True,
                     "gone_status": bundle.get("gone_status") or 404,
                 }
+                if bundle.get("gone_note"):
+                    # The recorded note reproduces state_reason exactly for
+                    # every deletion shape (HTTP status, oracle, targeted).
+                    served["gone_note"] = bundle["gone_note"]
+                if bundle.get("gone_verdict"):
+                    # The oracle can report 'transferred' as well as 'deleted':
+                    # the verdict travels so replay reproduces items.state.
+                    served["gone_verdict"] = bundle["gone_verdict"]
+                out[number] = served
                 continue
             child: dict = {}
             for section in ("pull", "issue_comments", "review_comments", "reviews", "files"):
@@ -101,3 +110,37 @@ class JsonlReplaySource:
 
     def list_releases(self) -> list[dict]:
         return list(self._releases)
+
+    # -- deliberate REST-fallback absence ------------------------------------
+    #
+    # The recorded bundles ARE the child data; there is nothing to fall back
+    # to. These stubs convert what would otherwise be a raw AttributeError
+    # (sync's per-item REST fallback calling a missing method) into the
+    # repo's standard GitHubError, so `--include-patches` replays and edge
+    # shapes fail as a clean reported sync error instead of a traceback
+    # (PR #37 review).
+
+    @staticmethod
+    def _no_rest_fallback(name: str) -> None:
+        from zaxbygraph.github import GitHubError
+
+        raise GitHubError(
+            f"replay source has no REST fallback ({name}): the recorded bundles "
+            'are the child data; re-record the sidecar with the flags you need '
+            "(e.g. --include-patches)"
+        )
+
+    def get_pull(self, number: int) -> dict:
+        self._no_rest_fallback("get_pull")
+
+    def list_issue_comments(self, number: int) -> list[dict]:
+        self._no_rest_fallback("list_issue_comments")
+
+    def list_reviews(self, number: int) -> list[dict]:
+        self._no_rest_fallback("list_reviews")
+
+    def list_review_comments(self, number: int) -> list[dict]:
+        self._no_rest_fallback("list_review_comments")
+
+    def list_pr_files(self, number: int) -> list[dict]:
+        self._no_rest_fallback("list_pr_files")

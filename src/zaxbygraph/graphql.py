@@ -355,8 +355,8 @@ class GraphQLSource(GhApiSource):
             return self._capabilities
         query = (
             "query { rateLimit { remaining resetAt } "
-            'i: __type(name: "Issue") { fields { name } } '
-            'p: __type(name: "PullRequest") { fields { name } } }'
+            'i: __type(name: "Issue") { fields(includeDeprecated: true) { name } } '
+            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } }'
         )
         payload = self._graphql(query)
         caps: dict[str, set[str]] = {}
@@ -388,9 +388,13 @@ class GraphQLSource(GhApiSource):
         for type_name in ("Issue", "PullRequest"):
             fields = caps.get(type_name) if isinstance(caps, dict) else None
             # The probe path passes sets, the meta-cache path passes lists
-            # (JSON round-trip): accept any non-string collection.
+            # (JSON round-trip): accept any non-string collection, but every
+            # entry must be a real field name — a corrupt row degrades to
+            # "unknown" (full field set), never to a stripped query.
             if isinstance(fields, (list, set, tuple, frozenset)) and len(fields) > 0:
-                parsed[type_name] = {str(f) for f in fields}
+                names = {f for f in fields if isinstance(f, str) and f}
+                if names:
+                    parsed[type_name] = names
         self._capabilities = parsed or None
 
     def _fields_for(self, kind: str) -> str:
@@ -507,6 +511,13 @@ class GraphQLSource(GhApiSource):
                     or "Could not resolve to a pullRequest" in emsg
                 ):
                     continue
+                if "RATE_LIMIT" in etype or "rate limit" in emsg.lower():
+                    # A rate-limit error must always surface to the sleep/retry
+                    # ladder, even when GitHub scopes it to one section with a
+                    # path — dropping it would store partial data as a clean
+                    # run and keep hammering a throttled API (PR #37 review).
+                    hard.append(e)
+                    continue
                 path = e.get("path")
                 if (
                     aliases is not None
@@ -590,7 +601,11 @@ class GraphQLSource(GhApiSource):
             f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
             f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args)} }} }} }}"
         )
-        payload = self._graphql(query)
+        # The alias map lets a section-scoped runtime error degrade the same
+        # way the page query degrades: the timeline section drops and the
+        # retained-set/truncation flag rules apply, instead of aborting the
+        # whole sync (issue #23 review round 2).
+        payload = self._graphql(query, aliases={alias: number})
         repo_payload = payload.get("repository")
         if not isinstance(repo_payload, dict):
             raise GitHubError("unexpected graphql repository payload")

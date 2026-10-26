@@ -28,6 +28,7 @@ from zaxbygraph.graphql import GraphQLSource
 from zaxbygraph.sync import _gh_host, _gh_version, sync_repo
 from test_sync_plumbing import (
     _FULL_SCHEMA,
+    _BundleSource,
     _FakeGhHost,
     _listing_item,
     _page_payload,
@@ -266,34 +267,44 @@ class CapabilityCacheTests(TempDBTest):
 
     def test_second_source_reuses_persisted_probe(self) -> None:
         """After one sync probed, a SECOND source over the same store must
-        hydrate from meta: no additional introspection call. Killed by:
-        ignoring the cached meta row (always probing)."""
+        hydrate from meta: no additional introspection call, AND the hydrated
+        map must actually filter the second source's page query (behavioral
+        pin — a no-op attach_capabilities must fail this test; PR #37 review
+        round 2)."""
         schema = {"Issue": ["databaseId", "comments"], "PullRequest": _FULL_SCHEMA["PullRequest"]}
-        responses = [
-            _page_payload([1]),
-            [issue(1, title="one", comments=1, updated_at=ts(10))],
-            [],
-            [],
-        ]
         host = _FakeGhHost()
         host.write_schema(schema)
-        host.write_graphql_responses([_page_payload([1])])
-        # two syncs x (listing + comments fallback + releases)
+        # one GraphQL page per sync (the fake serves them by call counter)
+        host.write_graphql_responses([_page_payload([1]), _page_payload([1])])
+        # per sync: (since-filtered listing, releases) — 2 REST calls each
         listing = [issue(1, title="one", comments=1, updated_at=ts(10))]
-        host.write_rest_responses([listing, [], [], listing, [], []])
+        host.write_rest_responses([listing, [], listing, []])
         with host:
             first = sync_repo(self.conn, host.source(), REPO)
             probes_after_first = sum(1 for c in host.calls() if c["probe"])
             second = sync_repo(self.conn, host.source(), REPO)
             probes_after_second = sum(1 for c in host.calls() if c["probe"])
+            pages = [c for c in host.calls() if not c["probe"]]
         self.assertIsNone(first["last_error"])
         self.assertIsNone(second["last_error"])
+        self.assertEqual(first["ingested"], 1)
+        self.assertEqual(second["ingested"], 1, "the second sync must really re-ingest")
         self.assertEqual(probes_after_first, 1)
         self.assertEqual(
             probes_after_second,
             1,
             "the second source must hydrate capabilities from the meta cache",
         )
+        # BEHAVIORAL pin: the second sync's page query was built from the
+        # hydrated map (timelineItems absent from the schema) without any
+        # second probe — an attach no-op would leave timelineItems selected.
+        self.assertGreaterEqual(len(pages), 2)
+        for page in pages:
+            self.assertNotIn(
+                "timelineItems",
+                page["query"],
+                "the hydrated capability map must filter the page query",
+            )
         cached = get_meta(self.conn, _capabilities_key())
         self.assertIsNotNone(cached)
         self.assertIn("Issue", json.loads(cached))
@@ -687,6 +698,352 @@ class NumbersCliEdgeTests(TempDBTest):
 
     def test_force_combination_exits_2(self) -> None:
         self.assertEqual(self._cmd("1,2", force=True), 2)
+
+class FeedbackRoundTests(TempDBTest):
+    """PR #37 post-publication review fixes (swarm-pr-review + critic)."""
+
+    def test_probe_query_uses_include_deprecated_argument(self) -> None:
+        """The probe must pass includeDeprecated as the ARGUMENT to fields()
+        (deprecated-but-served fields must stay selected). Killed by: the
+        regressive form 'fields { name includeDeprecated }' — selecting a
+        nonexistent __Field subfield, which fails real introspection on every
+        run (PR #37 feedback-round critic, live-verified)."""
+        src = GraphQLSource("acme", "forgegate")
+        captured: list[str] = []
+
+        def fake_graphql(query, aliases=None):
+            captured.append(query)
+            return {
+                "i": {"fields": [{"name": "databaseId"}]},
+                "p": {"fields": [{"name": "comments"}]},
+            }
+
+        with patch.object(GraphQLSource, "_graphql", side_effect=fake_graphql):
+            src.probe_capabilities()
+        self.assertEqual(len(captured), 1)
+        self.assertIn(
+            "fields(includeDeprecated: true) { name }",
+            captured[0],
+            "the probe must request deprecated-but-served fields by argument",
+        )
+        self.assertNotIn("name includeDeprecated", captured[0])
+
+    def test_rate_limited_section_error_surfaces(self) -> None:
+        """A path-scoped RATE_LIMITED error must RAISE (engaging the sleep/
+        retry ladder), never drop as a section. Killed by: removing the
+        rate-limit gate from the section-error classifier."""
+        from zaxbygraph.github import GitHubError as GHError
+
+        host = _FakeGhHost()
+        host.write_schema(_FULL_SCHEMA)
+        host.write_graphql_responses(
+            [
+                {
+                    "data": None,
+                    "errors": [
+                        {
+                            "type": "RATE_LIMITED",
+                            "message": "API rate limit exceeded",
+                            "path": ["repository", "i1", "comments"],
+                        }
+                    ],
+                }
+            ]
+        )
+        with host:
+            src = host.source()
+            with self.assertRaises(GHError) as ctx:
+                src.fetch_children([_listing_item(1)])
+        self.assertIn("rate limit", str(ctx.exception).lower())
+
+    def test_timeline_alias_scoped_error_degrades(self) -> None:
+        """A section-scoped runtime error on a TIMELINE CONTINUATION page must
+        degrade (drop the section, no events) instead of aborting the sync.
+        Killed by: removing the aliases argument from _timeline_page."""
+        host = _FakeGhHost()
+        host.write_schema(_FULL_SCHEMA)
+        host.write_graphql_responses(
+            [
+                {
+                    "data": {
+                        "rateLimit": {"remaining": 4321, "resetAt": "2026-10-03T13:00:00Z"},
+                        "repository": {"i1": {"timelineItems": None}},
+                    },
+                    "errors": [
+                        {
+                            "type": "FORBIDDEN",
+                            "message": "mocked timeline continuation denial",
+                            "path": ["repository", "i1", "timelineItems"],
+                        }
+                    ],
+                }
+            ]
+        )
+        with host:
+            src = host.source()
+            events, info = src._timeline_page(1, "issue", "first: 50")
+        self.assertEqual(events, [])
+        self.assertEqual(info, {})
+
+    def test_attach_capabilities_strict_entries(self) -> None:
+        """A corrupt meta row must degrade to UNKNOWN (full field set), never
+        to a stripped query; non-string entries are ignored individually.
+        Killed by: str()-ing arbitrary entries back into the capability set."""
+        src = GraphQLSource("acme", "forgegate")
+        src.attach_capabilities({"Issue": [None, "comments", 123], "PullRequest": []})
+        self.assertEqual(src._capabilities, {"Issue": {"comments"}})
+        src.attach_capabilities({"Issue": [None], "PullRequest": ["comments"]})
+        self.assertEqual(src._capabilities, {"PullRequest": {"comments"}})
+        src.attach_capabilities({"Issue": [None], "PullRequest": []})
+        self.assertIsNone(src._capabilities, "all-unknown entries must deactivate")
+
+    def test_no_incomplete_note_for_structurally_na_sections(self) -> None:
+        """A plain issue on the bulk path must not log 'children incomplete:
+        files, pull, review_comments, reviews' — structurally-N/A sections
+        are complete. Killed by: reverting the N/A completeness rule."""
+        src = _BundleSource()
+        src.add_issue(issue(1, title="one", comments=0, updated_at=ts(10)))
+        dest = Path(self._td.name) / "sidecar"
+        result = sync_repo(self.conn, src, REPO, jsonl_path=dest)
+        self.assertIsNone(result["last_error"])
+        notes = [
+            r["note"] for r in self.conn.execute("SELECT note FROM fetch_log").fetchall()
+        ]
+        self.assertFalse(
+            any((n or "").startswith("children incomplete") for n in notes),
+            f"an issue has no N/A sections to report; got {notes}",
+        )
+
+    def test_targeted_noop_keeps_last_error(self) -> None:
+        """A targeted run that ingests NOTHING must not clear a previous
+        failure's last_error (no readiness laundering). Killed by: removing
+        the ingested_count guard from the targeted finalizer."""
+        from zaxbygraph.cli import cmd_sync
+
+        self.conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, full_sync_pending, last_error) "
+            "VALUES (?, ?, 0, 'previous failure')",
+            (REPO, "2026-01-01T00:00:00Z"),
+        )
+        self.conn.commit()
+        src = _NumberedSource()
+        src.add_issue(issue(5, title="unrelated", updated_at=ts(50)))
+        args = type(
+            "Args",
+            (),
+            {
+                "repo": REPO,
+                "db": str(self.db_path),
+                "force": False,
+                "include_patches": False,
+                "jsonl": None,
+                "jsonl_flag": False,
+                "format": "json",
+                "source": "graphql",
+                "wait": False,
+                "numbers": "999999",
+            },
+        )()
+        with patch("zaxbygraph.cli.GhApiSource", return_value=src):
+            code = cmd_sync(args)
+        self.assertEqual(code, 0)
+        row = self.conn.execute(
+            "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()
+        self.assertEqual(
+            row["last_error"],
+            "previous failure",
+            "a no-op targeted run must not launder a failed sync's error",
+        )
+
+    def test_gone_bundle_for_already_stored_deletion(self) -> None:
+        """A deletion of an ALREADY-STORED item must reach the sidecar and
+        replay to the same state/state_reason (the HIGH finding of the PR #37
+        review: replay used to resurrect the deleted item)."""
+        from zaxbygraph.github import GitHubError as GHError
+
+        class _Stored404Source(FakeGitHubSource):
+            """Item 1 is stored, then its per-item pull fetch 404s: the
+            exists-branch deletion with the listing payload in hand."""
+
+            def get_pull(self, number: int) -> dict:
+                if number == 1:
+                    raise GHError("HTTP 410 Gone", status=410)
+                return super().get_pull(number)
+
+        src = _Stored404Source()
+        src.add_pr(
+            issue(1, title="gone-later", comments=0, kind="pr", updated_at=ts(10)),
+            pull(1, changed_files=0),
+        )
+        sidecar = Path(self._td.name) / "sidecar"
+        result = sync_repo(self.conn, src, REPO, jsonl_path=sidecar)
+        self.assertIsNone(result["last_error"])
+        orig = self.conn.execute(
+            "SELECT state, state_reason FROM items WHERE number = 1"
+        ).fetchone()
+        self.assertEqual(orig["state"], "deleted")
+        records = [
+            json.loads(line)
+            for line in (sidecar / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        gone = [
+            r for r in records
+            if r.get("resource") == "item_bundle" and r["payload"].get("gone")
+        ]
+        self.assertEqual(len(gone), 1, "the already-stored deletion must be sidecar'd")
+
+        from replay import JsonlReplaySource
+
+        replay_conn = connect(Path(self._td.name) / "replay.db")
+        init_schema(replay_conn)
+        try:
+            sync_repo(replay_conn, JsonlReplaySource(sidecar / "events.jsonl"), REPO)
+            got = replay_conn.execute(
+                "SELECT state, state_reason FROM items WHERE number = 1"
+            ).fetchone()
+            self.assertEqual(got["state"], "deleted", "replay must not resurrect")
+            self.assertEqual(got["state_reason"], orig["state_reason"])
+        finally:
+            replay_conn.close()
+
+    def test_gone_bundle_for_numbers_deletion(self) -> None:
+        """A targeted refresh of a number GitHub no longer has must sidecar
+        the deletion (from the stored payload) and replay to deleted."""
+        src = _NumberedSource()
+        src.missing_status = {2: 404}
+        sidecar = Path(self._td.name) / "sidecar"
+        from zaxbygraph.store import ingest_item
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        ingest_item(
+            self.conn, REPO, issue(2, title="stored", updated_at=ts(5)),
+            pull_raw=None, issue_comments=[], review_comments=[],
+            reviews=[], files=[], include_patches=False,
+            advance_watermark=False,
+        )
+        self.conn.commit()
+        result = sync_repo(self.conn, src, REPO, jsonl_path=sidecar, numbers=[2])
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT state FROM items WHERE number = 2"
+            ).fetchone()[0],
+            "deleted",
+        )
+        orig = self.conn.execute(
+            "SELECT state_reason FROM items WHERE number = 2"
+        ).fetchone()["state_reason"]
+        records = [
+            json.loads(line)
+            for line in (sidecar / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        ]
+        gone = [
+            r for r in records
+            if r.get("resource") == "item_bundle" and r["payload"].get("gone")
+        ]
+        self.assertEqual(len(gone), 1)
+
+        from replay import JsonlReplaySource
+
+        replay_conn = connect(Path(self._td.name) / "replay.db")
+        init_schema(replay_conn)
+        try:
+            sync_repo(replay_conn, JsonlReplaySource(sidecar / "events.jsonl"), REPO)
+            got = replay_conn.execute(
+                "SELECT state, state_reason FROM items WHERE number = 2"
+            ).fetchone()
+            self.assertEqual(got["state"], "deleted")
+            self.assertEqual(got["state_reason"], orig)
+
+            # A 'transferred' oracle verdict must survive the round trip too:
+            # rewrite the bundle's verdict and confirm replay honors it
+            # (PR #37 feedback-round critic — replay.py used to drop it).
+            transferred_bundle = dict(gone[0])
+            transferred_bundle["payload"] = {
+                **gone[0]["payload"], "gone_verdict": "transferred"
+            }
+            transferred = Path(self._td.name) / "transferred.jsonl"
+            transferred.write_text(
+                json.dumps(transferred_bundle) + "\n", encoding="utf-8"
+            )
+            replay_conn.execute("DELETE FROM items")
+            replay_conn.commit()
+            sync_repo(replay_conn, JsonlReplaySource(transferred), REPO)
+            got_t = replay_conn.execute(
+                "SELECT state, state_reason FROM items WHERE number = 2"
+            ).fetchone()
+            self.assertEqual(
+                got_t["state"],
+                "transferred",
+                "the carried verdict must reach the replayed row",
+            )
+            self.assertIn("marked transferred", got_t["state_reason"])
+        finally:
+            replay_conn.close()
+
+    def test_capability_cache_self_heals_after_fatal_error(self) -> None:
+        """A fatal GitHubError while running on a CACHED capability map must
+        delete the meta row so the next sync re-probes (no permanent
+        post-probe-drift abort). Killed by: removing the invalidation from
+        sync_repo's recorder path."""
+        schema = {"Issue": ["databaseId", "comments"], "PullRequest": _FULL_SCHEMA["PullRequest"]}
+        host = _FakeGhHost()
+        host.write_schema(schema)
+        listing = [issue(1, title="one", comments=1, updated_at=ts(10))]
+        # sync1 ok; sync2's page is a VALIDATION error (data null -> hard,
+        # no rate attrs -> fatal on the first attempt); sync3 must re-probe
+        # (probe count 2) and recover off the third response.
+        validation_error = {
+            "data": None,
+            "errors": [{"message": "Field 'comments' doesn't exist"}],
+        }
+        host.write_graphql_responses([_page_payload([1]), validation_error, _page_payload([1])])
+        host.write_rest_responses([listing, [], listing, listing, []])
+        with host:
+            r1 = sync_repo(self.conn, host.source(), REPO)
+            self.assertIsNone(r1["last_error"])
+            from zaxbygraph.sync import SyncError
+
+            with self.assertRaises(SyncError):
+                sync_repo(self.conn, host.source(), REPO)
+            row = self.conn.execute(
+                "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchone()
+            self.assertIsNotNone(row["last_error"], "the drifted run must fail loudly")
+            self.assertIsNone(
+                get_meta(self.conn, _capabilities_key()),
+                "the fatal error must have invalidated the cached map",
+            )
+            r3 = sync_repo(self.conn, host.source(), REPO)
+            self.assertIsNone(r3["last_error"], "the next sync must re-probe and recover")
+            probes = sum(1 for c in host.calls() if c["probe"])
+        self.assertEqual(
+            probes,
+            2,
+            "the fatal error must invalidate the cached map (exactly one re-probe)",
+        )
+        self.assertIsNotNone(get_meta(self.conn, _capabilities_key()))
+
+    def test_mcp_runner_forwards_numbers(self) -> None:
+        """The MCP default sync runner must forward `numbers` to sync_repo
+        (an ignored numbers argument ran a FULL sync with the deletion
+        oracle — the opposite of a targeted refresh)."""
+        from zaxbygraph import mcp_server
+
+        captured: dict = {}
+
+        def fake_sync_repo(conn, source, repo, **kw):
+            captured.update(kw)
+
+        fake_conn = unittest.mock.MagicMock()
+        with patch.object(mcp_server, "sync_repo", side_effect=fake_sync_repo), \
+                patch.object(mcp_server, "init_schema"), \
+                patch.object(mcp_server, "connect", return_value=fake_conn):
+            mcp_server._default_sync_runner(
+                Path(self._td.name) / "x.db", REPO, numbers=[2, 3]
+            )
+        self.assertEqual(captured.get("numbers"), [2, 3])
 
 
 if __name__ == "__main__":

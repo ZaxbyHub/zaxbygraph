@@ -194,7 +194,7 @@ class FakeTimelineApi:
         self.pages = list(pages)
         self.queries: list[str] = []
 
-    def __call__(self, query: str) -> dict:
+    def __call__(self, query: str, aliases: dict[str, int] | None = None) -> dict:
         self.queries.append(query)
         return self.pages.pop(0)
 

@@ -483,6 +483,7 @@ def mark_sync_finished(
     rate_limit_remaining: int | None = None,
     rate_limit_reset_at: str | None = None,
     targeted: bool = False,
+    ingested_count: int = 0,
 ) -> None:
     """Stamp a clean finish.
 
@@ -498,7 +499,10 @@ def mark_sync_finished(
     freshness stamp moves — `last_incr_sync_at` means a drained incremental
     listing whose coverage is bounded by the watermark, which a targeted
     refresh is not — and `full_sync_pending` is preserved so a never- or
-    interrupted-full corpus still reads incomplete.
+    interrupted-full corpus still reads incomplete. A targeted run that
+    ingested NOTHING (ingested_count == 0) leaves a previous `last_error`
+    standing: a no-op refresh must not launder a failed sync's error into a
+    clean readiness verdict (PR #37 review).
 
     The rate-limit columns carry the window this run slept through (NULL when
     it saw none), verbatim as the source reported it (issue #5 AC4).
@@ -509,12 +513,13 @@ def mark_sync_finished(
         conn.execute(
             """
             UPDATE sync_state SET
-                last_error = NULL,
+                last_error = CASE WHEN :ingested > 0 THEN NULL ELSE last_error END,
                 rate_limit_remaining = :rate_remaining,
                 rate_limit_reset_at = :rate_reset_at
             WHERE repo = :repo
             """,
             {
+                "ingested": ingested_count,
                 "repo": repo,
                 "rate_remaining": rate_limit_remaining,
                 "rate_reset_at": rate_limit_reset_at,

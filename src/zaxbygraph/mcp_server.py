@@ -127,7 +127,8 @@ _JOB_SEQ = itertools.count(1)
 
 
 def _default_sync_runner(
-    db_path, repo: str, *, force: bool = False, include_patches: bool = False
+    db_path, repo: str, *, force: bool = False, include_patches: bool = False,
+    numbers: list[int] | None = None,
 ) -> None:
     """The real background sync: the cmd_sync core without CLI output.
 
@@ -137,7 +138,8 @@ def _default_sync_runner(
     try:
         init_schema(conn)
         source = GhApiSource(*repo.split("/", 1))
-        sync_repo(conn, source, repo, force=force, include_patches=include_patches)
+        sync_repo(conn, source, repo, force=force, include_patches=include_patches,
+                  numbers=numbers)
     finally:
         conn.close()
 
@@ -768,12 +770,26 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     runner = ctx.sync_runner
     force = _bool_arg(arguments, "force")
     include_patches = _bool_arg(arguments, "include_patches")
-    if runner is _default_sync_runner and (force or include_patches):
+    numbers_raw = arguments.get("numbers")
+    numbers: list[int] | None = None
+    if numbers_raw is not None:
+        if not isinstance(numbers_raw, list) or not numbers_raw or not all(
+            isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in numbers_raw
+        ):
+            raise ToolError(
+                "bad_request",
+                "numbers must be a non-empty list of positive integers",
+                hint='e.g. "numbers": [12, 34]',
+            )
+        numbers = numbers_raw
+    if runner is _default_sync_runner and (force or include_patches or numbers):
         # Advertised arguments must actually reach sync_repo; the injected
         # test seam keeps its pinned (db_path, repo) signature.
-        def runner(db_path_, repo_, _force=force, _patches=include_patches):
+        def runner(db_path_, repo_, _force=force, _patches=include_patches,
+                   _numbers=numbers):
             return _default_sync_runner(
-                db_path_, repo_, force=_force, include_patches=_patches
+                db_path_, repo_, force=_force, include_patches=_patches,
+                numbers=_numbers,
             )
     try:
         job_id, started = _start_job(db_path, slug, runner)
@@ -894,6 +910,11 @@ _TOOLS: list[dict] = [
         "inputSchema": _schema(
             {
                 "force": {"type": "boolean", "description": "Ignore the watermark; full pull"},
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "description": "Refresh exactly these items; the watermark is untouched",
+                },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},
                 **_REPO_DB,
             }
