@@ -211,6 +211,57 @@ class CapabilityCacheTests(TempDBTest):
     """The persisted meta cache: reuse across sources, invalidation by
     host/gh-version, and no probe machinery for sources without the pair."""
 
+    def test_non_lead_field_omitted_from_query(self) -> None:
+        """Per-FIELD omission (issue #23 review finding 1): a probe reporting
+        a NON-lead PullRequest field absent (closingIssuesReferences — not a
+        fragment lead, buried mid-scalars at base granularity) must remove
+        exactly that field from the page query and record the omission.
+        Killed by: gating whole field blocks on their lead field only."""
+        pr_fields = [f for f in _FULL_SCHEMA["PullRequest"] if f != "closingIssuesReferences"]
+        host = _FakeGhHost()
+        host.write_schema({"Issue": _FULL_SCHEMA["Issue"], "PullRequest": pr_fields})
+        pr_node = {
+            "databaseId": 10_001,
+            "baseRefName": "main",
+            "mergedAt": None,
+            "additions": 1,
+            "deletions": 0,
+            "changedFiles": 0,
+            "commits": {"totalCount": 1},
+            "mergeCommit": None,
+            "headRefName": "feature",
+            "isDraft": False,
+            "mergedBy": None,
+        }
+        host.write_graphql_responses(
+            [
+                {
+                    "data": {
+                        "rateLimit": {"remaining": 4321, "resetAt": "2026-10-03T13:00:00Z"},
+                        "repository": {"p1": pr_node},
+                    }
+                }
+            ]
+        )
+        pr_item = _listing_item(1)
+        pr_item["pull_request"] = {"url": "https://api.github.com/repos/x"}  # PR-shaped alias
+        with host:
+            src = host.source()
+            src.probe_capabilities()
+            children = src.fetch_children([pr_item])
+            calls = host.calls()
+        self.assertIn(1, children)
+        pages = [c for c in calls if not c["probe"]]
+        self.assertGreaterEqual(len(pages), 1)
+        for page in pages:
+            self.assertNotIn(
+                "closingIssuesReferences",
+                page["query"],
+                "a probed-absent NON-lead field must be omitted from the page query",
+            )
+            self.assertIn("isDraft", page["query"], "sibling fields must stay selected")
+        self.assertIn("closingIssuesReferences", src.omitted_fields)
+
     def test_second_source_reuses_persisted_probe(self) -> None:
         """After one sync probed, a SECOND source over the same store must
         hydrate from meta: no additional introspection call. Killed by:
@@ -287,13 +338,21 @@ class CapabilityCacheTests(TempDBTest):
 
 class _NumberedSource(FakeGitHubSource):
     """A numbers-capable fake: get_issues serves exactly the requested
-    numbers (or None for a number GitHub does not have)."""
+    numbers as (payload, status) tuples; missing numbers carry the status
+    the caller states (404/410) or None when unknown."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.missing_status: dict[int, int | None] = {}
 
     def get_issues(self, numbers):
-        out: dict[int, dict | None] = {}
+        out: dict[int, tuple[dict | None, int | None]] = {}
         for n in numbers:
             rec = self.issues.get(int(n))
-            out[int(n)] = deepcopy(rec) if rec is not None else None
+            if rec is not None:
+                out[int(n)] = (deepcopy(rec), 200)
+            else:
+                out[int(n)] = (None, self.missing_status.get(int(n), 404))
         return out
 
 
@@ -395,31 +454,45 @@ class NumbersModeStateTests(TempDBTest):
 
     def test_numbers_404_marks_stored_and_skips_missing(self) -> None:
         """A requested number GitHub no longer has: a STORED item is marked
-        deleted (no watermark movement); a never-stored number only leaves a
-        fetch_log note. Killed by: aborting the run on the 404."""
+        deleted with the REAL reported status (no watermark movement); a
+        never-stored number only leaves a fetch_log note; an unknown status
+        (None) never fabricates an HTTP code in state_reason. Killed by:
+        hardcoding 404 into the mark note regardless of the carried status."""
         src = _NumberedSource()
         src.add_issue(issue(1, title="kept", updated_at=ts(10)))
+        src.missing_status = {2: 410, 3: None, 9: 404, 8: None}
         self._seed_state(since="2026-01-01T00:00:00Z")
-        # pre-store item 2 so the 404 marks it gone
+        # pre-store items 2 and 3 so their absences mark them gone
         from zaxbygraph.store import ingest_item
 
         self.conn.execute("BEGIN IMMEDIATE")
         ingest_item(
-            self.conn, REPO, issue(2, title="gone", updated_at=ts(5)),
+            self.conn, REPO, issue(2, title="gone-410", updated_at=ts(5)),
+            pull_raw=None, issue_comments=[], review_comments=[],
+            reviews=[], files=[], include_patches=False,
+            advance_watermark=False,
+        )
+        ingest_item(
+            self.conn, REPO, issue(3, title="gone-unknown", updated_at=ts(6)),
             pull_raw=None, issue_comments=[], review_comments=[],
             reviews=[], files=[], include_patches=False,
             advance_watermark=False,
         )
         self.conn.commit()
-        code = self._run_numbers(src, "1,2,9")
+        code = self._run_numbers(src, "1,2,3,8,9")
         self.assertEqual(code, 0)
-        states = {
-            r["number"]: r["state"]
-            for r in self.conn.execute("SELECT number, state FROM items").fetchall()
+        rows = {
+            r["number"]: (r["state"], r["state_reason"])
+            for r in self.conn.execute(
+                "SELECT number, state, state_reason FROM items"
+            ).fetchall()
         }
-        self.assertEqual(states.get(1), "open")
-        self.assertEqual(states.get(2), "deleted")
-        self.assertNotIn(9, states)
+        self.assertEqual(rows[1][0], "open")
+        self.assertEqual(rows[2][0], "deleted")
+        self.assertIn("HTTP 410", rows[2][1], "the carried status must reach state_reason")
+        self.assertEqual(rows[3][0], "open", "an unknown status must not mark a deletion")
+        self.assertNotIn(8, rows)
+        self.assertNotIn(9, rows)
         notes = [
             r["note"] for r in self.conn.execute("SELECT note FROM fetch_log").fetchall()
         ]

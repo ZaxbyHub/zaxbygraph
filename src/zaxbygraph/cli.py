@@ -464,7 +464,7 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
 def cmd_sync(args: argparse.Namespace) -> int:
     numbers: list[int] | None = None
     numbers_raw = getattr(args, "numbers", None)
-    if numbers_raw:
+    if numbers_raw is not None:
         try:
             numbers = [int(x) for x in str(numbers_raw).replace(" ", "").split(",") if x != ""]
         except ValueError:

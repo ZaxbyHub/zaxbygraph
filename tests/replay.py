@@ -61,12 +61,16 @@ class JsonlReplaySource:
         if page:
             yield page
 
-    def get_issues(self, numbers: list[int]) -> dict[int, dict | None]:
-        """Exact-number shells from the recorded bundles (numbers mode)."""
-        out: dict[int, dict | None] = {}
+    def get_issues(self, numbers: list[int]) -> dict[int, tuple[dict | None, int | None]]:
+        """Exact-number shells from the recorded bundles (numbers mode).
+
+        A number absent from the recording is `(None, None)` — unknown, not
+        an HTTP 404 — so sync skips it with a note instead of marking a
+        deletion reason the replay never observed."""
+        out: dict[int, tuple[dict | None, int | None]] = {}
         for number in numbers:
             bundle = self._by_number.get(int(number))
-            out[int(number)] = None if bundle is None else bundle["item"]
+            out[int(number)] = (None, None) if bundle is None else (bundle["item"], 200)
         return out
 
     def fetch_children(self, items) -> dict[int, dict]:

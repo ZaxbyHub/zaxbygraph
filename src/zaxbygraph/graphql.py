@@ -111,6 +111,17 @@ reviews(first: 50) {
 }
 """
 
+_CLOSING_REFS_NODES = """
+closingIssuesReferences(first: 100) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    number
+    repository { nameWithOwner }
+  }
+}
+"""
+
 _PULL_SCALARS = """
 additions
 deletions
@@ -122,15 +133,7 @@ baseRefName
 headRefName
 isDraft
 mergedBy { login }
-closingIssuesReferences(first: 100) {
-  totalCount
-  pageInfo { hasNextPage }
-  nodes {
-    number
-    repository { nameWithOwner }
-  }
-}
-"""
+""" + _CLOSING_REFS_NODES
 
 #: Timeline events ride every page query (issue #6): closed events carry the
 #: closer union (commit sha or pull request number), cross-references carry
@@ -180,20 +183,35 @@ databaseId
 {_TIMELINE_NODES}
 """
 
-#: Field-selection blocks for the page query, each tagged with the leading
-#: schema field it renders. A capability probe drops every block whose lead
-#: field the host's schema no longer carries, and the omitted field names are
-#: recorded for fetch_log (issue #23).
+#: Field-selection fragments for the page query, each tagged with the exact
+#: schema field it renders. A capability probe drops every fragment whose
+#: field the host's schema no longer carries — PER FIELD, not per block, so
+#: drift on any single selected field degrades that selection instead of
+#: aborting the sync with a validation error (issue #23). Omitted names are
+#: recorded for fetch_log.
+_PULL_SCALAR_FRAGMENTS = (
+    ("additions", "additions"),
+    ("deletions", "deletions"),
+    ("changedFiles", "changedFiles"),
+    ("commits", "commits { totalCount }"),
+    ("mergedAt", "mergedAt"),
+    ("mergeCommit", "mergeCommit { oid }"),
+    ("baseRefName", "baseRefName"),
+    ("headRefName", "headRefName"),
+    ("isDraft", "isDraft"),
+    ("mergedBy", "mergedBy { login }"),
+)
 _ISSUE_TYPE_BLOCKS = (
     ("comments", _ISSUE_COMMENT_NODES),
     ("timelineItems", _TIMELINE_NODES),
 )
 _PULL_TYPE_BLOCKS = (
     ("comments", _ISSUE_COMMENT_NODES),
-    ("additions", _PULL_SCALARS),
+    *_PULL_SCALAR_FRAGMENTS,
     ("reviews", _REVIEW_NODES),
     ("files", _FILE_NODES),
     ("timelineItems", _TIMELINE_NODES),
+    ("closingIssuesReferences", _CLOSING_REFS_NODES),
 )
 
 _CHANGE_TYPE_TO_STATUS = {
@@ -351,7 +369,10 @@ class GraphQLSource(GhApiSource):
                     for f in node["fields"]
                     if isinstance(f, dict) and f.get("name")
                 }
-            caps[type_name] = names
+            if names:
+                # An empty introspection answer means "unknown", not "the type
+                # has no fields" — omit it so the fail-open rule applies.
+                caps[type_name] = names
         self._capabilities = caps
         return caps
 
@@ -359,14 +380,18 @@ class GraphQLSource(GhApiSource):
         """Activate a PERSISTED capability map (never introspects).
 
         Accepts the JSON round-trip shape {"Issue": [...], "PullRequest":
-        [...]}; malformed entries are ignored so a corrupt meta row degrades
-        to no-capabilities rather than breaking the sync."""
+        [...]}; malformed or EMPTY entries are ignored — an empty field set
+        means "unknown", never "the type has no fields", so a corrupt meta
+        row degrades to no-capabilities (full field set) rather than
+        stripping the query down to databaseId alone."""
         parsed: dict[str, set[str]] = {}
         for type_name in ("Issue", "PullRequest"):
             fields = caps.get(type_name) if isinstance(caps, dict) else None
-            if isinstance(fields, list):
+            # The probe path passes sets, the meta-cache path passes lists
+            # (JSON round-trip): accept any non-string collection.
+            if isinstance(fields, (list, set, tuple, frozenset)) and len(fields) > 0:
                 parsed[type_name] = {str(f) for f in fields}
-        self._capabilities = parsed
+        self._capabilities = parsed or None
 
     def _fields_for(self, kind: str) -> str:
         """Field selection for one alias, honoring the active capability map.
@@ -381,7 +406,11 @@ class GraphQLSource(GhApiSource):
         caps = self._capabilities
         if caps is None:
             return lead
-        present = caps.get("PullRequest" if kind == "pr" else "Issue", set())
+        present = caps.get("PullRequest" if kind == "pr" else "Issue")
+        if present is None:
+            # The probe reported nothing for this type: unknown, not absent —
+            # fail open to the full selection (issue #23).
+            return lead
         parts = ["databaseId"]
         for field, block in blocks:
             if field in present:

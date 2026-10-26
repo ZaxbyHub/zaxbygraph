@@ -380,21 +380,27 @@ def _numbered_payloads(
         results = _call_with_rate_retry(getter, sorted(wanted)) or {}
         shells: list[dict] = []
         for n in sorted(wanted):
-            payload = results.get(n)
+            entry = results.get(n)
+            payload = entry[0] if isinstance(entry, tuple) else entry
             if isinstance(payload, dict):
                 shells.append(payload)
         if shells:
             yield shells
         for n in sorted(wanted):
-            if isinstance(results.get(n), dict):
+            entry = results.get(n)
+            payload = entry[0] if isinstance(entry, tuple) else entry
+            status = entry[1] if isinstance(entry, tuple) else None
+            if isinstance(payload, dict):
                 continue
             exists = conn.execute(
                 "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, n)
             ).fetchone() is not None
-            if exists:
+            if exists and status in (404, 410):
+                # The recorded reason carries the REAL status the source
+                # reported — never a hardcoded one (issue #23 review).
                 _mark_gone(
                     conn, repo, n, "deleted",
-                    "GitHub returned HTTP 404 while fetching item data",
+                    f"GitHub returned HTTP {status} while fetching item data",
                 )
             else:
                 conn.execute("BEGIN IMMEDIATE")
