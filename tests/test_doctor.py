@@ -42,7 +42,7 @@ from pathlib import Path
 from fixtures import FakeGitHubSource, issue
 from test_migrations import V1_SCHEMA_SQL
 from zaxbygraph.cli import main
-from zaxbygraph.db import connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 from zaxbygraph.sync import sync_repo
 
 SLUG = "acme/widget"
@@ -370,7 +370,10 @@ class DoctorTests(unittest.TestCase):
 
         store = self.home / "github.com" / "acme" / "widget" / "history.db"
         self.assertTrue(store.exists())
-        self.assertEqual(int(read_only_rows(store, "PRAGMA user_version")[0][0]), 6)
+        self.assertEqual(
+            int(read_only_rows(store, "PRAGMA user_version")[0][0]),
+            CURRENT_USER_VERSION,
+        )
         rows = read_only_rows(
             store,
             "SELECT source, evidence FROM edges"

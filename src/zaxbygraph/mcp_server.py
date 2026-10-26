@@ -831,12 +831,12 @@ _CURSOR = {"type": "string", "description": "Opaque cursor from a previous trunc
 _TOOLS: list[dict] = [
     {
         "name": "graph_status",
-        "description": "Sync freshness, counts, and any running sync for the resolved repo (the status command, plus live sync progress)",
+        "description": "Sync freshness, counts, corpus coverage, and any running sync for the resolved repo (the status command, plus live sync progress)",
         "inputSchema": _schema(dict(_REPO_DB)),
     },
     {
         "name": "search",
-        "description": "Relevance-ranked full-text search over titles, bodies, labels, and comments",
+        "description": "Relevance-ranked full-text search over titles, bodies, labels, comments, review bodies, and PR touched paths",
         "inputSchema": _schema({"query": {"type": "string"}, "limit": _LIMIT, "cursor": _CURSOR, **_REPO_DB}, ["query"]),
     },
     {

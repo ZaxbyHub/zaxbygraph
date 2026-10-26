@@ -45,6 +45,8 @@ _MOJIBAKE_LIKE = (
 _COPY_TABLES = (
     ("items", None),
     ("labels", None),
+    ("assignees", None),
+    ("issue_field_values", None),
     ("comments", "pk"),
     ("reviews", None),
     ("pr_files", None),

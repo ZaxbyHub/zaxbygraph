@@ -643,7 +643,11 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
     # reset here (once per sync), never per page (issue #23).
     source.omitted_fields = []
     source._capabilities_from_cache = False
-    key = f"capability_probe:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
+    # v2: the selection gained comment-scope fields (issue #24); v1 caches
+    # predate them, so a stale v1 map would fail-open into a GraphQL
+    # validation error on hosts lacking those fields. Versioning invalidates
+    # old caches instead.
+    key = f"capability_probe:v2:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
     cached = get_meta(conn, key)
     if cached:
         try:
@@ -1071,7 +1075,7 @@ def sync_repo(
             try:
                 key = getattr(
                     source, "_capabilities_meta_key",
-                    f"capability_probe:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}",
+                    f"capability_probe:v2:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}",
                 )
                 conn.execute("DELETE FROM meta WHERE key = ?", (key,))
                 conn.commit()

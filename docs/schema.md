@@ -1,4 +1,4 @@
-# Schema reference (schema version 6, `PRAGMA user_version` = 6)
+# Schema reference (schema version 7, `PRAGMA user_version` = 7)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -62,6 +62,19 @@ One row per issue or pull request. The central table.
 | `commits` | INTEGER | PRs only. |
 | `html_url` | TEXT | Browser URL. |
 | `api_url` | TEXT | REST URL. |
+| `reactions_total` | INTEGER | v7, listing-owned (`reactions.total_count`). A re-ingest from a source that does not carry the key preserves the stored value; a key present with JSON null clears it. `NULL` on rows whose last payload predated v7. |
+| `milestone` | TEXT | v7, listing-owned (`milestone.title`); same ABSENT/present-null rule. |
+| `item_type` | TEXT | v7, listing-owned (`type.name`); same rule. |
+| `sub_issues_total` | INTEGER | v7, listing-owned (`sub_issues_summary.total`). PR rows never carry the summaries in the listing payload, so this stays `NULL` for them. |
+| `sub_issues_completed` | INTEGER | v7, listing-owned (`sub_issues_summary.completed`). |
+| `dependencies_blocked_by` | INTEGER | v7, listing-owned (`issue_dependencies_summary.blocked_by`) — the **open** count. The link relations themselves are issue #27's scope. |
+| `dependencies_blocking` | INTEGER | v7, listing-owned (`issue_dependencies_summary.blocking`) — the **open** count. |
+| `dependencies_total_blocked_by` | INTEGER | v7, listing-owned (`issue_dependencies_summary.total_blocked_by`) — kept distinct from the open count. |
+| `dependencies_total_blocking` | INTEGER | v7, listing-owned (`issue_dependencies_summary.total_blocking`). |
+| `author_association` | TEXT | v7, listing-owned (the item row's own actor association). |
+| `merged_by` | TEXT | v7, **pull-owned** (`/pulls/{n}` `merged_by` login). A listing-only re-ingest preserves it — the AC3 rule reproduced on `merge_commit` before v7. |
+| `comment_count` | INTEGER | v7, **derived**: the stored-row count of `comments` for the item, recomputed on every ingest and by the migration — not a payload field. |
+| `paths_text` | TEXT | v7, **derived**: space-joined `pr_files` paths (`ORDER BY path`), recomputed on every ingest. Indexed in `items_fts` as the search surface for touched paths, weighted below title/body. An emptied files section empties it too. |
 | `raw_json` | TEXT | Merged list + pull payload. |
 
 A closed PR that was merged has both `state='closed'` and a non-null
@@ -84,6 +97,31 @@ would be a performance change, not a correctness one. The finish-time
 `sqlite_stat1` table inside the store; it is planner bookkeeping, hidden
 from `zaxbygraph schema`, and safe to delete.
 
+## assignees
+
+v7. Listing-payload assignees, one row per entry.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `repo` | TEXT | |
+| `number` | INTEGER | The item this assignee belongs to. |
+| `login` | TEXT | `PRIMARY KEY (repo, number, login)` — duplicate payload entries upsert idempotently. |
+
+Item-scoped: replaced with the other children on every re-ingest.
+
+## issue_field_values
+
+v7. Listing-payload custom issue field values, one row per entry.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `repo` | TEXT | |
+| `number` | INTEGER | The item this value belongs to. |
+| `field_name` | TEXT | The payload entry's `name`. `PRIMARY KEY (repo, number, field_name)`. |
+| `value` | TEXT | Stringified payload value; `NULL` when the entry carried an explicit null. |
+
+Item-scoped: replaced with the other children on every re-ingest.
+
 ## comments
 
 Issue comments and PR review comments.
@@ -96,6 +134,7 @@ Issue comments and PR review comments.
 | `number` | INTEGER | The item this comment belongs to. |
 | `kind` | TEXT | `'issue_comment'` or `'review_comment'` (CHECK-constrained). Issue and review comments have separate id spaces, so `github_id` alone is not unique. |
 | `author` | TEXT | |
+| `author_association` | TEXT | v7. REST supplies it natively; GraphQL maps `authorAssociation` when the capability probe reports the field. A probe-degraded re-ingest preserves the stored value via the pre-replacement snapshot. |
 | `created_at` | TEXT | |
 | `updated_at` | TEXT | |
 | `body` | TEXT | |
@@ -458,18 +497,42 @@ WHERE items_fts MATCH 'watermark'
 ORDER BY rank;
 ```
 
-`items_fts` indexes `title`, `body`, and `labels_text`, with
-`content_rowid='id'` — so join it on `items.id`. `comments_fts` indexes comment
-`body` with `content_rowid='pk'` — join that one on `comments.pk`, not
-`comments.github_id`. Both tables tokenize with `porter unicode61` (schema
-v3; the v2→v3 migration rebuilds older databases in place). For hand-written
-SQL, FTS5 MATCH syntax applies: `"exact phrase"`, `a AND b`, `a OR b`,
-`NOT`, and `pref*` prefix matching — a bare multi-word string is an implicit
-AND, and a porter-stemmed term matches its morphological variants.
+`items_fts` indexes `title`, `body`, `labels_text`, and (v7)
+`paths_text`, with `content_rowid='id'` — so join it on `items.id`.
+`comments_fts` indexes comment `body` with `content_rowid='pk'` — join that
+one on `comments.pk`, not `comments.github_id`. `reviews_fts` (v7) indexes
+review `body` with `content_rowid='id'` — join it on `reviews.id`. All three
+tokenize with `porter unicode61` (schema v3; the v2→v3 migration rebuilds
+older databases in place, and the v6→v7 migration rebuilds `items_fts` and
+`reviews_fts` in place — creating an external-content FTS never indexes rows
+the store already holds). For hand-written SQL, FTS5 MATCH syntax applies:
+`"exact phrase"`, `a AND b`, `a OR b`, `NOT`, and `pref*` prefix matching — a
+bare multi-word string is an implicit AND, and a porter-stemmed term matches
+its morphological variants.
 
-Note that `zaxbygraph search` already wraps both tables with stemmed,
-bm25-ranked, OR-fallback matching and merged comment hits, so prefer it over
-hand-written FTS SQL unless you need a shape it does not produce.
+Note that `zaxbygraph search` already wraps all three tables with stemmed,
+bm25-ranked, OR-fallback matching and merged comment/review hits (path text
+weighted below title and body), so prefer it over hand-written FTS SQL unless
+you need a shape it does not produce. On a pre-v7 store (reads never
+migrate), `search` degrades to the legacy items+comments arms and reports
+`index_stale: true`; `status`'s `coverage.null_v7_rows` is `null` there for
+the same reason.
+
+## status coverage
+
+`status`'s `coverage` block (v7) distinguishes "absent upstream" from "not
+fetched": `truncation_notes` maps `fetch_log.resource` to the count of that
+resource's notes containing `truncated`; `dropped_fields` counts
+capability-probe `omitted <field>` notes; `null_v7_rows` counts items rows
+where `reactions_total` or `author_association` is `NULL` — the two listing
+keys GitHub always carries with a non-null value, so their `NULL`
+unambiguously marks a payload that predated v7. Columns whose `NULL` is
+legitimate current state are deliberately excluded (unmilestoned/untyped
+issues' `milestone`/`item_type`, PR rows' missing dependency summaries,
+unmerged PRs' pull trio) so ordinary rows are not flagged. `null_v7_rows` is
+`null` on pre-v7 stores. `store_bytes` is the database size in bytes
+(`PRAGMA page_size * page_count`, database-global). The three derived counts
+follow `status`'s repo scoping.
 
 ## SQL access
 

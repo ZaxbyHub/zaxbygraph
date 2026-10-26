@@ -1,4 +1,4 @@
--- zaxbygraph schema v6 (`PRAGMA user_version` = 6; see db.py MIGRATIONS)
+-- zaxbygraph schema v7 (`PRAGMA user_version` = 7; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -39,6 +39,26 @@ CREATE TABLE IF NOT EXISTS items (
     commits       INTEGER,
     html_url      TEXT,
     api_url       TEXT,
+    -- v7 payload-signal columns (issue #24). Listing-owned columns are
+    -- extracted from the /issues listing payload only; merged_by,
+    -- merge_commit and merged_at are pull-owned. Re-ingest from a source
+    -- that does not carry a column preserves the stored value (ABSENT-key
+    -- semantics, store.upsert_item_row); a key present with JSON null
+    -- clears it. comment_count and paths_text are derived: recomputed from
+    -- the stored child rows on every ingest, never read from a payload.
+    reactions_total               INTEGER,
+    milestone                     TEXT,
+    item_type                     TEXT,
+    sub_issues_total              INTEGER,
+    sub_issues_completed          INTEGER,
+    dependencies_blocked_by       INTEGER,
+    dependencies_blocking         INTEGER,
+    dependencies_total_blocked_by INTEGER,
+    dependencies_total_blocking   INTEGER,
+    author_association            TEXT,
+    merged_by                     TEXT,
+    comment_count                 INTEGER NOT NULL DEFAULT 0,
+    paths_text                    TEXT NOT NULL DEFAULT '',
     raw_json      TEXT NOT NULL,
     UNIQUE (repo, number)
 );
@@ -62,6 +82,23 @@ CREATE TABLE IF NOT EXISTS labels (
     PRIMARY KEY (repo, number, name)
 );
 
+-- v7: listing-payload assignees and custom issue field values, one row per
+-- payload entry, replaced with the other item-scoped children on re-ingest.
+CREATE TABLE IF NOT EXISTS assignees (
+    repo   TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    login  TEXT NOT NULL,
+    PRIMARY KEY (repo, number, login)
+);
+
+CREATE TABLE IF NOT EXISTS issue_field_values (
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    field_name TEXT NOT NULL,
+    value      TEXT,
+    PRIMARY KEY (repo, number, field_name)
+);
+
 CREATE TABLE IF NOT EXISTS comments (
     pk          INTEGER PRIMARY KEY AUTOINCREMENT,
     github_id   INTEGER NOT NULL,
@@ -69,6 +106,7 @@ CREATE TABLE IF NOT EXISTS comments (
     number      INTEGER NOT NULL,
     kind        TEXT NOT NULL CHECK (kind IN ('issue_comment', 'review_comment')),
     author      TEXT,
+    author_association TEXT,
     created_at  TEXT,
     updated_at  TEXT,
     body        TEXT,
@@ -179,6 +217,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
     title,
     body,
     labels_text,
+    paths_text,
     tokenize = 'porter unicode61',
     content='items',
     content_rowid='id'
@@ -191,21 +230,30 @@ CREATE VIRTUAL TABLE IF NOT EXISTS comments_fts USING fts5(
     content_rowid='pk'
 );
 
+-- v7: review bodies join search (issue #24 AC4). Built and repopulated by
+-- migrate_v6_to_v7 for existing stores; fresh stores get the shape here.
+CREATE VIRTUAL TABLE IF NOT EXISTS reviews_fts USING fts5(
+    body,
+    tokenize = 'porter unicode61',
+    content='reviews',
+    content_rowid='id'
+);
+
 CREATE TRIGGER IF NOT EXISTS items_ai AFTER INSERT ON items BEGIN
-    INSERT INTO items_fts(rowid, title, body, labels_text)
-    VALUES (new.id, new.title, new.body, new.labels_text);
+    INSERT INTO items_fts(rowid, title, body, labels_text, paths_text)
+    VALUES (new.id, new.title, new.body, new.labels_text, new.paths_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS items_ad AFTER DELETE ON items BEGIN
-    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
-    VALUES ('delete', old.id, old.title, old.body, old.labels_text);
+    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text, paths_text)
+    VALUES ('delete', old.id, old.title, old.body, old.labels_text, old.paths_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE ON items BEGIN
-    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text)
-    VALUES ('delete', old.id, old.title, old.body, old.labels_text);
-    INSERT INTO items_fts(rowid, title, body, labels_text)
-    VALUES (new.id, new.title, new.body, new.labels_text);
+    INSERT INTO items_fts(items_fts, rowid, title, body, labels_text, paths_text)
+    VALUES ('delete', old.id, old.title, old.body, old.labels_text, old.paths_text);
+    INSERT INTO items_fts(rowid, title, body, labels_text, paths_text)
+    VALUES (new.id, new.title, new.body, new.labels_text, new.paths_text);
 END;
 
 CREATE TRIGGER IF NOT EXISTS comments_ai AFTER INSERT ON comments BEGIN
@@ -221,4 +269,19 @@ CREATE TRIGGER IF NOT EXISTS comments_au AFTER UPDATE ON comments BEGIN
     INSERT INTO comments_fts(comments_fts, rowid, body)
     VALUES ('delete', old.pk, old.body);
     INSERT INTO comments_fts(rowid, body) VALUES (new.pk, new.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS reviews_ai AFTER INSERT ON reviews BEGIN
+    INSERT INTO reviews_fts(rowid, body) VALUES (new.id, new.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS reviews_ad AFTER DELETE ON reviews BEGIN
+    INSERT INTO reviews_fts(reviews_fts, rowid, body)
+    VALUES ('delete', old.id, old.body);
+END;
+
+CREATE TRIGGER IF NOT EXISTS reviews_au AFTER UPDATE ON reviews BEGIN
+    INSERT INTO reviews_fts(reviews_fts, rowid, body)
+    VALUES ('delete', old.id, old.body);
+    INSERT INTO reviews_fts(rowid, body) VALUES (new.id, new.body);
 END;

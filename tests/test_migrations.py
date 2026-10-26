@@ -5,7 +5,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zaxbygraph.db import CURRENT_USER_VERSION, _schema_sql, connect, init_schema
+from zaxbygraph.db import (
+    CURRENT_USER_VERSION,
+    SCHEMA_VERSION,
+    _schema_sql,
+    connect,
+    init_schema,
+)
 from zaxbygraph.query import status, search
 
 #: The schema as it stood at base e2ef892 (v1): no `PRAGMA user_version`, no
@@ -1120,14 +1126,14 @@ class MigrationTests(unittest.TestCase):
 
         self.assertEqual(
             conn.execute("PRAGMA user_version").fetchone()[0],
-            6,
-            "v4 database must migrate to user_version 6",
+            CURRENT_USER_VERSION,
+            "v4 database must migrate to the current user_version",
         )
         self.assertEqual(
             conn.execute(
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()[0],
-            "6",
+            SCHEMA_VERSION,
         )
         # exact backfill: no reliance on a column DEFAULT. Order is SQLite
         # binary collation on src_id TEXT: digits before letters.
@@ -1228,7 +1234,9 @@ class MigrateV5ToV6Tests(unittest.TestCase):
 
     def test_duplicates_collapse_and_index_installs(self) -> None:
         conn = self._open()
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
         rows = conn.execute(
             "SELECT source, evidence FROM edges"
             " WHERE rel = 'closes' AND src_id = '14' AND dst_id = '6'"
@@ -1271,7 +1279,9 @@ class MigrateV5ToV6Tests(unittest.TestCase):
         conn = connect(self.db_path)
         self.addCleanup(conn.close)
         init_schema(conn)
-        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
         # a closes pair still inserts once from either stream...
         conn.execute(
             "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"

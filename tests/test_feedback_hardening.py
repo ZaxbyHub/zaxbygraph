@@ -15,7 +15,7 @@ import unittest
 
 from fixtures import TempDBTest, issue, pull
 from test_migrations import V4_SCHEMA_SQL
-from zaxbygraph.db import connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 from zaxbygraph.store import ingest_item
 
 REPO = "zaxbyhub/zaxbygraph"
@@ -46,7 +46,10 @@ class UniqueKeyDiscriminatorTests(unittest.TestCase):
             )
             conn.commit()
             init_schema(conn)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(
+                conn.execute("PRAGMA user_version").fetchone()[0],
+                CURRENT_USER_VERSION,
+            )
             # Sanity: the backfilled row really is closes_keyword/keyword.
             self.assertEqual(
                 tuple(

@@ -24,7 +24,7 @@ import unittest
 from pathlib import Path
 
 from fixtures import REPO, TempDBTest, issue, pull
-from zaxbygraph.db import connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 from zaxbygraph.store import ingest_item
 
 #: The closure pair under test: PR 8 closes issue 5, reported once by
@@ -222,9 +222,9 @@ class ClosesUniquenessTest(TempDBTest):
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             self.assertEqual(
                 version,
-                6,
+                CURRENT_USER_VERSION,
                 "MIGRATE1: the stamped v5 store must come out of init_schema "
-                "at user_version 6, got " + str(version),
+                "at the current user_version, got " + str(version),
             )
             index_name = unique_closes_pair_index(conn)
             self.assertIsNotNone(
