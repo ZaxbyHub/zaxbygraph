@@ -96,6 +96,211 @@ def snapshot_comment_associations(
     return maps
 
 
+def snapshot_revision_state(
+    conn: sqlite3.Connection, repo: str, number: int, incoming_id: int
+) -> dict:
+    """Pre-replace state for revision pre-images (issue #25): the stored item
+    text row and canonical child maps, read BEFORE replace_item_children
+    deletes them. The item row resolves through the same two identities
+    upsert_item_row will overwrite — (repo, number) first, then the incoming
+    GitHub id — so an ID-conflict update cannot displace text without a
+    pre-image. Child maps key by identity, last-writer-wins in row order
+    (rows are already unique per identity; canonicalization matters for the
+    incoming side)."""
+    item = conn.execute(
+        "SELECT title, body, created_at, updated_at FROM items"
+        " WHERE repo = ? AND number = ?",
+        (repo, number),
+    ).fetchone()
+    if item is None:
+        item = conn.execute(
+            "SELECT title, body, created_at, updated_at FROM items WHERE id = ?",
+            (incoming_id,),
+        ).fetchone()
+    comments: dict = {}
+    for row in conn.execute(
+        "SELECT kind, github_id, body, created_at, updated_at FROM comments"
+        " WHERE repo = ? AND number = ?",
+        (repo, number),
+    ):
+        comments[(row["kind"], row["github_id"])] = (
+            row["body"],
+            row["created_at"],
+            row["updated_at"],
+        )
+    reviews: dict = {}
+    for row in conn.execute(
+        "SELECT id, body, submitted_at FROM reviews WHERE repo = ? AND number = ?",
+        (repo, number),
+    ):
+        reviews[row["id"]] = (row["body"], row["submitted_at"])
+    return {"item": item, "comments": comments, "reviews": reviews}
+
+
+def _insert_revision(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    entity: str,
+    entity_id: int | None,
+    kind: str | None,
+    origin: str,
+    content: str | None,
+    valid_from: str,
+    valid_to: str | None,
+) -> None:
+    """One append-only pre-image row (issue #25). Never updated or deleted by
+    the ingest path; consolidation is the sanctioned rewrite."""
+    conn.execute(
+        "INSERT INTO revisions(repo, number, entity, entity_id, kind, origin,"
+        " content, valid_from, valid_to)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (repo, number, entity, entity_id, kind, origin, content, valid_from, valid_to),
+    )
+
+
+def _canonical_comments(comments: list[dict]) -> dict:
+    """`{github_id: rec}` last-writer-wins, so duplicate pagination rows
+    collapse to the final state before any diff (issue #25)."""
+    canonical: dict = {}
+    for rec in comments:
+        if not isinstance(rec, dict):
+            continue
+        gid = rec.get("id")
+        if gid is None:
+            continue
+        canonical[int(gid)] = rec
+    return canonical
+
+
+def write_revisions(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    snap: dict,
+    merged: dict,
+    issue_comments: list[dict],
+    review_comments: list[dict],
+    reviews: list[dict],
+    children_complete: dict[str, bool] | None,
+) -> None:
+    """Pre-images of the text this ingest displaces (issue #25). Runs inside
+    ingest_item's caller-owned transaction, after upsert_item_row.
+
+    Rules: a row is written only when the stored value and incoming value
+    differ (exact NULL-aware string inequality — the issue's "hash differs"
+    predicate; no content key exists, so A→B→A cannot wedge). Any changed
+    stored value writes a pre-image, including to/from NULL and ""/NULL;
+    content is exactly the displaced value. First ingest writes nothing.
+    Tombstones (origin='deleted') fire only when the section's
+    `children_complete` flag IS True (identity check, not truthiness) using
+    the production section keys. Windows are GitHub times: items/comments
+    from updated_at else created_at; reviews from submitted_at, else the
+    stored item's created_at when NULL; valid_to is the incoming item's
+    updated_at except for comment edits, which prefer the comment's own
+    incoming updated_at.
+    """
+    prior_item = snap["item"]
+    incoming_updated = merged.get("updated_at")
+    rows: list[tuple] = []
+    if prior_item is not None:
+        item_valid_from = prior_item["updated_at"] or prior_item["created_at"]
+        for entity, stored in (
+            ("item_title", prior_item["title"]),
+            ("item_body", prior_item["body"]),
+        ):
+            # Title is stored coerced (`raw.get("title") or ""`), so the
+            # comparison coerces too — a payload without a title key is
+            # unchanged, not an endless "" -> None edit (issue #25 AC3).
+            incoming = (
+                (merged.get("title") or "")
+                if entity == "item_title"
+                else merged.get("body")
+            )
+            if stored != incoming:
+                rows.append(
+                    (entity, None, None, "edit", stored, item_valid_from, incoming_updated)
+                )
+    incoming_issue = _canonical_comments(issue_comments)
+    incoming_review_comments = _canonical_comments(review_comments)
+    for kind_name, incoming in (
+        ("issue_comment", incoming_issue),
+        ("review_comment", incoming_review_comments),
+    ):
+        for gid in sorted(incoming):
+            rec = incoming[gid]
+            prior = snap["comments"].get((kind_name, gid))
+            if prior is None:
+                continue
+            stored_body = prior[0]
+            incoming_body = rec.get("body")
+            if stored_body == incoming_body:
+                continue
+            valid_from = prior[2] or prior[1]
+            valid_to = rec.get("updated_at") or incoming_updated
+            rows.append(
+                ("comment", gid, kind_name, "edit", stored_body, valid_from, valid_to)
+            )
+    incoming_reviews = {}
+    for rec in reviews:
+        if not isinstance(rec, dict):
+            continue
+        rid = rec.get("id")
+        if rid is None:
+            continue
+        incoming_reviews[int(rid)] = rec
+    for rid in sorted(incoming_reviews):
+        rec = incoming_reviews[rid]
+        prior = snap["reviews"].get(rid)
+        if prior is None:
+            continue
+        stored_body = prior[0]
+        if stored_body == rec.get("body"):
+            continue
+        item_created = prior_item["created_at"] if prior_item is not None else None
+        valid_from = prior[1] or item_created
+        rows.append(
+            ("review", rid, None, "edit", stored_body, valid_from, incoming_updated)
+        )
+    complete = children_complete if isinstance(children_complete, dict) else {}
+    for kind_name, section, incoming in (
+        ("issue_comment", "issue_comments", incoming_issue),
+        ("review_comment", "review_comments", incoming_review_comments),
+    ):
+        if complete.get(section) is not True:
+            continue
+        for (snap_kind, gid) in sorted(snap["comments"]):
+            if snap_kind != kind_name or gid in incoming:
+                continue
+            body, created_at, updated_at = snap["comments"][(snap_kind, gid)]
+            rows.append(
+                ("comment", gid, kind_name, "deleted", body,
+                 updated_at or created_at, incoming_updated)
+            )
+    if complete.get("reviews") is True:
+        for rid in sorted(snap["reviews"]):
+            if rid in incoming_reviews:
+                continue
+            body, submitted_at = snap["reviews"][rid]
+            item_created = prior_item["created_at"] if prior_item is not None else None
+            rows.append(
+                ("review", rid, None, "deleted", body,
+                 submitted_at or item_created, incoming_updated)
+            )
+    for entity, entity_id, kind, origin, content, valid_from, valid_to in rows:
+        # A displacement whose GitHub-time window cannot be established from
+        # the payload (NULL stamps on both sides) is not recorded: the
+        # window columns are NOT NULL and an unusable or inverted window
+        # would either abort the ingest or store an unqueryable row
+        # (issue #25 review PRR-003).
+        if valid_from is None or valid_to is None:
+            continue
+        _insert_revision(
+            conn, repo, number, entity, entity_id, kind, origin, content,
+            valid_from, valid_to,
+        )
+
+
 def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None:
     """Delete the edges this item OWNS, keeping everything else.
 
@@ -794,8 +999,11 @@ def ingest_item(
     resolved (issue #23): True where the bulk payload answered the section
     complete, False where a REST fallback, a truncation cap, or the 404 path
     produced it. It is accepted here so the ingest boundary can never silently
-    present a fallback-resolved section as bulk-complete; the map is not
-    persisted (what to DO with completeness is #25's scope). With
+    present a fallback-resolved section as bulk-complete. Since #25 the map
+    is consumed, not ignored: a section marked True gates tombstones for
+    children that vanish (write_revisions), and the exact map rides the
+    item_bundle sidecar for replay — it is still not stored in the database.
+    With
     `advance_watermark=False` (sync --numbers) the watermark is left exactly
     as found: a targeted refresh says nothing about listing coverage.
     """
@@ -831,8 +1039,22 @@ def ingest_item(
     issue_associations, review_associations = snapshot_comment_associations(
         conn, repo, number
     )
+    rev_snap = snapshot_revision_state(conn, repo, number, int(merged["id"]))
     replace_item_children(conn, repo, number)
     upsert_item_row(conn, repo, merged, kind, list_raw=list_raw, pull_raw=pull_raw)
+    # Pre-images of the text this ingest displaced (issue #25): same
+    # transaction, deterministic row order, append-only.
+    write_revisions(
+        conn,
+        repo,
+        number,
+        rev_snap,
+        merged,
+        issue_comments,
+        review_comments,
+        reviews,
+        children_complete,
+    )
     insert_labels(conn, repo, number, merged)
     insert_comments(
         conn, repo, number, issue_comments, "issue_comment", issue_associations

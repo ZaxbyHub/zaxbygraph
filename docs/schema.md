@@ -1,4 +1,4 @@
-# Schema reference (schema version 7, `PRAGMA user_version` = 7)
+# Schema reference (schema version 8, `PRAGMA user_version` = 8)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -332,6 +332,53 @@ Two boundaries:
 
 Releases are not graph nodes in v0.1 — they are a table only.
 
+## revisions
+
+v8. Evidence history: the pre-image of every displaced text version — item
+title, item body, comment body, review body — written inside the same
+transaction that replaces it (issue #25).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | INTEGER | Primary key; the sequence order for the item's history. Assigned at insert, never updated. |
+| `repo` | TEXT | Owning item's repo. |
+| `number` | INTEGER | Owning item's number. |
+| `entity` | TEXT | `item_title`, `item_body`, `comment`, or `review`. |
+| `entity_id` | INTEGER | GitHub id for `comment`/`review` entities; `NULL` for item entities. |
+| `kind` | TEXT | `issue_comment` / `review_comment` for comments; `NULL` otherwise. |
+| `origin` | TEXT | `edit` (displaced by a newer payload) or `deleted` (vanished from a fetch whose section's `children_complete` flag was exactly `True`). |
+| `content` | TEXT | Exactly the displaced stored value — a pre-image, so a first ingest writes nothing and an unchanged re-ingest writes nothing (growth tracks real edit volume). `NULL` is legal: the text was absent before this version began. |
+| `valid_from` | TEXT | GitHub time this version became current: `updated_at` else `created_at` (items, comments); `submitted_at` else the owning item's `created_at` when `NULL` (reviews). Never the sync wall clock. |
+| `valid_to` | TEXT | GitHub time it was displaced: the incoming item's `updated_at`, except comment edits prefer the comment's own incoming `updated_at`. |
+
+Write rules:
+
+- **Append-only at ingest.** Nothing in the sync path updates or deletes a
+  revision — not child replacement, not the deletion oracle, not migrations.
+  `doctor --consolidate` is the one sanctioned rewrite: it replaces the whole
+  corpus snapshot and re-assigns fresh ids, ordered so each item's sequence
+  survives.
+- **No content key.** A row exists only when the stored value and the
+  incoming value differ (exact, NULL-aware). An edit reverted A→B→A therefore
+  yields two rows and can never wedge a sync. A displacement whose
+  GitHub-time window cannot be established (both bounding stamps NULL on
+  the payload and stored row) is not recorded rather than written with an
+  unusable window.
+- **Tombstones are complete-fetch facts.** An `origin='deleted'` row means
+  the entity was present in the stored children and absent from a fetch the
+  source flagged complete for that section. A degraded fetch (flag missing,
+  `False`, or otherwise not exactly `True`) writes no `deleted` rows —
+  `edit` pre-images are still written whenever content changed. Boundary:
+  a degraded fetch still replaces children, so an absence first seen
+  degraded destroys the stored row and a later complete fetch has nothing
+  to tombstone — that evidence gap is a deliberate property of the shipped
+  replace-on-ingest contract, not a bug.
+- **Backfill: none.** Text displaced before v8 was never stored, so a
+  migrated database starts with an empty `revisions` table. `status`
+  coverage reports `revision_rows`/`revision_bytes` as `NULL` on pre-v8
+  stores and honest zeros on an empty v8 store; `item --history` /
+  `--as-of` degrade with an explicit note rather than fabricating history.
+
 ## sync_state
 
 One row per repo. What `zaxbygraph status` reads.
@@ -362,7 +409,7 @@ can disagree with its live `counts[]` for the same reason.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `6`). The
+`PRAGMA user_version` is the authoritative schema state (currently `8`). The
 `meta.schema_version` row is informational only. `init_schema` (which runs
 the migration chain) executes only on a WRITABLE open: a `sync`, an
 MCP-triggered sync, or `doctor --consolidate` (adoption migrates its temp
@@ -533,6 +580,17 @@ unmerged PRs' pull trio) so ordinary rows are not flagged. `null_v7_rows` is
 `null` on pre-v7 stores. `store_bytes` is the database size in bytes
 (`PRAGMA page_size * page_count`, database-global). The three derived counts
 follow `status`'s repo scoping.
+
+v8 adds two revision-coverage counts, repo-scoped the same way:
+`revision_rows` counts stored pre-images and `revision_bytes` sums their
+`content` sizes in UTF-8 bytes (`LENGTH(CAST(content AS BLOB))` — a plain
+text `LENGTH` counts characters, not bytes). Both are `NULL` on pre-v8
+stores and honest `0` on a v8 store with no edits yet, so "no history
+recorded" is never confused with "history recorded, nothing displaced".
+Feature gates pin the schema slot that introduced each capability (v7
+coverage on `>= 7`, revision coverage on `>= 8`), never the build's current
+version — a read-only store several slots behind keeps every feature its own
+schema supports.
 
 ## SQL access
 

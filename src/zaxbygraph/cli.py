@@ -30,6 +30,8 @@ from zaxbygraph.query import (
     export_graph,
     file_history,
     item,
+    item_as_of,
+    item_history,
     open_items,
     path_between,
     pr_overlap,
@@ -601,6 +603,16 @@ def cmd_search(args: argparse.Namespace) -> int:
     return _run_read(args, search, args.query, args.limit)
 
 
+def _parse_as_of(value: str) -> datetime:
+    """Validate a user-supplied --as-of timestamp (issue #25). Delegates to
+    the query layer's parser so CLI and read semantics cannot diverge; naive
+    and malformed input raise ValueError, which cmd_item turns into a coded
+    error rather than a traceback."""
+    from zaxbygraph.query import _parse_instant
+
+    return _parse_instant(value)
+
+
 def cmd_item(args: argparse.Namespace) -> int:
     repo: str | None = None
     db_path: Path | None = None
@@ -617,7 +629,36 @@ def cmd_item(args: argparse.Namespace) -> int:
             db_path=db_path or getattr(args, "db", None),
         )
     try:
+        at: datetime | None = None
+        if getattr(args, "as_of", None) is not None and getattr(args, "history", False):
+            conn.close()
+            return emit_failure(
+                args,
+                2,
+                "--history and --as-of are mutually exclusive",
+                slug=repo,
+                db_path=db_path,
+                code_key="bad_flags",
+            )
+        if getattr(args, "as_of", None) is not None:
+            try:
+                at = _parse_as_of(args.as_of)
+            except ValueError as exc:
+                conn.close()
+                return emit_failure(
+                    args,
+                    1,
+                    f"invalid --as-of value: {exc}",
+                    slug=repo,
+                    db_path=db_path,
+                    code_key="bad_as_of",
+                )
         data = item(conn, args.number, repo=repo)
+        if data is not None:
+            if at is not None:
+                data = item_as_of(conn, args.number, at, repo=repo)
+            elif getattr(args, "history", False):
+                data = item_history(conn, args.number, repo=repo)
         if data is not None:
             truncated = _truncate_bodies(data, args.max_body_chars)
             fresh = _freshness(conn, repo)
@@ -647,7 +688,8 @@ def cmd_item(args: argparse.Namespace) -> int:
 
 def _truncate_bodies(data: dict, limit: int) -> bool:
     """AC6: cut item/comment/review bodies to --max-body-chars and mark each
-    truncated object `truncated: true`. Returns whether anything was cut."""
+    truncated object `truncated: true`. Returns whether anything was cut.
+    Revision history content (--history) truncates the same way (issue #25)."""
     if limit is None or limit <= 0:
         return False
     cut = False
@@ -665,6 +707,14 @@ def _truncate_bodies(data: dict, limit: int) -> bool:
                 obj["body"] = text[:limit]
                 obj["truncated"] = True
                 cut = True
+    for rev in data.get("revisions") or []:
+        if not isinstance(rev, dict):
+            continue
+        text = rev.get("content")
+        if isinstance(text, str) and len(text) > limit:
+            rev["content"] = text[:limit]
+            rev["truncated"] = True
+            cut = True
     return cut
 
 
@@ -1202,6 +1252,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="Truncate the item/comment/review bodies to N chars (marks truncated)",
+    )
+    sp.add_argument(
+        "--history",
+        action="store_true",
+        help="List the item's stored revision pre-images (issue #25)",
+    )
+    sp.add_argument(
+        "--as-of",
+        dest="as_of",
+        default=None,
+        metavar="T",
+        help="Reconstruct the item's text entities as of GitHub time T (ISO-8601)",
     )
     sp.set_defaults(func=cmd_item)
 

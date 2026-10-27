@@ -1,4 +1,4 @@
--- zaxbygraph schema v7 (`PRAGMA user_version` = 7; see db.py MIGRATIONS)
+-- zaxbygraph schema v8 (`PRAGMA user_version` = 8; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -285,3 +285,24 @@ CREATE TRIGGER IF NOT EXISTS reviews_au AFTER UPDATE ON reviews BEGIN
     VALUES ('delete', old.id, old.body);
     INSERT INTO reviews_fts(rowid, body) VALUES (new.id, new.body);
 END;
+
+-- Evidence history (issue #25, migration v8): pre-images of displaced text.
+-- Append-only at ingest — rows are never updated or deleted by the sync
+-- path; doctor --consolidate replaces the whole corpus snapshot (the one
+-- sanctioned rewrite, with fresh ids). `content` is exactly the displaced
+-- stored value (NULL legal: the text was absent before). Windows are GitHub
+-- times, never the sync wall clock; per-entity provenance in docs/schema.md.
+CREATE TABLE IF NOT EXISTS revisions (
+    id INTEGER PRIMARY KEY,
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    entity TEXT NOT NULL CHECK (entity IN ('item_title','item_body','comment','review')),
+    entity_id INTEGER,
+    kind TEXT,
+    origin TEXT NOT NULL CHECK (origin IN ('edit','deleted')),
+    content TEXT,
+    valid_from TEXT NOT NULL,
+    valid_to TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_revisions_item ON revisions(repo, number);

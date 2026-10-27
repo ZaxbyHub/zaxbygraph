@@ -170,6 +170,15 @@ def _resolve_children(
 
     sections: dict[str, list[dict]] = {}
     complete: dict[str, bool] = {}
+    # Issue #25: a recorded `children_complete` map rides replay bundles (the
+    # reader injects all-False for legacy recordings). Its presence — not its
+    # values — disables the REST fallbacks below: a recording reproduces what
+    # the original ingest saw, so a section it marks False is served as the
+    # recorded (possibly partial/empty) list, never re-fetched.
+    recorded_complete = (
+        provided.get("children_complete") if provided is not None else None
+    )
+    has_recording = isinstance(recorded_complete, dict)
     for name, fallback_name in _CHILD_FALLBACK.items():
         provided_section = provided.get(name) if provided is not None else None
         provided_flagged = bool(provided.get(f"{name}_incomplete")) if provided is not None else False
@@ -193,6 +202,12 @@ def _resolve_children(
             else:
                 sections[name] = list(provided_section or [])
                 complete[name] = True
+        elif has_recording:
+            # Recorded bundle: serve exactly what was recorded (absent
+            # section = empty list), flag it per the recording, never
+            # re-fetch.
+            sections[name] = list(provided_section or [])
+            complete[name] = bool(recorded_complete.get(name, False))
         elif kind == "pr" or name == "issue_comments":
             if name == "issue_comments":
                 if list_raw.get("comments"):
@@ -240,6 +255,15 @@ def _resolve_children(
             flags["closing_refs_incomplete"] = True
     complete["timeline"] = timeline_complete
     complete["pull"] = (pull_raw is not None) or kind != "pr"
+    if has_recording:
+        # The recording's completeness, verbatim, for every key it names
+        # (issue #25) — a recorded False overrides the computed True for a
+        # provided section, exactly as a recorded True overrides a computed
+        # False. Content always comes from the recording; only the map is
+        # overridden here.
+        for name in (*_CHILD_FALLBACK, "pull", "timeline"):
+            if name in recorded_complete:
+                complete[name] = bool(recorded_complete[name])
     return (
         pull_raw,
         sections["issue_comments"],
@@ -319,6 +343,10 @@ def _write_gone_bundle(
             "reviews": [],
             "files": [],
             "timeline": [],
+            # Nothing was answered behind the 404/410 (issue #23/#25): the
+            # recorded map makes that explicit so replay never tombstones a
+            # gone item's children.
+            "children_complete": _gone_children_complete(),
             "gone": True,
             "gone_status": None,
             "gone_note": gone_note,
@@ -971,6 +999,12 @@ def sync_repo(
                                 "reviews": reviews,
                                 "files": files,
                                 "timeline": timeline,
+                                # The exact completeness map ingest saw
+                                # (issue #25): replay applies it verbatim so
+                                # it can never fabricate tombstones the
+                                # original run suppressed. Pre-#25 bundles
+                                # lack the key; the reader fails them closed.
+                                "children_complete": children_complete,
                                 "gone": False,
                                 "gone_status": None,
                             },

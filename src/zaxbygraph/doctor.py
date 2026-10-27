@@ -42,6 +42,10 @@ _MOJIBAKE_LIKE = (
 
 #: tables copied on adoption -> the autoincrement pk column to omit (None =
 #: keep every column; GitHub-assigned ids in items/releases/reviews are kept).
+#: Issue #25: `revisions` adopts with FRESH ids (its id is the synthetic
+#: sequence, omitted here), and the copy loop orders by the omitted pk so
+#: each item's revision sequence survives the copy. Consolidation is the one
+#: sanctioned rewrite of revision history (append-only everywhere else).
 _COPY_TABLES = (
     ("items", None),
     ("labels", None),
@@ -53,6 +57,7 @@ _COPY_TABLES = (
     ("releases", None),
     ("edges", "id"),
     ("fetch_log", "id"),
+    ("revisions", "id"),
 )
 
 
@@ -179,9 +184,9 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
 
     One transaction: delete every store row whose repo is the folded slug,
     then insert the candidate's rows with repo lowered - omitting
-    AUTOINCREMENT pk columns (comments.pk, edges.id, fetch_log.id) so they
-    re-assign, keeping GitHub-assigned ids (items.id, releases.id,
-    reviews.id). sync_state is replaced and counts recomputed. Plain
+    synthetic-pk columns (comments.pk with its AUTOINCREMENT, edges.id,
+    fetch_log.id, revisions.id) so they re-assign, keeping GitHub-assigned
+    ids (items.id, releases.id, reviews.id). sync_state is replaced and counts recomputed. Plain
     INSERTs only: post-delete there is nothing to conflict with, and
     INSERT OR REPLACE's double-unique semantics could silently drop rows.
     """
@@ -212,9 +217,15 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                     else:
                         select_cols = ", ".join(cols)
                     placeholders = ", ".join("?" for _ in cols)
+                    # Ordered by the omitted pk (issue #25): destination ids
+                    # are fresh, so insertion order is the only place the
+                    # source sequence survives — required for revisions,
+                    # deterministic for the other omit-pk tables.
+                    order_by = f" ORDER BY {autoinc_pk}" if autoinc_pk else ""
                     rows = src.execute(
                         f"SELECT {select_cols} FROM {table}"
-                        + (" WHERE lower(repo) = ?" if "repo" in cols else ""),
+                        + (" WHERE lower(repo) = ?" if "repo" in cols else "")
+                        + order_by,
                         (repo_l,) if "repo" in cols else (),
                     ).fetchall()
                     insert_sql = (
