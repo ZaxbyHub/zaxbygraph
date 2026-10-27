@@ -949,6 +949,14 @@ STRUCTURAL = frozenset(
         "closed_by_commit",
         "merged_commit",
         "reverts",
+        # v9 (issue #26): a PR's own branch name links it to its issue.
+        "branch_ref",
+        # v10 (issue #27): GitHub-reported links and the duplicate text stream.
+        "blocked_by",
+        "child_of",
+        "duplicate_of",
+        "linked_pr",
+        "duplicate_keyword",
     }
 )
 PATH_EXCLUDED_RELATIONS = frozenset(

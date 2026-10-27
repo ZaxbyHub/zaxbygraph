@@ -905,7 +905,7 @@ class ReplayFidelityTests(TempDBTest):
         self.assertFalse(any(provided["children_complete"].values()))
         resolved = _resolve_children(src, list_raw, "issue", False,
                                      provided=provided)
-        complete = resolved[-1]
+        complete = resolved[7]
         self.assertFalse(complete["issue_comments"])
         # And through a full sync: no tombstone can exist for the section.
         conn, _ = self._replay([{"resource": "item_bundle", "payload": legacy}])
@@ -950,7 +950,7 @@ class ReplayFidelityTests(TempDBTest):
         provided = src.fetch_children(page[0])[1]
         resolved = _resolve_children(src, page[0][0], "issue", False,
                                      provided=provided)
-        self.assertTrue(resolved[-1]["issue_comments"])
+        self.assertTrue(resolved[7]["issue_comments"])
         # Degraded recording: same payload, recorded False — no fallback
         # fires (the REST stubs would raise a clean GitHubError).
         rec["children_complete"] = {name: False for name in rec["children_complete"]}
@@ -963,7 +963,7 @@ class ReplayFidelityTests(TempDBTest):
         provided2 = src2.fetch_children(page2[0])[1]
         resolved2 = _resolve_children(src2, page2[0][0], "issue", False,
                                       provided=provided2)
-        self.assertFalse(resolved2[-1]["issue_comments"])
+        self.assertFalse(resolved2[7]["issue_comments"])
 
     def test_targeted_replay_uses_latest_children(self) -> None:
         """`sync --numbers` over a replay source: latest shell, latest

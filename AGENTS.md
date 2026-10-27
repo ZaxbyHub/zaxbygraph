@@ -86,11 +86,18 @@ shouldn't.
   `status` still shows that something went wrong.
 - **Item-scoped child rows are replaced on re-ingest** (labels, comments,
   reviews, pr_files for that number), while edges pointing *at* the item from
-  elsewhere survive — see the next point.
+  elsewhere survive — see the next point. The v10 exceptions are deliberate
+  and completeness-gated: `item_events` and `pr_commits` replace only when
+  their GitHub-reported section was fetched complete, so a degraded re-ingest
+  leaves them untouched (docs/schema.md).
 - **On item upsert, delete only edges the item owns**: its outbound edges and
   the actor relations pointing at it — except outbound edges with `source IN
-  ('timeline','closing_ref')`, which are append-only GitHub-reported link
-  facts and survive every re-ingest. Inbound `mentions`/`closes` from *other*
+  ('timeline','closing_ref','link')`, which are GitHub-reported link facts a
+  degraded re-ingest cannot re-derive and survive every re-ingest. The v10
+  `link` stream is additionally replaced **per connection** when that
+  connection was fetched complete (overflow is union-only), so a complete
+  re-fetch retracts removed links while a degraded one never does
+  (docs/schema.md). Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.
 

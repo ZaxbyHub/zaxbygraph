@@ -54,6 +54,24 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "valid_from": "GitHub time this version became current: updated_at else created_at (items/comments); submitted_at else the owning item's created_at (reviews). Never the sync wall clock",
         "valid_to": "GitHub time it was displaced: the incoming item's updated_at, except comment edits prefer the comment's own incoming updated_at",
     },
+    "item_path_refs": {
+        "origin": "v9. Which text the path came from: 'body', 'issue_comment:<github_id>', 'review_comment:<github_id>', or 'review:<id>'. Item-scoped, replaced with the other children on every re-ingest",
+        "path": "v9. The RAW string as mentioned in text (frames, path:L:C tokens, same-repo blob URLs, backticked segments) - deliberately UNRESOLVED: resolution against the known file vocabulary happens at READ time (issue #29), never at ingest, so rows stay independent of sync order",
+        "backticked": "v9. 1 when the path appeared inside backticks in its text",
+    },
+    "item_signatures": {
+        "exception": "v9. The exception class name verbatim from a fenced block (e.g. TypeError)",
+        "error_line": "v9. The exception line with run-varying constants masked (0x-hex -> '<hex>', digit runs -> '<n>') so the signature is stable across runs that differ only in addresses and line numbers",
+        "frame_function": "v9. The nearest preceding Python frame's function name when the block carries frames; NULL otherwise",
+    },
+    "item_events": {
+        "type": "v10. Timeline event types stored as rows (currently 'reopened'); these never become edges. Replaced only when the timeline section was fetched COMPLETE - a degraded re-ingest (REST source, 404, capability-dropped, truncation cap) leaves stored rows untouched",
+        "created_at": "v10. GitHub time of the event; NOT NULL - a malformed event with no stamp is skipped rather than stored with a fabricated identity",
+    },
+    "pr_commits": {
+        "sha": "v10. The commit oid; one row per commit of a PR. Replaced only when the commits section was fetched complete",
+        "message": "v10. messageHeadline and messageBody composed; closes_keyword edges with 'commit <sha>' provenance derive from these RETAINED rows on every ingest, so a REST or overflowed re-ingest never retracts them",
+    },
     "sync_state": {
         "issues_since": "Watermark passed back verbatim and inclusive; never adjusted",
         "last_error": "Non-null means the last sync stopped early - re-run sync",

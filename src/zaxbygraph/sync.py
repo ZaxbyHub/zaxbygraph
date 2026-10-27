@@ -135,13 +135,41 @@ def _source_budget_floor(source) -> tuple[int, str] | None:
     return None
 
 
+def _connection_complete(
+    links: dict | None, connection: str, links_incomplete: object
+) -> bool:
+    """True iff the links section was carried AND the connection key is
+    present in it AND that connection did not overflow (issue #27: a
+    capability-dropped or absent field is never complete, so its stored link
+    edges can never be retracted)."""
+    if not isinstance(links, dict) or connection not in links:
+        return False
+    if isinstance(links_incomplete, (list, tuple, set, frozenset)):
+        return connection not in links_incomplete
+    if links_incomplete:
+        return False
+    return True
+
+
 def _resolve_children(
     source: GitHubSource,
     list_raw: dict,
     kind: str,
     include_patches: bool,
     provided: dict | None = None,
-) -> tuple[dict | None, list[dict], list[dict], list[dict], list[dict], list[dict], dict, dict[str, bool]]:
+) -> tuple[
+    dict | None,
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict],
+    list[dict] | None,
+    dict,
+    dict[str, bool],
+    dict | None,
+    object,
+    list[dict] | None,
+]:
     """Children for one item: inline or bulk-provided payload where present
     and complete, per-item REST fallback where flagged incomplete or absent
     (issue #5). `provided` is what the source's fetch_children bulk call
@@ -238,22 +266,62 @@ def _resolve_children(
     # none and previously stored timeline edges survive via the delete-owned
     # exemption in store.delete_owned_edges. The same is true of closing
     # references, which ride the pull section of the GraphQL payload only.
-    timeline: list[dict] = []
+    # GraphQL-only sections (issue #27): presence is carried SEPARATELY from
+    # completeness. None = the section was never carried (plain REST source,
+    # the 404 path, a capability-dropped field) — stored link edges,
+    # item_events and pr_commits rows must survive untouched. A carried
+    # section replaces stored state only when its completeness key is True.
+    # Plain REST is NOT a degradation for these sections: None simply means
+    # "nothing was answered".
+    timeline: list[dict] | None = None
+    links: dict | None = None
+    links_incomplete: object = None
+    pr_commits: list[dict] | None = None
     flags: dict[str, bool] = {}
-    # A source with no bulk context (plain REST) answers no timeline by
-    # design — that is not a degradation. Only a bulk payload that flagged
-    # truncation (or answered without the section) marks it incomplete.
-    timeline_complete = provided is None
+    # A source with no bulk context (plain REST) answers none of the
+    # GraphQL-only sections by design — that is not a degradation, so the
+    # completeness map reads complete (no per-item fetch_log noise, the PR
+    # #37 review rule) while the None PRESENCE signals keep every stored
+    # link edge / event / commit row untouched.
+    rest_source = provided is None
+    timeline_complete = rest_source
     if provided is not None:
         provided_timeline = provided.get("timeline")
         if isinstance(provided_timeline, list):
             timeline = list(provided_timeline)
             timeline_complete = not provided.get("timeline_incomplete")
+        # A carried NULL timeline (no production mapper emits one) stays
+        # ABSENT: presence None keeps stored item_events untouched, the
+        # conservative direction (final-critic note).
+        provided_links = provided.get("links")
+        if isinstance(provided_links, dict):
+            links = provided_links
+            # The overflow marker arrives as a LIST of connection names from
+            # the production mapper; the legacy BOOLEAN form (recorded
+            # bundles, fixtures) means every connection overflowed.
+            links_incomplete = provided.get("links_incomplete")
+        provided_commits = provided.get("pr_commits")
+        if isinstance(provided_commits, list):
+            pr_commits = list(provided_commits)
         if provided.get("timeline_incomplete"):
             flags["timeline_incomplete"] = True
         if provided.get("closing_refs_incomplete"):
             flags["closing_refs_incomplete"] = True
     complete["timeline"] = timeline_complete
+    if rest_source:
+        complete["links_blocked_by"] = True
+        complete["links_parent"] = True
+        complete["links_duplicate_of"] = True
+        complete["links_open_prs"] = True
+        complete["pr_commits"] = True
+    else:
+        complete["links_blocked_by"] = _connection_complete(links, "blocked_by", links_incomplete)
+        complete["links_parent"] = _connection_complete(links, "parent", links_incomplete)
+        complete["links_duplicate_of"] = _connection_complete(links, "duplicate_of", links_incomplete)
+        complete["links_open_prs"] = _connection_complete(links, "open_prs", links_incomplete)
+        complete["pr_commits"] = pr_commits is not None and not provided.get(
+            "pr_commits_incomplete"
+        )
     complete["pull"] = (pull_raw is not None) or kind != "pr"
     if has_recording:
         # The recording's completeness, verbatim, for every key it names
@@ -261,7 +329,16 @@ def _resolve_children(
         # provided section, exactly as a recorded True overrides a computed
         # False. Content always comes from the recording; only the map is
         # overridden here.
-        for name in (*_CHILD_FALLBACK, "pull", "timeline"):
+        for name in (
+            *_CHILD_FALLBACK,
+            "pull",
+            "timeline",
+            "links_blocked_by",
+            "links_parent",
+            "links_duplicate_of",
+            "links_open_prs",
+            "pr_commits",
+        ):
             if name in recorded_complete:
                 complete[name] = bool(recorded_complete[name])
     return (
@@ -273,6 +350,9 @@ def _resolve_children(
         timeline,
         flags,
         complete,
+        links,
+        links_incomplete,
+        pr_commits,
     )
 
 
@@ -296,10 +376,26 @@ def _mark_gone(
         raise
 
 
+#: children_complete keys whose False state means a per-item fetch fallback
+#: happened (the per-item "children incomplete" fetch_log note). The v10
+#: connection gates are deliberately absent: an absent connection is not a
+#: per-item fallback.
+_LOGGABLE_SECTIONS = frozenset({*_CHILD_FALLBACK, "pull", "timeline"})
+
+
 def _gone_children_complete() -> dict[str, bool]:
     """The all-False completeness map for a gone item (issue #23): no section
     was answered — there is nothing behind a 404/410."""
-    return {**{name: False for name in _CHILD_FALLBACK}, "pull": False, "timeline": False}
+    return {
+        **{name: False for name in _CHILD_FALLBACK},
+        "pull": False,
+        "timeline": False,
+        "links_blocked_by": False,
+        "links_parent": False,
+        "links_duplicate_of": False,
+        "links_open_prs": False,
+        "pr_commits": False,
+    }
 
 
 def _stored_list_raw(conn: sqlite3.Connection, repo: str, number: int) -> dict | None:
@@ -671,11 +767,11 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
     # reset here (once per sync), never per page (issue #23).
     source.omitted_fields = []
     source._capabilities_from_cache = False
-    # v2: the selection gained comment-scope fields (issue #24); v1 caches
-    # predate them, so a stale v1 map would fail-open into a GraphQL
-    # validation error on hosts lacking those fields. Versioning invalidates
-    # old caches instead.
-    key = f"capability_probe:v2:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
+    # v3: the selection gained the five issue #27 fields and the timeline
+    # enum introspection; v2/v1 caches cannot know them, and a stale map
+    # would strip the new sections by the per-field drop rule instead of
+    # degrading honestly. Versioning invalidates old caches instead.
+    key = f"capability_probe:v3:{_gh_host()}:{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
     cached = get_meta(conn, key)
     if cached:
         try:
@@ -701,7 +797,17 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
             raise
         return
     attach(caps)
-    set_meta(conn, key, json.dumps({k: sorted(v) for k, v in caps.items()}, sort_keys=True))
+    set_meta(
+        conn,
+        key,
+        json.dumps(
+            {
+                k: (sorted(v) if isinstance(v, (set, frozenset, list)) else v)
+                for k, v in caps.items()
+            },
+            sort_keys=True,
+        ),
+    )
     conn.commit()
 
 
@@ -880,7 +986,8 @@ def sync_repo(
                             continue
                         try:
                             (pull_raw, issue_comments, review_comments, reviews,
-                             files, timeline, flags, children_complete) = (
+                             files, timeline, flags, children_complete,
+                             links, links_incomplete, pr_commits) = (
                                 _resolve_children(
                                     source, list_raw, kind, include_patches,
                                     provided=provided,
@@ -912,10 +1019,22 @@ def sync_repo(
                                 include_patches=include_patches,
                                 timeline=timeline,
                                 children_complete=children_complete,
+                                links=links,
+                                links_incomplete=links_incomplete,
+                                pr_commits=pr_commits,
                                 advance_watermark=numbers is None,
                             )
+                            # The note covers the fetch-fallback sections
+                            # only. The v10 connection gates (links_*/,
+                            # pr_commits) are NOT fallback signals: an absent
+                            # connection is recorded ONCE per run by the
+                            # probe's omitted_fields row, and repeating it
+                            # per item would drown the real degradation
+                            # notes (the PR #37 noise rule).
                             incomplete = sorted(
-                                s for s, ok in children_complete.items() if not ok
+                                s
+                                for s, ok in children_complete.items()
+                                if not ok and s in _LOGGABLE_SECTIONS
                             )
                             if incomplete:
                                 log_fetch(
@@ -999,6 +1118,13 @@ def sync_repo(
                                 "reviews": reviews,
                                 "files": files,
                                 "timeline": timeline,
+                                # v10 sections (issue #27): the exact link
+                                # and commit payloads ingest saw, with the
+                                # same presence semantics (None = never
+                                # carried) so replay reproduces the store.
+                                "links": links,
+                                "links_incomplete": links_incomplete,
+                                "pr_commits": pr_commits,
                                 # The exact completeness map ingest saw
                                 # (issue #25): replay applies it verbatim so
                                 # it can never fabricate tombstones the

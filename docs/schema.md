@@ -203,7 +203,7 @@ The graph itself. One row per relationship.
 | `dst_id` | TEXT | A commit endpoint carries the sha, so the graph joins to `git log`. |
 | `confidence` | TEXT | Always `'EXTRACTED'`, enforced by a CHECK constraint. |
 | `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is** — with the `closes` exception below. |
-| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. |
+| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'link'` (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. `link` edges are exempt from the delete-on-re-ingest rule like `timeline`/`closing_ref`, and are replaced per connection only when that connection was fetched complete. |
 
 Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 
@@ -244,6 +244,12 @@ keeps two-rows-are-two-facts.
 | `merged_by` | item → actor | Who merged the PR. |
 | `merged_commit` | item → commit | The PR's merge commit sha — joins the graph to `git log`. |
 | `reverts` | item → commit, or item → item | A `This reverts commit <sha>` body line targets the commit; a title-only revert (`Revert "…"`) targets the item whose exact quoted title matches, when exactly one does. |
+| `branch_ref` | item → item | v9: the PR's `head_ref` carries exactly one issue number that names one stored issue. Multi-token branches (`fix/12-34`) and ghosts name nothing. Keyword-derived (rebuilt on re-ingest). |
+| `blocked_by` | item → item | v10: GitHub-reported `blockedBy` connection. `source='link'`. |
+| `child_of` | item → item | v10: GitHub-reported sub-issue `parent`. `source='link'`. |
+| `duplicate_of` | item → item | v10: GitHub-reported `duplicateOf`. `source='link'`. Text saying "duplicate of #N" produces `duplicate_keyword` instead — never this relation. |
+| `linked_pr` | item → item | v10: the issue's open linked PRs from GitHub's `closedByPullRequestsReferences` (`includeClosedPrs: false`). `source='link'`. |
+| `duplicate_keyword` | item → item | v10: "duplicate of #N" text in a body, comment, or review body. Keyword-derived only; foreign references dropped. |
 
 `closes_keyword` and `mentions` are mutually exclusive within a single text
 payload — a body, one comment, or one review body: a number that is closed by
@@ -378,6 +384,44 @@ Write rules:
   coverage reports `revision_rows`/`revision_bytes` as `NULL` on pre-v8
   stores and honest zeros on an empty v8 store; `item --history` /
   `--as-of` degrade with an explicit note rather than fabricating history.
+
+
+## item_path_refs
+
+v9 (issue #26). Raw path strings mentioned in item text — Python frames
+(`File "<path>", line N`), `path:L:C` tokens, same-repo `blob/<ref>/<path>`
+URLs, and backticked `seg/seg.ext` segments. Item-scoped children: replaced
+on every re-ingest.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `origin` | TEXT | `'body'`, `'issue_comment:<id>'`, `'review_comment:<id>'`, or `'review:<id>'`. |
+| `path` | TEXT | The raw string, deliberately UNRESOLVED — resolution against the stored file vocabulary happens at read time (issue #29), never at ingest, so rows stay independent of sync order. |
+| `backticked` | INTEGER | 1 when the path appeared inside backticks. |
+
+## item_signatures
+
+v9 (issue #26). Error signatures from fenced blocks: the exception name, the
+exception line with run-varying constants masked (`0x…` → `<hex>`, digit runs
+→ `<n>`), and the nearest frame function when the block carries Python
+frames. Item-scoped, replaced on re-ingest.
+
+## item_events
+
+v10 (issue #27). GitHub-reported timeline events stored as rows (currently
+`reopened`); events never become edges. Replaced only when the timeline
+section was fetched **complete** — a degraded re-ingest (REST source, 404,
+capability-dropped field, truncation cap) leaves stored rows untouched, and a
+plain-REST sync answers no timeline at all (presence `None`), which touches
+nothing.
+
+## pr_commits
+
+v10 (issue #27). A PR's commit messages (`sha`, headline+body composed).
+Replaced only when the commits section was fetched complete. The derived
+`closes_keyword` edges (a commit message saying `fixes #N`, evidence
+`commit <sha> closing keyword`) re-derive from these RETAINED rows on every
+ingest, so a REST or overflowed re-ingest never retracts them.
 
 ## sync_state
 

@@ -1,4 +1,4 @@
--- zaxbygraph schema v8 (`PRAGMA user_version` = 8; see db.py MIGRATIONS)
+-- zaxbygraph schema v10 (`PRAGMA user_version` = 10; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 
@@ -306,3 +306,52 @@ CREATE TABLE IF NOT EXISTS revisions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_revisions_item ON revisions(repo, number);
+
+-- Text-derived references (issue #26, migration v9): raw path strings and
+-- error signatures mentioned in item text. Paths are stored RAW and resolved
+-- against the file vocabulary at READ time (issue #29) — resolving at ingest
+-- would make rows depend on sync order. Replaced with the other item-scoped
+-- children on every re-ingest; doctor --consolidate is the sanctioned rewrite.
+CREATE TABLE IF NOT EXISTS item_path_refs (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    origin TEXT NOT NULL,
+    path TEXT NOT NULL,
+    backticked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (repo, number, origin, path)
+);
+
+CREATE INDEX IF NOT EXISTS idx_item_path_refs_path ON item_path_refs(path);
+
+CREATE TABLE IF NOT EXISTS item_signatures (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    exception TEXT NOT NULL,
+    error_line TEXT NOT NULL,
+    frame_function TEXT,
+    PRIMARY KEY (repo, number, exception, error_line)
+);
+
+-- GitHub-reported links, events and commit messages (issue #27, migration
+-- v10). item_events rows are replaced only when the timeline section was
+-- fetched complete; pr_commits rows only when the commits section was — a
+-- degraded re-ingest touches neither. Reopen events never become edges; commit
+-- messages derive closes_keyword edges, re-derived from the RETAINED rows.
+CREATE TABLE IF NOT EXISTS item_events (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (repo, number, type, created_at)
+);
+
+CREATE TABLE IF NOT EXISTS pr_commits (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    sha TEXT NOT NULL,
+    message TEXT,
+    PRIMARY KEY (repo, number, sha)
+);
+
+CREATE INDEX IF NOT EXISTS idx_items_repo_head ON items(repo, head_ref)
+    WHERE kind = 'pr' AND head_ref IS NOT NULL;

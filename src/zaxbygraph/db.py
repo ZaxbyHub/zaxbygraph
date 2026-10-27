@@ -11,21 +11,24 @@ from zaxbygraph.extract import (
 )
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "10"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 8
+CURRENT_USER_VERSION = 10
 
 #: Feature gates compare against the slot that INTRODUCED a capability, never
 #: against CURRENT_USER_VERSION: a read-only store several slots behind must
 #: keep every feature its own schema supports (reads never migrate). v7
 #: payload-signal reads gate on _V7_USER_VERSION; v8 revision history on
-#: _V8_USER_VERSION. A v9 slot MUST re-pin both to their introducing slots.
+#: _V8_USER_VERSION; v9 text-derived references and v10 link events/commits
+#: on their own slots. A v11 slot MUST re-pin all four to their slots.
 _V7_USER_VERSION = 7
 _V8_USER_VERSION = 8
+_V9_USER_VERSION = 9
+_V10_USER_VERSION = 10
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -891,6 +894,240 @@ def migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
     )
 
 
+def _backfill_text_refs(conn: sqlite3.Connection) -> None:
+    """Populate v9 surfaces from ALREADY-STORED payloads (issue #26).
+
+    The current text of every item, comment and review is in raw_json, so —
+    unlike v8's displaced text — the references are derivable without any
+    GitHub call. Backfills: item_path_refs, item_signatures, the new
+    duplicate_keyword edges, position-enriched mention/closes_keyword
+    evidence (evidence-only upsert; edge identity untouched), and forward
+    branch_ref from stored PR head_refs (single numeric token resolving to
+    one stored issue). Keyword edges are only ever ADDED here, never
+    retracted: the migration cannot see text that pre-dates the stored
+    snapshot, and removal is the live ingest's job.
+    """
+    from zaxbygraph import extract as _extract
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS item_path_refs ("
+        " repo TEXT NOT NULL, number INTEGER NOT NULL,"
+        " origin TEXT NOT NULL, path TEXT NOT NULL,"
+        " backticked INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY (repo, number, origin, path))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_path_refs_path"
+        " ON item_path_refs(path)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS item_signatures ("
+        " repo TEXT NOT NULL, number INTEGER NOT NULL,"
+        " exception TEXT NOT NULL, error_line TEXT NOT NULL,"
+        " frame_function TEXT,"
+        " PRIMARY KEY (repo, number, exception, error_line))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_repo_head ON items(repo, head_ref)"
+        " WHERE kind = 'pr' AND head_ref IS NOT NULL"
+    )
+
+    # Branch targets are STORED ISSUES (kind='issue'), the same rule the
+    # live forward pass enforces (store.issue_number_lookup) — a PR-numbered
+    # token never satisfies it (review round 1).
+    stored_numbers: dict[str, set[int]] = {}
+    for row in conn.execute(
+        "SELECT repo, number FROM items WHERE kind = 'issue'"
+    ).fetchall():
+        stored_numbers.setdefault(row["repo"], set()).add(row["number"])
+
+    def _upsert_keyword_edge(
+        repo: str, number: int, rel: str, dst: int, evidence: str
+    ) -> None:
+        # The same scoped-merge rule as collapse_edges (plan revision 4):
+        # when several stored payloads close the SAME pair (item body AND a
+        # comment), the migrated evidence unions instead of last-write-wins
+        # dropping a provenance (final critic finding 2). Other relations
+        # keep last-write (evidence-only enrichment; title beats body is
+        # handled by the callers' mentioned set).
+        if rel == "closes_keyword":
+            row = conn.execute(
+                "SELECT evidence FROM edges WHERE repo = ? AND src_type ="
+                " 'item' AND src_id = ? AND rel = 'closes_keyword' AND"
+                " dst_type = 'item' AND dst_id = ? AND source = 'keyword'",
+                (repo, str(number), str(dst)),
+            ).fetchone()
+            if row is not None and row["evidence"]:
+                evidence = _extract.merge_evidence(row["evidence"], evidence)
+        conn.execute(
+            "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+            " confidence, evidence, source)"
+            " VALUES (?, 'item', ?, ?, 'item', ?, 'EXTRACTED', ?, 'keyword')"
+            " ON CONFLICT(repo, src_type, src_id, rel, dst_type, dst_id, source)"
+            " DO UPDATE SET evidence = excluded.evidence",
+            (repo, str(number), rel, str(dst), evidence),
+        )
+
+    for row in conn.execute("SELECT repo, number, raw_json FROM items").fetchall():
+        repo, number = row["repo"], row["number"]
+        try:
+            raw = json.loads(row["raw_json"])
+        except ValueError:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        title = raw.get("title") or ""
+        body = raw.get("body") or ""
+        for path, backticked in _extract.parse_path_refs(body, repo):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"
+                " path, backticked) VALUES (?, ?, 'body', ?, ?)",
+                (repo, number, path, backticked),
+            )
+        for exception, error_line, frame_function in (
+            _extract.parse_error_signatures(body)
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_signatures(repo, number,"
+                " exception, error_line, frame_function) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, exception, error_line, frame_function),
+            )
+        for n, location in _extract.iter_duplicate_locations(title, repo, "title"):
+            _upsert_keyword_edge(repo, number, "duplicate_keyword", n, location)
+        for n, location in _extract.iter_duplicate_locations(body, repo):
+            _upsert_keyword_edge(repo, number, "duplicate_keyword", n, location)
+        # Parity with the live edges_from_item (review round 1): a closing
+        # keyword reference is NOT also a mention within one payload, and an
+        # item never references itself.
+        closed = {n for n, _ in _extract.iter_closing_locations(body, repo)}
+        mentioned: set[int] = set()
+        for n, location in _extract.iter_mention_locations(title, repo, "title"):
+            if n != number and n not in closed:
+                _upsert_keyword_edge(repo, number, "mentions", n, location)
+                mentioned.add(n)
+        for n, location in _extract.iter_mention_locations(body, repo):
+            # Title beats body (the live setdefault keeps the title's
+            # evidence); a body-only mention upserts.
+            if n != number and n not in closed and n not in mentioned:
+                _upsert_keyword_edge(repo, number, "mentions", n, location)
+        for n, location in _extract.iter_closing_locations(body, repo):
+            if n != number:
+                _upsert_keyword_edge(
+                    repo, number, "closes_keyword", n, f"{location} closing keyword"
+                )
+        head_row = conn.execute(
+            "SELECT head_ref FROM items WHERE repo = ? AND number = ?",
+            (repo, number),
+        ).fetchone()
+        head_ref = head_row["head_ref"] if head_row is not None else None
+        if head_ref:
+            tokens = _extract.branch_number_tokens(head_ref)
+            if len(tokens) == 1:
+                token = tokens[0]
+                if token in stored_numbers.get(repo, set()) and token != number:
+                    _upsert_keyword_edge(
+                        repo, number, "branch_ref", token, f"head_ref {head_ref}"
+                    )
+
+    for row in conn.execute(
+        "SELECT repo, number, kind, github_id, body FROM comments"
+    ).fetchall():
+        repo, number = row["repo"], row["number"]
+        body = row["body"] or ""
+        origin = f"{row['kind']}:{row['github_id']}"
+        for path, backticked in _extract.parse_path_refs(body, repo):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"
+                " path, backticked) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, origin, path, backticked),
+            )
+        for exception, error_line, frame_function in (
+            _extract.parse_error_signatures(body)
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_signatures(repo, number,"
+                " exception, error_line, frame_function) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, exception, error_line, frame_function),
+            )
+        # Edge evidence carries the LIVE prefix (final critic finding 1):
+        # live edges_from_comment labels every reference comment:<github_id>,
+        # never the default body@.
+        prefix = f"comment:{row['github_id']}"
+        closed = {n for n, _ in _extract.iter_closing_locations(body, repo, prefix)}
+        for n, location in _extract.iter_duplicate_locations(body, repo, prefix):
+            _upsert_keyword_edge(repo, number, "duplicate_keyword", n, location)
+        for n, location in _extract.iter_mention_locations(body, repo, prefix):
+            if n != number and n not in closed:
+                _upsert_keyword_edge(repo, number, "mentions", n, location)
+        for n, location in _extract.iter_closing_locations(body, repo, prefix):
+            if n != number:
+                _upsert_keyword_edge(
+                    repo, number, "closes_keyword", n, f"{location} closing keyword"
+                )
+
+    for row in conn.execute(
+        "SELECT repo, number, id, body FROM reviews"
+    ).fetchall():
+        repo, number = row["repo"], row["number"]
+        body = row["body"] or ""
+        origin = f"review:{row['id']}"
+        for path, backticked in _extract.parse_path_refs(body, repo):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"
+                " path, backticked) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, origin, path, backticked),
+            )
+        # Review loops carry the same live-path parity: duplicate_keyword
+        # (the live edges_from_review emits it; round-1 review), the
+        # closing/mentions exclusion, and the LIVE evidence prefix
+        # review:<id> (final critic finding 1).
+        prefix = f"review:{row['id']}"
+        closed = {n for n, _ in _extract.iter_closing_locations(body, repo, prefix)}
+        for n, location in _extract.iter_duplicate_locations(body, repo, prefix):
+            _upsert_keyword_edge(repo, number, "duplicate_keyword", n, location)
+        for n, location in _extract.iter_mention_locations(body, repo, prefix):
+            if n != number and n not in closed:
+                _upsert_keyword_edge(repo, number, "mentions", n, location)
+        for n, location in _extract.iter_closing_locations(body, repo, prefix):
+            if n != number:
+                _upsert_keyword_edge(
+                    repo, number, "closes_keyword", n, f"{location} closing keyword"
+                )
+
+
+def migrate_v8_to_v9(conn: sqlite3.Connection) -> None:
+    """v8 -> v9: text-derived references (issue #26).
+
+    Additive tables (item_path_refs, item_signatures), the branch-head partial
+    index, and a backfill from already-stored raw_json — the current text IS
+    stored, so unlike v8 the references are derivable without GitHub calls.
+    Per-statement `execute`; no-op-safe on a fresh database.
+    """
+    _backfill_text_refs(conn)
+
+
+def migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
+    """v9 -> v10: GitHub-reported links, events and commit messages (#27).
+
+    Additive only: item_events and pr_commits. No backfill is possible —
+    reopen events and commit messages were never fetched before this schema
+    slot, so a migrated store starts with both tables empty and reads keep
+    working through the missing-table degradation arms.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS item_events ("
+        " repo TEXT NOT NULL, number INTEGER NOT NULL,"
+        " type TEXT NOT NULL, created_at TEXT NOT NULL,"
+        " PRIMARY KEY (repo, number, type, created_at))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS pr_commits ("
+        " repo TEXT NOT NULL, number INTEGER NOT NULL,"
+        " sha TEXT NOT NULL, message TEXT,"
+        " PRIMARY KEY (repo, number, sha))"
+    )
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -901,6 +1138,8 @@ MIGRATIONS = [
     (6, migrate_v5_to_v6),
     (7, migrate_v6_to_v7),
     (8, migrate_v7_to_v8),
+    (9, migrate_v8_to_v9),
+    (10, migrate_v9_to_v10),
 ]
 
 
