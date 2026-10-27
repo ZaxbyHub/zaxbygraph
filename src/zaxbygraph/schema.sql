@@ -1,4 +1,4 @@
--- zaxbygraph schema v7 (`PRAGMA user_version` = 7; see db.py MIGRATIONS)
+-- zaxbygraph schema v8 (`PRAGMA user_version` = 8; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- Derived/interpreted tables are NEVER written by the fetcher.
 

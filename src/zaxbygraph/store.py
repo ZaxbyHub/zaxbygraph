@@ -288,6 +288,13 @@ def write_revisions(
                  submitted_at or item_created, incoming_updated)
             )
     for entity, entity_id, kind, origin, content, valid_from, valid_to in rows:
+        # A displacement whose GitHub-time window cannot be established from
+        # the payload (NULL stamps on both sides) is not recorded: the
+        # window columns are NOT NULL and an unusable or inverted window
+        # would either abort the ingest or store an unqueryable row
+        # (issue #25 review PRR-003).
+        if valid_from is None or valid_to is None:
+            continue
         _insert_revision(
             conn, repo, number, entity, entity_id, kind, origin, content,
             valid_from, valid_to,

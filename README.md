@@ -266,9 +266,10 @@ snippet, comment snippet). **Shape change (v0.3): the separate
 zaxbygraph item N
 ```
 
-Returns every `items` column plus nested `labels`, `comments`, `reviews`,
-`files`, and `edges`. This is the one command that returns bodies, so it is the
-expensive one — reach for `search` or `sql` when you need breadth.
+Returns the stored `items` fields (everything except `raw_json`) plus nested
+`labels`, `comments`, `reviews`, `files`, and `edges`. This is the one command
+that returns bodies, so it is the expensive one — reach for `search` or `sql`
+when you need breadth.
 
 Exits 1 with `error: item #N not found` if the number is not in the DB.
 
@@ -280,8 +281,9 @@ zaxbygraph item N --history          # the stored revision pre-images, ordered
 zaxbygraph item N --as-of 2026-10-01T12:00:00Z
 ```
 
-`--history` returns the standard `item` envelope — every `items` column and
-the nested `labels`/`comments`/`reviews`/`files`/`edges`, all reflecting
+`--history` returns the standard `item` envelope — the same fields `item`
+exposes (no `raw_json`) and the nested
+`labels`/`comments`/`reviews`/`files`/`edges`, all reflecting
 current state — plus `revisions`: one row per displaced text version
 (entity, origin `edit`/`deleted`, the exact displaced `content`, and
 GitHub-time `valid_from`/`valid_to`). `--as-of T` returns the item envelope
@@ -292,9 +294,11 @@ else the live row once T is past its validity start — plus `as_of`,
 entities with no version at T (never back-dated). `--as-of` omits `edges`
 and `index_stale`: edges carry no recorded history, so the current graph is
 not presented beside an as-of text view. The two flags are
-mutually exclusive; a malformed or timezone-naive `--as-of` exits 1 with
-`code: bad_as_of`. Pre-v8 stores have no recorded history: both flags return
-the item with an empty/note-only history rather than a fabricated one.
+mutually exclusive; a malformed, timezone-naive, or empty `--as-of` exits 1
+with `code: bad_as_of`. On pre-v8 stores neither flag fabricates history:
+`--history` returns an empty `revisions` list, and `--as-of` returns the
+current text unevaluated by any window — both carry `history_note` (and the
+pre-v8 `--as-of` payload has no `absent_entities` key).
 
 ### `related` — neighborhood
 
@@ -525,7 +529,8 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
-  `bad_request`, `bad_sql`, `runtime`) to **stdout**, so `json.load(stdin)`
+  `bad_request`, `bad_as_of`, `bad_flags`, `bad_sql`, `runtime`) to
+  **stdout**, so `json.load(stdin)`
   never sees an empty stream. The same `error: MESSAGE` one-liner is still
   printed to stderr for humans; argparse usage errors remain plain stderr.
 - `sync` failures also persist to `sync_state.last_error`, so a later `status`

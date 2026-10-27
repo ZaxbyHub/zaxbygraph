@@ -1337,7 +1337,14 @@ class MigrateV7ToV8Tests(unittest.TestCase):
             self.assertEqual(
                 int(conn.execute("PRAGMA user_version").fetchone()[0]), 7
             )
-            init_schema(conn)
+            # Exercise the migration ITSELF: init_schema would recreate the
+            # dropped table from schema.sql before the chain runs (PRR-007),
+            # so the DDL under test is invoked directly here.
+            from zaxbygraph.db import migrate_v7_to_v8
+
+            migrate_v7_to_v8(conn)
+            conn.execute("PRAGMA user_version = 8")
+            conn.commit()
             self.assertEqual(
                 int(conn.execute("PRAGMA user_version").fetchone()[0]), 8
             )

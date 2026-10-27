@@ -630,7 +630,7 @@ def cmd_item(args: argparse.Namespace) -> int:
         )
     try:
         at: datetime | None = None
-        if getattr(args, "as_of", None) and getattr(args, "history", False):
+        if getattr(args, "as_of", None) is not None and getattr(args, "history", False):
             conn.close()
             return emit_failure(
                 args,
@@ -640,7 +640,7 @@ def cmd_item(args: argparse.Namespace) -> int:
                 db_path=db_path,
                 code_key="bad_flags",
             )
-        if getattr(args, "as_of", None):
+        if getattr(args, "as_of", None) is not None:
             try:
                 at = _parse_as_of(args.as_of)
             except ValueError as exc:

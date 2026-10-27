@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -253,6 +255,25 @@ class RevisionRuleTests(TempDBTest):
         edits = [r for r in rev_rows(self.conn, number=7) if r[3] == "edit"]
         self.assertEqual([(r[1], r[4]) for r in edits], [(21, "orig")])
 
+    def test_null_timestamp_displacement_skips_revision(self) -> None:
+        """PRR-003: a displacement whose GitHub-time window cannot be
+        established (NULL stamps) is not recorded — and never aborts the
+        ingest."""
+        good = dict(issue(9, title="t", body="A",
+                          updated_at="2026-01-01T00:00:00Z"))
+        self.ingest(good)
+        poisoned = dict(good, body="B", updated_at=None)
+        self.ingest(poisoned)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM revisions"), 0)
+        self.assertEqual(
+            tuple(self.conn.execute(
+                "SELECT body FROM items WHERE number = 9").fetchone()),
+            ("B",),
+        )
+        # A later well-stamped displacement records normally again.
+        self.ingest(dict(good, body="C", updated_at="2026-01-02T00:00:00Z"))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM revisions"), 1)
+
     def test_gone_item_writes_no_tombstones(self) -> None:
         """The 404 path keeps stored children and the all-False completeness
         map (issue #23): no tombstones, children retained."""
@@ -298,7 +319,7 @@ class RevisionTransactionTests(TempDBTest):
             "CREATE TRIGGER revisions_block BEFORE INSERT ON revisions"
             " BEGIN SELECT RAISE(ABORT, 'sabotaged'); END"
         )
-        with self.assertRaises(Exception):
+        with self.assertRaises(sqlite3.DatabaseError) as ctx:
             self.conn.execute("BEGIN")
             try:
                 ingest_item(self.conn, REPO,
@@ -310,6 +331,8 @@ class RevisionTransactionTests(TempDBTest):
             except Exception:
                 self.conn.rollback()
                 raise
+        self.assertIn("sabotaged", str(ctx.exception))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM revisions"), 0)
         self.conn.execute("DROP TRIGGER revisions_block")
         self.assertEqual(
             tuple(self.conn.execute(
@@ -421,6 +444,126 @@ class RevisionReadTests(TempDBTest):
         # 2026-01-02T00:00:00+02:00 == 2026-01-01T22:00:00Z: inside rev 1.
         at = item_as_of(self.conn, 1, _parse_instant("2026-01-02T00:00:00+02:00"), repo=REPO)
         self.assertEqual(at["body"], "B1")
+
+    def test_as_of_null_body_is_a_version(self) -> None:
+        """PRR-004: a live NULL body is a valid version at T, not an
+        absence."""
+        self.conn.execute("BEGIN")
+        ingest_item(self.conn, REPO,
+                    issue(11, title="t", body="b",
+                          updated_at="2026-01-01T00:00:00Z"),
+                    pull_raw=None,
+                    issue_comments=[{**comment(601, "seed", created_at="2026-01-01T01:00:00Z"),
+                                     "body": None}],
+                    review_comments=[], reviews=[], files=[], include_patches=False,
+                    children_complete={"issue_comments": True})
+        self.conn.commit()
+        from zaxbygraph.query import _parse_instant
+
+        at = item_as_of(self.conn, 11,
+                        _parse_instant("2026-01-02T00:00:00Z"), repo=REPO)
+        self.assertEqual([c["github_id"] for c in at["comments"]], [601])
+        self.assertIsNone(at["comments"][0]["body"])
+        self.assertEqual(at["comments"][0]["version_source"], "live")
+        self.assertEqual(at["absent_entities"], [])
+
+    def test_as_of_null_submitted_at_review_uses_item_created(self) -> None:
+        """PRR-005: the documented submitted_at -> item created_at fallback
+        applies on the read path too."""
+        self.conn.execute("BEGIN")
+        ingest_item(self.conn, REPO,
+                    issue(12, title="t", body="b",
+                          updated_at="2026-01-01T00:00:00Z",
+                          created_at="2026-01-01T00:00:00Z"),
+                    pull_raw=None, issue_comments=[], review_comments=[],
+                    reviews=[{**review(901, state="APPROVED", body="r"),
+                              "submitted_at": None}],
+                    files=[], include_patches=False)
+        self.conn.commit()
+        from zaxbygraph.query import _parse_instant
+
+        at = item_as_of(self.conn, 12,
+                        _parse_instant("2026-01-05T00:00:00Z"), repo=REPO)
+        self.assertEqual([r["id"] for r in at["reviews"]], [901])
+        self.assertEqual(at["reviews"][0]["version_source"], "live")
+
+    def test_live_start_uses_latest_window_end(self) -> None:
+        """PRR-008: live validity starts at the LATEST valid_to across the
+        entity's revisions, not the max-id row's."""
+        self.conn.execute("BEGIN")
+        ingest_item(self.conn, REPO,
+                    issue(13, title="v1", body="b1",
+                          updated_at="2026-01-01T00:00:00Z"),
+                    pull_raw=None, issue_comments=[], review_comments=[],
+                    reviews=[], files=[], include_patches=False)
+        self.conn.commit()
+        # Hand-written sequence: max-id row carries the EARLIER end.
+        self.conn.executemany(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, 13, 'item_body', 'edit', ?, ?, ?)",
+            [(REPO, "old", "2025-12-01T00:00:00Z", "2026-01-05T00:00:00Z"),
+             (REPO, "newer", "2025-12-01T00:00:00Z", "2026-01-03T00:00:00Z")],
+        )
+        self.conn.commit()
+        from zaxbygraph.query import _parse_instant
+
+        # 01-04 is before the LATEST end (01-05): the revision that owns it
+        # is the old row, not the live text.
+        at = item_as_of(self.conn, 13,
+                        _parse_instant("2026-01-04T00:00:00Z"), repo=REPO)
+        self.assertEqual(at["body"], "old")
+
+    def test_as_of_empty_string_is_bad_as_of(self) -> None:
+        """PRR-006: an explicitly empty --as-of is rejected, and the
+        mutual-exclusion guard is not bypassed by it."""
+        self._seed()
+        from zaxbygraph.cli import build_parser, cmd_item
+
+        args = build_parser().parse_args(
+            ["item", "1", "--as-of", "", "--db", str(self.db_path),
+             "--repo", REPO, "--format", "json"]
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_item(args), 1)
+        self.assertEqual(json.loads(buf.getvalue())["error"]["code"], "bad_as_of")
+
+        args = build_parser().parse_args(
+            ["item", "1", "--history", "--as-of", "", "--db",
+             str(self.db_path), "--repo", REPO, "--format", "json"]
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_item(args), 2)
+        self.assertEqual(json.loads(buf.getvalue())["error"]["code"], "bad_flags")
+
+    def test_as_of_overflow_instant_is_bad_as_of(self) -> None:
+        """PRR-009: boundary instants that overflow the UTC conversion get
+        the coded error, not a traceback."""
+        self._seed()
+        from zaxbygraph.cli import build_parser, cmd_item
+
+        args = build_parser().parse_args(
+            ["item", "1", "--as-of", "9999-12-31T23:59:59-01:00", "--db",
+             str(self.db_path), "--repo", REPO, "--format", "json"]
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cmd_item(args), 1)
+        self.assertEqual(json.loads(buf.getvalue())["error"]["code"], "bad_as_of")
+
+    def test_status_counts_are_repo_scoped(self) -> None:
+        """PRR-011/TC-15: another repo's revisions never leak into this
+        repo's coverage counts."""
+        self.conn.execute(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, 1, 'item_body', 'edit', 'x',"
+            " '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            ("other/repo",),
+        )
+        cov = status(self.conn, repo=REPO)["coverage"]
+        self.assertEqual(cov["revision_rows"], 0)
+        self.assertEqual(cov["revision_bytes"], 0)
 
     def test_plain_item_unchanged(self) -> None:
         """AC6: the no-flag item output stays byte-identical to the base
@@ -912,6 +1055,66 @@ class ReplayFidelityTests(TempDBTest):
             ).fetchone()[0],
             watermark,
         )
+
+
+class ConsolidationRevisionTests(unittest.TestCase):
+    """PRR-001 (plan D5): consolidation adopts revisions with fresh ids in
+    per-item sequence order and removes stale destination rows for the
+    slug, without touching other repos' history."""
+
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        self.store_db = Path(td.name) / "store.db"
+        self.candidate_db = Path(td.name) / "candidate.db"
+
+    def test_consolidation_adopts_revisions_fresh_ids_in_order(self) -> None:
+        from zaxbygraph.doctor import consolidate
+
+        # Destination store: stale revisions for the slug under adoption,
+        # plus another repo's history that must survive.
+        dest = connect(self.store_db)
+        init_schema(dest)
+        dest.executemany(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, ?, 'item_body', 'edit', ?, ?, ?)",
+            [(REPO, 1, "STALE-OLD", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+             (REPO, 1, "STALE-NEW", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+             ("other/repo", 1, "KEEP", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")],
+        )
+        dest.commit()
+
+        # Candidate: its own two-revision sequence for the same slug.
+        cand = connect(self.candidate_db)
+        init_schema(cand)
+        cand.executemany(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, ?, 'item_body', 'edit', ?, ?, ?)",
+            [(REPO, 7, "CAND-A", "2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z"),
+             (REPO, 7, "CAND-B", "2026-02-02T00:00:00Z", "2026-02-03T00:00:00Z")],
+        )
+        cand.commit()
+        cand.close()
+
+        consolidate(self.store_db, self.candidate_db, REPO)
+        rows = [
+            tuple(r)
+            for r in dest.execute(
+                "SELECT id, repo, number, entity, content FROM revisions"
+                " ORDER BY id"
+            )
+        ]
+        # Fresh ids: the adopted pair is appended after the surviving
+        # other-repo row, in candidate sequence order; the stale slug rows
+        # are gone.
+        self.assertEqual(
+            [(r[1], r[2], r[3], r[4]) for r in rows],
+            [("other/repo", 1, "item_body", "KEEP"),
+             (REPO, 7, "item_body", "CAND-A"),
+             (REPO, 7, "item_body", "CAND-B")],
+        )
+        self.assertEqual([r[0] for r in rows], sorted(r[0] for r in rows))
+        dest.close()
 
 
 if __name__ == "__main__":

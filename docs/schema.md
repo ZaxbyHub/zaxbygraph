@@ -1,4 +1,4 @@
-# Schema reference (schema version 7, `PRAGMA user_version` = 7)
+# Schema reference (schema version 8, `PRAGMA user_version` = 8)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -360,14 +360,18 @@ Write rules:
   survives.
 - **No content key.** A row exists only when the stored value and the
   incoming value differ (exact, NULL-aware). An edit reverted A→B→A therefore
-  yields two rows and can never wedge a sync.
+  yields two rows and can never wedge a sync. A displacement whose
+  GitHub-time window cannot be established (both bounding stamps NULL on
+  the payload and stored row) is not recorded rather than written with an
+  unusable window.
 - **Tombstones are complete-fetch facts.** An `origin='deleted'` row means
   the entity was present in the stored children and absent from a fetch the
   source flagged complete for that section. A degraded fetch (flag missing,
-  `False`, or otherwise not exactly `True`) writes nothing. Boundary: a
-  degraded fetch still replaces children, so an absence first seen degraded
-  destroys the stored row and a later complete fetch has nothing to
-  tombstone — that evidence gap is a deliberate property of the shipped
+  `False`, or otherwise not exactly `True`) writes no `deleted` rows —
+  `edit` pre-images are still written whenever content changed. Boundary:
+  a degraded fetch still replaces children, so an absence first seen
+  degraded destroys the stored row and a later complete fetch has nothing
+  to tombstone — that evidence gap is a deliberate property of the shipped
   replace-on-ingest contract, not a bug.
 - **Backfill: none.** Text displaced before v8 was never stored, so a
   migrated database starts with an empty `revisions` table. `status`

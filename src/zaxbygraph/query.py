@@ -506,7 +506,12 @@ def _parse_instant(value: str) -> datetime:
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
         raise ValueError(f"timestamp is not timezone-aware: {value!r}")
-    return parsed.astimezone(timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError as exc:
+        # Boundary instants (e.g. 9999-12-31T23:59:59-01:00) overflow the
+        # UTC conversion; normalize to the same coded-error family.
+        raise ValueError(f"timestamp out of range: {value!r}") from exc
 
 
 def _parse_instant_lenient(value: str | None) -> datetime | None:
@@ -516,7 +521,7 @@ def _parse_instant_lenient(value: str | None) -> datetime | None:
         return None
     try:
         return _parse_instant(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
 
 
@@ -569,14 +574,18 @@ def _matching_revision(
 
 
 def _live_start(revisions: list[sqlite3.Row], current_stamp: str | None) -> datetime | None:
-    """Live validity start for one entity (issue #25): the max-id revision's
-    valid_to — by sequence, regardless of whether it matches T — else the
-    entity's current-version timestamp (updated_at else created_at; reviews'
-    submitted_at fallback is resolved by the caller)."""
-    if revisions:
-        latest = _parse_instant_lenient(revisions[-1]["valid_to"])
-        if latest is not None:
-            return latest
+    """Live validity start for one entity (issue #25): the LATEST valid_to
+    across the entity's revisions — by instant, not insert sequence, so a
+    displaced version whose valid_to regresses cannot back-date the live
+    text — else the entity's current-version timestamp (updated_at else
+    created_at; reviews' submitted_at fallback is resolved by the caller)."""
+    ends = [
+        instant
+        for instant in (_parse_instant_lenient(row["valid_to"]) for row in revisions)
+        if instant is not None
+    ]
+    if ends:
+        return max(ends)
     return _parse_instant_lenient(current_stamp)
 
 
@@ -677,20 +686,26 @@ def item_as_of(
         key = (row["entity"], row["entity_id"], row["kind"])
         by_entity[key].append(row)
 
+    absent: list[dict] = []
     title_text, title_version = _versioned_text(
         by_entity[("item_title", None, None)], rec.get("title"),
         rec.get("updated_at") or rec.get("created_at"), at,
     )
     rec["title"] = title_text
     rec["title_version"] = title_version
+    if title_version["version_source"] is None:
+        absent.append({"entity": "item_title", "entity_id": None, "kind": None,
+                       "version": None, "origin": "no_version"})
     body_text, body_version = _versioned_text(
         by_entity[("item_body", None, None)], rec.get("body"),
         rec.get("updated_at") or rec.get("created_at"), at,
     )
     rec["body"] = body_text
     rec["body_version"] = body_version
+    if body_version["version_source"] is None:
+        absent.append({"entity": "item_body", "entity_id": None, "kind": None,
+                       "version": None, "origin": "no_version"})
 
-    absent: list[dict] = []
     as_of_comments: list[dict] = []
     # Live-comment updated_at is not part of the plain item projection (AC6
     # byte-identity), so the as-of path fetches the current-version stamps
@@ -709,7 +724,7 @@ def item_as_of(
             rows, comment.get("body"),
             comment_stamps.get(comment["pk"]) or comment.get("created_at"), at,
         )
-        if text is None:
+        if version["version_source"] is None:
             absent.append(
                 {
                     "entity": "comment",
@@ -767,9 +782,10 @@ def item_as_of(
         key = ("review", review["id"], None)
         rows = by_entity.get(key, [])
         text, version = _versioned_text(
-            rows, review.get("body"), review.get("submitted_at"), at,
+            rows, review.get("body"),
+            review.get("submitted_at") or rec.get("created_at"), at,
         )
-        if text is None:
+        if version["version_source"] is None:
             absent.append(
                 {
                     "entity": "review",

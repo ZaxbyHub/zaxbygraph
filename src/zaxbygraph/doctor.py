@@ -184,9 +184,9 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
 
     One transaction: delete every store row whose repo is the folded slug,
     then insert the candidate's rows with repo lowered - omitting
-    AUTOINCREMENT pk columns (comments.pk, edges.id, fetch_log.id) so they
-    re-assign, keeping GitHub-assigned ids (items.id, releases.id,
-    reviews.id). sync_state is replaced and counts recomputed. Plain
+    synthetic-pk columns (comments.pk with its AUTOINCREMENT, edges.id,
+    fetch_log.id, revisions.id) so they re-assign, keeping GitHub-assigned
+    ids (items.id, releases.id, reviews.id). sync_state is replaced and counts recomputed. Plain
     INSERTs only: post-delete there is nothing to conflict with, and
     INSERT OR REPLACE's double-unique semantics could silently drop rows.
     """
