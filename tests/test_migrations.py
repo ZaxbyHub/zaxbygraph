@@ -1305,5 +1305,106 @@ class MigrateV5ToV6Tests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0], count)
 
 
+class MigrateV7ToV8Tests(unittest.TestCase):
+    """v8 adds the revisions evidence-history table (issue #25): additive
+    only, no backfill (prior text was never stored), idempotent on re-open."""
+
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        self.db_path = Path(td.name) / "history.db"
+
+    def _v7_store_with_data(self) -> sqlite3.Connection:
+        """A store at the v7 shape: current objects minus the v8 additions,
+        user_version pinned to 7, one item + edge of real data."""
+        conn = connect(self.db_path)
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state,"
+            " created_at, updated_at, raw_json) VALUES (10001, ?, 1, 'issue',"
+            " 't', 'b', 'open', '2026-01-01T00:00:00Z',"
+            " '2026-01-01T00:00:00Z', '{}')",
+            ("acme/forgegate",),
+        )
+        conn.execute("PRAGMA user_version = 7")
+        conn.execute("DROP TABLE revisions")
+        conn.commit()
+        return conn
+
+    def test_v7_store_gains_empty_history_and_keeps_data(self) -> None:
+        conn = self._v7_store_with_data()
+        try:
+            self.assertEqual(
+                int(conn.execute("PRAGMA user_version").fetchone()[0]), 7
+            )
+            init_schema(conn)
+            self.assertEqual(
+                int(conn.execute("PRAGMA user_version").fetchone()[0]), 8
+            )
+            cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(revisions)")
+            }
+            self.assertEqual(
+                cols,
+                {"id", "repo", "number", "entity", "entity_id", "kind",
+                 "origin", "content", "valid_from", "valid_to"},
+            )
+            # Empty backfill: history starts honest (nothing recorded), and
+            # the migrated store's existing data is untouched.
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM revisions").fetchone()[0], 0
+            )
+            self.assertEqual(
+                tuple(conn.execute(
+                    "SELECT title FROM items WHERE id = 10001"
+                ).fetchone()),
+                ("t",),
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' AND"
+                    " name = 'idx_revisions_item'"
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
+    def test_fresh_database_born_at_v8(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            init_schema(conn)
+            self.assertEqual(
+                int(conn.execute("PRAGMA user_version").fetchone()[0]), 8
+            )
+            self.assertIsNotNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND"
+                    " name = 'revisions'"
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
+    def test_reopen_is_idempotent_with_revision_rows(self) -> None:
+        conn = connect(self.db_path)
+        try:
+            init_schema(conn)
+            conn.execute(
+                "INSERT INTO revisions(repo, number, entity, origin, content,"
+                " valid_from, valid_to) VALUES (?, 1, 'item_body', 'edit',"
+                " 'old', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+                ("acme/forgegate",),
+            )
+            conn.commit()
+            init_schema(conn)
+            init_schema(conn)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM revisions").fetchone()[0], 1
+            )
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

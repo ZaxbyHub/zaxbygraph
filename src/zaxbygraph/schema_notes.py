@@ -47,6 +47,13 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "comments": {
         "author_association": "v7. REST supplies it natively; GraphQL maps authorAssociation when the capability probe reports the field. A probe-degraded re-ingest preserves the stored value via the pre-replacement snapshot",
     },
+    "revisions": {
+        "id": "v8. Sequence order for one item's displaced-text history; assigned at insert and never updated. doctor --consolidate is the one sanctioned rewrite (fresh ids, per-item order preserved)",
+        "content": "Exactly the displaced stored value - a pre-image, so first ingest writes nothing and unchanged re-ingests write nothing. NULL is legal and meaningful: the text was absent before this version",
+        "origin": "'edit' (replaced by a newer payload) or 'deleted' (vanished from a fetch whose children_complete flag was True). A degraded fetch never writes tombstones, and a degraded absence still replaces children - so an absence first seen degraded leaves no trace for a later complete fetch to tombstone (documented boundary)",
+        "valid_from": "GitHub time this version became current: updated_at else created_at (items/comments); submitted_at else the owning item's created_at (reviews). Never the sync wall clock",
+        "valid_to": "GitHub time it was displaced: the incoming item's updated_at, except comment edits prefer the comment's own incoming updated_at",
+    },
     "sync_state": {
         "issues_since": "Watermark passed back verbatim and inclusive; never adjusted",
         "last_error": "Non-null means the last sync stopped early - re-run sync",

@@ -150,7 +150,7 @@ zaxbygraph sync --repo OWNER/REPO [--force] [--numbers N,M] [--include-patches] 
 | `--force` | Ignore the watermark and do a full pull. Needed when you suspect updates that did not bump `updated_at` (review-only changes), and required to backfill patches after a no-patch sync. |
 | `--numbers N,M` | Refresh exactly these items (GraphQL source: through the bulk children path; `--source rest` fetches each item's children per item over REST). The watermark and freshness stamps are untouched, the deletion oracle never runs, and the run never completes a full sync: a store that has never had one stays marked pending, so a numbers-only corpus reads incomplete. A targeted run that ingests nothing leaves a previous `last_error` standing. A number that 404/410s marks that stored item `deleted` (recorded in the sidecar); a never-stored missing number only leaves a `fetch_log` note. Cannot be combined with `--force`. |
 | `--include-patches` | Store unified diffs in `pr_files.patch`. Off by default — patches dominate the database size. |
-| `--jsonl [DIR]` | Also append one `item_bundle` record per ingested item to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). Each record is an envelope `{"resource": "item_bundle", "payload": {...}}` whose payload carries `number`, `item`, `pull`, every child section, the timeline, and `gone`/`gone_status` (present on every bundle; `gone: true` marks a recorded deletion, with `gone_note` carrying the exact deletion reason). Every deletion shape is recorded — first-sighting 404/410, an already-stored item that later disappears, the deletion oracle, and targeted refreshes. Bundles are deduplicable by `(number, item.updated_at)` (a resumed sync may duplicate lines, so consumers key on that pair), and the format replaced the pre-0.4.x per-resource records — pre-upgrade `events.jsonl` files contain no bundles and cannot be replayed (start a fresh sidecar file). Replay: `JsonlReplaySource` lives in the repository's `tests/replay.py` (not part of the installed package) and does not support `--include-patches` replays. Releases are appended as separate `release` records. |
+| `--jsonl [DIR]` | Also append one `item_bundle` record per ingested item to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). Each record is an envelope `{"resource": "item_bundle", "payload": {...}}` whose payload carries `number`, `item`, `pull`, every child section, the timeline, `children_complete` (the exact per-section completeness map the ingest saw, since schema v8), and `gone`/`gone_status` (present on every bundle; `gone: true` marks a recorded deletion, with `gone_note` carrying the exact deletion reason). Every deletion shape is recorded — first-sighting 404/410, an already-stored item that later disappears, the deletion oracle, and targeted refreshes. **Do not deduplicate bundles by `(number, item.updated_at)`**: that pair is not unique — a resumed sync may duplicate lines (collapse only *adjacent* byte-identical records for a number), and distinct same-timestamp observations are real history that LAST-WINS would silently discard. Replay (`JsonlReplaySource`, in the repository's `tests/replay.py`, not part of the installed package) treats bundles as ordered observations, keeps nonconsecutive repeats, serves each version with its own children, applies `children_complete` verbatim, and fails pre-v8 bundles (no `children_complete` key) closed so replay never fabricates deletion evidence the original run did not observe. Replay does not support `--include-patches` replays. The format replaced the pre-0.4.x per-resource records — pre-upgrade `events.jsonl` files contain no bundles and cannot be replayed (start a fresh sidecar file). Releases are appended as separate `release` records. |
 
 Sync is sequential and resumable. With the default `graphql` source, cost is
 roughly one listing call per 100 items plus one bulk-children query per up
@@ -271,6 +271,30 @@ Returns every `items` column plus nested `labels`, `comments`, `reviews`,
 expensive one — reach for `search` or `sql` when you need breadth.
 
 Exits 1 with `error: item #N not found` if the number is not in the DB.
+
+Two evidence-history flags (schema v8) extend the command without changing the
+plain shape — without them the output is byte-identical to pre-v8:
+
+```bash
+zaxbygraph item N --history          # the stored revision pre-images, ordered
+zaxbygraph item N --as-of 2026-10-01T12:00:00Z
+```
+
+`--history` returns the standard `item` envelope — every `items` column and
+the nested `labels`/`comments`/`reviews`/`files`/`edges`, all reflecting
+current state — plus `revisions`: one row per displaced text version
+(entity, origin `edit`/`deleted`, the exact displaced `content`, and
+GitHub-time `valid_from`/`valid_to`). `--as-of T` returns the item envelope
+with each text entity replaced by the version whose
+`[valid_from, valid_to)` window contains T — a revision when one matches,
+else the live row once T is past its validity start — plus `as_of`,
+`as_of_basis` (disclosing every window rule), and `absent_entities` for
+entities with no version at T (never back-dated). `--as-of` omits `edges`
+and `index_stale`: edges carry no recorded history, so the current graph is
+not presented beside an as-of text view. The two flags are
+mutually exclusive; a malformed or timezone-naive `--as-of` exits 1 with
+`code: bad_as_of`. Pre-v8 stores have no recorded history: both flags return
+the item with an empty/note-only history rather than a fabricated one.
 
 ### `related` — neighborhood
 

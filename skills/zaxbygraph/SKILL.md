@@ -92,6 +92,7 @@ registers it.
 | Is there data, and is it stale, incomplete, or broken? | `status` — check `complete`, `last_error`, and `issues_since` |
 | Anything about a keyword, error string, symptom | `search "QUERY"` |
 | Everything about one issue/PR | `item N` |
+| What did this issue/PR (or its comments/reviews) say at time T / what changed | `item N --history` / `item N --as-of "T"` (schema v8 stores revision pre-images; windows are GitHub times) |
 | What connects to this issue/PR | `related N [--depth 1]` |
 | Which files change most / are riskiest | `churn [--limit 30]` |
 | What's currently open | `open` |

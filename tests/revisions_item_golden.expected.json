@@ -1,0 +1,104 @@
+{
+  "ok": true,
+  "db": "<DB>",
+  "repo": "acme/forgegate",
+  "freshness": {
+    "synced_at": null,
+    "age_s": null,
+    "complete": true
+  },
+  "data": {
+    "id": 10001,
+    "repo": "acme/forgegate",
+    "number": 1,
+    "kind": "issue",
+    "node_id": "I_1",
+    "title": "golden one",
+    "body": "GOLDEN-BODY-ONE",
+    "labels_text": "bug",
+    "state": "open",
+    "state_reason": null,
+    "author": "alice",
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-01-01T00:30:00Z",
+    "closed_at": null,
+    "merged_at": null,
+    "merge_commit": null,
+    "draft": 0,
+    "locked": 0,
+    "base_ref": null,
+    "head_ref": null,
+    "additions": null,
+    "deletions": null,
+    "changed_files": null,
+    "commits": null,
+    "html_url": "https://github.com/acme/forgegate/issues/1",
+    "api_url": "https://api.github.com/repos/acme/forgegate/issues/1",
+    "reactions_total": null,
+    "milestone": null,
+    "item_type": null,
+    "sub_issues_total": null,
+    "sub_issues_completed": null,
+    "dependencies_blocked_by": null,
+    "dependencies_blocking": null,
+    "dependencies_total_blocked_by": null,
+    "dependencies_total_blocking": null,
+    "author_association": null,
+    "merged_by": null,
+    "comment_count": 1,
+    "paths_text": "",
+    "labels": [
+      {
+        "name": "bug",
+        "color": "ff0000"
+      }
+    ],
+    "comments": [
+      {
+        "pk": 1,
+        "github_id": 501,
+        "kind": "issue_comment",
+        "author": "alice",
+        "created_at": "2026-01-01T01:00:00Z",
+        "body": "GOLDEN-COMMENT",
+        "html_url": "https://github.com/acme/forgegate/issues/1#issuecomment-501"
+      }
+    ],
+    "reviews": [],
+    "files": [],
+    "edges": [
+      {
+        "src_type": "item",
+        "src_id": "1",
+        "rel": "has_label",
+        "dst_type": "label",
+        "dst_id": "bug",
+        "confidence": "EXTRACTED",
+        "evidence": "labels[]",
+        "source": "payload"
+      },
+      {
+        "src_type": "actor",
+        "src_id": "alice",
+        "rel": "authored",
+        "dst_type": "item",
+        "dst_id": "1",
+        "confidence": "EXTRACTED",
+        "evidence": "user.login",
+        "source": "payload"
+      },
+      {
+        "src_type": "actor",
+        "src_id": "alice",
+        "rel": "commented",
+        "dst_type": "item",
+        "dst_id": "1",
+        "confidence": "EXTRACTED",
+        "evidence": "comment:501",
+        "source": "payload"
+      }
+    ],
+    "index_stale": false
+  },
+  "truncated": false
+}

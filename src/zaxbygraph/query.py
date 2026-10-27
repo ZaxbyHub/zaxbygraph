@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 import sqlite3
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 
-from zaxbygraph.db import CURRENT_USER_VERSION
+from zaxbygraph.db import CURRENT_USER_VERSION, _V7_USER_VERSION, _V8_USER_VERSION
 from zaxbygraph.repo import validate_slug
 
 _FIRST_KW = re.compile(r"\s*([A-Za-z]+)", re.I)
@@ -123,7 +124,10 @@ def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> 
         "SELECT COUNT(*) FROM fetch_log WHERE note LIKE 'omitted %'" + repo_filter,
         repo_params,
     ).fetchone()[0]
-    if user_version >= CURRENT_USER_VERSION:
+    # v7 feature gates pin the slot that introduced the columns (issue #25):
+    # a read-only store several slots behind keeps every feature its own
+    # schema supports, so this must never ride CURRENT_USER_VERSION.
+    if user_version >= _V7_USER_VERSION:
         null_v7_rows = conn.execute(
             "SELECT COUNT(*) FROM items WHERE ("
             + " OR ".join(f"{column} IS NULL" for column in _COVERAGE_NULL_COLUMNS)
@@ -133,12 +137,30 @@ def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> 
         ).fetchone()[0]
     else:
         null_v7_rows = None
+    # v8 revision coverage: real UTF-8 byte counts (LENGTH on a BLOB cast
+    # counts bytes where LENGTH on text counts characters), zero — never
+    # null — on an empty v8 table, null on a pre-v8 store.
+    if user_version >= _V8_USER_VERSION:
+        revision_rows = conn.execute(
+            "SELECT COUNT(*) FROM revisions" + (" WHERE repo = ?" if repo else ""),
+            (repo,) if repo else (),
+        ).fetchone()[0]
+        revision_bytes = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0) FROM revisions"
+            + (" WHERE repo = ?" if repo else ""),
+            (repo,) if repo else (),
+        ).fetchone()[0]
+    else:
+        revision_rows = None
+        revision_bytes = None
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     page_count = conn.execute("PRAGMA page_count").fetchone()[0]
     return {
         "truncation_notes": truncation_notes,
         "dropped_fields": dropped_fields,
         "null_v7_rows": null_v7_rows,
+        "revision_rows": revision_rows,
+        "revision_bytes": revision_bytes,
         "store_bytes": page_size * page_count,
     }
 
@@ -340,10 +362,12 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
         }
     mode = "all"
     match = all_query
-    # A pre-v7 store (index_stale) has no paths_text/reviews_fts objects;
-    # reads never migrate, so search runs the legacy arms there (issue #6
-    # degrade contract, extended by #24).
-    legacy = index_stale
+    # Feature gate, not staleness (issue #25): the v7 search arms
+    # (paths_text/reviews_fts) exist on any store at or past slot 7, so the
+    # legacy decision pins _V7_USER_VERSION — a v7 store keeps those arms
+    # after the build moves to v8. `index_stale` above keeps its own
+    # current-schema meaning and stays a separate signal.
+    legacy = user_version < _V7_USER_VERSION
     total, page = _run_search_pass(conn, match, repo, limit, legacy=legacy)
     # Blocks keep the page honest under the fallback: the strict pass's page
     # is kept whole (its rows hydrated against the all-tokens match, so their
@@ -469,6 +493,331 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
     # Mirrors search(): a pre-v5 database returns edges without provenance
     # and is flagged, on both polarities, so consumers get a stable envelope.
     rec["index_stale"] = not source_available
+    return rec
+
+
+def _parse_instant(value: str) -> datetime:
+    """Parse a GitHub timestamp or user-supplied --as-of value into an aware
+    UTC instant. Z-suffixed and mixed offsets both normalize; naive input is
+    rejected (the caller turns that into a coded error)."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError(f"timestamp is not timezone-aware: {value!r}")
+    return parsed.astimezone(timezone.utc)
+
+
+def _parse_instant_lenient(value: str | None) -> datetime | None:
+    """Best-effort instant for stored window boundaries; a malformed stored
+    stamp makes the row non-matching instead of failing the whole query."""
+    if not value:
+        return None
+    try:
+        return _parse_instant(value)
+    except ValueError:
+        return None
+
+
+_AS_OF_BASIS = {
+    "windows": (
+        "GitHub times, never the sync wall clock: items and comments run on"
+        " updated_at else created_at; reviews on submitted_at, falling back"
+        " to the owning item's created_at when NULL"
+    ),
+    "comparison": "aware UTC instants (mixed offsets and Z both accepted)",
+    "selection": (
+        "strict [valid_from, valid_to) containment; among overlapping"
+        " revisions the highest id wins (most recently displaced); live"
+        " validity starts at the latest revision's valid_to by sequence,"
+        " else the entity's current-version timestamp"
+    ),
+    "first_sighting": (
+        "a store-recorded version is treated as valid from its GitHub"
+        " current-version time; text first seen later than T is absent at T"
+    ),
+}
+
+_HISTORY_NOTE = "store predates revision capture (schema v8); no history was recorded"
+
+
+def _revision_rows(
+    conn: sqlite3.Connection, repo: str, number: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, entity, entity_id, kind, origin, content, valid_from, valid_to"
+        " FROM revisions WHERE repo = ? AND number = ? ORDER BY id",
+        (repo, number),
+    ).fetchall()
+
+
+def _matching_revision(
+    revisions: list[sqlite3.Row], at: datetime
+) -> sqlite3.Row | None:
+    """Strict [valid_from, valid_to) containment; highest id wins among
+    overlapping windows (equal/backwards GitHub timestamps)."""
+    best: sqlite3.Row | None = None
+    for row in revisions:
+        start = _parse_instant_lenient(row["valid_from"])
+        end = _parse_instant_lenient(row["valid_to"])
+        if start is None or end is None:
+            continue
+        if start <= at < end and (best is None or row["id"] > best["id"]):
+            best = row
+    return best
+
+
+def _live_start(revisions: list[sqlite3.Row], current_stamp: str | None) -> datetime | None:
+    """Live validity start for one entity (issue #25): the max-id revision's
+    valid_to — by sequence, regardless of whether it matches T — else the
+    entity's current-version timestamp (updated_at else created_at; reviews'
+    submitted_at fallback is resolved by the caller)."""
+    if revisions:
+        latest = _parse_instant_lenient(revisions[-1]["valid_to"])
+        if latest is not None:
+            return latest
+    return _parse_instant_lenient(current_stamp)
+
+
+def _revision_version(row: sqlite3.Row) -> dict:
+    version = {
+        "version_source": "revision",
+        "revision_id": row["id"],
+        "entity": row["entity"],
+        "entity_id": row["entity_id"],
+        "kind": row["kind"],
+        "origin": row["origin"],
+        "content": row["content"],
+        "valid_from": row["valid_from"],
+        "valid_to": row["valid_to"],
+    }
+    return version
+
+
+def _versioned_text(
+    revisions: list[sqlite3.Row],
+    live_text: str | None,
+    live_stamp: str | None,
+    at: datetime,
+) -> tuple[str | None, dict]:
+    """As-of text for one entity plus its source-tagged version object.
+    Returns (None, absent-marker) when no version was valid at T."""
+    match = _matching_revision(revisions, at)
+    if match is not None:
+        return match["content"], _revision_version(match)
+    start = _live_start(revisions, live_stamp)
+    if start is not None and at >= start:
+        return live_text, {
+            "version_source": "live",
+            "entity": revisions[-1]["entity"] if revisions else None,
+            "origin": "live",
+        }
+    return None, {"version_source": None, "origin": "no_version"}
+
+
+def item_history(
+    conn: sqlite3.Connection, number: int, repo: str | None = None
+) -> dict | None:
+    """`item N --history` (issue #25): the standard item envelope (same
+    nested collections as `item`) plus `revisions`, the item's revision
+    sequence ordered by id. Pre-v8 stores read-degrade with an honest note;
+    the plain (no-flag) item surface is untouched."""
+    rec = item(conn, number, repo=repo)
+    if rec is None:
+        return None
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if user_version < _V8_USER_VERSION:
+        rec["revisions"] = []
+        rec["history_note"] = _HISTORY_NOTE
+        return rec
+    rec["revisions"] = [
+        {
+            "id": row["id"],
+            "entity": row["entity"],
+            "entity_id": row["entity_id"],
+            "kind": row["kind"],
+            "origin": row["origin"],
+            "content": row["content"],
+            "valid_from": row["valid_from"],
+            "valid_to": row["valid_to"],
+        }
+        for row in _revision_rows(conn, rec["repo"], rec["number"])
+    ]
+    return rec
+
+
+def item_as_of(
+    conn: sqlite3.Connection, number: int, at: datetime, repo: str | None = None
+) -> dict | None:
+    """`item N --as-of T` (issue #25): every text entity's version whose
+    `[valid_from, valid_to)` contains T (or the live version when T is at or
+    past its validity start), with as_of_basis disclosing every window rule.
+    Edges and index_stale are omitted: edges carry no recorded history, so
+    presenting the current graph beside an as-of text view would conflate
+    two time bases. Pre-v8 stores reconstruct from live rows only, with the
+    same note as --history."""
+    base = item(conn, number, repo=repo)
+    if base is None:
+        return None
+    rec: dict = {k: v for k, v in base.items() if k not in ("edges", "index_stale")}
+    rec["as_of"] = at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rec["as_of_basis"] = dict(_AS_OF_BASIS)
+    user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if user_version < _V8_USER_VERSION:
+        rec["history_note"] = _HISTORY_NOTE
+        rec["title_version"] = {"version_source": "live", "origin": "live"}
+        rec["body_version"] = {"version_source": "live", "origin": "live"}
+        return rec
+    r = rec["repo"]
+    n = rec["number"]
+    revisions = _revision_rows(conn, r, n)
+    by_entity: dict = defaultdict(list)
+    for row in revisions:
+        key = (row["entity"], row["entity_id"], row["kind"])
+        by_entity[key].append(row)
+
+    title_text, title_version = _versioned_text(
+        by_entity[("item_title", None, None)], rec.get("title"),
+        rec.get("updated_at") or rec.get("created_at"), at,
+    )
+    rec["title"] = title_text
+    rec["title_version"] = title_version
+    body_text, body_version = _versioned_text(
+        by_entity[("item_body", None, None)], rec.get("body"),
+        rec.get("updated_at") or rec.get("created_at"), at,
+    )
+    rec["body"] = body_text
+    rec["body_version"] = body_version
+
+    absent: list[dict] = []
+    as_of_comments: list[dict] = []
+    # Live-comment updated_at is not part of the plain item projection (AC6
+    # byte-identity), so the as-of path fetches the current-version stamps
+    # separately rather than widening the shared SELECT.
+    comment_stamps = {
+        row["pk"]: row["updated_at"]
+        for row in conn.execute(
+            "SELECT pk, updated_at FROM comments WHERE repo = ? AND number = ?",
+            (r, n),
+        )
+    }
+    for comment in rec.get("comments") or []:
+        key = ("comment", comment["github_id"], comment["kind"])
+        rows = by_entity.get(key, [])
+        text, version = _versioned_text(
+            rows, comment.get("body"),
+            comment_stamps.get(comment["pk"]) or comment.get("created_at"), at,
+        )
+        if text is None:
+            absent.append(
+                {
+                    "entity": "comment",
+                    "entity_id": comment["github_id"],
+                    "kind": comment["kind"],
+                    "version": None,
+                    "origin": (rows[-1]["origin"] if rows else "no_version"),
+                }
+            )
+            continue
+        as_of_comment = dict(comment)
+        as_of_comment["body"] = text
+        as_of_comment.update(
+            {k: v for k, v in version.items() if k in ("version_source", "revision_id", "origin")}
+        )
+        as_of_comments.append(as_of_comment)
+    # Deleted comments (no live row) whose tombstone window contains T come
+    # back as revision-only objects; identity fields come from the revision.
+    live_pairs = {(c["kind"], c["github_id"]) for c in rec.get("comments") or []}
+    for key, rows in by_entity.items():
+        entity, entity_id, kind = key
+        if entity != "comment" or (kind, entity_id) in live_pairs:
+            continue
+        match = _matching_revision(rows, at)
+        if match is None:
+            # No version of this deleted entity was valid at T — reported
+            # absent with the window that ended, never silently dropped.
+            absent.append(
+                {
+                    "entity": "comment",
+                    "entity_id": entity_id,
+                    "kind": kind,
+                    "version": None,
+                    "origin": (rows[-1]["origin"] if rows else "no_version"),
+                }
+            )
+            continue
+        as_of_comments.append(
+            {
+                "github_id": entity_id,
+                "kind": kind,
+                "author": None,
+                "created_at": match["valid_from"],
+                "body": match["content"],
+                "html_url": None,
+                "version_source": "revision",
+                "revision_id": match["id"],
+                "origin": match["origin"],
+            }
+        )
+    rec["comments"] = as_of_comments
+
+    as_of_reviews: list[dict] = []
+    for review in rec.get("reviews") or []:
+        key = ("review", review["id"], None)
+        rows = by_entity.get(key, [])
+        text, version = _versioned_text(
+            rows, review.get("body"), review.get("submitted_at"), at,
+        )
+        if text is None:
+            absent.append(
+                {
+                    "entity": "review",
+                    "entity_id": review["id"],
+                    "kind": None,
+                    "version": None,
+                    "origin": (rows[-1]["origin"] if rows else "no_version"),
+                }
+            )
+            continue
+        as_of_review = dict(review)
+        as_of_review["body"] = text
+        as_of_review.update(
+            {k: v for k, v in version.items() if k in ("version_source", "revision_id", "origin")}
+        )
+        as_of_reviews.append(as_of_review)
+    live_review_ids = {rv["id"] for rv in rec.get("reviews") or []}
+    for key, rows in by_entity.items():
+        entity, entity_id, kind = key
+        if entity != "review" or entity_id in live_review_ids:
+            continue
+        match = _matching_revision(rows, at)
+        if match is None:
+            absent.append(
+                {
+                    "entity": "review",
+                    "entity_id": entity_id,
+                    "kind": None,
+                    "version": None,
+                    "origin": (rows[-1]["origin"] if rows else "no_version"),
+                }
+            )
+            continue
+        as_of_reviews.append(
+            {
+                "id": entity_id,
+                "author": None,
+                "state": None,
+                "submitted_at": match["valid_from"],
+                "body": match["content"],
+                "html_url": None,
+                "version_source": "revision",
+                "revision_id": match["id"],
+                "origin": match["origin"],
+            }
+        )
+    rec["reviews"] = as_of_reviews
+    rec["absent_entities"] = absent
     return rec
 
 

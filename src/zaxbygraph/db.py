@@ -11,13 +11,21 @@ from zaxbygraph.extract import (
 )
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 7
+CURRENT_USER_VERSION = 8
+
+#: Feature gates compare against the slot that INTRODUCED a capability, never
+#: against CURRENT_USER_VERSION: a read-only store several slots behind must
+#: keep every feature its own schema supports (reads never migrate). v7
+#: payload-signal reads gate on _V7_USER_VERSION; v8 revision history on
+#: _V8_USER_VERSION. A v9 slot MUST re-pin both to their introducing slots.
+_V7_USER_VERSION = 7
+_V8_USER_VERSION = 8
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -854,6 +862,35 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
 
 
+def migrate_v7_to_v8(conn: sqlite3.Connection) -> None:
+    """v7 -> v8: evidence history — pre-images of displaced text (issue #25).
+
+    Additive only: the `revisions` table plus its item index. Fresh databases
+    already carry both via schema.sql, so every statement is idempotent
+    (per-statement `execute`; executescript is forbidden in migrations — see
+    _FTS_PORTER_STATEMENTS). No backfill is possible: prior text was never
+    stored, so a migrated store starts with an empty history and `status`
+    reports that honestly (coverage nulls on pre-v8, zeros on an empty v8).
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS revisions ("
+        " id INTEGER PRIMARY KEY,"
+        " repo TEXT NOT NULL,"
+        " number INTEGER NOT NULL,"
+        " entity TEXT NOT NULL CHECK (entity IN"
+        "  ('item_title','item_body','comment','review')),"
+        " entity_id INTEGER,"
+        " kind TEXT,"
+        " origin TEXT NOT NULL CHECK (origin IN ('edit','deleted')),"
+        " content TEXT,"
+        " valid_from TEXT NOT NULL,"
+        " valid_to TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_revisions_item ON revisions(repo, number)"
+    )
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -863,6 +900,7 @@ MIGRATIONS = [
     (5, migrate_v4_to_v5),
     (6, migrate_v5_to_v6),
     (7, migrate_v6_to_v7),
+    (8, migrate_v7_to_v8),
 ]
 
 
