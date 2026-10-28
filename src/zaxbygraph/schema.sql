@@ -1,6 +1,9 @@
 -- zaxbygraph schema v10 (`PRAGMA user_version` = 10; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
--- Derived/interpreted tables are NEVER written by the fetcher.
+-- All table rows are mechanically derived from fetched GitHub data:
+-- the fetcher replaces item-scoped child tables on re-ingest (v10's
+-- item_events/pr_commits only when their section was fetched complete),
+-- appends the append-only streams, and never interprets.
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,

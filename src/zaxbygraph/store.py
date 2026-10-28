@@ -9,6 +9,7 @@ from zaxbygraph.extract import (
     ABSENT,
     CLOSES_REF_MARKER,
     EVIDENCE_CAP,
+    LINK_CONNECTIONS,
     PULL_OWNED_EXTRACTIONS,
     branch_number_tokens,
     collapse_edges,
@@ -402,15 +403,20 @@ def insert_pr_commits(
     commits: list[dict] | None,
     commits_complete: bool,
 ) -> None:
-    """Commit messages become pr_commits rows (issue #27 AC5), replaced only
-    when the commits section was fetched complete. Derived closes_keyword
-    edges re-derive from these RETAINED rows on every ingest, so a degraded
-    re-ingest never retracts them."""
-    if commits is None or not commits_complete:
+    """Commit messages become pr_commits rows (issue #27 AC5). A COMPLETE
+    section replaces this item's rows exactly; an INCOMPLETE section (the
+    commits connection overflowed at 50) UNIONS the fetched messages into
+    the retained rows without deleting anything — the same degrade rule as
+    the link stream's overflow (review round PRR-008: discarding the fetched
+    page left >50-commit PRs with no rows and no derived edges at all).
+    Derived closes_keyword edges re-derive from these RETAINED rows on every
+    ingest, so a REST re-ingest never retracts them."""
+    if commits is None:
         return
-    conn.execute(
-        "DELETE FROM pr_commits WHERE repo = ? AND number = ?", (repo, number)
-    )
+    if commits_complete:
+        conn.execute(
+            "DELETE FROM pr_commits WHERE repo = ? AND number = ?", (repo, number)
+        )
     for rec in commits:
         if not isinstance(rec, dict):
             continue
@@ -426,12 +432,10 @@ def insert_pr_commits(
 
 
 #: The links-section connection keys and the edge relation each replaces.
-_LINK_RELATIONS = {
-    "blocked_by": "blocked_by",
-    "parent": "child_of",
-    "duplicate_of": "duplicate_of",
-    "open_prs": "linked_pr",
-}
+#: Single source of truth: extract._LINK_CONNECTIONS (PR #41 review PRR-013) —
+#: rebuild_links deletes per this map while edges_from_links emits per that
+#: one; a drift would orphan edges silently.
+_LINK_RELATIONS = LINK_CONNECTIONS
 
 
 def rebuild_links(
@@ -447,6 +451,13 @@ def rebuild_links(
     if links is None or not isinstance(links, dict):
         return
     incomplete = normalize_incomplete_connections(links_incomplete)
+    # An overflow marker naming an UNKNOWN connection (a GraphQL field name,
+    # a hand-written bundle, a future rename) cannot be attributed to any
+    # specific connection: treat EVERY carried connection as overflowed —
+    # union-only, nothing replaced (review round PRR-007; replacing on an
+    # unrecognized marker silently retracted edges from a truncated page).
+    if incomplete - set(_LINK_RELATIONS):
+        incomplete = set(_LINK_RELATIONS) & set(links)
     emitted = edges_from_links(repo, number, links)
     for connection, relation in _LINK_RELATIONS.items():
         if connection not in links:
@@ -471,10 +482,12 @@ def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None
     re-ingest (REST source, files-section-missing pull fallback, the 404
     empty-children path) cannot re-derive them, and a closer PR's payload can
     never re-derive an edge whose evidence lives on the closed item's
-    timeline. They are append-only once written — refreshed by upsert when
-    the source provides the section again, never retracted (issue #6; the
-    `--force` trade-off is documented in docs/schema.md). Inbound
-    mentions/closes from other items always survive."""
+    timeline. timeline and closing_ref edges are append-only once written —
+    refreshed by upsert when the source provides the section again, never
+    retracted (issue #6). link edges are replaced per connection when that
+    connection was fetched complete, union-only on overflow, and survive
+    every degraded re-ingest (docs/schema.md). Inbound mentions/closes from
+    other items always survive."""
     nid = str(number)
     conn.execute(
         "DELETE FROM edges WHERE repo = ? AND src_type = 'item' AND src_id = ? "

@@ -16,7 +16,7 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "src_id": "TEXT-typed even for item numbers - filter with src_id = '10', not 10; a foreign cross-referenced source is a repo-qualified id (`owner/repo#N`), never a bare number",
         "dst_id": "TEXT-typed even for item numbers - use dst_id = '10' in SQL filters; a commit endpoint carries the sha so the graph joins to `git log`",
         "evidence": "Provenance payload; never part of an edge's identity - `source` is part of the key because the same pair reported by two streams is two facts, with the closes exception: rel='closes' holds one row per pair whose evidence carries each stream that reported it - both when both streams did (schema v6)",
-        "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced events), 'closing_ref' (PR closingIssuesReferences), 'payload' (structured fields). Part of the unique key except for rel='closes', where GitHub-reported streams merge into one row (closing_ref preferred when present, each reporting stream's evidence kept)",
+        "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced/reopened events), 'closing_ref' (PR closingIssuesReferences), 'link' (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections; replaced per connection when fetched complete, union-only on overflow), 'payload' (structured fields). Part of the unique key except for rel='closes', where GitHub-reported streams merge into one row (closing_ref preferred when present, each reporting stream's evidence kept)",
     },
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",
@@ -35,7 +35,7 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "item_type": "v7, listing-owned (type.name); same ABSENT/present-null rule",
         "sub_issues_total": "v7, listing-owned (sub_issues_summary.total); PR rows never carry the summaries in the listing payload, so this stays NULL for them",
         "sub_issues_completed": "v7, listing-owned (sub_issues_summary.completed)",
-        "dependencies_blocked_by": "v7, listing-owned (issue_dependencies_summary.blocked_by) - the OPEN count; the link relations themselves are issue #27's scope",
+        "dependencies_blocked_by": "v7, listing-owned (issue_dependencies_summary.blocked_by) - the OPEN count; the link relations themselves shipped in schema v10",
         "dependencies_blocking": "v7, listing-owned (issue_dependencies_summary.blocking) - the OPEN count",
         "dependencies_total_blocked_by": "v7, listing-owned (issue_dependencies_summary.total_blocked_by) - kept distinct from the open count",
         "dependencies_total_blocking": "v7, listing-owned (issue_dependencies_summary.total_blocking)",

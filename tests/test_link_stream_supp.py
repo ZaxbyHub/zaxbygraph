@@ -476,6 +476,96 @@ class ReplayTimelinePresenceTests(TempDBTest):
         )
 
 
+class OverflowSemanticsTests(TempDBTest):
+    """Feedback-round pins (PR #41 review PRR-008/009/019): an overflowed
+    commits section UNIONS the fetched messages instead of discarding them,
+    and an unknown overflow marker is conservative."""
+
+    def _ingest_commits(self, number: int, updated: str, shas: list[str], complete: bool) -> None:
+        self.conn.execute("BEGIN")
+        ingest_item(
+            self.conn,
+            REPO,
+            issue(number, title="t", updated_at=updated),
+            pull_raw=None,
+            issue_comments=[],
+            review_comments=[],
+            reviews=[],
+            files=[],
+            include_patches=False,
+            pr_commits=[{"sha": sha, "message": f"fixes #{100 + i}"} for i, sha in enumerate(shas)],
+            children_complete={"pr_commits": complete},
+        )
+        self.conn.commit()
+
+    def test_commits_overflow_unions_fetched_messages(self) -> None:
+        """A >50-commit PR keeps the fetched messages (union) instead of
+        storing nothing; killed by reverting insert_pr_commits to
+        complete-gated discard (PRR-008)."""
+        self._ingest_commits(
+            21, ts(10), [f"sha{i}" for i in range(50)], complete=False
+        )
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM pr_commits WHERE number = 21"),
+            50,
+            "OVERFLOW-DISCARD: an overflowed commits section must still union"
+            " the fetched page",
+        )
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE src_id = '21'"
+                " AND rel = 'closes_keyword' AND evidence LIKE 'commit %'"
+            ),
+            50,
+            "OVERFLOW-EDGES-MISSING: unioned commit rows must derive edges",
+        )
+
+    def test_complete_commits_section_still_replaces(self) -> None:
+        """The complete-gated replace rule is untouched by the union fix."""
+        self._ingest_commits(22, ts(10), ["old1"], complete=True)
+        self._ingest_commits(22, ts(20), ["new1"], complete=True)
+        shas = {
+            r["sha"]
+            for r in self.conn.execute("SELECT sha FROM pr_commits WHERE number = 22")
+        }
+        self.assertEqual(shas, {"new1"}, "REPLACE-BROKEN: stale sha survived")
+
+    def test_unknown_overflow_marker_is_conservative(self) -> None:
+        """An overflow marker naming an UNKNOWN connection (a GraphQL field
+        name, a rename) cannot be attributed: every carried connection is
+        treated as overflowed — union-only, nothing replaced. Killed by
+        reverting rebuild_links' unknown-marker guard (PRR-007)."""
+        from zaxbygraph.store import rebuild_links
+
+        self.conn.execute("BEGIN")
+        rebuild_links(
+            self.conn,
+            REPO,
+            30,
+            {"blocked_by": [{"number": 9, "repo": None}]},
+            ["blockedBy"],
+        )
+        self.conn.commit()
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM edges WHERE rel = 'blocked_by'"),
+            1,
+            "UNKNOWN-MARKER-REPLACED: the truncated page must not replace",
+        )
+        rebuild_links(
+            self.conn,
+            REPO,
+            30,
+            {"blocked_by": [{"number": 10, "repo": None}]},
+            ["blockedBy"],
+        )
+        self.conn.commit()
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM edges WHERE rel = 'blocked_by'"),
+            2,
+            "UNION-BROKEN: the second (still-marker) ingest must union",
+        )
+
+
 class ConsolidationDriftGuardTests(unittest.TestCase):
     def test_copy_tables_covers_every_item_scoped_child(self) -> None:
         """Every table in sqlite_master whose PK leads with (repo, number)

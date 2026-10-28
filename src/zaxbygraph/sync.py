@@ -173,13 +173,12 @@ def _resolve_children(
     """Children for one item: inline or bulk-provided payload where present
     and complete, per-item REST fallback where flagged incomplete or absent
     (issue #5). `provided` is what the source's fetch_children bulk call
-    returned for this item; inline payload keys take precedence. Returns the
-    five legacy sections plus the GraphQL-only timeline event list and a
-    flags dict (timeline_incomplete / closing_refs_incomplete) for sync to
-    record in fetch_log (#6), and a per-section `children_complete` map
-    (issue #23): True where the bulk payload answered the section complete,
-    False where a REST fallback, a truncation cap, or an inline
-    `<name>_incomplete` flag produced it.
+    returned for this item; inline payload keys take precedence. Returns an
+    11-tuple: the five legacy sections, the GraphQL-only timeline event list
+    (None = section never carried), a flags dict, the per-section
+    `children_complete` map (issue #23, extended per connection in v10), and
+    the v10 `links` dict / `links_incomplete` marker / `pr_commits` list —
+    all three None when the section was never carried (issue #27).
 
     The absent-everywhere path keeps the legacy rules (comments only when the
     count is nonzero, pull details only for PRs, files via changed_files),
@@ -307,6 +306,29 @@ def _resolve_children(
             flags["timeline_incomplete"] = True
         if provided.get("closing_refs_incomplete"):
             flags["closing_refs_incomplete"] = True
+        if provided.get("pr_commits_incomplete"):
+            flags["pr_commits_incomplete"] = True
+        overflowed = provided.get("links_incomplete")
+        if overflowed:
+            names = (
+                overflowed
+                if isinstance(overflowed, list)
+                else sorted(
+                    {
+                        name
+                        for name in (
+                            "blocked_by",
+                            "parent",
+                            "duplicate_of",
+                            "open_prs",
+                        )
+                        if name in (links or {})
+                    }
+                )
+                or ["links"]
+            )
+            for name in names:
+                flags[f"links_overflow_{name}"] = True
     complete["timeline"] = timeline_complete
     if rest_source:
         complete["links_blocked_by"] = True
@@ -1063,7 +1085,42 @@ def sync_repo(
                                     "item",
                                     str(number),
                                     note=(
-                                        f"timeline truncated: retained newest {len(timeline)} events"
+                                        f"timeline truncated: retained newest {len(timeline or [])} events"
+                                    ),
+                                    status=None,
+                                )
+                            for flag_name, note in sorted(
+                                (f, n)
+                                for f, n in (
+                                    (
+                                        "pr_commits_incomplete",
+                                        "commits truncated: retained first"
+                                        f" {len(pr_commits or [])} messages"
+                                        " (union-only)",
+                                    ),
+                                )
+                                if flags.get(f)
+                            ):
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note=note,
+                                    status=None,
+                                )
+                            for flag_name in sorted(
+                                f for f in flags if f.startswith("links_overflow_")
+                            ):
+                                log_fetch(
+                                    conn,
+                                    repo,
+                                    "item",
+                                    str(number),
+                                    note=(
+                                        "links connection overflowed"
+                                        f" ({flag_name.removeprefix('links_overflow_')}):"
+                                        " union-only"
                                     ),
                                     status=None,
                                 )

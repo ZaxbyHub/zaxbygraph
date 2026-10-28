@@ -968,11 +968,13 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
             (repo, str(number), rel, str(dst), evidence),
         )
 
-    for row in conn.execute("SELECT repo, number, raw_json FROM items").fetchall():
+    for row in conn.execute(
+        "SELECT repo, number, raw_json, head_ref FROM items"
+    ).fetchall():
         repo, number = row["repo"], row["number"]
         try:
             raw = json.loads(row["raw_json"])
-        except ValueError:
+        except (TypeError, ValueError):
             continue
         if not isinstance(raw, dict):
             continue
@@ -1015,11 +1017,7 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
                 _upsert_keyword_edge(
                     repo, number, "closes_keyword", n, f"{location} closing keyword"
                 )
-        head_row = conn.execute(
-            "SELECT head_ref FROM items WHERE repo = ? AND number = ?",
-            (repo, number),
-        ).fetchone()
-        head_ref = head_row["head_ref"] if head_row is not None else None
+        head_ref = row["head_ref"]
         if head_ref:
             tokens = _extract.branch_number_tokens(head_ref)
             if len(tokens) == 1:
@@ -1076,6 +1074,14 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
                 "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"
                 " path, backticked) VALUES (?, ?, ?, ?, ?)",
                 (repo, number, origin, path, backticked),
+            )
+        for exception, error_line, frame_function in (
+            _extract.parse_error_signatures(body)
+        ):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_signatures(repo, number,"
+                " exception, error_line, frame_function) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, exception, error_line, frame_function),
             )
         # Review loops carry the same live-path parity: duplicate_keyword
         # (the live edges_from_review emits it; round-1 review), the

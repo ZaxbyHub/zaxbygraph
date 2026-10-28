@@ -454,6 +454,118 @@ class MigrationBackfillTests(TempDBTest):
         )
 
 
+class ReviewSignatureBackfillTests(TempDBTest):
+    def test_review_body_signatures_backfilled(self) -> None:
+        """Review-body error signatures are backfilled like every other text
+        family (review round PRR-003). Killed by removing the reviews loop's
+        parse_error_signatures call."""
+        review_body = "Crash:\n```\nValueError: review-side 0xff\n```"
+        self.conn.execute("BEGIN")
+        self.conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, body, state,"
+            " created_at, updated_at, raw_json)"
+            " VALUES (9, ?, 9, 'issue', 't', NULL, 'open', ?, ?, '{}')",
+            (REPO, ts(0), ts(1)),
+        )
+        self.conn.execute(
+            "INSERT INTO reviews(id, repo, number, author, state, body,"
+            " submitted_at, raw_json)"
+            " VALUES (701, ?, 9, 'bob', 'APPROVED', ?, ?, '{}')",
+            (REPO, review_body, ts(1)),
+        )
+        self.conn.commit()
+        from zaxbygraph.db import migrate_v8_to_v9
+
+        migrate_v8_to_v9(self.conn)
+        rows = self.conn.execute(
+            "SELECT exception, error_line FROM item_signatures WHERE number = 9"
+        ).fetchall()
+        self.assertEqual(
+            [(r["exception"], r["error_line"]) for r in rows],
+            [("ValueError", "ValueError: review-side <hex>")],
+            "REVIEW-SIGNATURES-MISSING: review-body signatures never backfilled",
+        )
+
+
+class ExtractGuardTests(unittest.TestCase):
+    """Feedback-round pins (PRR-002/005/006/012) on the extractors."""
+
+    def test_branch_tokens_reject_word_embedded_digits(self) -> None:
+        """`python3-support`'s 3 and `v2`'s 2 are words, not issue refs;
+        delimiter-adjacent runs still tokenize (PRR-006)."""
+        from zaxbygraph.extract import branch_number_tokens
+
+        self.assertEqual(branch_number_tokens("feature/python3-support"), [])
+        self.assertEqual(branch_number_tokens("v2-fix"), [])
+        self.assertEqual(branch_number_tokens("issue-2-fix"), [2])
+        self.assertEqual(branch_number_tokens("fix/26-add"), [26])
+
+    def test_commit_message_self_reference_suppressed(self) -> None:
+        from zaxbygraph.extract import edges_from_commit_messages
+
+        self.assertEqual(
+            edges_from_commit_messages(
+                REPO, 7, [{"sha": "abc", "message": "fixes #7"}]
+            ),
+            [],
+            "COMMIT-SELF-EDGE: a commit closing its own PR made an edge",
+        )
+
+    def test_duplicate_keyword_self_reference_suppressed(self) -> None:
+        from zaxbygraph.extract import edges_from_item
+
+        raw = {
+            "number": 42,
+            "title": "duplicate of #42",
+            "body": "",
+            "user": {"login": "a"},
+        }
+        self.assertEqual(
+            [e for e in edges_from_item(REPO, raw) if e[2] == "duplicate_keyword"],
+            [],
+            "DUP-SELF-EDGE: self duplicate_keyword stored",
+        )
+
+    def test_blob_url_line_anchors_stripped(self) -> None:
+        from zaxbygraph.extract import parse_path_refs
+
+        self.assertEqual(
+            parse_path_refs(
+                "https://github.com/me/repo/blob/abc/src/foo.py#L10 here",
+                "me/repo",
+            ),
+            [("src/foo.py", 0)],
+            "ANCHOR-LEAK: the #L10 fragment stayed in the path",
+        )
+
+    def test_foreign_blob_with_line_col_dropped(self) -> None:
+        from zaxbygraph.extract import parse_path_refs
+
+        self.assertEqual(
+            parse_path_refs(
+                "see https://github.com/other/repo/blob/main/src/x.py:10:5 end",
+                "me/repo",
+            ),
+            [],
+            "FOREIGN-LEAK: a foreign blob URL produced a path ref",
+        )
+
+    def test_path_col_scan_linear(self) -> None:
+        """The :L:C scan is amortized-linear (PRR-004): an 80k-char word run
+        parses in bounded time (< 1s), where the old regex took ~65s."""
+        import time
+
+        from zaxbygraph.extract import parse_path_refs
+
+        body = "a." * 40000
+        start = time.time()
+        parse_path_refs(body, REPO)
+        elapsed = time.time() - start
+        self.assertLess(
+            elapsed, 1.0, f"QUADRATIC-REGRESSION: 80k chars took {elapsed:.2f}s"
+        )
+
+
 class FrameFunctionTests(unittest.TestCase):
     def test_frame_function_positive_and_negative(self) -> None:
         """The nearest preceding `File "...", line N, in <func>` names the

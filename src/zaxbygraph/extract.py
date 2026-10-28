@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 
-_CLOSE_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)"
+_CLOSE_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?"
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
@@ -43,21 +43,47 @@ def _mask_foreign(text: str, repo: str) -> str:
     character of a foreign URL or `owner/repo#N` span becomes a space, so
     bare #N cannot steal them AND match offsets still index the ORIGINAL
     text. `_strip_foreign` collapses spans to one space, which shifts every
-    later offset; position-aware extraction must use this instead."""
+    later offset; position-aware extraction must use this instead.
 
-    def blank(match: re.Match[str]) -> str:
-        slug = match.group(1)
-        if slug.lower() == repo.lower():
-            return match.group(0)
-        return " " * len(match.group(0))
+    Linear implementation (PR #41 review PRR-004): the URL form anchors on a
+    literal prefix and the `owner/repo#N` form anchors on `#N` with a bounded
+    backward walk (owner/repo slugs are <= 140 chars), instead of a
+    `(?:x/)+`-style regex that rescans whole word runs from every start
+    position."""
 
-    text = re.sub(
+    def foreign_slug(slug: str) -> bool:
+        parts = slug.split("/")
+        return (
+            len(parts) == 2
+            and all(parts)
+            and parts[0].lower() + "/" + parts[1].lower() != repo.lower()
+        )
+
+    spans: list[tuple[int, int]] = []
+    for match in re.finditer(
         r"https?://github\.com/([\w.-]+/[\w.-]+)/(?:issues|pull)/\d+",
-        blank,
         text,
         flags=re.I,
-    )
-    text = re.sub(r"([\w.-]+/[\w.-]+)#\d+", blank, text)
+    ):
+        if match.group(1).lower() != repo.lower():
+            end = match.end()
+            if text[end:].startswith("#") and text[end + 1 :].isdigit():
+                end = match.end() + len(text[end + 1 :]) + 1
+            spans.append((match.start(), end))
+    for match in re.finditer(r"#\d+\b", text):
+        end = match.start()
+        start = end
+        while (
+            start > 0
+            and end - start < 200
+            and (text[start - 1].isalnum() or text[start - 1] in "./_-")
+        ):
+            start -= 1
+        slug = text[start:end]
+        if foreign_slug(slug):
+            spans.append((start, match.end()))
+    for start, end in sorted(spans, reverse=True):
+        text = text[:start] + " " * (end - start) + text[end:]
     return text
 
 
@@ -244,10 +270,14 @@ def edges_from_item(repo: str, raw: dict) -> list[tuple]:
     for n, location in sorted(mentions.items()):
         if n != number and n not in closed:
             edges.append(("item", item_id, "mentions", "item", str(n), location, "keyword"))
+    duplicates: dict[int, str] = {}
     for n, location in iter_duplicate_locations(title, repo, "title"):
-        edges.append(("item", item_id, "duplicate_keyword", "item", str(n), location, "keyword"))
+        duplicates.setdefault(n, location)
     for n, location in iter_duplicate_locations(body, repo):
-        edges.append(("item", item_id, "duplicate_keyword", "item", str(n), location, "keyword"))
+        duplicates.setdefault(n, location)
+    for n, location in sorted(duplicates.items()):
+        if n != number:
+            edges.append(("item", item_id, "duplicate_keyword", "item", str(n), location, "keyword"))
     return edges
 
 
@@ -277,7 +307,8 @@ def edges_from_comment(repo: str, number: int, raw: dict) -> list[tuple]:
         if n != number and n not in closed:
             edges.append(("item", str(number), "mentions", "item", str(n), location, "keyword"))
     for n, location in iter_duplicate_locations(body, repo, f"comment:{cid}"):
-        edges.append(("item", str(number), "duplicate_keyword", "item", str(n), location, "keyword"))
+        if n != number:
+            edges.append(("item", str(number), "duplicate_keyword", "item", str(n), location, "keyword"))
     return edges
 
 
@@ -310,7 +341,8 @@ def edges_from_review(repo: str, number: int, raw: dict) -> list[tuple]:
         if n != number and n not in closed:
             edges.append(("item", str(number), "mentions", "item", str(n), location, "keyword"))
     for n, location in iter_duplicate_locations(body, repo, f"review:{rid}"):
-        edges.append(("item", str(number), "duplicate_keyword", "item", str(n), location, "keyword"))
+        if n != number:
+            edges.append(("item", str(number), "duplicate_keyword", "item", str(n), location, "keyword"))
     return edges
 
 
@@ -437,7 +469,7 @@ RELATIONS = frozenset(
 # ==== issue #26 text-derived references (migration v9) ======================
 
 _PY_FRAME_RE = re.compile(r'File "([^"\n]+)", line \d+(?:, in ([A-Za-z_][\w.]*))?')
-_PATH_COL_RE = re.compile(r"\b((?:[\w.-]+/)+[\w.-]+):(\d+):(\d+)\b")
+_LINE_COL_RE = re.compile(r":\d+:\d+")
 _BACKTICK_PATH_RE = re.compile(r"`([^`\n]+)`")
 _TRAILING_PUNCT = ".,;:!?)>]}"
 
@@ -465,13 +497,30 @@ def parse_path_refs(text: str | None, repo: str) -> list[tuple[str, int]]:
 
     def record(candidate: str, backticked: int) -> None:
         candidate = candidate.replace("\\\\", "/").strip().rstrip(_TRAILING_PUNCT)
+        candidate = candidate.split("#", 1)[0]
         if _plausible_path(candidate):
             flags[candidate] = flags.get(candidate, 0) | backticked
 
     for match in _PY_FRAME_RE.finditer(text):
         record(match.group(1), 0)
-    for match in _PATH_COL_RE.finditer(text):
-        record(match.group(1), 0)
+    # :L:C tokens via a linear backward walk over the foreign-MASKED text
+    # (the mask is same-length, so offsets index the input): foreign URLs are
+    # blanked before the walk and can never produce a row (the cross-repo
+    # rule), and the walk is amortized-linear where the old (?:x/)+ regex was
+    # quadratic on long word runs (PR #41 review PRR-004).
+    masked = _mask_foreign(text, repo)
+    for match in _LINE_COL_RE.finditer(masked):
+        end = match.start()
+        start = end
+        while start > 0 and (
+            masked[start - 1].isalnum() or masked[start - 1] in "./_-"
+        ):
+            start -= 1
+        candidate = masked[start:end]
+        # '//' means the walk crossed into a URL (a blob URL the issues/pull
+        # mask does not cover) — never a local path.
+        if "/" in candidate and "//" not in candidate:
+            record(candidate, 0)
     for match in re.finditer(
         rf"(?i)https?://github\.com/{re.escape(repo)}/blob/[^/\s)]+/([^\s)`]+)",
         text,
@@ -521,14 +570,19 @@ def parse_error_signatures(text: str | None) -> list[tuple[str, str, str | None]
 
 
 def branch_number_tokens(head_ref: str | None) -> list[int]:
-    """Every maximal digit run in a branch name (issue #26 AC4):
-    `fix/26-add-path-refs` -> [26], `issue-26` -> [26], `fix/26-27` ->
-    [26, 27]. The branch_ref rule emits only for EXACTLY ONE token — a
-    single token can never become ambiguous later (issue numbers are unique
-    per repo), so no retraction path is ever needed."""
+    """Maximal digit runs in a branch name that are not embedded in a word
+    (issue #26 AC4): `fix/26-add-path-refs` -> [26], `issue-26` -> [26],
+    `fix/26-27` -> [26, 27]. A run adjacent to a letter is part of a word —
+    `python3-support`'s "3" or `v2`'s "2" — never an issue reference (PR #41
+    review PRR-006). The branch_ref rule emits only for EXACTLY ONE token —
+    a single token can never become ambiguous later (issue numbers are
+    unique per repo), so no retraction path is ever needed."""
     if not head_ref:
         return []
-    return [int(token) for token in re.findall(r"\d+", head_ref)]
+    return [
+        int(token)
+        for token in re.findall(r"(?<![A-Za-z])\d+(?![A-Za-z])", head_ref)
+    ]
 
 
 # ==== issue #27 GitHub-reported links (migration v10) =======================
@@ -537,7 +591,7 @@ def branch_number_tokens(head_ref: str | None) -> list[int]:
 #: source='link' stream. parent/duplicateOf are SINGULAR nodes (live schema
 #: verified, plan-critic round 1); blockedBy/closedByPullRequestsReferences
 #: are connections.
-_LINK_CONNECTIONS = {
+LINK_CONNECTIONS = {
     "blocked_by": "blocked_by",
     "parent": "child_of",
     "duplicate_of": "duplicate_of",
@@ -575,7 +629,7 @@ def edges_from_links(repo: str, number: int, links: object) -> list[tuple]:
     if not isinstance(links, dict):
         return edges
     nid = str(number)
-    for connection, relation in _LINK_CONNECTIONS.items():
+    for connection, relation in LINK_CONNECTIONS.items():
         if connection not in links:
             continue
         value = links[connection]
@@ -595,7 +649,7 @@ def normalize_incomplete_connections(links_incomplete: object) -> set[str]:
     if isinstance(links_incomplete, (list, tuple, set, frozenset)):
         return {str(name) for name in links_incomplete}
     if links_incomplete:
-        return set(_LINK_CONNECTIONS)
+        return set(LINK_CONNECTIONS)
     return set()
 
 
@@ -619,6 +673,8 @@ def edges_from_commit_messages(
         if not isinstance(sha, str) or not sha.strip():
             continue
         for n, _location in iter_closing_locations(message, repo):
+            if n == number:
+                continue
             edges.append(
                 (
                     "item",

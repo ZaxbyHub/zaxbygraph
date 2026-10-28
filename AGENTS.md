@@ -85,7 +85,7 @@ shouldn't.
   sync records `last_error` and exits non-zero with a message, so a later
   `status` still shows that something went wrong.
 - **Item-scoped child rows are replaced on re-ingest** (labels, comments,
-  reviews, pr_files for that number), while edges pointing *at* the item from
+  reviews, pr_files, item_path_refs, item_signatures for that number), while edges pointing *at* the item from
   elsewhere survive — see the next point. The v10 exceptions are deliberate
   and completeness-gated: `item_events` and `pr_commits` replace only when
   their GitHub-reported section was fetched complete, so a degraded re-ingest

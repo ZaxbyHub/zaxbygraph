@@ -182,19 +182,6 @@ commits(first: 50) {
 }
 """
 
-_PULL_SCALARS = """
-additions
-deletions
-changedFiles
-""" + _COMMITS_NODES + """
-mergedAt
-mergeCommit { oid }
-baseRefName
-headRefName
-isDraft
-mergedBy { login }
-""" + _CLOSING_REFS_NODES
-
 #: Timeline event types the page queries request. REOPENED_EVENT (issue #27
 #: AC7) rides the same connection; a host whose schema lacks it is degraded
 #: by the capability probe's ENUM introspection (unknown = fail open and
@@ -205,7 +192,7 @@ _TIMELINE_TYPES_ALL = "[" + ", ".join(_TIMELINE_EVENT_TYPES) + "]"
 _TIMELINE_NODES_TMPL = """
 timelineItems(first: 50, itemTypes: %(types)s) {
   totalCount
-  pageInfo { hasNextPage }
+  pageInfo { hasNextPage endCursor }
   nodes {
     __typename
     ... on ClosedEvent {
