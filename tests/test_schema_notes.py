@@ -48,7 +48,12 @@ def _guardrail_commands() -> list[list[str]]:
     """One success-path invocation per envelope-covered subcommand. `sync`
     is excluded (network write; its envelope is pinned by test_sync.py);
     `mcp` is excluded too (a long-running stdio server with no envelope —
-    its contract is pinned by tests/test_mcp.py)."""
+    its contract is pinned by tests/test_mcp.py); `export-corpus` is
+    excluded because its SUCCESS surface is the canonical-JSONL corpus
+    artifact itself (issue #28), not an envelope — its structured error
+    envelopes (`bad_include`, `repo_required`, `out_is_database`,
+    `store_too_old`, `store_too_new`, `incomplete_store`) are pinned by
+    tests/test_export_corpus.py."""
     return [
         ["status"],
         ["search", "needle"],
@@ -372,7 +377,7 @@ class EnvelopeContractTests(unittest.TestCase):
             missing = [k for k in required if k not in payload]
             if missing:
                 problems.append(f"{name} missing {','.join(missing)}")
-        uncovered = registered - seen - {"sync", "mcp"}
+        uncovered = registered - seen - {"sync", "mcp", "export-corpus"}
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"
         )

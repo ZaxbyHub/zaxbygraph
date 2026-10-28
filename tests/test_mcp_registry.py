@@ -40,6 +40,7 @@ CLI_TO_SURFACE = {
     # commands for the human operating a shell.
     "churn": "documented-gap: aggregation view, read it via the sql tool (SELECT path, COUNT(*) FROM pr_files ...)",
     "export-graph": "documented-gap: bulk export for graph viewers, not an agent query",
+    "export-corpus": "documented-gap: deterministic canonical-JSONL corpus snapshot for pins/audits, written by a shell; not an agent query",
     "where": "documented-gap: prints the resolution chain for a shell checkout",
     "doctor": "documented-gap: store maintenance for a human",
     "sync": "sync",
