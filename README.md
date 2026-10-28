@@ -131,7 +131,7 @@ Every command accepts:
 | Flag | Meaning |
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
-| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. |
+| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. Exception: `export-corpus` refuses `--repo ''` (`repo_required`) — a corpus is defined per repo. |
 | `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
@@ -456,20 +456,28 @@ endpoint is stored.
 Flags: `--include raw` adds each item/comment/review/release's stored
 `raw_json`; `--include patches` adds `pr_files.patch` (null unless the store
 was synced with `--include-patches`); `--include revisions` adds a line with
-the #25 revision rows (id-free). `--require-complete` exits non-zero unless
-the store is complete and error-free (the manifest always mirrors the
-underlying `full_sync_pending`/`last_error` fields either way). All reads run
-under one read snapshot: a concurrent sync cannot split the corpus. Stores
-older than schema v10 are refused (`store_too_old`) — re-run `sync` once to
-migrate. `--repo ''` (no filter) is refused (`repo_required`): a corpus is
-defined per repo. The `--format`/`--fields` flags do not apply here — the
-artifact itself is the output, and in text mode the stderr identity line
-still prints (never merge stderr into the artifact). `--out` refuses to
-overwrite the database or its sidecars (`out_is_database`).
+the #25 revision rows (id-free). Unknown `--include` values are refused
+(`bad_include`, exit 2). `--require-complete` refuses with `incomplete_store`
+(exit 1) unless the store is complete and error-free (the manifest always
+mirrors the underlying `full_sync_pending`/`last_error` fields either way).
+All reads run under one read snapshot: a concurrent sync cannot split the
+corpus. Stores outside this build's schema range are refused: below v10
+(`store_too_old` — re-run `sync` once to migrate) and above the build's
+known version (`store_too_new` — upgrade zaxbygraph). `--repo ''` (no
+filter) is refused (`repo_required`): a corpus is defined per repo. The
+`--format`/`--fields` flags do not shape the artifact itself (the corpus
+bytes are the output), though failures still follow `--format` (envelope vs
+text line) and in text mode the stderr identity line still prints (never
+merge stderr into the artifact). `--out` refuses to overwrite the database
+or any of its sidecars, including `-journal` (`out_is_database`), and
+refuses device paths (`--out NUL`).
 
 > **Warning:** exports contain GitHub user content verbatim (titles, bodies,
 > comments, reviews, release notes). Treat the artifact as you would the
-> GitHub data itself.
+> GitHub data itself. The unhashed `provenance` block additionally carries
+> operational metadata: the full `fetch_log` (including free-text notes),
+> the `sync_state` row (including `last_error` text), and the global `meta`
+> table (which names the GitHub host and gh version the sync ran through).
 
 ## MCP server
 
@@ -572,10 +580,14 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
-  `bad_request`, `bad_as_of`, `bad_flags`, `bad_sql`, `runtime`) to
+  `bad_request`, `bad_as_of`, `bad_flags`, `bad_sql`, `runtime`; export-corpus
+  additionally emits `repo_required`, `bad_include`, `out_is_database`,
+  `store_too_old`, `store_too_new`, `incomplete_store`) to
   **stdout**, so `json.load(stdin)`
   never sees an empty stream. The same `error: MESSAGE` one-liner is still
   printed to stderr for humans; argparse usage errors remain plain stderr.
+  `export-corpus` is also the one command whose *success* output is not the
+  envelope: the artifact bytes are the output (see its section above).
 - `sync` failures also persist to `sync_state.last_error`, so a later `status`
   still reports a sync that failed hours ago.
 

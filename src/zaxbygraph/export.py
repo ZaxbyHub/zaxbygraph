@@ -13,9 +13,11 @@ Determinism contract (see README and the issue-#28 trace):
   failures), terminated with ``\\n``, written to a binary target.
 - Row order is content-keyed only. SQLite-assigned identities
   (``comments.pk``, ``edges.id``, ``revisions.id``) never appear in output
-  and never influence order — a no-op sync churns them (the inclusive
-  boundary re-ingest replaces child rows), so including them would move the
-  hash after every sync. ``items.id``/``reviews.id``/``releases.id`` are
+  and never influence order. ``comments.pk`` and ``edges.id`` are rewritten
+  by the inclusive-boundary re-ingest every sync performs (child rows and
+  owned edges are replaced); ``revisions.id`` is excluded as a
+  SQLite-assigned surrogate even though revisions themselves are
+  append-only. ``items.id``/``reviews.id``/``releases.id`` are
   GitHub-assigned stable ids and stay.
 - ``corpus_sha256`` is the sha256 over the concatenated content-line bytes —
   everything after the manifest line. The manifest carries an unhashed
@@ -26,7 +28,8 @@ Determinism contract (see README and the issue-#28 trace):
   trailer.
 - All reads inside one export run under one ``BEGIN DEFERRED`` snapshot so a
   concurrent sync cannot split the corpus (WAL readers snapshot on first
-  read).
+  read). The manifest's ``fetch_log`` array streams element-wise into the
+  line, so neither memory nor the dict ever materializes the whole table.
 - Content order: manifest, items (by number), releases (by tag_name),
   optional revisions line, orphan trailer last.
 """
@@ -40,6 +43,8 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from typing import IO, Iterator
+
+from zaxbygraph.db import CURRENT_USER_VERSION
 
 SCHEMA_NAME = "zaxbygraph.corpus.v1"
 
@@ -89,8 +94,12 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
     fixes the snapshot, so a concurrent sync committing mid-export cannot
     make later statements see newer rows than earlier ones. The connection
     is switched to autocommit isolation so the module never interleaves its
-    own implicit BEGIN with ours.
+    own implicit BEGIN with ours; the caller's previous isolation level is
+    restored on exit (and switching levels can itself commit — the CLI only
+    ever hands over a connection with no transaction open, and the read
+    tier writes nothing, so nothing of the caller's is ever committed).
     """
+    previous_isolation = conn.isolation_level
     conn.isolation_level = None
     conn.execute("BEGIN DEFERRED")
     try:
@@ -100,15 +109,29 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
             conn.execute("ROLLBACK")
         except sqlite3.Error:
             pass
+        conn.isolation_level = previous_isolation
 
 
 def _reject_database_alias(out_path: str, db_path: str) -> None:
     """--out must never name the database or its sidecars: the destination is
     opened with a plain writable open after the read connection exists, and
     ``open(path, "wb")`` would truncate an aliased store despite SQLite
-    running mode=ro."""
-    candidates = [db_path, db_path + "-wal", db_path + "-shm"]
+    running mode=ro. A stray ``-journal`` file is the worst case: SQLite
+    treats it as a hot journal and refuses every subsequent read-only open
+    until it is deleted by hand."""
+    candidates = [
+        db_path,
+        db_path + "-wal",
+        db_path + "-shm",
+        db_path + "-journal",
+    ]
     out_real = os.path.realpath(out_path)
+    if out_real.startswith("\\\\.\\") or out_real.startswith("/dev/"):
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} resolves to a device, not a file;"
+            " refusing to discard the corpus",
+        )
     for cand in candidates:
         if os.path.realpath(cand) == out_real:
             raise ExportError(
@@ -433,10 +456,22 @@ def write_corpus(
             "export-corpus requires a resolved repository;"
             " --repo '' is not supported here",
         )
+    if out_path is None and target is None:
+        raise ExportError(
+            "no_target",
+            "write_corpus needs an open binary target or an --out path",
+        )
+    if out_path == "":
+        raise ExportError(
+            "no_target",
+            "--out requires a non-empty path",
+        )
     if out_path:
         _reject_database_alias(out_path, db_path)
 
     fd, spool_path = tempfile.mkstemp(prefix="zaxbygraph-export-")
+    os.close(fd)
+    fd, manifest_path = tempfile.mkstemp(prefix="zaxbygraph-export-manifest-")
     os.close(fd)
     try:
         # Snapshot phase: BEGIN DEFERRED is taken before the first read and
@@ -452,6 +487,14 @@ def write_corpus(
                     f"{MIN_EXPORT_VERSION}+ (item_events/pr_commits are missing"
                     " below it)",
                     hint="re-run sync once against this database to migrate",
+                )
+            if version > CURRENT_USER_VERSION:
+                raise ExportError(
+                    "store_too_new",
+                    f"store schema is v{version}; this build understands up to"
+                    f" v{CURRENT_USER_VERSION} — exporting would silently"
+                    " omit fields it does not know about",
+                    hint="upgrade zaxbygraph to at least the store's schema",
                 )
             state = _check_completeness(conn, repo, require_complete)
 
@@ -573,25 +616,9 @@ def write_corpus(
             sync_state_row = conn.execute(
                 "SELECT * FROM sync_state WHERE repo = ?", (repo,)
             ).fetchone()
-            provenance = {
-                "sync_state": (
-                    {k: sync_state_row[k] for k in sync_state_row.keys()}
-                    if sync_state_row
-                    else None
-                ),
-                "fetch_log": [
-                    {k: r[k] for k in r.keys()}
-                    for r in conn.execute(
-                        "SELECT * FROM fetch_log WHERE repo = ? ORDER BY id",
-                        (repo,),
-                    )
-                ],
-                "meta": {
-                    r["key"]: r["value"]
-                    for r in conn.execute(
-                        "SELECT key, value FROM meta ORDER BY key"
-                    )
-                },
+            meta = {
+                r["key"]: r["value"]
+                for r in conn.execute("SELECT key, value FROM meta ORDER BY key")
             }
 
             manifest = {
@@ -608,22 +635,90 @@ def write_corpus(
                     "issues_since": state["issues_since"],
                     "include_patches": bool(state["include_patches"]),
                 },
-                "provenance": provenance,
+                "provenance": {
+                    "sync_state": (
+                        {k: sync_state_row[k] for k in sync_state_row.keys()}
+                        if sync_state_row
+                        else None
+                    ),
+                    # Placeholder: the fetch_log array is streamed into the
+                    # manifest line below, element-wise, so neither memory
+                    # nor this dict ever holds the whole table.
+                    "fetch_log": [],
+                    "meta": meta,
+                },
             }
 
-        # All guards passed, the snapshot is released, and the spool is
-        # complete: touch the destination only now.
-        with open(spool_path, "rb") as spool:
-            if out_path:
-                with open(out_path, "wb") as out:
-                    out.write(canonical(manifest) + b"\n")
+            # The manifest line streams the fetch_log array element-wise:
+            # canonical() of the manifest-with-empty-array produces the exact
+            # bytes the full-line encoding would, with the empty array as the
+            # insertion point (the marker cannot occur inside a string value
+            # — JSON escaping escapes the double quotes it contains).
+            manifest_head = canonical(manifest)
+            marker = b'"provenance":{"fetch_log":[]'
+            cut = manifest_head.find(marker)
+            if cut < 0:  # pragma: no cover - structure is fixed by canonical()
+                raise ExportError(
+                    "runtime", "manifest serialization marker not found"
+                )
+            # Keep the array's opening bracket in the prefix; the suffix
+            # already carries the array's closing bracket, so the streamed
+            # elements replace only the empty interior.
+            split = cut + len(marker) - 1
+            with open(manifest_path, "wb") as mspool:
+                mspool.write(manifest_head[:split])
+                first = True
+                for r in conn.execute(
+                    "SELECT * FROM fetch_log WHERE repo = ? ORDER BY id",
+                    (repo,),
+                ):
+                    if not first:
+                        mspool.write(b",")
+                    mspool.write(canonical({k: r[k] for k in r.keys()}))
+                    first = False
+                mspool.write(manifest_head[split:])
+                mspool.write(b"\n")
+
+        # All guards passed, the snapshot is released, and both spools are
+        # complete: touch the destination only now, atomically for a file
+        # target (temp file in the destination's own directory + os.replace,
+        # so a mid-copy failure never truncates a previous good export).
+        if out_path:
+            _reject_database_alias(out_path, db_path)
+            fd, dest_tmp = tempfile.mkstemp(
+                prefix="zaxbygraph-out-", dir=os.path.dirname(out_path) or "."
+            )
+            os.close(fd)
+            try:
+                with open(dest_tmp, "wb") as out, open(
+                    manifest_path, "rb"
+                ) as mspool, open(spool_path, "rb") as spool:
+                    while True:
+                        chunk = mspool.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
                     while True:
                         chunk = spool.read(1 << 20)
                         if not chunk:
                             break
                         out.write(chunk)
-            elif target is not None:
-                target.write(canonical(manifest) + b"\n")
+                os.replace(dest_tmp, out_path)
+            except BaseException:
+                try:
+                    os.unlink(dest_tmp)
+                except OSError:
+                    pass
+                raise
+        elif target is not None:
+            with open(manifest_path, "rb") as mspool, open(
+                spool_path, "rb"
+            ) as spool:
+                while True:
+                    chunk = mspool.read(1 << 20)
+                    if not chunk:
+                        break
+                    target.write(chunk)
                 while True:
                     chunk = spool.read(1 << 20)
                     if not chunk:
@@ -631,7 +726,8 @@ def write_corpus(
                     target.write(chunk)
         return manifest
     finally:
-        try:
-            os.unlink(spool_path)
-        except OSError:
-            pass
+        for path in (spool_path, manifest_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass

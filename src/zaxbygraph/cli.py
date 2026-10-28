@@ -1147,6 +1147,17 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             hint=f"--include accepts: {', '.join(export.INCLUDE_CHOICES)}",
         )
     out_path = getattr(args, "out", None)
+    if out_path == "":
+        conn.close()
+        return emit_failure(
+            args,
+            2,
+            "--out requires a non-empty path",
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_flags",
+            hint="pass --out F with a destination file, or omit --out for stdout",
+        )
     ok = False
     try:
         target = None if out_path else sys.stdout.buffer
@@ -1170,6 +1181,16 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             code_key=exc.code,
             hint=exc.hint,
         )
+    except (OSError, sqlite3.Error) as exc:
+        # Storage faults answer with the envelope like every other refusal
+        # (AGENTS: reported, not swallowed and not a traceback).
+        return emit_failure(
+            args,
+            1,
+            f"export failed: {exc}",
+            slug=repo,
+            db_path=db_path,
+        )
     finally:
         if ok and _format_of(args) == "text":
             # The same stderr trust summary every read prints in text mode
@@ -1178,9 +1199,15 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             line = _identity_line(conn, repo, db_path)
             if line:
                 print(line, file=sys.stderr)
-        conn.close()
-        if not out_path:
-            sys.stdout.flush()
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+        if not out_path and ok:
+            try:
+                sys.stdout.flush()
+            except OSError:
+                pass
     return 0
 
 

@@ -102,6 +102,7 @@ registers it.
 | What closed an issue (PRs + commits, with provenance) | `what-closed` |
 | Anything the above don't shape | `sql "SELECT …"` |
 | Feed a graph viewer or join to a code graph | `export-graph` |
+| Pin exactly which corpus an answer was computed from | `export-corpus` — deterministic hash-stamped JSONL snapshot (artifact bytes, not an envelope) |
 
 Start with `status`. `complete: false` or a non-null `last_error` means the
 last sync stopped early and the DB is incomplete — re-run `sync` (the
@@ -112,7 +113,10 @@ watermark resumes it) before drawing conclusions from counts.
 Every command's JSON output is one self-describing **envelope** (v0.2):
 `{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
 plus `error:{code, message, hint?}` on failures. The per-command payload lives
-under `data`; `ok` is at the root. Errors answer on **stdout** in JSON mode
+under `data`; `ok` is at the root. **Sole exception: `export-corpus` writes
+the corpus artifact bytes (manifest line + JSONL content) instead of an
+envelope**; its failures still answer with the standard envelope. Errors
+answer on **stdout** in JSON mode
 (exit codes unchanged), and stderr keeps one `error: MESSAGE` echo; in text
 mode a successful read that resolves a repo also writes exactly one identity
 line (`sync`/`doctor` never do; slug-less reads print none; `synced=0` means

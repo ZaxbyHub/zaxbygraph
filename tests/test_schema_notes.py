@@ -49,10 +49,11 @@ def _guardrail_commands() -> list[list[str]]:
     is excluded (network write; its envelope is pinned by test_sync.py);
     `mcp` is excluded too (a long-running stdio server with no envelope —
     its contract is pinned by tests/test_mcp.py); `export-corpus` is
-    excluded because its SUCCESS surface is the binary corpus artifact
-    itself (issue #28), not an envelope — its structured error envelopes
-    (bad_include, repo_required, out_is_database, store_too_old,
-    incomplete_store) are pinned by tests/test_export_corpus.py."""
+    excluded because its SUCCESS surface is the canonical-JSONL corpus
+    artifact itself (issue #28), not an envelope — its structured error
+    envelopes (`bad_include`, `repo_required`, `out_is_database`,
+    `store_too_old`, `store_too_new`, `incomplete_store`) are pinned by
+    tests/test_export_corpus.py."""
     return [
         ["status"],
         ["search", "needle"],

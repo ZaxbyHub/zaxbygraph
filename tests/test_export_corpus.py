@@ -23,7 +23,6 @@ from fixtures import (
     REPO,
     FakeGitHubSource,
     TempDBTest,
-    comment,
     issue,
     pr_file,
     pull,
@@ -40,7 +39,7 @@ from zaxbygraph.sync import sync_repo
 #: corrected to the plan's full-unique-key law and a review row joined the
 #: fixture store — 08-test-results.md records the round.)
 GOLDEN_FIXTURE_SHA256 = (
-    "d21ed347259af5f51b5ee5ed3e917f7da7bb9544f9f7ab803aecd7c761b60fb9"
+    "9d0eba2712428ba6dc3be590353577b67b977e047291313a96ced06b06c3d046"
 )
 
 
@@ -120,10 +119,12 @@ def _rich_store(conn: sqlite3.Connection) -> FakeGitHubSource:
     src.comment_on(1, "a comment with an em-dash — and ünïcode")
     src.add_pr(
         issue(2, title="Probe PR", body="", kind="pr"),
-        pull(2, merged=True),
+        pull(2, merged=True, additions=3, deletions=1),
         files=[pr_file("src/app.py")],
     )
-    src.reviews[2] = [review(303, "APPROVED", "ship it — ok")]
+    review_row = review(303, "APPROVED", "ship it — ok")
+    review_row["html_url"] = f"https://github.com/{REPO}/pull/2#pullrequestreview-303"
+    src.reviews[2] = [review_row]
     src.releases.append(
         {
             "id": 77,
@@ -855,6 +856,203 @@ class GuardTests(TempDBTest):
         finally:
             conn.close()
         self.assertEqual(ctx.exception.code, "store_too_old")
+
+    def test_store_too_new_refuses_envelope_and_old_is_envelope_pinned(self) -> None:
+        """Symmetric version guard (cubic CUB-1): a store NEWER than this
+        build is refused — exporting it would silently omit fields this
+        build does not know — and BOTH version refusals answer through the
+        CLI as structured envelopes (the schema-notes carve-out credits
+        these pins)."""
+        self._synced()
+        for version, expected_code in ((11, "store_too_new"), (9, "store_too_old")):
+            self.conn.execute(f"PRAGMA user_version = {version}")
+            self.conn.commit()
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zaxbygraph",
+                    "export-corpus",
+                    "--repo",
+                    REPO,
+                    "--db",
+                    str(self.db_path),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 2, (version, proc.stderr))
+            env = json.loads(proc.stdout.decode("utf-8"))
+            self.assertFalse(env["ok"])
+            self.assertEqual(env["error"]["code"], expected_code)
+
+    def test_journal_sidecar_out_is_refused(self) -> None:
+        """--out <db>-journal must be refused: a corpus written there is a
+        fake hot journal that bricks every read-only open of the store until
+        it is deleted by hand (executed brick probe, swarm review PRR-002)."""
+        self._synced()
+        before = self.db_path.read_bytes()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zaxbygraph",
+                "export-corpus",
+                "--repo",
+                REPO,
+                "--db",
+                str(self.db_path),
+                "--out",
+                str(self.db_path) + "-journal",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 2)
+        env = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(env["error"]["code"], "out_is_database")
+        self.assertFalse((Path(str(self.db_path) + "-journal")).exists())
+        self.assertEqual(self.db_path.read_bytes(), before)
+
+    def test_device_path_out_is_refused(self) -> None:
+        """--out NUL must be refused, not silently successful (a device
+        target discards the corpus and reports exit 0)."""
+        self._synced()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zaxbygraph",
+                "export-corpus",
+                "--repo",
+                REPO,
+                "--db",
+                str(self.db_path),
+                "--out",
+                "NUL",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 2)
+        env = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(env["error"]["code"], "out_is_database")
+
+    def test_empty_out_value_is_refused(self) -> None:
+        """--out "" must not silently become "write to stdout" (PRR-004)."""
+        self._synced()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zaxbygraph",
+                "export-corpus",
+                "--repo",
+                REPO,
+                "--db",
+                str(self.db_path),
+                "--out",
+                "",
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 2)
+        env = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(env["error"]["code"], "bad_flags")
+
+    def test_destination_failure_answers_envelope_not_traceback(self) -> None:
+        """--out into a missing directory must produce the structured error
+        envelope, not a traceback (PRR-001 / cubic CUB-2)."""
+        self._synced()
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "no-such-dir" / "corpus.jsonl"
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zaxbygraph",
+                    "export-corpus",
+                    "--repo",
+                    REPO,
+                    "--db",
+                    str(self.db_path),
+                    "--out",
+                    str(missing),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 1)
+            self.assertNotIn(b"Traceback", proc.stderr)
+            env = json.loads(proc.stdout.decode("utf-8"))
+            self.assertFalse(env["ok"])
+
+    def test_empty_store_exports_a_pinned_empty_corpus(self) -> None:
+        """A synced-but-empty store exports a legitimate 2-line corpus
+        (manifest + empty orphan trailer) — pinned so the behavior cannot
+        drift silently (cubic CUB-3 adjudication)."""
+        src = FakeGitHubSource()
+        sync_repo(self.conn, src, REPO)
+        self.conn.execute(
+            "DELETE FROM comments"
+        )  # nothing to delete; store has zero items already
+        self.conn.commit()
+        conn = open_existing(self.db_path)
+        try:
+            data = _export(conn, str(self.db_path))
+        finally:
+            conn.close()
+        lines = _content_lines(data)
+        manifest = _manifest_of(data)
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(json.loads(lines[0].decode("ascii"))["type"], "orphan_edges")
+        self.assertEqual(manifest["counts"]["items"], 0)
+        self.assertTrue(manifest["store"]["complete"])
+
+    def test_child_collections_render_seeded_rows_in_order(self) -> None:
+        """The six child collections the fixture stores leave empty render
+        seeded rows with the right mapping and content-key order (a wrong
+        column name or sort would crash or misorder here)."""
+        self._synced()
+        self.conn.executemany(
+            "INSERT INTO assignees(repo, number, login) VALUES (?, 1, ?)",
+            [(REPO, "zed"), (REPO, "amy")],
+        )
+        self.conn.execute(
+            "INSERT INTO issue_field_values(repo, number, field_name, value)"
+            " VALUES (?, 1, 'priority', 'P1')",
+            (REPO,),
+        )
+        self.conn.executemany(
+            "INSERT INTO item_events(repo, number, type, created_at)"
+            " VALUES (?, 1, ?, ?)",
+            [
+                (REPO, "closed", "2026-02-02T00:00:00Z"),
+                (REPO, "referenced", "2026-02-01T00:00:00Z"),
+            ],
+        )
+        self.conn.commit()
+        conn = open_existing(self.db_path)
+        try:
+            data = _export(conn, str(self.db_path))
+        finally:
+            conn.close()
+        for line in _content_lines(data):
+            obj = json.loads(line.decode("ascii"))
+            if obj.get("type") == "item" and obj["number"] == 1:
+                self.assertEqual(obj["assignees"], ["amy", "zed"])
+                self.assertEqual(
+                    obj["issue_field_values"],
+                    [{"field_name": "priority", "value": "P1"}],
+                )
+                self.assertEqual(
+                    [e["type"] for e in obj["item_events"]],
+                    ["closed", "referenced"],
+                )
+                break
+        else:
+            self.fail("item 1 not found in export")
 
     def test_concurrent_commit_cannot_split_the_snapshot(self) -> None:
         # WAL snapshot isolation: BEGIN DEFERRED snapshots on FIRST access,
