@@ -62,6 +62,12 @@ def _guardrail_commands() -> list[list[str]]:
         ["churn"],
         ["open"],
         ["path", "1", "2"],
+        # issue #29 derived reads against the same seed corpus (issues 1/2,
+        # merged PR 10 touching src/store.py): all exit 0.
+        ["similar", "1"],
+        ["explain", "1", "2"],
+        ["coupling", "src/store.py"],
+        ["eval", "similar"],
         ["sql", "SELECT number FROM items"],
         ["schema"],
         ["schema", "pr_files"],

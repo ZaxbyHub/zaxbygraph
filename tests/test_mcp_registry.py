@@ -43,6 +43,12 @@ CLI_TO_SURFACE = {
     "export-corpus": "documented-gap: deterministic canonical-JSONL corpus snapshot for pins/audits, written by a shell; not an agent query",
     "where": "documented-gap: prints the resolution chain for a shell checkout",
     "doctor": "documented-gap: store maintenance for a human",
+    # Derived reads (issue #29): typed MCP tools for the derived tier are
+    # issue #32's lane; until then the CLI surface is the only one.
+    "similar": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
+    "explain": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
+    "coupling": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
+    "eval": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
     "sync": "sync",
 }
 

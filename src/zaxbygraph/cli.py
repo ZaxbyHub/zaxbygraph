@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from zaxbygraph import __version__
+from zaxbygraph import derive
 from zaxbygraph import export
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.doctor import doctor as doctor_run
@@ -28,6 +29,7 @@ from zaxbygraph.paths import (
 from zaxbygraph.query import (
     assert_read_sql,
     churn,
+    _clamp_limit,
     export_graph,
     file_history,
     item,
@@ -342,10 +344,11 @@ def emit_failure(
 class _ReadFailure(Exception):
     """A read that must not proceed: carries its exit code and message."""
 
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, code_key: str | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.code_key = code_key
 
 
 def _resolved_repo(args: argparse.Namespace) -> tuple[str | None, str]:
@@ -406,7 +409,10 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
                 "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
             ).fetchone()
         except sqlite3.DatabaseError as exc:
-            raise _ReadFailure(1, f"{db_path} is not a zaxbygraph database: {exc}")
+            raise _ReadFailure(
+                1, f"{db_path} is not a zaxbygraph database: {exc}",
+                code_key="store_unreadable",
+            )
         if row is not None:
             if row["repo"] != slug:
                 raise _ReadFailure(
@@ -733,6 +739,217 @@ def cmd_open(args: argparse.Namespace) -> int:
 
 def cmd_path(args: argparse.Namespace) -> int:
     return _run_read(args, path_between, args.a, args.b)
+
+
+def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
+    """Derived-tier read runner: same resolution and envelope as
+    ``_run_read``, over the same ``mode=ro`` connection ``open_existing``
+    already provides (temp objects work there; main-db writes are
+    impossible). Query-time failures map to coded envelopes, never
+    tracebacks: unknown items to ``not_found``, configuration problems and
+    bad requests to exit 2, store-level failures to exit 1."""
+    repo: str | None = None
+    db_path: Path | None = None
+    try:
+        conn, repo, db_path = _open_for_read(args)
+    except _ReadFailure as exc:
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
+        )
+    try:
+        data = query_fn(conn, *extra, repo=repo, db_path=db_path)
+        fresh = _freshness(conn, repo)
+        line = _identity_line(conn, repo, db_path)
+    except LookupError as exc:
+        return emit_failure(
+            args, 1, str(exc), slug=repo, db_path=db_path, code_key="not_found"
+        )
+    except derive.ConfigError as exc:
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        return emit_failure(args, 2, message, slug=repo, db_path=db_path)
+    except ValueError as exc:
+        return emit_failure(args, 2, str(exc), slug=repo, db_path=db_path)
+    except sqlite3.Error as exc:
+        # A store that cannot be read (corrupt file, or a read-only
+        # directory blocking the -shm) is a store_unreadable, distinct from
+        # a generic runtime error: the envelope names the actionable cause.
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
+    finally:
+        conn.close()
+    emit_result(
+        args, data, slug=repo, db_path=db_path, freshness=fresh, identity_line=line
+    )
+    return 0
+
+
+def _resolve_weight_config(
+    db_path: Path | None, explicit: str | None
+) -> tuple[dict | None, str | None, str | None]:
+    """Weight-config discovery per the plan's precedence chain: defaults,
+    then ``<store>/config.toml``, then ``.zaxbygraph.toml`` (cwd), then an
+    explicit ``--config`` path (highest). Returns the paths that exist."""
+    store_cfg: str | None = None
+    if db_path is not None:
+        store_candidate = db_path.parent / "config.toml"
+        if store_candidate.is_file():
+            store_cfg = str(store_candidate)
+    cwd_cfg: str | None = None
+    candidate = Path(".zaxbygraph.toml")
+    if candidate.is_file():
+        cwd_cfg = str(candidate)
+    return store_cfg, cwd_cfg, explicit
+
+
+def _git_ls_files() -> tuple[list[str] | None, str | None]:
+    """Opt-in ``git ls-files`` of the invoking checkout plus its HEAD sha.
+    Degrades to ``(None, None)`` outside a git checkout — the response then
+    carries ``ls_files_applied: false``."""
+    import subprocess
+
+    try:
+        files = subprocess.run(
+            ["git", "ls-files"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if files.returncode != 0:
+            return None, None
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return (
+            files.stdout.splitlines(),
+            head.stdout.strip() if head.returncode == 0 else None,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, None
+
+
+def _similar_query(
+    conn: sqlite3.Connection,
+    number: int,
+    limit: int,
+    config: str | None,
+    ls_files_flag: bool,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    ls_files: list[str] | None = None
+    ls_head: str | None = None
+    applied = False
+    if ls_files_flag:
+        ls_files, ls_head = _git_ls_files()
+        applied = ls_files is not None
+    out = _derive.similar(
+        conn,
+        repo,
+        number,
+        limit=_clamp_limit(limit),
+        weights=weights,
+        ls_files=ls_files,
+    )
+    out["ls_files_applied"] = applied
+    out["ls_files_head"] = ls_head
+    return out
+
+
+def _explain_query(
+    conn: sqlite3.Connection,
+    a: int,
+    b: int,
+    config: str | None,
+    ls_files_flag: bool,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    ls_files: list[str] | None = None
+    ls_head: str | None = None
+    applied = False
+    if ls_files_flag:
+        ls_files, ls_head = _git_ls_files()
+        applied = ls_files is not None
+    out = _derive.explain(
+        conn, repo, a, b, weights=weights, ls_files=ls_files
+    )
+    out["ls_files_applied"] = applied
+    out["ls_files_head"] = ls_head
+    return out
+
+
+def _coupling_query(
+    conn: sqlite3.Connection,
+    path: str,
+    limit: int,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    # coupling uses no weight config, so db_path is accepted for runner
+    # signature uniformity and unused.
+    return _derive.coupling(conn, repo, path, limit=_clamp_limit(limit))
+
+
+def _eval_query(
+    conn: sqlite3.Connection,
+    mode: str,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive, evaluate as _evaluate
+
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = None
+    if store_cfg or cwd_cfg or explicit:
+        weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    return _evaluate.run_eval(conn, repo, mode, weights=weights)
+
+
+def cmd_similar(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args, _similar_query, args.number, args.limit, args.config, args.ls_files
+    )
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args, _explain_query, args.a, args.b, args.config, args.ls_files
+    )
+
+
+def cmd_coupling(args: argparse.Namespace) -> int:
+    return _run_derived_read(args, _coupling_query, args.path, args.limit)
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    return _run_derived_read(args, _eval_query, args.mode, args.config)
 
 
 def _run_read_promote_truncated(
@@ -1395,6 +1612,48 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("a")
     sp.add_argument("b")
     sp.set_defaults(func=cmd_path)
+
+    sp = sub.add_parser(
+        "similar", help="Related items with per-signal evidence (derived, read-only)"
+    )
+    add_common(sp)
+    sp.add_argument("number", type=int)
+    sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument(
+        "--ls-files",
+        action="store_true",
+        help="Intersect resolved paths with this checkout's git ls-files",
+    )
+    sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
+    sp.set_defaults(func=cmd_similar)
+
+    sp = sub.add_parser(
+        "explain", help="Full per-signal breakdown for one pair (derived, read-only)"
+    )
+    add_common(sp)
+    sp.add_argument("a", type=int)
+    sp.add_argument("b", type=int)
+    sp.add_argument("--ls-files", action="store_true")
+    sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
+    sp.set_defaults(func=cmd_explain)
+
+    sp = sub.add_parser(
+        "coupling",
+        help="Files that change together with PATH (merged PRs, support/confidence/lift)",
+    )
+    add_common(sp)
+    sp.add_argument("path")
+    sp.add_argument("--limit", type=int, default=20)
+    sp.set_defaults(func=cmd_coupling)
+
+    sp = sub.add_parser(
+        "eval",
+        help="Measure retrieval quality against GitHub-reported ground truth",
+    )
+    add_common(sp)
+    sp.add_argument("mode", choices=["similar", "localize", "bundle"])
+    sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
+    sp.set_defaults(func=cmd_eval)
 
     sp = sub.add_parser("sql", help="Read-only SQL (SELECT/WITH/EXPLAIN)")
     add_common(sp)

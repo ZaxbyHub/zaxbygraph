@@ -434,6 +434,117 @@ def _release_content(row: sqlite3.Row, include: frozenset[str]) -> dict:
     return content
 
 
+def iter_corpus_content_lines(
+    conn: sqlite3.Connection,
+    repo: str,
+    include: frozenset[str],
+    routing: dict | None = None,
+) -> Iterator[bytes]:
+    """Yield the exact content-line byte pieces ``write_corpus`` spools, in
+    order: item lines (by number, each carrying its ``content_hash``),
+    release lines (by ``tag_name``), the optional ``revisions`` line, and the
+    ``orphan_edges`` trailer last.
+
+    ``include`` changes bytes exactly as documented for ``write_corpus``
+    (``raw``/``patches`` alter item lines; ``revisions`` adds a whole line).
+    Transaction ownership stays with the caller: the iterator never opens,
+    commits, or rolls back — run it inside your own read snapshot so the
+    pieces belong to one corpus state. When ``routing`` is a dict, it
+    receives the ``items``/``releases``/``orphan_edges`` counts.
+    """
+    local = {
+        str(r[0]) for r in conn.execute("SELECT number FROM items WHERE repo = ?", (repo,))
+    }
+    items = 0
+    for row in conn.execute(
+        "SELECT * FROM items WHERE repo = ? ORDER BY number", (repo,)
+    ):
+        content = _item_content(conn, repo, row, include, local)
+        digest = hashlib.sha256(canonical(content)).hexdigest()
+        content["content_hash"] = digest
+        yield canonical(content) + b"\n"
+        items += 1
+    releases = 0
+    for row in conn.execute(
+        "SELECT * FROM releases WHERE repo = ? ORDER BY tag_name", (repo,)
+    ):
+        yield canonical(_release_content(row, include)) + b"\n"
+        releases += 1
+    if "revisions" in include:
+        # Streamed element-wise: the rows array is never materialized.
+        # revisions.id (SQLite-assigned) is excluded; order is the content
+        # key, not the id.
+        rev_order = (
+            "number, entity, entity_id, kind, origin, valid_from, valid_to, content"
+        )
+        yield b'{"rows":['
+        first = True
+        for r in conn.execute(
+            "SELECT number, entity, entity_id, kind, origin, content,"
+            " valid_from, valid_to FROM revisions WHERE repo = ?"
+            f" ORDER BY {rev_order}",
+            (repo,),
+        ):
+            element = canonical(
+                {
+                    "number": r["number"],
+                    "entity": r["entity"],
+                    "entity_id": r["entity_id"],
+                    "kind": r["kind"],
+                    "origin": r["origin"],
+                    "content": r["content"],
+                    "valid_from": r["valid_from"],
+                    "valid_to": r["valid_to"],
+                }
+            )
+            if not first:
+                yield b","
+            yield element
+            first = False
+        yield b'],"type":"revisions"}\n'
+    # Orphan trailer: streamed from one ordered pass, element-wise, never
+    # materialized. Always the final content line.
+    yield b'{"edges":['
+    first = True
+    orphans = 0
+
+    def _is_orphan(r: sqlite3.Row) -> bool:
+        src_local = r["src_type"] == "item" and r["src_id"] in local
+        dst_local = r["dst_type"] == "item" and r["dst_id"] in local
+        return not src_local and not dst_local
+
+    for r in conn.execute(
+        f"SELECT {_EDGE_COLUMNS} FROM edges WHERE repo = ? ORDER BY {_EDGE_ORDER}",
+        (repo,),
+    ):
+        if not _is_orphan(r):
+            continue
+        element = canonical(_edge_row(r))
+        if not first:
+            yield b","
+        yield element
+        orphans += 1
+        first = False
+    yield b'],"type":"orphan_edges"}\n'
+    if routing is not None:
+        routing["items"] = items
+        routing["releases"] = releases
+        routing["orphan_edges"] = orphans
+
+
+def corpus_sha256_from_lines(pieces: Iterator[bytes]) -> str:
+    """Digest the exact content-line byte pieces into ``corpus_sha256``.
+
+    Feeding this the output of :func:`iter_corpus_content_lines` for one
+    snapshot yields the same digest ``write_corpus`` records for that
+    snapshot (parity pinned by tests).
+    """
+    hasher = hashlib.sha256()
+    for piece in pieces:
+        hasher.update(piece)
+    return hasher.hexdigest()
+
+
 def write_corpus(
     conn: sqlite3.Connection,
     repo: str,
@@ -498,13 +609,6 @@ def write_corpus(
                 )
             state = _check_completeness(conn, repo, require_complete)
 
-            local = {
-                str(r[0])
-                for r in conn.execute(
-                    "SELECT number FROM items WHERE repo = ?", (repo,)
-                )
-            }
-
             counts = {
                 "items": 0,
                 "releases": 0,
@@ -523,83 +627,13 @@ def write_corpus(
                 "SELECT COUNT(*) FROM reviews WHERE repo = ?", (repo,)
             ).fetchone()[0]
 
-            # Items: one canonical line each, ordered by number. Content hash
-            # is over the object without the hash field itself.
-            item_rows = conn.execute(
-                "SELECT * FROM items WHERE repo = ? ORDER BY number", (repo,)
-            )
-            for row in item_rows:
-                content = _item_content(conn, repo, row, include, local)
-                digest = hashlib.sha256(canonical(content)).hexdigest()
-                content["content_hash"] = digest
-                spool.write(canonical(content) + b"\n")
-                counts["items"] += 1
-
-            for row in conn.execute(
-                "SELECT * FROM releases WHERE repo = ? ORDER BY tag_name",
-                (repo,),
+            # Items, releases, the optional revisions line, and the orphan
+            # trailer: one shared byte-piece stream (issue #29 eval consumes
+            # the same stream for its snapshot hash).
+            for piece in iter_corpus_content_lines(
+                conn, repo, include, routing=counts
             ):
-                spool.write(canonical(_release_content(row, include)) + b"\n")
-                counts["releases"] += 1
-
-            if "revisions" in include:
-                # Streamed element-wise: the rows array is never
-                # materialized. revisions.id (SQLite-assigned) is excluded;
-                # order is the content key, not the id.
-                rev_order = (
-                    "number, entity, entity_id, kind, origin,"
-                    " valid_from, valid_to, content"
-                )
-                spool.write(b'{"rows":[')
-                first = True
-                for r in conn.execute(
-                    "SELECT number, entity, entity_id, kind, origin, content,"
-                    " valid_from, valid_to FROM revisions WHERE repo = ?"
-                    f" ORDER BY {rev_order}",
-                    (repo,),
-                ):
-                    element = canonical(
-                        {
-                            "number": r["number"],
-                            "entity": r["entity"],
-                            "entity_id": r["entity_id"],
-                            "kind": r["kind"],
-                            "origin": r["origin"],
-                            "content": r["content"],
-                            "valid_from": r["valid_from"],
-                            "valid_to": r["valid_to"],
-                        }
-                    )
-                    if not first:
-                        spool.write(b",")
-                    spool.write(element)
-                    first = False
-                spool.write(b'],"type":"revisions"}\n')
-
-            # Orphan trailer: streamed from one ordered pass, element-wise,
-            # never materialized. Always the final content line.
-            spool.write(b'{"edges":[')
-            first = True
-
-            def _is_orphan(r: sqlite3.Row) -> bool:
-                src_local = r["src_type"] == "item" and r["src_id"] in local
-                dst_local = r["dst_type"] == "item" and r["dst_id"] in local
-                return not src_local and not dst_local
-
-            for r in conn.execute(
-                f"SELECT {_EDGE_COLUMNS} FROM edges WHERE repo = ?"
-                f" ORDER BY {_EDGE_ORDER}",
-                (repo,),
-            ):
-                if not _is_orphan(r):
-                    continue
-                element = canonical(_edge_row(r))
-                if not first:
-                    spool.write(b",")
-                spool.write(element)
-                counts["orphan_edges"] += 1
-                first = False
-            spool.write(b'],"type":"orphan_edges"}\n')
+                spool.write(piece)
 
             # The piecemeal lines above must hash exactly the bytes written;
             # simplest correct approach: hash the whole spool once.

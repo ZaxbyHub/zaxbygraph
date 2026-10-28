@@ -691,3 +691,27 @@ Results are capped (default 200 rows) and rows are fetched incrementally, so a
 query that *matches* millions of rows does not materialize them all. A
 non-positive `--limit` is clamped rather than passed through, because a negative
 `LIMIT` means *unlimited* in SQLite.
+
+## Derived reads (issue #29)
+
+`similar`, `explain`, `coupling`, `localize` ranking, and `eval` are **derived
+reads**: they are computed at query time from the tables above and never
+stored. Every result carries `derived: true`. The invariants:
+
+- The derived tier opens the store through the same read-only connection
+  reads use (`db.open_existing`, `mode=ro`); temp tables hold per-query
+  scratch, and a store file hash before/after any derived command is
+  byte-identical. The `sql` subcommand's authorizer denies the temp-object
+  creates the derived tier needs, so the two never share a connection
+  factory.
+- No new relations: derived pairs never enter `edges` (whose rows remain
+  EXTRACTED, GitHub-reported facts only), and the feature needs no schema
+  migration.
+- Raw path strings in `item_path_refs` are resolved at read time against a
+  vocabulary built from merged-PR `pr_files` paths (minus `removed`), by
+  exact or unique-suffix match; unresolved mentions never anchor a derived
+  pair.
+- `eval` consumes this store read-only and reports `corpus_sha256` over the
+  same content-line stream `export-corpus` hashes (via the exported
+  `iter_corpus_content_lines` / `corpus_sha256_from_lines` helpers), inside
+  one read snapshot with the metrics.

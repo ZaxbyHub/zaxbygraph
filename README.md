@@ -137,6 +137,36 @@ Every command accepts:
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
 
+### Derived reads — `similar`, `explain`, `coupling`, `eval`
+
+Four commands compute relatedness at query time from GitHub-reported facts
+already in the store. Everything they return is marked `derived: true`:
+these are computed opinions (weighted signals over paths, terms, error
+signatures, co-change and adjacency), never extracted evidence — they never
+touch the `edges` table and the store file stays byte-identical after every
+run. A pair is only ever proposed when an anchor signal fires (shared
+resolved path, shared error signature, shared item-item adjacency, or
+co-change between direct files); lexical/title/label similarity can only
+raise an anchored pair's score, so vocabulary-only and label-only look-alikes
+never pair. Weights live in a `[derive]` TOML table — defaults, then
+`<store>/config.toml`, then `.zaxbygraph.toml` in the working directory,
+then an explicit `--config` file (later wins per key; unknown keys, negative
+or non-finite values, and out-of-range hub parameters are `config_error`s).
+
+```bash
+zaxbygraph similar 42 [--limit 20] [--ls-files] [--config WEIGHTS.toml]
+zaxbygraph explain 42 57 [--ls-files] [--config WEIGHTS.toml]
+zaxbygraph coupling "src/zaxbygraph/query.py" [--limit 20]
+zaxbygraph eval similar|localize|bundle [--config WEIGHTS.toml]
+```
+
+| Command | Meaning |
+| --- | --- |
+| `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match, and unresolved mentions can never anchor a pair. `--ls-files` intersects the resolved vocabulary with the invoking checkout's `git ls-files` and echoes that checkout's HEAD sha. |
+| `explain A B` | The exact per-signal breakdown one pair scored — the same function `similar` slices, so the two cannot diverge. |
+| `coupling PATH` | Files that change together with PATH over merged PRs touching 2–50 files: `support` (co-occurrence count), `confidence` (support/support(PATH)), `lift` (N·support/(support(PATH)·support(other)), `null` instead of NaN when either file never appears in the population). Unmerged PRs never count. |
+| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5), and the issue sets single PRs closed (bundle: pair recall/precision) — under leakage controls (candidates restricted to items that existed at the target's creation; the target's closing PRs, post-cutoff PRs, post-fix comments and their rolled-up references excluded; signature components suppressed because stored signatures carry no origin). Results whose controls could not be applied are labelled `with_leakage` with reasons, and every result prints the `corpus_sha256` of the exact snapshot the metrics were computed on. |
+
 ### `sync` — fetch into the graph
 
 ```bash
