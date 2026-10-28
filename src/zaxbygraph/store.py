@@ -9,11 +9,15 @@ from zaxbygraph.extract import (
     ABSENT,
     CLOSES_REF_MARKER,
     EVIDENCE_CAP,
+    LINK_CONNECTIONS,
     PULL_OWNED_EXTRACTIONS,
+    branch_number_tokens,
     collapse_edges,
     edges_from_comment,
+    edges_from_commit_messages,
     edges_from_files,
     edges_from_item,
+    edges_from_links,
     edges_from_pr_state,
     edges_from_review,
     edges_from_timeline,
@@ -22,6 +26,9 @@ from zaxbygraph.extract import (
     item_kind,
     merge_absent,
     merge_evidence,
+    normalize_incomplete_connections,
+    parse_error_signatures,
+    parse_path_refs,
     revert_title_variants,
 )
 
@@ -74,6 +81,17 @@ def replace_item_children(conn: sqlite3.Connection, repo: str, number: int) -> N
     conn.execute(
         "DELETE FROM issue_field_values WHERE repo = ? AND number = ?", (repo, number)
     )
+    # v9 text-derived references (issue #26): derived from this item's text
+    # payload, so they replace with the other children on every re-ingest.
+    conn.execute(
+        "DELETE FROM item_path_refs WHERE repo = ? AND number = ?", (repo, number)
+    )
+    conn.execute(
+        "DELETE FROM item_signatures WHERE repo = ? AND number = ?", (repo, number)
+    )
+    # item_events and pr_commits are deliberately NOT here: they replace only
+    # when their GitHub-reported section was fetched complete (issue #27), so
+    # a degraded re-ingest must leave the stored rows alone.
 
 
 def snapshot_comment_associations(
@@ -301,23 +319,179 @@ def write_revisions(
         )
 
 
+def write_text_refs(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    body: str | None,
+    issue_comments: list[dict],
+    review_comments: list[dict],
+    reviews: list[dict],
+) -> None:
+    """Raw path refs and error signatures from this item's text (issue #26).
+    Runs inside ingest_item's transaction after replace_item_children emptied
+    the item's rows; every row derives from the text in hand with its origin
+    ('body', 'issue_comment:<id>', 'review_comment:<id>', 'review:<id>')."""
+    families: list[tuple[str, str | None]] = [("body", body)]
+    for rec in issue_comments:
+        gid = rec.get("id") or rec.get("github_id")
+        if gid is not None:
+            families.append((f"issue_comment:{gid}", rec.get("body")))
+    for rec in review_comments:
+        gid = rec.get("id") or rec.get("github_id")
+        if gid is not None:
+            families.append((f"review_comment:{gid}", rec.get("body")))
+    for rec in reviews:
+        rid = rec.get("id")
+        if rid is not None:
+            families.append((f"review:{rid}", rec.get("body")))
+    for origin, text in families:
+        for path, backticked in parse_path_refs(text, repo):
+            conn.execute(
+                "INSERT INTO item_path_refs(repo, number, origin, path, backticked)"
+                " VALUES (?, ?, ?, ?, ?)"
+                " ON CONFLICT(repo, number, origin, path) DO UPDATE SET"
+                " backticked = MAX(item_path_refs.backticked, excluded.backticked)",
+                (repo, number, origin, path, backticked),
+            )
+        for exception, error_line, frame_function in parse_error_signatures(text):
+            conn.execute(
+                "INSERT OR IGNORE INTO item_signatures(repo, number, exception,"
+                " error_line, frame_function) VALUES (?, ?, ?, ?, ?)",
+                (repo, number, exception, error_line, frame_function),
+            )
+
+
+def write_item_events(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    timeline: list[dict] | None,
+    timeline_complete: bool,
+) -> None:
+    """Reopen events become item_events rows (issue #27 AC7). Fires only when
+    the timeline section was PRESENT (None = never carried: plain REST, the
+    404 path — touching nothing is the degraded rule); rows replace ONLY when
+    the section was complete, so a truncated timeline never retracts stored
+    events."""
+    if timeline is None or not timeline_complete:
+        return
+    conn.execute(
+        "DELETE FROM item_events WHERE repo = ? AND number = ?", (repo, number)
+    )
+    for event in timeline:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "reopened":
+            continue
+        created_at = event.get("created_at")
+        if not created_at:
+            # The PK is NOT NULL on created_at (round-2 critic): a malformed
+            # event is skipped, never stored with a fabricated stamp.
+            continue
+        conn.execute(
+            "INSERT OR IGNORE INTO item_events(repo, number, type, created_at)"
+            " VALUES (?, ?, 'reopened', ?)",
+            (repo, number, created_at),
+        )
+
+
+def insert_pr_commits(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    commits: list[dict] | None,
+    commits_complete: bool,
+) -> None:
+    """Commit messages become pr_commits rows (issue #27 AC5). A COMPLETE
+    section replaces this item's rows exactly; an INCOMPLETE section (the
+    commits connection overflowed at 50) UNIONS the fetched messages into
+    the retained rows without deleting anything — the same degrade rule as
+    the link stream's overflow (review round PRR-008: discarding the fetched
+    page left >50-commit PRs with no rows and no derived edges at all).
+    Derived closes_keyword edges re-derive from these RETAINED rows on every
+    ingest, so a REST re-ingest never retracts them."""
+    if commits is None:
+        return
+    if commits_complete:
+        conn.execute(
+            "DELETE FROM pr_commits WHERE repo = ? AND number = ?", (repo, number)
+        )
+    for rec in commits:
+        if not isinstance(rec, dict):
+            continue
+        sha = rec.get("sha")
+        if not isinstance(sha, str) or not sha.strip():
+            continue
+        message = rec.get("message")
+        conn.execute(
+            "INSERT OR IGNORE INTO pr_commits(repo, number, sha, message)"
+            " VALUES (?, ?, ?, ?)",
+            (repo, number, sha.strip(), message),
+        )
+
+
+#: The links-section connection keys and the edge relation each replaces.
+#: Single source of truth: extract._LINK_CONNECTIONS (PR #41 review PRR-013) —
+#: rebuild_links deletes per this map while edges_from_links emits per that
+#: one; a drift would orphan edges silently.
+_LINK_RELATIONS = LINK_CONNECTIONS
+
+
+def rebuild_links(
+    conn: sqlite3.Connection, repo: str, number: int, links: dict | None,
+    links_incomplete: object,
+) -> None:
+    """GitHub-reported link edges (issue #27): per connection, a COMPLETE
+    fetch replaces this item's edges of that relation exactly; an OVERFLOWED
+    connection (named in links_incomplete) unions without retraction; an
+    ABSENT section (links is None, or the key missing from the dict) touches
+    nothing — a degraded re-ingest can never retract a GitHub-reported link
+    fact."""
+    if links is None or not isinstance(links, dict):
+        return
+    incomplete = normalize_incomplete_connections(links_incomplete)
+    # An overflow marker naming an UNKNOWN connection (a GraphQL field name,
+    # a hand-written bundle, a future rename) cannot be attributed to any
+    # specific connection: treat EVERY carried connection as overflowed —
+    # union-only, nothing replaced (review round PRR-007; replacing on an
+    # unrecognized marker silently retracted edges from a truncated page).
+    if incomplete - set(_LINK_RELATIONS):
+        incomplete = set(_LINK_RELATIONS) & set(links)
+    emitted = edges_from_links(repo, number, links)
+    for connection, relation in _LINK_RELATIONS.items():
+        if connection not in links:
+            continue
+        if connection not in incomplete:
+            conn.execute(
+                "DELETE FROM edges WHERE repo = ? AND src_type = 'item'"
+                " AND src_id = ? AND rel = ? AND source = 'link'",
+                (repo, str(number), relation),
+            )
+    for edge in collapse_edges(emitted):
+        insert_edge(conn, repo, edge)
+
+
 def delete_owned_edges(conn: sqlite3.Connection, repo: str, number: int) -> None:
     """Delete the edges this item OWNS, keeping everything else.
 
     Outbound text/payload edges are rebuilt from this item's payload, so they
-    go. The two GraphQL-only link streams (timeline events, closingIssue
-    references) are exempt (`source NOT IN ('timeline', 'closing_ref')`): a
-    degraded re-ingest (REST source, files-section-missing pull fallback, the
-    404 empty-children path) cannot re-derive them, and a closer PR's payload
-    can never re-derive an edge whose evidence lives on the closed item's
-    timeline. They are append-only once written — refreshed by upsert when
-    the source provides the section again, never retracted (issue #6; the
-    `--force` trade-off is documented in docs/schema.md). Inbound
-    mentions/closes from other items always survive."""
+    go. The three GraphQL-only link streams (timeline events, closingIssue
+    references, and the v10 GitHub-reported links) are exempt
+    (`source NOT IN ('timeline', 'closing_ref', 'link')`): a degraded
+    re-ingest (REST source, files-section-missing pull fallback, the 404
+    empty-children path) cannot re-derive them, and a closer PR's payload can
+    never re-derive an edge whose evidence lives on the closed item's
+    timeline. timeline and closing_ref edges are append-only once written —
+    refreshed by upsert when the source provides the section again, never
+    retracted (issue #6). link edges are replaced per connection when that
+    connection was fetched complete, union-only on overflow, and survive
+    every degraded re-ingest (docs/schema.md). Inbound mentions/closes from
+    other items always survive."""
     nid = str(number)
     conn.execute(
         "DELETE FROM edges WHERE repo = ? AND src_type = 'item' AND src_id = ? "
-        "AND source NOT IN ('timeline', 'closing_ref')",
+        "AND source NOT IN ('timeline', 'closing_ref', 'link')",
         (repo, nid),
     )
     # INDEXED BY is a plan hint, not a predicate change: the rel IN (...) term
@@ -731,8 +905,14 @@ def rebuild_edges(
     reviews: list[dict],
     files: list[dict],
     timeline: list[dict] | None = None,
+    links: dict | None = None,
+    links_incomplete: object = None,
 ) -> None:
     delete_owned_edges(conn, repo, number)
+    # GitHub-reported links replace/union per connection BEFORE the keyword
+    # edges insert (issue #27): the link stream's own exemption keeps a
+    # degraded re-ingest from retracting them.
+    rebuild_links(conn, repo, number, links, links_incomplete)
 
     def merge_commit_lookup(sha: str) -> int | None:
         row = conn.execute(
@@ -747,6 +927,15 @@ def rebuild_edges(
         ).fetchall()
         return [int(r[0]) for r in rows]
 
+    def issue_number_lookup(numbers: list[int]) -> set[int]:
+        placeholders = ",".join("?" * len(numbers))
+        rows = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND kind = 'issue'"
+            f" AND number IN ({placeholders})",
+            (repo, *numbers),
+        ).fetchall()
+        return {int(r[0]) for r in rows}
+
     collected: list[tuple] = []
     collected.extend(edges_from_item(repo, item_raw))
     for rec in issue_comments:
@@ -757,7 +946,23 @@ def rebuild_edges(
         collected.extend(edges_from_review(repo, number, rec))
     collected.extend(edges_from_files(number, files))
     collected.extend(edges_from_timeline(repo, number, timeline or [], merge_commit_lookup))
-    collected.extend(edges_from_pr_state(repo, item_raw, title_lookup))
+    collected.extend(edges_from_pr_state(repo, item_raw, title_lookup, issue_number_lookup))
+    # Commit-message closes_keyword edges derive from the RETAINED pr_commits
+    # rows, never from the payload in hand (issue #27): a REST re-ingest or an
+    # overflowed commits fetch re-derives IDENTICAL edges from the stored rows,
+    # so degradation can never retract them.
+    commit_rows = conn.execute(
+        "SELECT sha, message FROM pr_commits WHERE repo = ? AND number = ?",
+        (repo, number),
+    ).fetchall()
+    if commit_rows:
+        collected.extend(
+            edges_from_commit_messages(
+                repo,
+                number,
+                [{"sha": row["sha"], "message": row["message"]} for row in commit_rows],
+            )
+        )
     # Symmetric merge-close derivation (issue #6): a PR merged as commit X
     # closes every issue whose timeline already recorded closed_by_commit X,
     # whichever item ingests first. Self-excluded like the forward lookup,
@@ -793,6 +998,35 @@ def rebuild_edges(
                         "item",
                         nid,
                         evidence,
+                        "keyword",
+                    )
+                )
+    # Reverse branch reconciliation (issue #26 AC4, INSERT-ONLY): when THIS
+    # item is an issue, any stored PR whose head_ref carries exactly the
+    # number token N gains its branch_ref edge now, whichever ingests first.
+    # No edge owned by another item is ever deleted here (plan-critic round 2);
+    # a single token can never become ambiguous, so there is no retraction
+    # path at all.
+    if not (
+        item_raw.get("pull_request") is not None
+        or item_raw.get("merged_at") is not None
+        or (isinstance(item_raw.get("base"), dict) and isinstance(item_raw.get("head"), dict))
+    ):
+        for row in conn.execute(
+            "SELECT number, head_ref FROM items INDEXED BY idx_items_repo_head"
+            " WHERE repo = ? AND kind = 'pr' AND head_ref IS NOT NULL AND number != ?",
+            (repo, nid),
+        ).fetchall():
+            tokens = branch_number_tokens(row["head_ref"])
+            if len(tokens) == 1 and tokens[0] == number:
+                collected.append(
+                    (
+                        "item",
+                        str(row["number"]),
+                        "branch_ref",
+                        "item",
+                        nid,
+                        f"head_ref {row['head_ref']}",
                         "keyword",
                     )
                 )
@@ -983,6 +1217,9 @@ def ingest_item(
     include_patches: bool,
     timeline: list[dict] | None = None,
     children_complete: dict[str, bool] | None = None,
+    links: dict | None = None,
+    links_incomplete: object = None,
+    pr_commits: list[dict] | None = None,
     advance_watermark: bool = True,
 ) -> None:
     """One item, caller owns the transaction.
@@ -990,10 +1227,13 @@ def ingest_item(
     Identity and watermark come from the *issues list* payload. GET /pulls/{n}
     uses a different `id` and may have a different `updated_at`; those must
     not overwrite the list row (since filter is on issue updated_at).
-    `timeline` carries the item's GraphQL timeline events (closed /
-    cross-referenced); None means the source could not provide them, which
-    leaves previously stored timeline edges untouched via the delete-owned
-    exemption.
+    `timeline` carries the item's GraphQL timeline events; None means the
+    source could not provide them, which leaves previously stored timeline
+    edges untouched via the delete-owned exemption. The same
+    presence-vs-absence convention governs `links` and `pr_commits` (issue
+    #27): None = section never carried, so stored link edges, item_events and
+    pr_commits rows survive untouched; a carried section replaces only when
+    its completeness key is True.
 
     `children_complete` carries the per-section completeness map the sync
     resolved (issue #23): True where the bulk payload answered the section
@@ -1055,6 +1295,19 @@ def ingest_item(
         reviews,
         children_complete,
     )
+    # Text-derived references (issue #26): replaced with the children above.
+    write_text_refs(
+        conn, repo, number, merged.get("body"), issue_comments, review_comments, reviews
+    )
+    # GitHub-reported events and commit messages (issue #27): both gated on
+    # presence AND completeness, so a degraded re-ingest leaves stored rows.
+    complete_map = children_complete if isinstance(children_complete, dict) else {}
+    write_item_events(
+        conn, repo, number, timeline, complete_map.get("timeline") is True
+    )
+    insert_pr_commits(
+        conn, repo, number, pr_commits, complete_map.get("pr_commits") is True
+    )
     insert_labels(conn, repo, number, merged)
     insert_comments(
         conn, repo, number, issue_comments, "issue_comment", issue_associations
@@ -1093,6 +1346,8 @@ def ingest_item(
         reviews,
         files,
         timeline=timeline,
+        links=links,
+        links_incomplete=links_incomplete,
     )
     if advance_watermark:
         bump_watermark(conn, repo, list_raw.get("updated_at"))

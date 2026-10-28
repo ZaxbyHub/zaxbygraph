@@ -37,10 +37,10 @@ def _derived_relations() -> set[str]:
         "number": 1,
         "user": {"login": "alice"},
         "labels": [{"name": "bug"}],
-        "body": "Fixes #2, see #3",
+        "body": "Fixes #2, see #3, duplicate of #4",
     }
     out |= {e[2] for e in extract.edges_from_item(REPO, item)}
-    comment = {"id": 7, "user": {"login": "bob"}, "body": "fixes #2"}
+    comment = {"id": 7, "user": {"login": "bob"}, "body": "fixes #2, dup of #4"}
     out |= {e[2] for e in extract.edges_from_comment(REPO, 1, comment)}
     review = {"id": 8, "user": {"login": "bob"}, "state": "APPROVED", "body": "closes #2"}
     out |= {e[2] for e in extract.edges_from_review(REPO, 1, review)}
@@ -99,6 +99,35 @@ def _derived_relations() -> set[str]:
         e[2]
         for e in extract.edges_from_pr_state(
             REPO, pr_title_only, lambda span: [5]
+        )
+    }
+
+    # v9 (issue #26): branch_ref through the forward pass — a PR head_ref
+    # with exactly one numeric token resolving to one stored issue.
+    branch_pr = dict(item)
+    branch_pr["title"] = "pr"
+    branch_pr["merged_at"] = None
+    branch_pr["pull_request"] = {"url": "x"}
+    branch_pr["head"] = {"ref": "fix/5-slugged"}
+    out |= {
+        e[2]
+        for e in extract.edges_from_pr_state(
+            REPO, branch_pr, None, lambda numbers: {5}
+        )
+    }
+
+    # v10 (issue #27): every links connection plus commit-message keywords.
+    links = {
+        "blocked_by": [{"number": 2, "repo": None}],
+        "parent": {"number": 3, "repo": None},
+        "duplicate_of": {"number": 4, "repo": "Other/Repo"},
+        "open_prs": [{"number": 9, "repo": None}],
+    }
+    out |= {e[2] for e in extract.edges_from_links(REPO, 1, links)}
+    out |= {
+        e[2]
+        for e in extract.edges_from_commit_messages(
+            REPO, 1, [{"sha": "abc1234", "message": "fixes #2"}]
         )
     }
     return out

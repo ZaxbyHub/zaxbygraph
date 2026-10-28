@@ -124,24 +124,73 @@ closingIssuesReferences(first: 100) {
 }
 """
 
-_PULL_SCALARS = """
-additions
-deletions
-changedFiles
-commits { totalCount }
-mergedAt
-mergeCommit { oid }
-baseRefName
-headRefName
-isDraft
-mergedBy { login }
-""" + _CLOSING_REFS_NODES
+#: GitHub-reported link selections (issue #27). parent/duplicateOf are
+#: SINGULAR nodes (live-schema verified, plan-critic round 1) and may be
+#: JSON null (no parent / not a duplicate) — key presence is the carried
+#: signal, null is a cleared value.
+_LINKED_NODES = """
+blockedBy(first: 50) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    number
+    repository { nameWithOwner }
+  }
+}
+"""
 
-#: Timeline events ride every page query (issue #6): closed events carry the
-#: closer union (commit sha or pull request number), cross-references carry
-#: source/target so direction is stored as carried per side.
-_TIMELINE_NODES = """
-timelineItems(first: 50, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT]) {
+_PARENT_NODE = """
+parent {
+  number
+  repository { nameWithOwner }
+}
+"""
+
+_DUPLICATE_NODE = """
+duplicateOf {
+  number
+  repository { nameWithOwner }
+}
+"""
+
+_OPEN_PR_NODES = """
+closedByPullRequestsReferences(first: 50, includeClosedPrs: false) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    number
+    repository { nameWithOwner }
+  }
+}
+"""
+
+#: Commit messages (issue #27 AC5). The scalar totalCount the v7 selection
+#: carried survives inside the node-bearing connection — the probe drop-list
+#: keeps the SAME `commits` field name so the fragment tuple and the rendered
+#: query cannot drift (plan-critic round 1).
+_COMMITS_NODES = """
+commits(first: 50) {
+  totalCount
+  pageInfo { hasNextPage }
+  nodes {
+    commit {
+      oid
+      messageHeadline
+      messageBody
+    }
+  }
+}
+"""
+
+#: Timeline event types the page queries request. REOPENED_EVENT (issue #27
+#: AC7) rides the same connection; a host whose schema lacks it is degraded
+#: by the capability probe's ENUM introspection (unknown = fail open and
+#: include, the #23 rule).
+_TIMELINE_EVENT_TYPES = ("CLOSED_EVENT", "CROSS_REFERENCED_EVENT", "REOPENED_EVENT")
+_TIMELINE_TYPES_ALL = "[" + ", ".join(_TIMELINE_EVENT_TYPES) + "]"
+
+_TIMELINE_NODES_TMPL = """
+timelineItems(first: 50, itemTypes: %(types)s) {
   totalCount
   pageInfo { hasNextPage endCursor }
   nodes {
@@ -165,37 +214,41 @@ timelineItems(first: 50, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT]) {
         ... on Issue { number repository { nameWithOwner } }
         ... on PullRequest { number repository { nameWithOwner } }
       }
-    }
+    }%(reopened)s
   }
 }
 """
 
-_ISSUE_FIELDS = f"""
-databaseId
-{_ISSUE_COMMENT_NODES}
-{_TIMELINE_NODES}
+_REOPENED_FRAGMENT = """
+    ... on ReopenedEvent {
+      createdAt
+    }
 """
 
-_PULL_FIELDS = f"""
-databaseId
-{_ISSUE_COMMENT_NODES}
-{_PULL_SCALARS}
-{_REVIEW_NODES}
-{_FILE_NODES}
-{_TIMELINE_NODES}
-"""
+
+def _timeline_nodes(types: str = _TIMELINE_TYPES_ALL) -> str:
+    """The timelineItems selection at a given itemTypes list. Page queries
+    AND continuation queries render through the same helper (the continuation
+    path calls GraphQLSource._timeline_selection, which shares this)."""
+    reopened = _REOPENED_FRAGMENT if "REOPENED_EVENT" in types else ""
+    return _TIMELINE_NODES_TMPL % {"types": types, "reopened": reopened}
+
+
+#: Timeline events ride every page query (issue #6): closed events carry the
+#: closer union (commit sha or pull request number), cross-references carry
+#: source/target so direction is stored as carried per side; reopen events
+#: (issue #27) land in item_events, never in edges.
+_TIMELINE_NODES = _timeline_nodes()
 
 #: Field-selection fragments for the page query, each tagged with the exact
-#: schema field it renders. A capability probe drops every fragment whose
-#: field the host's schema no longer carries — PER FIELD, not per block, so
-#: drift on any single selected field degrades that selection instead of
-#: aborting the sync with a validation error (issue #23). Omitted names are
-#: recorded for fetch_log.
+#: schema field it renders; _PULL_TYPE_BLOCKS consumes this tuple. A
+#: capability probe drops every fragment whose field the host schema lacks
+#: (issue #23, per field).
 _PULL_SCALAR_FRAGMENTS = (
     ("additions", "additions"),
     ("deletions", "deletions"),
     ("changedFiles", "changedFiles"),
-    ("commits", "commits { totalCount }"),
+    ("commits", _COMMITS_NODES),
     ("mergedAt", "mergedAt"),
     ("mergeCommit", "mergeCommit { oid }"),
     ("baseRefName", "baseRefName"),
@@ -203,10 +256,20 @@ _PULL_SCALAR_FRAGMENTS = (
     ("isDraft", "isDraft"),
     ("mergedBy", "mergedBy { login }"),
 )
+
+#: Issue-side selections, tagged with the exact schema field each renders so
+#: the capability probe can drop them PER FIELD (issue #23).
 _ISSUE_TYPE_BLOCKS = (
     ("comments", _ISSUE_COMMENT_NODES),
+    ("blockedBy", _LINKED_NODES),
+    ("parent", _PARENT_NODE),
+    ("duplicateOf", _DUPLICATE_NODE),
+    ("closedByPullRequestsReferences", _OPEN_PR_NODES),
     ("timelineItems", _TIMELINE_NODES),
 )
+
+_ISSUE_FIELDS = "\n".join(["databaseId", *(block for _, block in _ISSUE_TYPE_BLOCKS)])
+
 _PULL_TYPE_BLOCKS = (
     ("comments", _ISSUE_COMMENT_NODES),
     *_PULL_SCALAR_FRAGMENTS,
@@ -216,6 +279,14 @@ _PULL_TYPE_BLOCKS = (
     ("closingIssuesReferences", _CLOSING_REFS_NODES),
 )
 
+_PULL_FIELDS = "\n".join(["databaseId", *(block for _, block in _PULL_TYPE_BLOCKS)])
+
+#: Field-selection fragments for the page query, each tagged with the exact
+#: schema field it renders. A capability probe drops every fragment whose
+#: field the host's schema no longer carries — PER FIELD, not per block, so
+#: drift on any single selected field degrades that selection instead of
+#: aborting the sync with a validation error (issue #23). Omitted names are
+#: recorded for fetch_log.
 _CHANGE_TYPE_TO_STATUS = {
     "ADDED": "added",
     "DELETED": "removed",
@@ -258,6 +329,18 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     if isinstance(total, int) and total > len(out):
         incomplete = True
     return out, incomplete
+
+
+def _commit_message(commit: dict) -> str | None:
+    """Headline + body composed into one message string (issue #27 AC5); a
+    null messageBody degrades to the headline alone."""
+    headline = commit.get("messageHeadline")
+    body = commit.get("messageBody")
+    if not headline:
+        return None
+    if body:
+        return headline + "\n\n" + body
+    return headline
 
 
 def _comment_payload(node: dict, *, in_reply_to_id=None) -> dict:
@@ -306,6 +389,11 @@ def _timeline_event(node: dict) -> dict:
             if closer_type == "PullRequest"
             else None,
         }
+    if typename == "ReopenedEvent":
+        return {
+            "type": "reopened",
+            "created_at": node.get("createdAt"),
+        }
     if typename == "CrossReferencedEvent":
         source = node.get("source")
         if not isinstance(source, dict):
@@ -328,12 +416,16 @@ def _timeline_event(node: dict) -> dict:
     return {"type": str(typename or "unknown").lower()}
 
 
-def _timeline_selection(args: str) -> str:
+def _timeline_selection(args: str, types: str = _TIMELINE_TYPES_ALL) -> str:
     """The timelineItems selection shared by the page query and the
     continuation/replacement queries (always inside the 250-per-request
-    GitHub cap)."""
+    GitHub cap). `types` is the capability-degraded itemTypes list the source
+    computes (issue #27) — page and continuation cannot drift."""
+    reopened = (
+        " ... on ReopenedEvent { createdAt }" if "REOPENED_EVENT" in types else ""
+    )
     return (
-        "timelineItems(%s itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT]) {"
+        "timelineItems(%s itemTypes: %s) {"
         " totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor }"
         " nodes { __typename"
         " ... on ClosedEvent { createdAt actor { login } closer { __typename"
@@ -341,8 +433,8 @@ def _timeline_selection(args: str) -> str:
         " ... on CrossReferencedEvent { createdAt actor { login } isCrossRepository"
         " willCloseTarget source { __typename"
         " ... on Issue { number repository { nameWithOwner } }"
-        " ... on PullRequest { number repository { nameWithOwner } } } } } }"
-    ) % args
+        " ... on PullRequest { number repository { nameWithOwner } } } }%s } }"
+    ) % (args, types, reopened)
 
 
 class GraphQLSource(GhApiSource):
@@ -383,7 +475,9 @@ class GraphQLSource(GhApiSource):
             'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } '
             'ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
             'rc: __type(name: "PullRequestReviewComment") '
-            "{ fields(includeDeprecated: true) { name } } }"
+            "{ fields(includeDeprecated: true) { name } } "
+            't: __type(name: "IssueTimelineItemsItemType") '
+            "{ enumValues { name } } }"
         )
         payload = self._graphql(query)
         caps: dict[str, set[str]] = {}
@@ -405,6 +499,20 @@ class GraphQLSource(GhApiSource):
                 # An empty introspection answer means "unknown", not "the type
                 # has no fields" — omit it so the fail-open rule applies.
                 caps[type_name] = names
+        enum_node = payload.get("t")
+        enum_names: set[str] = set()
+        if isinstance(enum_node, dict) and isinstance(enum_node.get("enumValues"), list):
+            enum_names = {
+                str(v.get("name"))
+                for v in enum_node["enumValues"]
+                if isinstance(v, dict) and v.get("name")
+            }
+        if enum_names:
+            # Stored ONLY when introspection answered (issue #27): a null or
+            # absent value never reaches the persistence serializer (round-2
+            # critic probe: sorted(None) aborts sync); an absent key on
+            # re-attach means unknown, which fails open.
+            caps["timeline_event_types"] = enum_names
         self._capabilities = caps
         return caps
 
@@ -418,7 +526,7 @@ class GraphQLSource(GhApiSource):
         row degrades to no-capabilities (full field set) rather than
         stripping the query down to databaseId alone."""
         parsed: dict[str, set[str]] = {}
-        for type_name in ("Issue", "PullRequest", "IssueComment", "PullRequestReviewComment"):
+        for type_name in ("Issue", "PullRequest", "IssueComment", "PullRequestReviewComment", "timeline_event_types"):
             fields = caps.get(type_name) if isinstance(caps, dict) else None
             # The probe path passes sets, the meta-cache path passes lists
             # (JSON round-trip): accept any non-string collection, but every
@@ -429,6 +537,27 @@ class GraphQLSource(GhApiSource):
                 if names:
                     parsed[type_name] = names
         self._capabilities = parsed or None
+
+    def _timeline_item_types(self) -> str:
+        """The itemTypes list the page/continuation queries request, degraded
+        when the probe's ENUM introspection knows the host schema lacks
+        REOPENED_EVENT (issue #27). Unknown (no probe, empty answer) fails
+        open to the full list; the two baseline event types are never
+        dropped."""
+        event_types = (
+            self._capabilities.get("timeline_event_types")
+            if self._capabilities
+            else None
+        )
+        if event_types is None:
+            return _TIMELINE_TYPES_ALL
+        kept = [t for t in _TIMELINE_EVENT_TYPES if t in event_types]
+        if not kept:
+            kept = ["CLOSED_EVENT", "CROSS_REFERENCED_EVENT"]
+        return "[" + ", ".join(kept) + "]"
+
+    def _timeline_block(self) -> str:
+        return _timeline_nodes(self._timeline_item_types())
 
     def _fields_for(self, kind: str) -> str:
         """Field selection for one alias, honoring the active capability map.
@@ -462,7 +591,10 @@ class GraphQLSource(GhApiSource):
             and "authorAssociation" not in review_comment_caps
         )
         parts = ["databaseId"]
+        timeline_block = self._timeline_block()
         for field, block in blocks:
+            if block is _TIMELINE_NODES:
+                block = timeline_block
             if field in present:
                 if strip_issue and block is _ISSUE_COMMENT_NODES:
                     block = block.replace("    authorAssociation\n", "")
@@ -657,7 +789,7 @@ class GraphQLSource(GhApiSource):
         query = (
             "query { rateLimit { remaining resetAt } "
             f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
-            f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args)} }} }} }}"
+            f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args, self._timeline_item_types())} }} }} }}"
         )
         # The alias map lets a section-scoped runtime error degrade the same
         # way the page query degrades: the timeline section drops and the
@@ -905,6 +1037,61 @@ class GraphQLSource(GhApiSource):
             children["pull"] = pull_payload
             if closing_more:
                 children["closing_refs_incomplete"] = True
+
+        # Commit messages (issue #27): independent of the pull gate — a
+        # capability mask can drop baseRefName/mergedAt while commits answer.
+        commits_conn = node.get("commits")
+        if isinstance(commits_conn, dict) and "nodes" in commits_conn:
+            commit_nodes, commits_more = _connection(commits_conn)
+            children["pr_commits"] = [
+                {
+                    "sha": ((c.get("commit") or {}).get("oid")),
+                    "message": _commit_message(c.get("commit") or {}),
+                }
+                for c in commit_nodes
+            ]
+            if commits_more:
+                children["pr_commits_incomplete"] = True
+
+        link_fields = (
+            "blockedBy",
+            "parent",
+            "duplicateOf",
+            "closedByPullRequestsReferences",
+        )
+        if any(field in node for field in link_fields):
+            def _link_node(raw_node: object) -> dict | None:
+                if not isinstance(raw_node, dict):
+                    return None
+                repo_ref = raw_node.get("repository")
+                return {
+                    "number": _int_or_none(raw_node.get("number")),
+                    "repo": repo_ref.get("nameWithOwner")
+                    if isinstance(repo_ref, dict)
+                    else None,
+                }
+
+            links: dict = {}
+            overflowed: list[str] = []
+            if "blockedBy" in node:
+                blocked_nodes, blocked_more = _connection(node.get("blockedBy"))
+                links["blocked_by"] = [_link_node(n) for n in blocked_nodes]
+                if blocked_more:
+                    overflowed.append("blocked_by")
+            if "parent" in node:
+                links["parent"] = _link_node(node.get("parent"))
+            if "duplicateOf" in node:
+                links["duplicate_of"] = _link_node(node.get("duplicateOf"))
+            if "closedByPullRequestsReferences" in node:
+                open_nodes, open_more = _connection(
+                    node.get("closedByPullRequestsReferences")
+                )
+                links["open_prs"] = [_link_node(n) for n in open_nodes]
+                if open_more:
+                    overflowed.append("open_prs")
+            children["links"] = links
+            if overflowed:
+                children["links_incomplete"] = overflowed
 
         if node.get("timelineItems") is not None:
             events, timeline_more = _connection(node.get("timelineItems"))

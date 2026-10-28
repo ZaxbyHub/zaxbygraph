@@ -58,6 +58,13 @@ _COPY_TABLES = (
     ("edges", "id"),
     ("fetch_log", "id"),
     ("revisions", "id"),
+    # v9 text-derived references (issue #26) and v10 events/commits
+    # (issue #27): composite-keyed item-scoped children, so consolidation
+    # must copy them like the other child tables or silently drop history.
+    ("item_path_refs", None),
+    ("item_signatures", None),
+    ("item_events", None),
+    ("pr_commits", None),
 )
 
 

@@ -43,9 +43,20 @@ from collections import deque
 from pathlib import Path
 
 #: The bulk child sections a bundle records, plus the GraphQL-only keys the
-#: recorded completeness map also covers.
+#: recorded completeness map also covers. v10 (issue #27) adds the links and
+#: pr_commits payloads (None = never carried, preserved verbatim) and the
+#: per-connection completeness keys.
 _RECORDED_SECTIONS = ("issue_comments", "review_comments", "reviews", "files")
-_RECORDED_COMPLETENESS_KEYS = (*_RECORDED_SECTIONS, "pull", "timeline")
+_RECORDED_COMPLETENESS_KEYS = (
+    *_RECORDED_SECTIONS,
+    "pull",
+    "timeline",
+    "links_blocked_by",
+    "links_parent",
+    "links_duplicate_of",
+    "links_open_prs",
+    "pr_commits",
+)
 
 
 def _absent_completeness() -> dict[str, bool]:
@@ -202,7 +213,21 @@ class JsonlReplaySource:
             for section in ("pull", *_RECORDED_SECTIONS):
                 if bundle.get(section) is not None:
                     child[section] = bundle[section]
-            child["timeline"] = list(bundle.get("timeline") or [])
+            # Presence semantics (issue #27): a bundle that recorded the
+            # timeline carries it (list); a REST-recorded null/missing key
+            # stays ABSENT so stored item_events survive the replay exactly
+            # as a live REST re-ingest leaves them.
+            if isinstance(bundle.get("timeline"), list):
+                child["timeline"] = list(bundle["timeline"])
+            # v10 sections ride with their PRESENCE semantics: a bundle that
+            # recorded links/pr_commits carries them; an older bundle's
+            # missing keys stay absent (None downstream), so stored link
+            # edges, events and commit rows survive the replay untouched.
+            for section in ("links", "pr_commits"):
+                if bundle.get(section) is not None:
+                    child[section] = bundle[section]
+            if "links_incomplete" in bundle:
+                child["links_incomplete"] = bundle["links_incomplete"]
             # The recorded completeness map rides the provided payload into
             # _resolve_children, which applies it verbatim (issue #25).
             child["children_complete"] = dict(

@@ -39,7 +39,7 @@ def _capabilities_key(version: str | None = None) -> str:
     """The meta key sync derives, or an explicitly different one."""
     if version is None:
         version = _gh_version(sys.executable)
-    return f"capability_probe:v2:{_gh_host()}:{version}"
+    return f"capability_probe:v3:{_gh_host()}:{version}"
 
 
 class _GoneBulkSource(PageShapedBulkSource):
@@ -110,8 +110,19 @@ class ProbeTrailTests(TempDBTest):
             ).fetchall()
         ]
         # exact: one row per omitted field, no spurious rows (a mutant that
-        # records omissions for fields it still selects would add rows here)
-        self.assertEqual(notes, ["omitted timelineItems"])
+        # records omissions for fields it still selects would add rows here).
+        # v10 (issue #27): the old-shape host schema also lacks the four link
+        # fields, so the probe omits all five.
+        self.assertEqual(
+            notes,
+            [
+                "omitted blockedBy",
+                "omitted closedByPullRequestsReferences",
+                "omitted duplicateOf",
+                "omitted parent",
+                "omitted timelineItems",
+            ],
+        )
 
     def test_drop_note_recorded(self) -> None:
         """A section-scoped FORBIDDEN must leave a fetch_log note naming the

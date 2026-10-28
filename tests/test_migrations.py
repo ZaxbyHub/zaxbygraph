@@ -1377,12 +1377,13 @@ class MigrateV7ToV8Tests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_fresh_database_born_at_v8(self) -> None:
+    def test_fresh_database_born_at_current_version(self) -> None:
         conn = connect(self.db_path)
         try:
             init_schema(conn)
             self.assertEqual(
-                int(conn.execute("PRAGMA user_version").fetchone()[0]), 8
+                int(conn.execute("PRAGMA user_version").fetchone()[0]),
+                CURRENT_USER_VERSION,
             )
             self.assertIsNotNone(
                 conn.execute(
