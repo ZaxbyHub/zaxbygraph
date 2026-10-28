@@ -428,6 +428,45 @@ column, which export-graph emits under the `provenance` key instead.
 Intended for handing to a graph viewer or joining with a code
 graph on `file:` nodes.
 
+### `export-corpus` — deterministic, hash-stamped corpus snapshot
+
+```bash
+zaxbygraph export-corpus [--out F] [--include raw,patches,revisions] [--require-complete]
+```
+
+Writes a schema-versioned JSONL snapshot (`zaxbygraph.corpus.v1`): the first
+line is a manifest (counts, `corpus_sha256`, store completeness, an unhashed
+`provenance` block carrying `fetch_log`, `sync_state` and `meta`), followed by
+one line per item (each with a sha256 `content_hash`) and one per release, an
+optional `revisions` line, and an `orphan_edges` trailer that is always the
+final content line. With no `--out`, the snapshot is written to **stdout as
+bytes** (binary — never text mode, so no platform newline translation).
+
+Determinism contract: two exports of one store are byte-identical; a sync
+that fetched nothing new leaves `corpus_sha256` unchanged (the hashed domain
+is stored content in canonical JSON — `sort_keys`, ASCII/UTF-8, `\n` — and
+excludes the SQLite-assigned identities `comments.pk`, `edges.id`,
+`revisions.id`, which are rewritten by the inclusive-boundary re-ingest every
+sync performs). Bundles, evaluation runs and git snapshots can therefore cite
+the exact corpus an answer was computed from. Every edge is emitted exactly
+once: under its `src` item, under its `dst` item when the source is an actor,
+commit, or a foreign `owner/repo#N` reference, or in the trailer when neither
+endpoint is stored.
+
+Flags: `--include raw` adds each item/comment/review/release's stored
+`raw_json`; `--include patches` adds `pr_files.patch` (null unless the store
+was synced with `--include-patches`); `--include revisions` adds a line with
+the #25 revision rows (id-free). `--require-complete` exits non-zero unless
+the store is complete and error-free (the manifest always mirrors the
+underlying `full_sync_pending`/`last_error` fields either way). All reads run
+under one read snapshot: a concurrent sync cannot split the corpus. Stores
+older than schema v10 are refused (`store_too_old`) — re-run `sync` once to
+migrate.
+
+> **Warning:** exports contain GitHub user content verbatim (titles, bodies,
+> comments, reviews, release notes). Treat the artifact as you would the
+> GitHub data itself.
+
 ## MCP server
 
 `zaxbygraph mcp` runs a stdio MCP (Model Context Protocol) server — the same

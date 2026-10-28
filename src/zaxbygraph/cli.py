@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from zaxbygraph import __version__
+from zaxbygraph import export
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.doctor import doctor as doctor_run
 # The default sync source is the GraphQL bulk source (issue #5); it is bound
@@ -1103,6 +1104,75 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_corpus(args: argparse.Namespace) -> int:
+    repo: str | None = None
+    db_path: Path | None = None
+    try:
+        conn, repo, db_path = _open_for_read(args)
+    except _ReadFailure as exc:
+        return emit_failure(
+            args,
+            exc.code,
+            exc.message,
+            slug=repo or getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+        )
+    if repo is None:
+        # Explicit --repo "" skips every corpus guard in _open_for_read; the
+        # corpus is defined per repo, so refuse rather than guess a filter.
+        return emit_failure(
+            args,
+            2,
+            "export-corpus requires a resolved repository; --repo '' is not"
+            " supported here",
+            slug=None,
+            db_path=db_path,
+            code_key="repo_required",
+        )
+    include = frozenset(
+        item.strip() for item in (args.include or "").split(",") if item.strip()
+    )
+    unknown = sorted(include - set(export.INCLUDE_CHOICES))
+    if unknown:
+        conn.close()
+        return emit_failure(
+            args,
+            2,
+            f"unknown --include value(s): {', '.join(unknown)}",
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_include",
+            hint=f"--include accepts: {', '.join(export.INCLUDE_CHOICES)}",
+        )
+    out_path = getattr(args, "out", None)
+    try:
+        target = None if out_path else sys.stdout.buffer
+        export.write_corpus(
+            conn,
+            repo,
+            target,
+            out_path,
+            include,
+            bool(getattr(args, "require_complete", False)),
+            str(db_path),
+        )
+    except export.ExportError as exc:
+        return emit_failure(
+            args,
+            exc.exit_code,
+            exc.message,
+            slug=repo,
+            db_path=db_path,
+            code_key=exc.code,
+            hint=exc.hint,
+        )
+    finally:
+        conn.close()
+        if not out_path:
+            sys.stdout.flush()
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     repo: str | None = None
     db_path: Path | None = None
@@ -1319,6 +1389,24 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("export-graph", help="Graphify-shaped {nodes, edges} JSON")
     add_common(sp)
     sp.set_defaults(func=cmd_export)
+    sp = sub.add_parser(
+        "export-corpus",
+        help="Deterministic hash-stamped corpus snapshot (JSONL, zaxbygraph.corpus.v1)",
+    )
+    add_common(sp)
+    sp.add_argument("--out", default=None, metavar="F", help="Write to file F (default: stdout, binary)")
+    sp.add_argument(
+        "--include",
+        default="",
+        metavar="ITEMS",
+        help="Comma-separated extras: raw,patches,revisions",
+    )
+    sp.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Refuse (exit 1) unless the store is complete and error-free",
+    )
+    sp.set_defaults(func=cmd_export_corpus)
 
     sp = sub.add_parser("where", help="Print the resolution chain for this checkout")
     add_common(sp)
