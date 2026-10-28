@@ -497,7 +497,7 @@ class ReplayFixtureTests(TempDBTest):
             db_file = replay_conn.execute("PRAGMA database_list").fetchone()[2]
             export_conn = open_existing(Path(db_file))
             try:
-                data = _export(export_conn, str(self.FIXTURE.parent))
+                data = _export(export_conn, str(db_file))
             finally:
                 export_conn.close()
             manifest = _verify_canonical_and_hashes(data)
@@ -581,6 +581,174 @@ class GuardTests(TempDBTest):
         self.assertEqual(len(rev_lines), 1)
         for row in rev_lines[0]["rows"]:
             self.assertNotIn("id", row)
+
+    def test_include_revisions_orders_by_content_key_and_carries_rows(self) -> None:
+        """The plan's non-vacuous revisions leg: real rows (an empty corpus
+        would make the id-free/order assertions iterate nothing), ordered by
+        the content key — never by the SQLite-assigned id, which
+        consolidation rewrites. The id order here deliberately CONTRADICTS
+        the content-key order, so a regression to ORDER BY id fails."""
+        self._synced()
+        # Content key (number, entity, ...) order: item 1 comment, then
+        # item_body, then item_title. Id order: 9001 title, 9002 body,
+        # 9003 comment — the opposite.
+        self.conn.executemany(
+            "INSERT INTO revisions(id, repo, number, entity, entity_id, kind,"
+            " origin, content, valid_from, valid_to)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    9001,
+                    REPO,
+                    1,
+                    "item_title",
+                    None,
+                    None,
+                    "edit",
+                    "older title",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-02T00:00:00Z",
+                ),
+                (
+                    9002,
+                    REPO,
+                    1,
+                    "item_body",
+                    None,
+                    None,
+                    "edit",
+                    "older content",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-02T00:00:00Z",
+                ),
+                (
+                    9003,
+                    REPO,
+                    1,
+                    "comment",
+                    50001,
+                    "issue_comment",
+                    "deleted",
+                    "a deleted comment body",
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-02T00:00:00Z",
+                ),
+                (
+                    9004,
+                    REPO,
+                    2,
+                    "item_title",
+                    None,
+                    None,
+                    "edit",
+                    "pr title preimage",
+                    "2026-01-03T00:00:00Z",
+                    "2026-01-04T00:00:00Z",
+                ),
+            ],
+        )
+        self.conn.commit()
+        conn = open_existing(self.db_path)
+        try:
+            data = _export(conn, str(self.db_path), include=("revisions",))
+        finally:
+            conn.close()
+        rev_lines = [
+            json.loads(line.decode("ascii"))
+            for line in _content_lines(data)
+            if b'"type":"revisions"' in line
+        ]
+        self.assertEqual(len(rev_lines), 1)
+        got = rev_lines[0]["rows"]
+        self.assertEqual(len(got), 4)
+        keys = [
+            (
+                r["number"],
+                r["entity"],
+                r["entity_id"],
+                r["kind"],
+                r["origin"],
+                r["valid_from"],
+                r["valid_to"],
+                r["content"],
+            )
+            for r in got
+        ]
+        self.assertEqual(keys, sorted(keys), "revisions must follow the content key")
+        # Content-key order: the item-1 comment row (id 9003, highest of the
+        # item-1 ids) comes FIRST, where ORDER BY id would put it last.
+        self.assertEqual(
+            [r["entity"] for r in got[:3]],
+            ["comment", "item_body", "item_title"],
+            "id order (title, body, comment) must not leak through",
+        )
+        for row in got:
+            self.assertNotIn("id", row)
+
+    def test_include_patches_exports_stored_patch(self) -> None:
+        """The stored (non-null) patch leg: a file synced WITH a patch under
+        --include-patches exports that exact patch text; the same store
+        without the flag omits the key; a no-patch sync exports null."""
+        patched_file = {
+            "filename": "src/app.py",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "sha": "abc123",
+            "patch": "@@ -1,2 +1,4 @@\n line\n+added",
+        }
+        src = FakeGitHubSource()
+        src.add_issue(issue(1, title="one", body="body"))
+        src.add_pr(issue(2, title="PR", body="", kind="pr"), pull(2, merged=True), files=[patched_file])
+        sync_repo(self.conn, src, REPO, include_patches=True)
+        self.assertEqual(
+            self.conn.execute("SELECT patch FROM pr_files WHERE number = 2").fetchone()["patch"],
+            patched_file["patch"],
+        )
+        conn = open_existing(self.db_path)
+        try:
+            with_flag = _export(conn, str(self.db_path), include=("patches",))
+            without_flag = _export(conn, str(self.db_path))
+        finally:
+            conn.close()
+        for line in _content_lines(with_flag):
+            obj = json.loads(line.decode("ascii"))
+            for f in obj.get("pr_files", []):
+                self.assertEqual(f["patch"], patched_file["patch"])
+        found = False
+        for line in _content_lines(without_flag):
+            obj = json.loads(line.decode("ascii"))
+            for f in obj.get("pr_files", []):
+                self.assertNotIn("patch", f)
+                found = True
+        self.assertTrue(found, "fixture must contain pr_files rows")
+
+    def test_text_mode_prints_stderr_identity_line(self) -> None:
+        """The review-round contract: in text mode a successful export prints
+        the same stderr trust summary as every other read; machine formats
+        stay silent (AC5 already pins the silent leg)."""
+        self._synced()
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "zaxbygraph",
+                "export-corpus",
+                "--repo",
+                REPO,
+                "--db",
+                str(self.db_path),
+                "--format",
+                "text",
+                "--out",
+                str(Path(self._td.name) / "corpus.jsonl"),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        self.assertTrue(proc.stderr.decode("utf-8").startswith("# db="))
 
     def test_per_item_edges_are_full_key_ordered(self) -> None:
         """The plan's ordering law: an item's routed edges are ordered by the

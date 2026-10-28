@@ -436,44 +436,50 @@ def write_corpus(
     if out_path:
         _reject_database_alias(out_path, db_path)
 
-    with _read_snapshot(conn):
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version < MIN_EXPORT_VERSION:
-            raise ExportError(
-                "store_too_old",
-                f"store schema is v{version}; export-corpus needs v"
-                f"{MIN_EXPORT_VERSION}+ (item_events/pr_commits are missing"
-                " below it)",
-                hint="re-run sync once against this database to migrate",
-            )
-        state = _check_completeness(conn, repo, require_complete)
+    fd, spool_path = tempfile.mkstemp(prefix="zaxbygraph-export-")
+    os.close(fd)
+    try:
+        # Snapshot phase: BEGIN DEFERRED is taken before the first read and
+        # held across every read of one export (spool + manifest), then
+        # RELEASED before the destination-copy phase — a WAL read-mark is
+        # never pinned across the disk write (plan REV 3, R2-2).
+        with _read_snapshot(conn), open(spool_path, "wb") as spool:
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            if version < MIN_EXPORT_VERSION:
+                raise ExportError(
+                    "store_too_old",
+                    f"store schema is v{version}; export-corpus needs v"
+                    f"{MIN_EXPORT_VERSION}+ (item_events/pr_commits are missing"
+                    " below it)",
+                    hint="re-run sync once against this database to migrate",
+                )
+            state = _check_completeness(conn, repo, require_complete)
 
-        local = {
-            str(r[0])
-            for r in conn.execute(
-                "SELECT number FROM items WHERE repo = ?", (repo,)
-            )
-        }
+            local = {
+                str(r[0])
+                for r in conn.execute(
+                    "SELECT number FROM items WHERE repo = ?", (repo,)
+                )
+            }
 
-        counts = {
-            "items": 0,
-            "releases": 0,
-            "edges": 0,
-            "orphan_edges": 0,
-            "comments": 0,
-            "reviews": 0,
-        }
-        counts["edges"] = conn.execute(
-            "SELECT COUNT(*) FROM edges WHERE repo = ?", (repo,)
-        ).fetchone()[0]
-        counts["comments"] = conn.execute(
-            "SELECT COUNT(*) FROM comments WHERE repo = ?", (repo,)
-        ).fetchone()[0]
-        counts["reviews"] = conn.execute(
-            "SELECT COUNT(*) FROM reviews WHERE repo = ?", (repo,)
-        ).fetchone()[0]
+            counts = {
+                "items": 0,
+                "releases": 0,
+                "edges": 0,
+                "orphan_edges": 0,
+                "comments": 0,
+                "reviews": 0,
+            }
+            counts["edges"] = conn.execute(
+                "SELECT COUNT(*) FROM edges WHERE repo = ?", (repo,)
+            ).fetchone()[0]
+            counts["comments"] = conn.execute(
+                "SELECT COUNT(*) FROM comments WHERE repo = ?", (repo,)
+            ).fetchone()[0]
+            counts["reviews"] = conn.execute(
+                "SELECT COUNT(*) FROM reviews WHERE repo = ?", (repo,)
+            ).fetchone()[0]
 
-        with tempfile.TemporaryFile() as spool:
             # Items: one canonical line each, ordered by number. Content hash
             # is over the object without the hash field itself.
             item_rows = conn.execute(
@@ -495,7 +501,8 @@ def write_corpus(
 
             if "revisions" in include:
                 # Streamed element-wise: the rows array is never
-                # materialized. revisions.id (SQLite-assigned) is excluded.
+                # materialized. revisions.id (SQLite-assigned) is excluded;
+                # order is the content key, not the id.
                 rev_order = (
                     "number, entity, entity_id, kind, origin,"
                     " valid_from, valid_to, content"
@@ -554,18 +561,15 @@ def write_corpus(
             # The piecemeal lines above must hash exactly the bytes written;
             # simplest correct approach: hash the whole spool once.
             hasher = hashlib.sha256()
-            spool.seek(0)
-            while True:
-                chunk = spool.read(1 << 20)
-                if not chunk:
-                    break
-                hasher.update(chunk)
+            spool.flush()
+            with open(spool_path, "rb") as reread:
+                while True:
+                    chunk = reread.read(1 << 20)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
             corpus_sha256 = hasher.hexdigest()
 
-            # All guards passed and the spool is complete. The manifest is
-            # composed inside the spool block so the emit phase can copy the
-            # spool before the context manager closes it; the destination is
-            # touched only now.
             sync_state_row = conn.execute(
                 "SELECT * FROM sync_state WHERE repo = ?", (repo,)
             ).fetchone()
@@ -607,10 +611,12 @@ def write_corpus(
                 "provenance": provenance,
             }
 
+        # All guards passed, the snapshot is released, and the spool is
+        # complete: touch the destination only now.
+        with open(spool_path, "rb") as spool:
             if out_path:
                 with open(out_path, "wb") as out:
                     out.write(canonical(manifest) + b"\n")
-                    spool.seek(0)
                     while True:
                         chunk = spool.read(1 << 20)
                         if not chunk:
@@ -618,10 +624,14 @@ def write_corpus(
                         out.write(chunk)
             elif target is not None:
                 target.write(canonical(manifest) + b"\n")
-                spool.seek(0)
                 while True:
                     chunk = spool.read(1 << 20)
                     if not chunk:
                         break
                     target.write(chunk)
         return manifest
+    finally:
+        try:
+            os.unlink(spool_path)
+        except OSError:
+            pass
