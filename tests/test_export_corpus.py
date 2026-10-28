@@ -916,7 +916,11 @@ class GuardTests(TempDBTest):
 
     def test_device_path_out_is_refused(self) -> None:
         """--out NUL must be refused, not silently successful (a device
-        target discards the corpus and reports exit 0)."""
+        target discards the corpus and reports exit 0). Windows-only: on
+        POSIX NUL is an ordinary legal filename and there is no device
+        namespace to guard."""
+        if sys.platform != "win32":
+            self.skipTest("Windows device-name semantics only")
         self._synced()
         proc = subprocess.run(
             [
