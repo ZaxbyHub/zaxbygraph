@@ -1120,6 +1120,8 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
     if repo is None:
         # Explicit --repo "" skips every corpus guard in _open_for_read; the
         # corpus is defined per repo, so refuse rather than guess a filter.
+        if conn is not None:
+            conn.close()
         return emit_failure(
             args,
             2,
@@ -1145,6 +1147,7 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             hint=f"--include accepts: {', '.join(export.INCLUDE_CHOICES)}",
         )
     out_path = getattr(args, "out", None)
+    ok = False
     try:
         target = None if out_path else sys.stdout.buffer
         export.write_corpus(
@@ -1156,6 +1159,7 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             bool(getattr(args, "require_complete", False)),
             str(db_path),
         )
+        ok = True
     except export.ExportError as exc:
         return emit_failure(
             args,
@@ -1167,6 +1171,13 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             hint=exc.hint,
         )
     finally:
+        if ok and _format_of(args) == "text":
+            # The same stderr trust summary every read prints in text mode
+            # (issue #17 contract); machine formats stay silent so piped
+            # captures parse.
+            line = _identity_line(conn, repo, db_path)
+            if line:
+                print(line, file=sys.stderr)
         conn.close()
         if not out_path:
             sys.stdout.flush()

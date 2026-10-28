@@ -27,6 +27,7 @@ from fixtures import (
     issue,
     pr_file,
     pull,
+    review,
 )
 from zaxbygraph import export as export_mod
 from zaxbygraph.db import connect, init_schema, open_existing
@@ -35,9 +36,11 @@ from zaxbygraph.sync import sync_repo
 #: Pinned cross-platform / replay golden hashes. These constants are part of
 #: the contract asserted on BOTH CI legs (AC5) and against the replayed
 #: fixture (AC6); regenerating them means an intentional format change and
-#: needs a plan.
+#: needs a plan. (Regenerated once during review: per-item edge ordering was
+#: corrected to the plan's full-unique-key law and a review row joined the
+#: fixture store — 08-test-results.md records the round.)
 GOLDEN_FIXTURE_SHA256 = (
-    "e58e48905e6a7b9e0582ee179ae3bd855973a5d74baa034f9829f5d10ab85bbd"
+    "d21ed347259af5f51b5ee5ed3e917f7da7bb9544f9f7ab803aecd7c761b60fb9"
 )
 
 
@@ -120,6 +123,7 @@ def _rich_store(conn: sqlite3.Connection) -> FakeGitHubSource:
         pull(2, merged=True),
         files=[pr_file("src/app.py")],
     )
+    src.reviews[2] = [review(303, "APPROVED", "ship it — ok")]
     src.releases.append(
         {
             "id": 77,
@@ -367,9 +371,71 @@ class IncompleteStoreTests(TempDBTest):
             with self.assertRaises(export_mod.ExportError) as ctx:
                 _export(conn, str(self.db_path), require_complete=True)
             self.assertEqual(ctx.exception.code, "incomplete_store")
+            self.assertEqual(ctx.exception.exit_code, 1)
         finally:
             self._flag(0, None)
             conn.close()
+
+        # End-to-end: the CLI maps the refusal to a non-zero exit with the
+        # structured envelope, and an existing --out file is byte-preserved
+        # across the refusal (the destination is only opened after every
+        # guard passes and the spool completes).
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "corpus.jsonl"
+            out.write_bytes(b"PRECIOUS\n")
+            conn = open_existing(self.db_path)
+            try:
+                self._flag(0, "boom")
+            finally:
+                conn.close()
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zaxbygraph",
+                    "export-corpus",
+                    "--repo",
+                    REPO,
+                    "--db",
+                    str(self.db_path),
+                    "--require-complete",
+                    "--out",
+                    str(out),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 1)
+            env = json.loads(proc.stdout.decode("utf-8"))
+            self.assertFalse(env["ok"])
+            self.assertEqual(env["error"]["code"], "incomplete_store")
+            self.assertEqual(out.read_bytes(), b"PRECIOUS\n")
+            # A clean store with --require-complete exits 0 through the CLI.
+            conn = open_existing(self.db_path)
+            try:
+                self._flag(0, None)
+            finally:
+                conn.close()
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "zaxbygraph",
+                    "export-corpus",
+                    "--repo",
+                    REPO,
+                    "--db",
+                    str(self.db_path),
+                    "--require-complete",
+                    "--out",
+                    str(out),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertNotEqual(out.read_bytes(), b"PRECIOUS\n")
+            self.assertTrue(out.read_bytes().endswith(b"\n"))
 
 
 class CrossPlatformTests(TempDBTest):
@@ -461,6 +527,7 @@ class GuardTests(TempDBTest):
                 include=("revisions",),
                 repo=REPO,
             )
+            with_patches = _export(conn, str(self.db_path), include=("patches",))
         finally:
             conn.close()
         # Default: no raw, no patch, no revisions line.
@@ -477,18 +544,34 @@ class GuardTests(TempDBTest):
             self.assertFalse(
                 any(b'"type":"revisions"' in line for line in _content_lines(data))
             )
-        # raw propagates to items AND nested comments.
-        item_raw = comment_raw = 0
+        # raw propagates to items, nested comments AND reviews, releases.
+        seen_raw = {"item": 0, "comment": 0, "review": 0, "release": 0}
         for line in _content_lines(with_raw):
             obj = json.loads(line.decode("ascii"))
-            if obj.get("type") == "item":
+            kind = obj.get("type")
+            if kind == "item":
                 if "raw" in obj:
-                    item_raw += 1
+                    seen_raw["item"] += 1
                 for c in obj.get("comments", []):
                     if "raw" in c:
-                        comment_raw += 1
-        self.assertEqual(item_raw, 2)
-        self.assertEqual(comment_raw, 1)
+                        seen_raw["comment"] += 1
+                for r in obj.get("reviews", []):
+                    if "raw" in r:
+                        seen_raw["review"] += 1
+            elif kind == "release" and "raw" in obj:
+                seen_raw["release"] += 1
+        self.assertEqual(seen_raw["item"], 2)
+        self.assertEqual(seen_raw["comment"], 1)
+        self.assertEqual(seen_raw["review"], 1)
+        self.assertEqual(seen_raw["release"], 1)
+        # patches: the key appears (null unless synced with --include-patches).
+        patch_keys = 0
+        for line in _content_lines(with_patches):
+            obj = json.loads(line.decode("ascii"))
+            for f in obj.get("pr_files", []):
+                self.assertIn("patch", f)
+                patch_keys += 1
+        self.assertEqual(patch_keys, 1)
         # revisions line present, id-free, ordered content-keyed.
         rev_lines = [
             json.loads(line.decode("ascii"))
@@ -498,6 +581,28 @@ class GuardTests(TempDBTest):
         self.assertEqual(len(rev_lines), 1)
         for row in rev_lines[0]["rows"]:
             self.assertNotIn("id", row)
+
+    def test_per_item_edges_are_full_key_ordered(self) -> None:
+        """The plan's ordering law: an item's routed edges are ordered by the
+        full unique key across BOTH routing arms (not block-concatenated)."""
+        src = _rich_store(self.conn)
+        sync_repo(self.conn, src, REPO)
+        # A dst-routed edge (actor authored) and src-routed edges (touches,
+        # merged_commit) both live on item 2; full-key order puts actor first
+        # (src_type 'actor' < 'item').
+        conn = open_existing(self.db_path)
+        try:
+            data = _export(conn, str(self.db_path))
+        finally:
+            conn.close()
+        for line in _content_lines(data):
+            obj = json.loads(line.decode("ascii"))
+            if obj.get("type") == "item" and obj["number"] == 2:
+                keys = [
+                    (e["src_type"], e["src_id"], e["rel"], e["dst_type"], e["dst_id"], e["source"])
+                    for e in obj["edges"]
+                ]
+                self.assertEqual(keys, sorted(keys))
 
     def test_invalid_include_value(self) -> None:
         self._synced()

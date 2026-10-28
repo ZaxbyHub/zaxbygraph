@@ -9,8 +9,8 @@ Determinism contract (see README and the issue-#28 trace):
 
 - Lines are canonical JSON: ``json.dumps(sort_keys=True, ensure_ascii=True,
   separators=(",", ":"))`` encoded ASCII (a UTF-8 subset; lone surrogates in
-  stored mojibake become ``\\udXXX`` escapes instead of encode failures),
-  terminated with ``\\n``, written to a binary target.
+  stored mojibake become ``\\ud800``-style escapes instead of encode
+  failures), terminated with ``\\n``, written to a binary target.
 - Row order is content-keyed only. SQLite-assigned identities
   (``comments.pk``, ``edges.id``, ``revisions.id``) never appear in output
   and never influence order — a no-op sync churns them (the inclusive
@@ -375,8 +375,18 @@ def _item_content(
                 (repo, row["number"]),
             )
         ],
-        "edges": _src_routed_edges(conn, repo, row["number"])
-        + _dst_routed_edges(conn, repo, row["number"], local),
+        "edges": sorted(
+            _src_routed_edges(conn, repo, row["number"])
+            + _dst_routed_edges(conn, repo, row["number"], local),
+            key=lambda e: (
+                e["src_type"],
+                e["src_id"],
+                e["rel"],
+                e["dst_type"],
+                e["dst_id"],
+                e["source"],
+            ),
+        ),
     }
     return content
 

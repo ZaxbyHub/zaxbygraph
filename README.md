@@ -461,7 +461,11 @@ the store is complete and error-free (the manifest always mirrors the
 underlying `full_sync_pending`/`last_error` fields either way). All reads run
 under one read snapshot: a concurrent sync cannot split the corpus. Stores
 older than schema v10 are refused (`store_too_old`) — re-run `sync` once to
-migrate.
+migrate. `--repo ''` (no filter) is refused (`repo_required`): a corpus is
+defined per repo. The `--format`/`--fields` flags do not apply here — the
+artifact itself is the output, and in text mode the stderr identity line
+still prints (never merge stderr into the artifact). `--out` refuses to
+overwrite the database or its sidecars (`out_is_database`).
 
 > **Warning:** exports contain GitHub user content verbatim (titles, bodies,
 > comments, reviews, release notes). Treat the artifact as you would the
