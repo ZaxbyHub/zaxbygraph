@@ -35,9 +35,10 @@ the recording in tests/eval_fixture/ is replayed and the pinned values are
 what the current harness measures on it; no random-baseline comparison is
 claimed; re-measured after the pr43 round-2 metric fixes — untruncated
 candidate pools, visible-partner recall denominators, scoreable-pair bundle
-denominators): localize Acc@5 = 1.0 (9 of 15 targets eligible), bundle
-pair_recall = 1.0, pair_precision = 0.105 (2 hits in 19 proposed pairs over
-2 scoreable truth pairs, 4 eligible targets).
+denominators — and again after the round-3 cochange symmetry fix, whose
+honest min-confidence scoring moved this corpus's bundle numbers from
+recall 1.0/precision 0.105 to 0.5/0.053): localize Acc@5 = 1.0 (9 of 15
+targets eligible), bundle pair_recall >= 0.5, pair_precision >= 0.05.
 The real corpus has zero duplicate_of edges, so the similar mode reports
 zero eligible targets there by construction; duplicate detection floors
 live on the synthetic store only.
@@ -570,8 +571,14 @@ class EvalTests(DerivedTierTest):
             self.assertEqual(localize_eval["corpus_sha256"], REPLAYED_CORPUS_SHA256)
             bundle_eval = run_eval(conn, "zaxbyhub/zaxbygraph", "bundle")
             self.assertGreaterEqual(bundle_eval["metrics"]["pair_recall"], 0.5)
+            # re-measured after the pr43 round-3 cochange symmetry fix:
+            # the honest symmetric confidence sup/max(sup_A, sup_B) (= the
+            # min of the two directional conditionals) lowers scores on
+            # hub-adjacent pairs, which honestly moved this corpus's
+            # numbers (recall 1.0 -> 0.5, precision 0.105 -> 0.053); the
+            # floors are regression pins, not quality oracles
             self.assertGreaterEqual(
-                bundle_eval["metrics"]["pair_precision"], 0.1
+                bundle_eval["metrics"]["pair_precision"], 0.05
             )
             self.assertEqual(bundle_eval["corpus_sha256"], REPLAYED_CORPUS_SHA256)
             # the real corpus carries zero duplicate_of ground truth; the
@@ -1436,6 +1443,85 @@ class GitLsFilesTests(unittest.TestCase):
                 os.chdir(old)
             self.assertIsNone(files)
             self.assertIsNone(head)
+
+
+class CochangeSymmetryTests(unittest.TestCase):
+    """Cubic run-2: the cochange score was max over DIRECTIONAL
+    conditionals (sup/support(A) vs sup/support(B)), which differ when the
+    two files' support counts differ — an AC2 violation invisible in the
+    synthetic fixture (its cochange scores are all 0). The symmetric
+    confidence sup/max(sup_A, sup_B) is commutative."""
+
+    def test_cochange_score_is_symmetric_under_unequal_support(self) -> None:
+        import shutil
+
+        from fixtures import FakeGitHubSource, issue, pr_file, pull
+        from zaxbygraph.sync import sync_repo
+        from zaxbygraph.derive import explain
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "sym.db"
+        conn = connect(db_path)
+        try:
+            init_schema(conn)
+            src = FakeGitHubSource()
+            # hub file src/hub.py: touched by PRs 900/901/902
+            for n in (900, 901, 902):
+                merged = pull(n, merged=True)
+                merged["merged_at"] = "2026-05-0%dT00:00:00Z" % ((n % 9) + 1,)
+                src.add_pr(
+                    issue(n, title=f"pr {n}", body="", kind="pr",
+                          created_at="2026-05-01T00:00:00Z"),
+                    merged,
+                    files=[pr_file("src/hub.py"), pr_file(f"src/only{n}.py")],
+                )
+            # rare file src/rare.py: ONLY PR 900 touches it besides hub
+            merged = pull(903, merged=True)
+            merged["merged_at"] = "2026-05-05T00:00:00Z"
+            src.add_pr(
+                issue(903, title="pr 903", body="", kind="pr",
+                      created_at="2026-05-01T00:00:00Z"),
+                merged,
+                files=[pr_file("src/hub.py"), pr_file("src/rare.py")],
+            )
+            src.add_issue(
+                issue(910, title="item touching hub",
+                      body="see src/hub.py:1:1", created_at="2026-06-01T00:00:00Z",
+                      comments=1)
+            )
+            src.comment_on(910, "see src/hub.py:1:1")
+            src.add_issue(
+                issue(911, title="item touching rare",
+                      body="see src/rare.py:2:2", created_at="2026-06-01T00:00:00Z",
+                      comments=1)
+            )
+            src.comment_on(911, "see src/rare.py:2:2")
+            sync_repo(conn, src, REPO)
+        finally:
+            conn.close()
+        ro = open_existing(db_path)
+        try:
+            ab = explain(ro, REPO, 910, 911)
+            ba = explain(ro, REPO, 911, 910)
+            self.assertEqual(
+                ab["components"]["cochange"]["score"],
+                ba["components"]["cochange"]["score"],
+            )
+            # the symmetric confidence is sup/max(sup_hub, sup_rare) =
+            # 1/max(4, 1) = 0.25 (hub support 4: PRs 900-903; rare 1)
+            self.assertAlmostEqual(
+                ab["components"]["cochange"]["score"], 0.25, places=6
+            )
+            # evidence confidence is the same symmetric value
+            self.assertAlmostEqual(
+                ab["components"]["cochange"]["evidence"]["pairs"][0]
+                ["confidence"],
+                0.25,
+                places=6,
+            )
+        finally:
+            ro.close()
 
 
 class EvalDegradationExtraTests(unittest.TestCase):

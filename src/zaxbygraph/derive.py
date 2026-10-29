@@ -557,22 +557,32 @@ def _cochange_between(
 ) -> tuple[float, list[dict]]:
     """Co-change signal between two resolved path sets (direct files only).
 
-    Score is the maximum single-pair confidence; evidence carries the
-    contributing pairs with their support.
+    Score is the maximum single-pair symmetric confidence,
+    ``support(A,B) / max(support(A), support(B))`` — commutative by
+    construction, so affinity stays symmetric even when the two files'
+    support counts differ (a directional ``support(A,B)/support(A)``
+    score was order-dependent and could break AC2; cubic run-2 thread).
+    Evidence carries the contributing pairs with their support.
     """
     support = ctx.get("coupling_support")
     if support is None:
         return 0.0, []
+    file_support = ctx.get("coupling_filesupport") or {}
     best = 0.0
     pairs = []
     for fa in sorted(a_paths):
         row = support.get(fa)
         if not row:
             continue
-        for fb, conf, sup in row:
+        for fb, _conf, sup in row:
             if fb in b_paths:
-                pairs.append({"a": fa, "b": fb, "support": sup, "confidence": conf})
-                best = max(best, conf)
+                sym_conf = sup / max(
+                    file_support.get(fa, sup), file_support.get(fb, sup)
+                )
+                pairs.append(
+                    {"a": fa, "b": fb, "support": sup, "confidence": sym_conf}
+                )
+                best = max(best, sym_conf)
     pairs.sort(key=lambda p: (-p["support"], p["a"], p["b"]))
     return best, pairs[:6]
 
