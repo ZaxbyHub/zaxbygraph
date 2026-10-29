@@ -838,9 +838,13 @@ def _git_ls_files() -> tuple[list[str] | None, str | None]:
     cwd-relative names for the cwd's subtree only, so from any subdirectory
     the intersection with the store's root-relative vocabulary would drop
     every path while the envelope still claimed ``ls_files_applied: true``
-    (pr43 review PRR-002). ``core.quotePath=false`` keeps non-ASCII paths in
-    raw UTF-8 instead of git's octal escapes, and ``core.fsmonitor=false``
-    keeps a hostile checkout's fsmonitor hook out of a read-only listing.
+    (pr43 review PRR-002). ``-z`` returns NUL-delimited, never-quoted raw
+    names — newline/quote parsing would drop any path git would otherwise
+    C-quote even with ``quotePath`` off (names containing ``"`` or control
+    characters), and ``splitlines()`` would also break on Unicode
+    separators (cubic run-3). ``core.quotePath=false`` is belt-and-braces
+    for older gits, and ``core.fsmonitor=false`` keeps a hostile checkout's
+    fsmonitor hook out of a read-only listing.
     """
     import subprocess
 
@@ -853,6 +857,7 @@ def _git_ls_files() -> tuple[list[str] | None, str | None]:
                 "-c",
                 "core.fsmonitor=false",
                 "ls-files",
+                "-z",
                 "--full-name",
                 "--",
                 ":/",
@@ -873,7 +878,7 @@ def _git_ls_files() -> tuple[list[str] | None, str | None]:
             check=False,
         )
         return (
-            files.stdout.splitlines(),
+            [line for line in files.stdout.split("\0") if line],
             head.stdout.strip() if head.returncode == 0 else None,
         )
     except (OSError, subprocess.TimeoutExpired):

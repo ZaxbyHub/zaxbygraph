@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from zaxbygraph import export
 from zaxbygraph.derive import (
     _parse_instant,
+    load_weights,
     similar as derive_similar,
     localize_files,
 )
@@ -184,6 +185,9 @@ def run_eval(
 ) -> dict:
     """Run one eval mode under AC6's leakage controls.
 
+    ``weights=None`` resolves the effective defaults here, so a direct
+    caller's envelope carries the same weights the derivation scored with
+    (the CLI always resolves them; cubic run-3 thread).
     Metrics and ``corpus_sha256`` share one ``BEGIN DEFERRED`` snapshot so
     the hash always identifies the corpus the metrics were computed on.
     Every result is ``derived: true`` and carries the weights used, so a
@@ -199,6 +203,8 @@ def run_eval(
         raise ValueError("repo_required: eval needs a resolved repository")
 
     leakage: dict[int, list[str]] = {}
+    if weights is None:
+        weights = load_weights()
     conn.execute("BEGIN DEFERRED")
     try:
         sha, labels = _snapshot_sha(conn, repo)

@@ -797,9 +797,26 @@ class CliContractTests(DerivedTierTest):
         envelope = json.loads(out)
         self.assertTrue(envelope["ok"])
         self.assertTrue(envelope["data"]["corpus_sha256"])
-        # PRR-021: eval metrics are tied to the [derive] config that
-        # produced them via the same weights key similar/explain carry.
-        self.assertTrue(envelope["data"]["weights"])
+        # PRR-021 (strengthened per cubic run-3): the envelope carries the
+        # EFFECTIVE weights, so a distinctive --config must surface in it —
+        # the test would previously pass even if eval ignored --config.
+        with tempfile.TemporaryDirectory() as td:
+            cfg = Path(td) / "weights.toml"
+            cfg.write_text("[derive]\nlexical = 2.5\n", encoding="utf-8")
+            rc, out, _err = self._run(
+                "eval", "similar", "--db", str(self.db_path), "--repo", REPO,
+                "--config", str(cfg), "--format", "json",
+            )
+            self.assertEqual(rc, 0, out)
+            envelope = json.loads(out)
+            self.assertTrue(envelope["ok"])
+            self.assertEqual(envelope["data"]["weights"]["lexical"], 2.5)
+        rc, out, _err = self._run(
+            "eval", "similar", "--db", str(self.db_path), "--repo", REPO, "--format", "json"
+        )
+        self.assertEqual(rc, 0, out)
+        envelope = json.loads(out)
+        self.assertNotEqual(envelope["data"]["weights"]["lexical"], 2.5)
 
     def test_config_errors_carry_config_error_code(self) -> None:
         """PRR-014: weight-config failures are config_errors, matching the
@@ -1427,6 +1444,39 @@ class GitLsFilesTests(unittest.TestCase):
             finally:
                 os.chdir(old)
             self.assertEqual(files, ["src/pkg/mod.py"])
+            self.assertTrue(head)
+
+    def test_ls_files_parses_nul_delimited_raw_names(self) -> None:
+        """Cubic run-3: output is NUL-delimited and never C-quoted, so
+        names with spaces or non-ASCII bytes survive round-trip (the
+        quoted/control-character cases the -z switch exists for cannot be
+        created on Windows, where such filenames are forbidden)."""
+        import os
+        import subprocess as sp
+
+        from zaxbygraph.cli import _git_ls_files
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src").mkdir()
+            (root / "src" / "café bar.py").write_text("x = 1\n", encoding="utf-8")
+
+            def git(*argv: str) -> None:
+                sp.run(["git", *argv], cwd=str(root), check=True, capture_output=True)
+
+            git("init")
+            git("-c", "user.email=t@example.com", "-c", "user.name=t", "add", ".")
+            git(
+                "-c", "user.email=t@example.com", "-c", "user.name=t",
+                "commit", "-m", "init",
+            )
+            old = os.getcwd()
+            os.chdir(root)
+            try:
+                files, head = _git_ls_files()
+            finally:
+                os.chdir(old)
+            self.assertEqual(files, ["src/café bar.py"])
             self.assertTrue(head)
 
     def test_outside_a_checkout_degrades(self) -> None:
