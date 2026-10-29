@@ -691,3 +691,30 @@ Results are capped (default 200 rows) and rows are fetched incrementally, so a
 query that *matches* millions of rows does not materialize them all. A
 non-positive `--limit` is clamped rather than passed through, because a negative
 `LIMIT` means *unlimited* in SQLite.
+
+## Derived reads (issue #29)
+
+`similar`, `explain`, `coupling`, and `eval` (whose `localize` mode ranks
+files) are **derived reads**: they are computed at query time from the tables
+above and never stored. Every result carries `derived: true`. The invariants:
+
+- The derived tier opens the store through the same read-only connection
+  reads use (`db.open_existing`, `mode=ro`); per-query scratch (the path
+  vocabulary, suffix index, adjacency, coupling index) lives in in-memory
+  Python structures, and a store file hash before/after any derived command
+  is byte-identical. The `sql` subcommand keeps its own guard layers and
+  never shares a connection factory with the tier.
+- No new relations: derived pairs never enter `edges` (whose rows remain
+  EXTRACTED, GitHub-reported facts only), and the feature needs no schema
+  migration. The four commands are not on the MCP surface yet — that
+  surfacing is issue #32's lane.
+- Raw path strings in `item_path_refs` are resolved at read time against a
+  vocabulary built from merged-PR `pr_files` paths (minus `removed`), by
+  exact or unique-suffix match in either direction; unresolved mentions
+  never anchor a derived pair.
+- `eval` consumes this store read-only and reports `corpus_sha256` over the
+  same content-line stream `export-corpus` hashes (via the exported
+  `iter_corpus_content_lines` / `corpus_sha256_from_lines` helpers), inside
+  one read snapshot with the metrics. Stores below the export floor or ahead
+  of this build report `corpus_sha256: null` with a `store_too_old` /
+  `store_too_new` label instead.
