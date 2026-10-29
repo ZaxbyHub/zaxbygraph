@@ -29,14 +29,17 @@ sys.path.insert(0, str(REPO_ROOT / "tests"))
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from fixtures_eval import record_real_corpus  # noqa: E402
-from zaxbygraph.db import connect, open_existing  # noqa: E402
+from zaxbygraph.db import open_existing  # noqa: E402
 
 
 def main() -> int:
     store_arg = sys.argv[1] if len(sys.argv) > 1 else None
     repo = "zaxbyhub/zaxbygraph"
     if store_arg:
-        conn = connect(Path(store_arg))
+        # open_existing, never connect(): recording only reads, and connect()
+        # would create a fresh database at a typo'd path or flip an existing
+        # store's journal mode (pr43 review PRR-024).
+        conn = open_existing(Path(store_arg))
     else:
         from zaxbygraph.paths import store_db_path, store_root
 

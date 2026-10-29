@@ -3,19 +3,28 @@ GitHub's own ground truth, under leakage controls.
 
 Ground truth comes only from GitHub-reported facts in the store:
 ``duplicate_of`` edges (duplicate detection), the files a merged fix PR
-touched (localization), and the issue sets single PRs closed (bundles).
+touched (localization), and the issue sets single merged PRs closed (bundles).
 Per target, the harness applies AC6's controls — candidates restricted to
 items that existed at the target's creation, the target's closing PRs and
-their edges excluded, PRs merged after the target's creation excluded,
-comments after the fix PR's creation excluded (including their rolled-up
-path references, via origin-timestamp joins), and the target–partner edges
-themselves excluded — and labels any result whose controls could not be
-applied ``with_leakage``. Signature components are suppressed in eval
+their edges excluded, PRs merged after the target's creation excluded, and
+the target–partner edges themselves excluded. Comment-origin scoping of
+rolled-up path references (origin-timestamp joins) is applied in the
+localize mode, which is where the plan's fix-PR comment cutoff is defined;
+the similar/bundle modes scope their candidate and vocabulary pools by the
+item-visibility cutoff but do not re-scope stored path references by comment
+time — a disclosed scoping decision, recorded in the PR #43 closure ledger.
+Signature components are suppressed in eval
 scoring by construction: ``item_signatures`` rows carry no origin, so a
 cutoff-visible signature set cannot be reconstructed (conservative
 suppression beats a leaky signal). Every scored target is therefore labelled
 ``with_leakage: signature_origin_unknown`` — the disclosure half of the
 plan's suppression contract.
+
+Disclosure is label-only by design (the plan's contract): a target whose
+controls could not be applied stays scored with its reason recorded, and
+``eligible_targets`` counts only targets with at least one in-scope
+ground-truth fact after controls. A mode with zero eligible targets reports
+empty metrics plus a ``no_ground_truth`` label.
 
 Metrics and ``corpus_sha256`` are computed inside ONE read snapshot, so a
 hash always identifies the corpus the metrics were computed on.
@@ -103,26 +112,33 @@ def _item_created(
 
 def _revised_after(
     conn: sqlite3.Connection, repo: str, number: int, cutoff_dt: datetime | None
-) -> bool:
-    """True when the item's title/body has a revision valid from after the
-    cutoff (best-effort: the revisions table is v8+; its absence simply
-    means the control cannot be applied and the caller labels leakage)."""
+) -> tuple[bool, bool]:
+    """``(revised_after_cutoff, control_applicable)``.
+
+    Item revisions are stored per slot — ``entity='item_title'`` or
+    ``'item_body'``, with ``kind`` NULL — and ``valid_from`` marks when a
+    revision became current. (The original query filtered
+    ``entity='item' AND kind IN (...)``, which the schema CHECK forbids, so
+    it matched nothing and the control never fired — pr43 review PRR-003.)
+    The revisions table is v8+; on older stores the control cannot be
+    applied and the caller discloses ``revisions_unavailable`` rather than
+    silently passing.
+    """
     if cutoff_dt is None:
-        return False
+        return False, False
     try:
         rows = conn.execute(
-            "SELECT kind, valid_from FROM revisions WHERE repo = ?"
-            " AND number = ? AND entity = 'item' AND kind IN"
-            " ('title', 'body', 'title_body')",
+            "SELECT valid_from FROM revisions WHERE repo = ?"
+            " AND number = ? AND entity IN ('item_title', 'item_body')",
             (repo, number),
         ).fetchall()
     except sqlite3.OperationalError:
-        return False
+        return False, False
     for row in rows:
         ts = _parse_instant(row["valid_from"])
         if ts is not None and ts > cutoff_dt:
-            return True
-    return False
+            return True, True
+    return False, True
 
 
 def _duplicate_pairs(conn: sqlite3.Connection, repo: str) -> dict[int, set[int]]:
@@ -144,11 +160,17 @@ def _duplicate_pairs(conn: sqlite3.Connection, repo: str) -> dict[int, set[int]]
 
 def _snapshot_sha(conn: sqlite3.Connection, repo: str) -> tuple[str | None, list[str]]:
     """Corpus sha for the store's default include set, or None + label when
-    the store predates the v10 export floor."""
+    the store predates the v10 export floor (``store_too_old``) or postdates
+    this build's schema (``store_too_new`` — export-corpus would refuse the
+    same store, so the hash would identify no exportable corpus; pr43
+    review PRR-022)."""
     labels = []
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     if version < export.MIN_EXPORT_VERSION:
         labels.append("store_too_old")
+        return None, labels
+    if version > export.CURRENT_USER_VERSION:
+        labels.append("store_too_new")
         return None, labels
     pieces = export.iter_corpus_content_lines(conn, repo, frozenset())
     return export.corpus_sha256_from_lines(pieces), labels
@@ -164,9 +186,12 @@ def run_eval(
 
     Metrics and ``corpus_sha256`` share one ``BEGIN DEFERRED`` snapshot so
     the hash always identifies the corpus the metrics were computed on.
-    Every result is ``derived: true``; targets whose controls could not be
-    fully applied are reported under ``with_leakage`` and excluded from the
-    strict denominators.
+    Every result is ``derived: true`` and carries the weights used, so a
+    metric is always tied to the ``[derive]`` configuration that produced
+    it (pr43 review PRR-021). Targets whose controls could not be applied
+    are disclosed under ``with_leakage`` and stay scored; denominators
+    count eligible targets only (≥1 in-scope ground-truth fact after
+    controls), and a zero-eligible mode adds a ``no_ground_truth`` label.
     """
     if mode not in EVAL_MODES:
         raise ValueError(f"unknown eval mode: {mode} (expected one of {EVAL_MODES})")
@@ -183,6 +208,8 @@ def run_eval(
             result = _eval_localize(conn, repo, weights, leakage)
         else:
             result = _eval_bundle(conn, repo, weights, leakage)
+        if result["metrics"].get("eligible_targets") == 0:
+            labels.append("no_ground_truth")
     finally:
         conn.rollback()
 
@@ -193,6 +220,7 @@ def run_eval(
             "corpus_sha256": sha,
             "with_leakage": {str(k): v for k, v in sorted(leakage.items())},
             "labels": labels,
+            "weights": weights,
             "derived": True,
         }
     )
@@ -208,8 +236,15 @@ def _eval_similar(
     """Duplicate detection: for each duplicate_of target, does the planted
     partner rank in the top 5 (recall@5) and at what reciprocal rank (MRR)?
     Controls: candidates filtered to items created at/before the target;
-    the target-partner adjacency removed; keyword-derived edges filtered
-    from adjacency; signature component suppressed (origin-less rows)."""
+    the target-partner adjacency AND the target's closing-PR edges removed
+    (a closing PR must not push the partner out of the window — plan's
+    per-target exclusion list); keyword-derived edges filtered from
+    adjacency; signature component suppressed (origin-less rows). The
+    candidate pool is untruncated before the visibility filter so a
+    post-cutoff leader can never crowd a pre-cutoff partner out of the
+    ranking (pr43 review PRR-006), and recall/MRR denominators count only
+    partners that are visible at the cutoff — an invisible partner can
+    never hit and would only understate the metric (PRR-007)."""
     pairs = _duplicate_pairs(conn, repo)
     recalls: list[float] = []
     rr: list[float] = []
@@ -219,21 +254,31 @@ def _eval_similar(
         if cutoff is None:
             leakage.setdefault(target, []).append("missing_created_at")
             continue
-        if _revised_after(conn, repo, target, _parse_instant(cutoff)):
+        cutoff_dt = _parse_instant(cutoff)
+        if cutoff_dt is None:
+            # A present-but-unparseable stamp would silently disable every
+            # cutoff control; exclude the target the same way a missing
+            # stamp is excluded (pr43 review PRR-009).
+            leakage.setdefault(target, []).append("created_at_unparseable")
+            continue
+        revised, revisions_ok = _revised_after(conn, repo, target, cutoff_dt)
+        if not revisions_ok:
+            leakage.setdefault(target, []).append("revisions_unavailable")
+        elif revised:
             leakage.setdefault(target, []).append("item_revised_after_cutoff")
+        closing = _closing_prs(conn, repo, target)
         # the signature component is suppressed unconditionally (origin-less
         # rows); the plan's disclosure half records that on every target
         leakage.setdefault(target, []).append("signature_origin_unknown")
-        cutoff_dt = _parse_instant(cutoff)
         excluded_adjacency = {
             frozenset((target, partner)) for partner in partners
-        }
+        } | {frozenset((target, pr)) for pr in closing}
         try:
             out = derive_similar(
                 conn,
                 repo,
                 target,
-                limit=20,
+                limit=None,
                 weights=weights,
                 exclude_adjacency=excluded_adjacency,
                 filtered_sources={"keyword"},
@@ -245,17 +290,17 @@ def _eval_similar(
         visible, unknown = _visible_candidates(out, cutoff)
         if unknown:
             leakage.setdefault(target, []).append("candidate_created_at_unknown")
+        visible_numbers = {c["number"] for c in visible}
+        in_scope = [p for p in partners if p in visible_numbers]
+        if not in_scope:
+            # No in-scope ground-truth fact after controls: the target is
+            # not eligible (plan: denominators = eligible targets only).
+            continue
         ranked = [c["number"] for c in visible[:5]]
-        hits = [1 if p in ranked else 0 for p in partners]
-        if not any(hits):
-            # A partner that never ranks may simply not exist in the pool —
-            # only count targets whose partners are visible candidates at all.
-            if not (set(partners) & {c["number"] for c in visible}):
-                continue
         eligible += 1
-        recalls.append(sum(hits) / len(partners))
+        recalls.append(sum(1 for p in in_scope if p in ranked) / len(in_scope))
         best = 0.0
-        for partner in partners:
+        for partner in in_scope:
             if partner in ranked:
                 best = max(best, 1.0 / (ranked.index(partner) + 1))
         rr.append(best)
@@ -304,6 +349,15 @@ def _eval_localize(
         if cutoff is None:
             leakage.setdefault(target, []).append("missing_created_at")
             continue
+        cutoff_dt = _parse_instant(cutoff)
+        if cutoff_dt is None:
+            leakage.setdefault(target, []).append("created_at_unparseable")
+            continue
+        revised, revisions_ok = _revised_after(conn, repo, target, cutoff_dt)
+        if not revisions_ok:
+            leakage.setdefault(target, []).append("revisions_unavailable")
+        elif revised:
+            leakage.setdefault(target, []).append("item_revised_after_cutoff")
         fix_created = [
             conn.execute(
                 "SELECT created_at FROM items WHERE repo = ? AND number = ?",
@@ -353,7 +407,7 @@ def _eval_pool(
     """The reachable candidate pool for one localize target (vocabulary from
     merged PRs at/before the cutoff, minus the excluded PRs)."""
     rows = conn.execute(
-        "SELECT pf.number, pf.path, pf.status FROM pr_files pf"
+        "SELECT pf.number, pf.path, pf.status, i.merged_at FROM pr_files pf"
         " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
         " WHERE pf.repo = ? AND i.merged_at IS NOT NULL",
         (repo,),
@@ -365,11 +419,7 @@ def _eval_pool(
             continue
         if row["status"] and row["status"] == "removed":
             continue
-        merged = conn.execute(
-            "SELECT merged_at FROM items WHERE repo = ? AND number = ?",
-            (repo, row["number"]),
-        ).fetchone()
-        merged_dt = _parse_instant(merged["merged_at"]) if merged else None
+        merged_dt = _parse_instant(row["merged_at"])
         if cutoff_dt is not None and (merged_dt is None or merged_dt > cutoff_dt):
             continue
         pool.add(row["path"].replace("\\", "/"))
@@ -415,9 +465,14 @@ def _eval_bundle(
     suppressed."""
     truth_pairs: set[frozenset[int]] = set()
     closed_by: dict[int, set[int]] = {}
+    # Ground truth is scoped to MERGED closing PRs (docstring + README):
+    # the join is what separates a real bundle from a PR that merely
+    # references issues it has not closed by merging (pr43 review PRR-008).
     for row in conn.execute(
-        "SELECT DISTINCT src_id FROM edges WHERE repo = ?"
-        " AND src_type = 'item' AND dst_type = 'item' AND rel = 'closes'",
+        "SELECT DISTINCT e.src_id FROM edges e"
+        " JOIN items i ON i.repo = e.repo AND i.number = e.src_id"
+        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND e.rel = 'closes' AND i.kind = 'pr' AND i.merged_at IS NOT NULL",
         (repo,),
     ):
         try:
@@ -442,12 +497,23 @@ def _eval_bundle(
         }
     target_issues = sorted({n for pair in truth_pairs for n in pair})
     proposed: set[frozenset[int]] = set()
-    eligible = 0
+    excluded_targets: set[int] = set()
     for target in target_issues:
         cutoff = _item_created(conn, repo, target)
         if cutoff is None:
             leakage.setdefault(target, []).append("missing_created_at")
+            excluded_targets.add(target)
             continue
+        cutoff_dt = _parse_instant(cutoff)
+        if cutoff_dt is None:
+            leakage.setdefault(target, []).append("created_at_unparseable")
+            excluded_targets.add(target)
+            continue
+        revised, revisions_ok = _revised_after(conn, repo, target, cutoff_dt)
+        if not revisions_ok:
+            leakage.setdefault(target, []).append("revisions_unavailable")
+        elif revised:
+            leakage.setdefault(target, []).append("item_revised_after_cutoff")
         closing = _closing_prs(conn, repo, target)
         leakage.setdefault(target, []).append("signature_origin_unknown")
         excluded_adjacency = {frozenset((target, pr)) for pr in closing}
@@ -456,7 +522,7 @@ def _eval_bundle(
                 conn,
                 repo,
                 target,
-                limit=5,
+                limit=None,
                 weights=weights,
                 exclude_adjacency=excluded_adjacency,
                 filtered_sources={"keyword"},
@@ -464,20 +530,43 @@ def _eval_bundle(
             )
         except LookupError:
             leakage.setdefault(target, []).append("target_missing")
+            excluded_targets.add(target)
             continue
-        cutoff_dt = _parse_instant(cutoff)
         visible, unknown = _visible_candidates(out, cutoff, kind="issue")
         if unknown:
             leakage.setdefault(target, []).append("candidate_created_at_unknown")
-        if visible:
-            eligible += 1
-        for c in visible:
-            proposed.add(frozenset((target, c["number"])))
-    truth_hit = sum(1 for p in proposed if p in truth_pairs)
+        # The proposal set is the tier's top-5 VISIBLE issue candidates: the
+        # visibility filter runs before the width cut, so post-creation PRs
+        # and future items can never consume the slots (pr43 review
+        # PRR-006's bundle half).
+        top = [c["number"] for c in visible[:5]]
+        for number in top:
+            proposed.add(frozenset((target, number)))
+    # Ground-truth-side denominators (plan: denominators = eligible targets
+    # only): a truth pair is scoreable when every endpoint survived the
+    # controls, and pair_recall never denominates over a pair that could
+    # not be proposed (pr43 critic round 2 — previously all-cutoff-excluded
+    # targets still yielded pair_recall 0.0 instead of empty metrics).
+    scoreable_pairs = {
+        pair
+        for pair in truth_pairs
+        if all(number not in excluded_targets for number in pair)
+    }
+    eligible = len({number for pair in scoreable_pairs for number in pair})
+    truth_hit = sum(1 for p in proposed if p in scoreable_pairs)
+    # Zero scoreable pairs → empty metrics (plan): precision over a proposal
+    # set with no scoreable truth is not a measurement, so it nulls too —
+    # the envelope must not mix null recall with 0.0 precision under
+    # no_ground_truth (pr43 round-2 gate probe).
+    scoreable = bool(scoreable_pairs)
     return {
         "metrics": {
-            "pair_recall": truth_hit / len(truth_pairs),
-            "pair_precision": truth_hit / len(proposed) if proposed else None,
+            "pair_recall": (
+                truth_hit / len(scoreable_pairs) if scoreable else None
+            ),
+            "pair_precision": (
+                truth_hit / len(proposed) if proposed and scoreable else None
+            ),
             "eligible_targets": eligible,
             "targets_total": len(target_issues),
             "truth_pairs": len(truth_pairs),

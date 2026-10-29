@@ -58,6 +58,12 @@ RAISE_SIGNALS = frozenset({"lexical", "title", "files_analog", "context"})
 DEFAULT_HUB_SHARE = 0.5
 DEFAULT_HUB_FLOOR = 0.25
 
+#: Weights are relative, so nothing legitimate needs a magnitude anywhere
+#: near this bound — but an unbounded weight makes ``total_score`` overflow
+#: to ``inf``, which ``json.dump`` emits as bare ``Infinity``: not valid
+#: RFC 8259 (pr43 review PRR-013).
+_MAX_WEIGHT = 1e9
+
 _TOKEN_RE = re.compile(r"[a-z0-9_]+")
 _TOKEN_MIN_LEN = 3
 _TOKEN_STOP = frozenset(
@@ -98,8 +104,16 @@ def tokenize(text: str | None) -> set[str]:
 
 
 def _norm_path(path: str) -> str:
-    """Normalize a stored path to forward slashes (Windows-first reads)."""
-    return path.replace("\\", "/").lstrip("./") if path else path
+    """Normalize a stored path to forward slashes (Windows-first reads).
+
+    Only a literal ``./`` prefix is stripped: ``lstrip("./")`` would take a
+    character SET and rename every dotfile (``.github/x`` -> ``github/x``),
+    colliding with real non-dot paths (pr43 review PRR-001).
+    """
+    normalized = path.replace("\\", "/")
+    if normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
 
 
 def load_weights(
@@ -110,8 +124,8 @@ def load_weights(
     """Resolve ``[derive]`` weights: defaults, then store, then cwd, then an
     explicit ``--config`` path — later sources win per key (merge, not
     replace). Raises :class:`ConfigError` naming the offending file for
-    malformed TOML, unknown keys, non-finite/negative weights, or
-    out-of-range hub parameters.
+    malformed TOML, unknown keys, non-finite/negative/over-magnitude
+    weights, or out-of-range hub parameters.
     """
     weights = dict(DEFAULT_WEIGHTS)
     hub = {"hub_share": DEFAULT_HUB_SHARE, "hub_floor": DEFAULT_HUB_FLOOR}
@@ -142,9 +156,21 @@ def load_weights(
                 )
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise ConfigError(f"[derive] {key} must be a number", path=path)
-            if not math.isfinite(value) or value < 0:
+            # math.isfinite raises OverflowError (not ValueError) on ints too
+            # large for float, so the magnitude check needs its own guard
+            # (pr43 review PRR-012); the upper bound keeps total_score inside
+            # what json can emit — an unbounded weight turns a score into a
+            # bare `Infinity`, which is not valid RFC 8259 (PRR-013).
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
                 raise ConfigError(
-                    f"[derive] {key} must be finite and non-negative", path=path
+                    f"[derive] {key} magnitude is out of range", path=path
+                ) from None
+            if not finite or value < 0 or value > _MAX_WEIGHT:
+                raise ConfigError(
+                    f"[derive] {key} must be finite, non-negative, and <= {_MAX_WEIGHT}",
+                    path=path,
                 )
             if key in hub:
                 hub[key] = float(value)
@@ -256,7 +282,12 @@ def _parse_instant(value: str | None) -> datetime | None:
 
 
 def _resolve_ref(ref: str, vocab: set[str], by_suffix: dict[str, list[str]]) -> str | None:
-    """Deterministic vocabulary resolution: exact, then unique suffix.
+    """Deterministic vocabulary resolution: exact, then unique suffix in
+    either direction — the ref is a component-boundary tail of a vocab path
+    (the common case, ``query.py`` -> ``src/zaxbygraph/query.py``; that is
+    exactly what ``by_suffix`` indexes), or a vocab path is a tail of the
+    ref (absolute or checkout-prefixed mentions, ``/repo/src/a.py`` ->
+    ``src/a.py``).
 
     Ambiguous or unresolved references resolve to None and can never anchor
     a pair.
@@ -266,9 +297,10 @@ def _resolve_ref(ref: str, vocab: set[str], by_suffix: dict[str, list[str]]) -> 
     matches = by_suffix.get(ref)
     if matches and len(matches) == 1:
         return matches[0]
-    tails = [p for p in vocab if p.endswith("/" + ref) or ("/" + p).endswith("/" + ref)]
-    if len(tails) == 1:
-        return tails[0]
+    # Reverse direction: a vocab path that is a tail of the longer ref.
+    heads = [p for p in vocab if p != ref and ref.endswith("/" + p)]
+    if len(heads) == 1:
+        return heads[0]
     return None
 
 
@@ -286,9 +318,12 @@ def build_context(
     ``removed`` statuses. Raw ``item_path_refs`` strings are then RESOLVED
     against that vocabulary (exact match, then unique-suffix match in either
     direction); unresolved references never enter a resolved path set and
-    can never anchor a pair — they only feed ``files_analog`` evidence.
-    ``ls_files`` (opt-in, from ``git ls-files`` of the invoking checkout)
-    intersects the vocabulary LAST.
+    can never anchor a pair. ``ls_files`` (opt-in, from ``git ls-files`` of
+    the invoking checkout) intersects AFTER resolution — suffix ambiguity is
+    decided by the full merged-PR vocabulary, never by the checkout filter,
+    so ``similar --ls-files`` and plain ``similar`` share resolution
+    semantics (pr43 review PRR-017). Hub statistics are likewise computed
+    over the full vocabulary before the filter thins it.
     """
     caps = caps or _Capabilities(conn)
     items = _load_items(conn, repo, caps)
@@ -305,10 +340,6 @@ def build_context(
             path = _norm_path(row["path"])
             if path:
                 vocab_files.setdefault(path, set()).add(row["number"])
-
-    if ls_files is not None:
-        allowed = {_norm_path(p) for p in ls_files}
-        vocab_files = {p: nums for p, nums in vocab_files.items() if p in allowed}
 
     # Resolution: exact match wins; otherwise a unique suffix match in
     # either direction (ref is a tail of a vocab path, or a vocab path is a
@@ -380,11 +411,25 @@ def build_context(
                 items[src].neighbors.add(dst)
                 items[dst].neighbors.add(src)
 
-    # Hub statistics over the resolved vocabulary: a path touching a large
-    # share of items carries less discriminating evidence.
+    # Hub statistics over the FULL resolved vocabulary: a path touching a
+    # large share of items carries less discriminating evidence. Computed
+    # before the ls-files filter so the checkout never changes evidence
+    # weight, only which paths can score.
     hub = {
         p: len(nums) / max(1, len(items)) for p, nums in vocab_files.items()
     }
+
+    # The ls-files intersection is applied LAST — after suffix resolution
+    # and hub statistics, so the checkout filter never changes what a
+    # reference resolves to or how much evidence a path carries; it only
+    # thins which paths can score (pr43 review PRR-017).
+    if ls_files is not None:
+        allowed = {_norm_path(p) for p in ls_files}
+        vocab_files = {p: nums for p, nums in vocab_files.items() if p in allowed}
+        for data in items.values():
+            if data.paths - allowed:
+                data.paths &= allowed
+
     return {
         "repo": repo,
         "items": items,
@@ -555,7 +600,7 @@ def similar(
     conn: sqlite3.Connection,
     repo: str,
     number: int,
-    limit: int = 20,
+    limit: int | None = 20,
     weights: dict | None = None,
     ls_files: list[str] | None = None,
     exclude_adjacency: set[frozenset[int]] | None = None,
@@ -567,6 +612,10 @@ def similar(
     Raises LookupError when the item does not exist in ``repo``. The target
     itself is never a candidate. A candidate pair is admitted only when an
     anchor signal fired (AC3's guard); raisers then lift its score.
+    ``limit=None`` returns the complete ranked pool — the eval harness uses
+    it to apply its own visibility filters BEFORE taking a top-N, so a
+    post-cutoff leader can never crowd a pre-cutoff partner out of the
+    window (pr43 review PRR-006).
     ``exclude_adjacency`` (eval) removes specific item pairs from the
     structural adjacency; ``filtered_sources`` (eval) drops keyword-derived
     edges from adjacency so comment-cutoff controls stay honest;
@@ -575,7 +624,6 @@ def similar(
     origin and a cutoff-visible subset cannot be reconstructed.
     """
     weights = weights or load_weights()
-    limit = _clamp_limit(limit)
     caps = _Capabilities(conn)
     ctx = build_context(
         conn,
@@ -626,11 +674,13 @@ def similar(
             }
         )
     candidates.sort(key=lambda c: (-c["total_score"], c["number"]))
-    candidates = candidates[:limit]
+    if limit is not None:
+        candidates = candidates[: _clamp_limit(limit)]
     return {
         "target": number,
         "repo": repo,
         "candidates": candidates,
+        "resolved_path_count": len(ctx["vocab"]),
         "weights": weights,
         "capabilities": caps.notes,
         "derived": True,
@@ -676,6 +726,7 @@ def explain(
             },
             "total_score": 0.0,
             "anchor": None,
+            "resolved_path_count": len(ctx["vocab"]),
             "weights": weights,
             "capabilities": caps.notes,
             "derived": True,
@@ -693,6 +744,7 @@ def explain(
         },
         "total_score": round(_total_score(components, weights), 6),
         "anchor": _anchor_fired(components),
+        "resolved_path_count": len(ctx["vocab"]),
         "weights": weights,
         "capabilities": caps.notes,
         "derived": True,
@@ -891,8 +943,12 @@ def localize_files(
     are excluded, an origin that fails to resolve suppresses the ref and
     flags the result. Deterministic order: score descending, then path
     ascending.
+
+    ``weights`` is accepted for call-site symmetry with :func:`similar` and
+    :func:`explain` but is unused today: file ranking is weight-free, so no
+    ``[derive]`` configuration is loaded here (an invalid weights file must
+    not abort a weight-free command — pr43 review PRR-025).
     """
-    weights = weights or load_weights()
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
     items = ctx["items"]
@@ -914,23 +970,27 @@ def localize_files(
             for i in range(len(parts)):
                 by_suffix.setdefault("/".join(parts[i:]), []).append(path)
         target_paths = set()
-        for row in conn.execute(
-            "SELECT path, origin FROM item_path_refs WHERE repo = ? AND number = ?",
-            (repo, number),
-        ):
-            ref = _norm_path(row["path"])
-            if not ref:
-                continue
-            ts, resolved = origin_timestamp(conn, repo, number, row["origin"])
-            if not resolved:
-                leakage_notes.append(f"origin_unresolved:{row['origin']}")
-                continue
-            ts_dt = _parse_instant(ts)
-            if row["origin"] != "body" and ts_dt is not None and ts_dt > comment_cutoff_dt:
-                continue
-            resolved_path = _resolve_ref(ref, pool_vocab, by_suffix)
-            if resolved_path is not None:
-                target_paths.add(resolved_path)
+        if caps.has_path_refs:
+            # Pre-v9 stores have no item_path_refs table: there are no stored
+            # refs to resolve, so target_paths stays empty instead of
+            # crashing (pr43 review PRR-011).
+            for row in conn.execute(
+                "SELECT path, origin FROM item_path_refs WHERE repo = ? AND number = ?",
+                (repo, number),
+            ):
+                ref = _norm_path(row["path"])
+                if not ref:
+                    continue
+                ts, resolved = origin_timestamp(conn, repo, number, row["origin"])
+                if not resolved:
+                    leakage_notes.append(f"origin_unresolved:{row['origin']}")
+                    continue
+                ts_dt = _parse_instant(ts)
+                if row["origin"] != "body" and ts_dt is not None and ts_dt > comment_cutoff_dt:
+                    continue
+                resolved_path = _resolve_ref(ref, pool_vocab, by_suffix)
+                if resolved_path is not None:
+                    target_paths.add(resolved_path)
     else:
         target_paths = set(target.paths)
 

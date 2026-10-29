@@ -131,7 +131,7 @@ Every command accepts:
 | Flag | Meaning |
 | --- | --- |
 | `--db PATH` | Database location. Default as above. |
-| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. Exception: `export-corpus` refuses `--repo ''` (`repo_required`) — a corpus is defined per repo. |
+| `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. Exception: `export-corpus` and the four derived reads refuse `--repo ''` (`repo_required`) — results are defined per repo. |
 | `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
@@ -143,15 +143,18 @@ Four commands compute relatedness at query time from GitHub-reported facts
 already in the store. Everything they return is marked `derived: true`:
 these are computed opinions (weighted signals over paths, terms, error
 signatures, co-change and adjacency), never extracted evidence — they never
-touch the `edges` table and the store file stays byte-identical after every
-run. A pair is only ever proposed when an anchor signal fires (shared
-resolved path, shared error signature, shared item-item adjacency, or
-co-change between direct files); lexical/title/label similarity can only
-raise an anchored pair's score, so vocabulary-only and label-only look-alikes
-never pair. Weights live in a `[derive]` TOML table — defaults, then
-`<store>/config.toml`, then `.zaxbygraph.toml` in the working directory,
-then an explicit `--config` file (later wins per key; unknown keys, negative
-or non-finite values, and out-of-range hub parameters are `config_error`s).
+write the `edges` table (they read adjacency from it) and the store file
+stays byte-identical after every run. A pair is only ever proposed when an
+anchor signal fires (shared resolved path, shared error signature, shared
+item-item adjacency, or co-change between direct files); lexical/title/label
+similarity can only raise an anchored pair's score, so vocabulary-only and
+label-only look-alikes never pair. Weights live in a `[derive]` TOML table —
+defaults, then `<store>/config.toml`, then `.zaxbygraph.toml` in the working
+directory, then an explicit `--config` file (later wins per key; unknown
+keys, negative/non-finite/over-magnitude (≤ 1e9) values, and out-of-range
+hub parameters are `config_error`s). All four commands require a resolved
+repository: with a resolvable store, `--repo ''` is refused with
+`repo_required` (a corpus is defined per repo), like `export-corpus`.
 
 ```bash
 zaxbygraph similar 42 [--limit 20] [--ls-files] [--config WEIGHTS.toml]
@@ -162,10 +165,10 @@ zaxbygraph eval similar|localize|bundle [--config WEIGHTS.toml]
 
 | Command | Meaning |
 | --- | --- |
-| `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match, and unresolved mentions can never anchor a pair. `--ls-files` intersects the resolved vocabulary with the invoking checkout's `git ls-files` and echoes that checkout's HEAD sha. |
+| `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, `resolved_path_count` (the vocabulary the pair scored against), capability degradation notes, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match in either direction (the mention is a tail of a stored path, or a stored path is a tail of the mention), and unresolved mentions can never anchor a pair. `--ls-files` intersects AFTER resolution — it only thins which paths can score, never what a mention resolves to — and echoes that checkout's HEAD sha plus `ls_files_applied` (false when the checkout could not be listed). |
 | `explain A B` | The exact per-signal breakdown one pair scored — the same function `similar` slices, so the two cannot diverge. |
-| `coupling PATH` | Files that change together with PATH over merged PRs touching 2–50 files: `support` (co-occurrence count), `confidence` (support/support(PATH)), `lift` (N·support/(support(PATH)·support(other)), `null` instead of NaN when either file never appears in the population). Unmerged PRs never count. |
-| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5), and the issue sets single PRs closed (bundle: pair recall/precision) — under leakage controls (candidates restricted to items that existed at the target's creation; the target's closing PRs, post-cutoff PRs, post-fix comments and their rolled-up references excluded; signature components suppressed because stored signatures carry no origin). Results whose controls could not be applied are labelled `with_leakage` with reasons, and every result prints the `corpus_sha256` of the exact snapshot the metrics were computed on. |
+| `coupling PATH` | Files that change together with PATH over merged PRs touching 2–50 files: `support` (co-occurrence count), `confidence` (support/support(PATH)), `lift` (N·support/(support(PATH)·support(other)), `null` instead of NaN when either file never appears in the population), `population_prs` (how many merged PRs are inside the 2–50 population). Unmerged PRs never count. An unknown path answers `reason: unknown_path`, a known path whose PRs all fall outside the population answers `reason: excluded_from_population`, and a repo with no qualifying PRs answers `reason: no_merged_prs` — never a silent empty list. |
+| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5), and the issue sets single merged PRs closed (bundle: pair recall/precision) — under leakage controls (candidates restricted to items that existed at the target's creation; the target's closing PRs and their edges excluded; post-cutoff PRs, post-fix comments and their rolled-up references excluded in the localize mode; signature components suppressed because stored signatures carry no origin). Results whose controls could not be applied are disclosed under `with_leakage` with reasons (disclosure is label-only; the scored target stays scored); denominators count eligible targets only, and a mode with zero eligible targets adds a `no_ground_truth` label. Current stores print the `corpus_sha256` of the exact snapshot the metrics were computed on; stores below the export floor or ahead of this build return `corpus_sha256: null` with a `store_too_old` / `store_too_new` label. |
 
 ### `sync` — fetch into the graph
 
@@ -612,7 +615,9 @@ Machine-readable rules, worth knowing before scripting against this:
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
   `bad_request`, `bad_as_of`, `bad_flags`, `bad_sql`, `runtime`; export-corpus
   additionally emits `repo_required`, `bad_include`, `out_is_database`,
-  `store_too_old`, `store_too_new`, `incomplete_store`) to
+  `store_too_old`, `store_too_new`, `incomplete_store`; the derived reads add
+  `config_error` for `[derive]` weight problems, and every store-opening read
+  emits `store_unreadable` when the store cannot be opened) to
   **stdout**, so `json.load(stdin)`
   never sees an empty stream. The same `error: MESSAGE` one-liner is still
   printed to stderr for humans; argparse usage errors remain plain stderr.

@@ -89,8 +89,11 @@ def build_eval_store(conn: sqlite3.Connection) -> FakeGitHubSource:
     - PR 130 merged T0+9d (non-closing, AFTER both duplicate targets):
       touches docs/leak.md — must be excluded by the item-visibility cutoff
     - issue 199 created T0+10d: future candidate, must be excluded
-    - PR 140 merged T0+2d: 3 files is fine, but PR 141 touches 1 file and
-      PR 142 touches 51 files — both OUTSIDE the coupling population.
+    - coupling population boundaries: PRs 10/11/120 (2 files each) sit
+      INSIDE the 2-50 population, while PR 141 touches 1 file and PR 142
+      touches 51 files — both OUTSIDE. (No mid-population 3-file PR is
+      built: pair support is per-file-pair, so a 2-file PR exercises the
+      same index arithmetic; noted in the PR #43 closure ledger.)
 
     The planted issue-owned anchor for {101, 102} is the resolved shared
     path src/feature.py (in the vocabulary via PRs 10 and 11, both merged

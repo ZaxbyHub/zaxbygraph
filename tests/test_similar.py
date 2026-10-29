@@ -33,8 +33,11 @@ is derived, not measured):
 REAL-CORPUS EMPIRICAL GOALS (regression pins, NOT hand-derived oracles —
 the recording in tests/eval_fixture/ is replayed and the pinned values are
 what the current harness measures on it; no random-baseline comparison is
-claimed): localize Acc@5 = 1.0, bundle pair_recall = 0.5,
-pair_precision = 0.111 (1 hit in 9 proposed pairs over 2 truth pairs).
+claimed; re-measured after the pr43 round-2 metric fixes — untruncated
+candidate pools, visible-partner recall denominators, scoreable-pair bundle
+denominators): localize Acc@5 = 1.0 (9 of 15 targets eligible), bundle
+pair_recall = 1.0, pair_precision = 0.105 (2 hits in 19 proposed pairs over
+2 scoreable truth pairs, 4 eligible targets).
 The real corpus has zero duplicate_of edges, so the similar mode reports
 zero eligible targets there by construction; duplicate detection floors
 live on the synthetic store only.
@@ -385,6 +388,20 @@ class ConfigTests(DerivedTierTest):
             with self.assertRaises(ConfigError):
                 load_weights(explicit_config=str(hub))
 
+    def test_weight_magnitude_bounds_are_coded(self) -> None:
+        """PRR-012/013: a TOML integer too big for float raises ConfigError
+        (not a raw OverflowError), and an over-magnitude weight cannot turn
+        a score into JSON `Infinity`."""
+        with tempfile.TemporaryDirectory() as td:
+            huge = Path(td) / "huge.toml"
+            huge.write_text(f"[derive]\nlexical = {10 ** 400}\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_weights(explicit_config=str(huge))
+            over = Path(td) / "over.toml"
+            over.write_text("[derive]\nlexical = 1e308\n", encoding="utf-8")
+            with self.assertRaises(ConfigError):
+                load_weights(explicit_config=str(over))
+
 
 class EvalTests(DerivedTierTest):
     def test_eval_leakage_controls(self) -> None:
@@ -416,7 +433,10 @@ class EvalTests(DerivedTierTest):
         # suppressed, issue 103 pairs with 101 ONLY through the common
         # neighbor the duplicate_of edge creates (103 mentions 102, so both
         # see 102 as adjacent). Removing the (101,102) adjacency removes
-        # 103's only anchor — the edge was load-bearing.
+        # 103's only anchor — the edge was load-bearing. The inserted edge
+        # is deleted in the finally block: leaving it behind would make
+        # every later test on this shared store see mutated geometry
+        # (pr43 review PRR-018).
         wconn = connect(self.db_path)
         try:
             wconn.execute(
@@ -427,22 +447,29 @@ class EvalTests(DerivedTierTest):
                 (REPO,),
             )
             wconn.commit()
+            suppressed = {"signature", "files_direct", "cochange"}
+            with_edge = similar(
+                self.conn, REPO, 101, limit=50, suppress_signals=suppressed
+            )
+            self.assertIn(103, [c["number"] for c in with_edge["candidates"]])
+            without_edge = similar(
+                self.conn,
+                REPO,
+                101,
+                limit=50,
+                suppress_signals=suppressed,
+                exclude_adjacency={frozenset((101, 102))},
+            )
+            self.assertNotIn(103, [c["number"] for c in without_edge["candidates"]])
         finally:
+            wconn.execute(
+                "DELETE FROM edges WHERE repo = ? AND src_type = 'item'"
+                " AND src_id = '103' AND rel = 'mentions' AND dst_type = 'item'"
+                " AND dst_id = '102' AND source = 'timeline'",
+                (REPO,),
+            )
+            wconn.commit()
             wconn.close()
-        suppressed = {"signature", "files_direct", "cochange"}
-        with_edge = similar(
-            self.conn, REPO, 101, limit=50, suppress_signals=suppressed
-        )
-        self.assertIn(103, [c["number"] for c in with_edge["candidates"]])
-        without_edge = similar(
-            self.conn,
-            REPO,
-            101,
-            limit=50,
-            suppress_signals=suppressed,
-            exclude_adjacency={frozenset((101, 102))},
-        )
-        self.assertNotIn(103, [c["number"] for c in without_edge["candidates"]])
         # (d) keyword-source filtering has its own bait: issue 106 mentions
         # 102 via a keyword-sourced edge, so 101 pairs with 106 through the
         # common neighbor 102 — and loses it when keyword edges are
@@ -763,6 +790,741 @@ class CliContractTests(DerivedTierTest):
         envelope = json.loads(out)
         self.assertTrue(envelope["ok"])
         self.assertTrue(envelope["data"]["corpus_sha256"])
+        # PRR-021: eval metrics are tied to the [derive] config that
+        # produced them via the same weights key similar/explain carry.
+        self.assertTrue(envelope["data"]["weights"])
+
+    def test_config_errors_carry_config_error_code(self) -> None:
+        """PRR-014: weight-config failures are config_errors, matching the
+        documented contract (previously the generic bad_request)."""
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad.toml"
+            bad.write_text("[derive]\nnope = 1\n", encoding="utf-8")
+            rc, out, _err = self._run(
+                "similar", "101", "--db", str(self.db_path), "--repo", REPO,
+                "--config", str(bad), "--format", "json",
+            )
+            self.assertEqual(rc, 2, out)
+            envelope = json.loads(out)
+            self.assertFalse(envelope["ok"])
+            self.assertEqual(envelope["error"]["code"], "config_error")
+
+    def test_repo_required_on_unresolved_repo(self) -> None:
+        """PRR-016: all four derived commands refuse an unresolved repo with
+        the canonical code instead of answering from an empty filter."""
+        for argv in (
+            ("similar", "101"),
+            ("explain", "101", "102"),
+            ("coupling", "src/feature.py"),
+            ("eval", "similar"),
+        ):
+            rc, out, _err = self._run(
+                *argv, "--db", str(self.db_path), "--repo", "", "--format", "json"
+            )
+            self.assertEqual(rc, 2, argv)
+            envelope = json.loads(out)
+            self.assertFalse(envelope["ok"])
+            self.assertEqual(envelope["error"]["code"], "repo_required", argv)
+
+    def test_corrupt_store_reports_store_unreadable_on_legacy_reads(self) -> None:
+        """PRR-015: the store_unreadable code is forwarded by every read
+        runner, not only the derived tier."""
+        import io
+        import json as _json
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from zaxbygraph.cli import main
+
+        junk = Path(self._td.name) / "junk2.db"
+        junk.write_bytes(b"still not a database" * 64)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(
+                ["search", "crash", "--db", str(junk), "--repo", REPO,
+                 "--format", "json"]
+            )
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err.getvalue())
+        envelope = _json.loads(out.getvalue())
+        self.assertEqual(envelope["error"]["code"], "store_unreadable")
+
+
+class PathResolutionTests(DerivedTierTest):
+    """PRR-001/017/020/028: normalization, resolution direction, and the
+    ls-files intersection order."""
+
+    def test_norm_path_preserves_dotfiles(self) -> None:
+        from zaxbygraph.derive import _norm_path
+
+        self.assertEqual(_norm_path(".github/workflows/ci.yml"), ".github/workflows/ci.yml")
+        self.assertEqual(_norm_path(".env"), ".env")
+        self.assertEqual(_norm_path("./src/feature.py"), "src/feature.py")
+        self.assertEqual(_norm_path("src\\windows\\path.py"), "src/windows/path.py")
+        self.assertEqual(_norm_path(""), "")
+        # a relative parent prefix survives normalization (it is data, not
+        # decoration: lstrip("./") used to rename it into existence)
+        self.assertEqual(_norm_path("../outside/x.py"), "../outside/x.py")
+
+    def test_resolve_ref_matches_in_either_direction(self) -> None:
+        """PRR-020: the documented bidirectional suffix match, implemented."""
+        from pathlib import PurePosixPath
+
+        from zaxbygraph.derive import _resolve_ref
+
+        def suffix_index(vocab: set[str]) -> dict[str, list[str]]:
+            by_suffix: dict[str, list[str]] = {}
+            for path in vocab:
+                parts = PurePosixPath(path).parts
+                for i in range(len(parts)):
+                    by_suffix.setdefault("/".join(parts[i:]), []).append(path)
+            return by_suffix
+
+        vocab = {"src/zaxbygraph/query.py", "docs/guide.md"}
+        by_suffix = suffix_index(vocab)
+        # forward: ref is a tail of a vocab path
+        self.assertEqual(
+            _resolve_ref("query.py", vocab, by_suffix), "src/zaxbygraph/query.py"
+        )
+        # reverse: a vocab path is a tail of the (longer) ref — absolute or
+        # checkout-prefixed mentions resolve too
+        self.assertEqual(
+            _resolve_ref("checkout/src/zaxbygraph/query.py", vocab, by_suffix),
+            "src/zaxbygraph/query.py",
+        )
+        # ambiguous in the reverse direction resolves to nothing: the ref
+        # ends with BOTH vocab paths
+        ambiguous = {"feature.py", "src/a/feature.py"}
+        self.assertIsNone(_resolve_ref("repo/src/a/feature.py", ambiguous, {}))
+        # a ref that ends with exactly one vocab path resolves uniquely —
+        # even when a sibling path shares the suffix's tail shape
+        self.assertEqual(
+            _resolve_ref(
+                "repo/src/a/feature.py",
+                {"src/a/feature.py", "src/b/feature.py"},
+                {},
+            ),
+            "src/a/feature.py",
+        )
+
+    def test_similar_explain_carry_resolved_path_count(self) -> None:
+        out = similar(self.conn, REPO, 101, limit=5)
+        self.assertGreater(out["resolved_path_count"], 0)
+        self.assertEqual(
+            explain(self.conn, REPO, 101, 102)["resolved_path_count"],
+            out["resolved_path_count"],
+        )
+        self.assertEqual(
+            explain(self.conn, REPO, 101, 101)["resolved_path_count"],
+            out["resolved_path_count"],
+        )
+
+    def test_ls_files_thins_but_never_redirects_resolution(self) -> None:
+        """PRR-017: the checkout filter removes paths from scoring; it must
+        not change what references resolve to (the intersection is applied
+        after resolution)."""
+        plain = similar(self.conn, REPO, 101, limit=50)
+        kept = similar(
+            self.conn,
+            REPO,
+            101,
+            limit=50,
+            ls_files=["src/feature.py", "src/fix_patch.py", "docs/leak.md", "docs/other.md"],
+        )
+        # intersecting with the full vocabulary changes nothing
+        self.assertEqual(
+            [c["number"] for c in plain["candidates"]],
+            [c["number"] for c in kept["candidates"]],
+        )
+        narrowed = similar(self.conn, REPO, 101, limit=50, ls_files=["docs/leak.md"])
+        numbers = {c["number"] for c in narrowed["candidates"]}
+        for cand in narrowed["candidates"]:
+            self.assertEqual(cand["components"]["files_direct"]["score"], 0.0)
+        # 101/102's only ANCHOR signal was the shared thinned path (labels
+        # and lexical merely raise), so the pair legitimately drops out of
+        # the narrowed ranking while remaining present unfiltered
+        self.assertIn(102, {c["number"] for c in plain["candidates"]})
+        self.assertNotIn(102, numbers)
+
+
+class RevisionControlTests(unittest.TestCase):
+    """PRR-003/004: the revised-after-cutoff disclosure actually fires, and
+    a pre-v8 store discloses that the control is unavailable."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._td = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls._td.name) / "rev.db"
+        conn = connect(cls.db_path)
+        try:
+            init_schema(conn)
+            build_eval_store(conn)
+            # A post-cutoff body edit on target 101 (created T0+4d): the
+            # item_title/item_body revision rows are what store.py writes
+            # (valid_to is NOT NULL — a still-current revision carries its
+            # supersedence stamp).
+            conn.execute(
+                "INSERT INTO revisions(repo, number, entity, entity_id, kind,"
+                " origin, content, valid_from, valid_to)"
+                " VALUES (?, '101', 'item_body', NULL, NULL, 'edit',"
+                " 'rewritten after the cutoff', ?, ?)",
+                (REPO, "2026-06-10T00:00:00Z", "2026-06-11T00:00:00Z"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._td.cleanup()
+
+    def test_revised_target_is_disclosed_in_every_mode(self) -> None:
+        ro = open_existing(self.db_path)
+        try:
+            for mode in ("similar", "localize", "bundle"):
+                result = run_eval(ro, REPO, mode)
+                self.assertIn(
+                    "item_revised_after_cutoff",
+                    result["with_leakage"].get("101", []),
+                    mode,
+                )
+            # disclosure is label-only: the similar metric still scores 101
+            similar_eval = run_eval(ro, REPO, "similar")
+            self.assertGreater(similar_eval["metrics"]["eligible_targets"], 0)
+        finally:
+            ro.close()
+
+    def test_pre_v8_store_discloses_unavailable_control(self) -> None:
+        import shutil
+
+        old = Path(self._td.name) / "prev8.db"
+        shutil.copyfile(self.db_path, old)
+        wconn = connect(old)
+        try:
+            wconn.execute("DROP TABLE revisions")
+            wconn.commit()
+        finally:
+            wconn.close()
+        ro = open_existing(old)
+        try:
+            for mode in ("similar", "localize", "bundle"):
+                result = run_eval(ro, REPO, mode)
+                self.assertIn(
+                    "revisions_unavailable", result["with_leakage"].get("101", []),
+                    mode,
+                )
+            # disclosure, not exclusion: scoring continues
+            self.assertGreater(result["metrics"]["eligible_targets"], 0)
+        finally:
+            ro.close()
+
+    def test_unparseable_created_at_is_excluded_and_labelled(self) -> None:
+        import shutil
+
+        broken = Path(self._td.name) / "brokenstamp.db"
+        shutil.copyfile(self.db_path, broken)
+        wconn = connect(broken)
+        try:
+            # move the planted revision out of the way so 101's only issue
+            # is its stamp, then corrupt 102's created_at (non-NULL junk)
+            wconn.execute("DELETE FROM revisions WHERE number = '101'")
+            wconn.execute(
+                "UPDATE items SET created_at = 'not-a-timestamp' WHERE number = '102'"
+            )
+            wconn.commit()
+        finally:
+            wconn.close()
+        ro = open_existing(broken)
+        try:
+            # 102 is a duplicate-similar target only (localize/bundle target
+            # issues come from closes edges: 101 and 105)
+            result = run_eval(ro, REPO, "similar")
+            self.assertIn(
+                "created_at_unparseable", result["with_leakage"].get("102", [])
+            )
+        finally:
+            ro.close()
+
+
+class ClosingPrexclusionTests(unittest.TestCase):
+    """PRR-005: eval modes exclude the target's closing-PR edges. Two
+    issues sharing NOTHING but their closing PR must not pair through it:
+    with the exclusion the bundle proposal set misses the truth pair, and
+    similar() only proposes it when the closing-PR adjacency is left in."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        from fixtures import FakeGitHubSource, issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        cls._td = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls._td.name) / "closing.db"
+        conn = connect(cls.db_path)
+        try:
+            init_schema(conn)
+            src = FakeGitHubSource()
+            src.add_issue(
+                issue(
+                    301,
+                    title="totally unrelated alpha problem",
+                    body="alpha rotor bearing wear",
+                    created_at="2026-06-02T00:00:00Z",
+                )
+            )
+            src.add_issue(
+                issue(
+                    302,
+                    title="unrelated gamma auth flow",
+                    body="gamma token refresh loop",
+                    created_at="2026-06-02T00:00:00Z",
+                )
+            )
+            merged = pull(310, merged=True)
+            merged["merged_at"] = "2026-06-04T00:00:00Z"
+            src.add_pr(
+                issue(
+                    310,
+                    title="chore merge",
+                    body="",
+                    kind="pr",
+                    created_at="2026-06-03T00:00:00Z",
+                ),
+                merged,
+                files=[pr_file("src/a.py"), pr_file("src/b.py")],
+            )
+            sync_repo(conn, src, REPO)
+            _insert_edge(conn, REPO, 310, "closes", 301, source="closing_ref")
+            _insert_edge(conn, REPO, 310, "closes", 302, source="closing_ref")
+            # the duplicate link makes {301, 302} eval-similar targets whose
+            # ONLY ranking bridge is the shared closing PR 310
+            _insert_edge(conn, REPO, 302, "duplicate_of", 301)
+            conn.commit()
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._td.cleanup()
+
+    def setUp(self) -> None:
+        self.conn = open_existing(self.db_path)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def test_closing_pr_alone_does_not_pair_issues_in_eval(self) -> None:
+        # the shared closing PR is the only bridge: with the exclusion,
+        # neither issue proposes the other, so the truth pair is missed.
+        result = run_eval(self.conn, REPO, "bundle")
+        self.assertGreaterEqual(result["metrics"]["truth_pairs"], 1)
+        self.assertEqual(result["metrics"]["pair_recall"], 0.0)
+
+    def test_closing_pr_alone_does_not_rank_partner_in_similar_eval(self) -> None:
+        """PRR-005's discriminating leg: the duplicate pair {301, 302}
+        anchors ONLY through the common closing-PR neighbor; the eval
+        excludes that adjacency, so the partner must NOT rank (pre-fix this
+        recalled 1.0 through the closing PR)."""
+        result = run_eval(self.conn, REPO, "similar")
+        # the partner never ranks, so NEITHER duplicate direction has an
+        # in-scope candidate: the metric is empty (pre-fix it recalled 1.0
+        # through the closing-PR adjacency)
+        self.assertIsNone(result["metrics"]["recall_at_5"])
+        self.assertEqual(result["metrics"]["eligible_targets"], 0)
+        self.assertIn("no_ground_truth", result["labels"])
+
+    def test_closing_pr_exclusion_is_the_only_toggle(self) -> None:
+        # proving the isolation: WITHOUT the exclusion the pair anchors
+        # through the closing PR (structural), so deleting exactly the
+        # (301, 310) adjacency from 302's view must remove the proposal.
+        with_edge = similar(self.conn, REPO, 302, limit=10)
+        self.assertIn(301, [c["number"] for c in with_edge["candidates"]])
+        without_edge = similar(
+            self.conn,
+            REPO,
+            302,
+            limit=10,
+            exclude_adjacency={frozenset((301, 310))},
+        )
+        self.assertNotIn(301, [c["number"] for c in without_edge["candidates"]])
+
+
+class EvalDenominatorTests(unittest.TestCase):
+    """Discriminating legs for the pr43 round-2 metric fixes: each test
+    FAILS against the pre-fix eval (truncation before filtering, all-partner
+    recall denominators, unmerged closers in bundle truth)."""
+
+    def _build(self, name: str) -> tuple[object, "FakeGitHubSource"]:  # type: ignore[name-defined]
+        from fixtures import FakeGitHubSource
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / name
+        conn = connect(db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        return conn, FakeGitHubSource()
+
+    def test_post_cutoff_leaders_cannot_crowd_the_window(self) -> None:
+        """PRR-006: 25 future decoys outrank the planted partner; the eval
+        must rank from the UNTRUNCATED pool and filter visibility BEFORE the
+        top-5 cut (pre-fix: limit=20 truncated the partner away and the
+        target was skipped, reporting no ground truth at all)."""
+        from fixtures import issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        conn, src = self._build("crowd.db")
+        merged = pull(500, merged=True)
+        merged["merged_at"] = "2026-05-01T00:00:00Z"
+        src.add_pr(
+            issue(500, title="vocab pr", body="", kind="pr", created_at="2026-05-01T00:00:00Z"),
+            merged,
+            files=[pr_file("src/shared.py")],
+        )
+        body = "alpha beta gamma delta epsilon zeta"
+        src.add_issue(
+            issue(501, title="submit crash", body=body, created_at="2026-06-01T00:00:00Z",
+                  comments=1)
+        )
+        # the path ref rides in a comment (extracted like the fixture does)
+        src.comment_on(501, "see src/shared.py:1:1")
+        src.add_issue(
+            issue(502, title="widget overview", body="widget plumbing notes entirely unrelated",
+                  created_at="2026-06-01T00:00:00Z", comments=1)
+        )
+        src.comment_on(502, "see src/shared.py:2:2")
+        for n in range(510, 535):
+            src.add_issue(
+                issue(n, title=f"decoy {n}", body=body, created_at="2026-07-01T00:00:00Z",
+                      comments=1)
+            )
+            src.comment_on(n, "see src/shared.py:3:3")
+        sync_repo(conn, src, REPO)
+        _insert_edge(conn, REPO, 502, "duplicate_of", 501)
+        conn.commit()
+        ro = open_existing(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
+        try:
+            result = run_eval(ro, REPO, "similar")
+        finally:
+            ro.close()
+        # BOTH duplicate directions are eligible now (each partner is visible
+        # at its target's cutoff): pre-fix, target 501 was skipped entirely
+        # (its partner truncated away by limit=20) leaving eligible == 1.
+        self.assertEqual(result["metrics"]["eligible_targets"], 2)
+        self.assertEqual(result["metrics"]["recall_at_5"], 1.0)
+
+    def test_recall_denominator_counts_only_visible_partners(self) -> None:
+        """PRR-007: partner 603 is created after the target and can never
+        hit; it must not sit in the recall denominator (pre-fix: 0.5)."""
+        from fixtures import issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        conn, src = self._build("denom.db")
+        merged = pull(600, merged=True)
+        merged["merged_at"] = "2026-05-01T00:00:00Z"
+        src.add_pr(
+            issue(600, title="vocab pr", body="", kind="pr", created_at="2026-05-01T00:00:00Z"),
+            merged,
+            files=[pr_file("src/both.py")],
+        )
+        for number, stamp in (
+            (601, "2026-06-01T00:00:00Z"),
+            (602, "2026-06-01T00:00:00Z"),
+            (603, "2026-07-01T00:00:00Z"),
+        ):
+            src.add_issue(
+                issue(number, title=f"crash on submit {number}",
+                      body="submit handler crashes on retry", created_at=stamp,
+                      comments=1)
+            )
+            src.comment_on(number, "see src/both.py:1:1")
+        sync_repo(conn, src, REPO)
+        _insert_edge(conn, REPO, 602, "duplicate_of", 601)
+        _insert_edge(conn, REPO, 603, "duplicate_of", 601)
+        conn.commit()
+        ro = open_existing(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
+        try:
+            result = run_eval(ro, REPO, "similar")
+        finally:
+            ro.close()
+        # all three targets are eligible; recall is 1.0 everywhere because
+        # the invisible partner 603 no longer sits in 601's denominator
+        # (pre-fix: recall (0.5 + 1.0 + 1.0) / 3)
+        self.assertEqual(result["metrics"]["eligible_targets"], 3)
+        self.assertEqual(result["metrics"]["recall_at_5"], 1.0)
+
+    def test_unmerged_closer_contributes_no_bundle_truth(self) -> None:
+        """PRR-008: an UNMERGED PR with closing keywords/references must not
+        seed bundle truth (pre-fix: truth_pairs == 1 and a real recall
+        denominator)."""
+        from fixtures import issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        conn, src = self._build("unmerged.db")
+        src.add_issue(
+            issue(701, title="first half", body="first half of the bundle",
+                  created_at="2026-06-01T00:00:00Z")
+        )
+        src.add_issue(
+            issue(702, title="second half", body="second half of the bundle",
+                  created_at="2026-06-01T00:00:00Z")
+        )
+        src.add_pr(
+            issue(710, title="open pr", body="", kind="pr", created_at="2026-06-02T00:00:00Z"),
+            pull(710, merged=False),  # never merged: no merged_at
+            files=[pr_file("src/x.py"), pr_file("src/y.py")],
+        )
+        sync_repo(conn, src, REPO)
+        _insert_edge(conn, REPO, 710, "closes", 701, source="closing_ref")
+        _insert_edge(conn, REPO, 710, "closes", 702, source="closing_ref")
+        conn.commit()
+        ro = open_existing(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
+        try:
+            result = run_eval(ro, REPO, "bundle")
+        finally:
+            ro.close()
+        self.assertEqual(result["metrics"]["truth_pairs"], 0)
+        self.assertIsNone(result["metrics"]["pair_recall"])
+        self.assertIn("no_ground_truth", result["labels"])
+
+    def test_all_targets_cutoff_excluded_yields_empty_bundle_metrics(self) -> None:
+        """pr43 critic round 2 (executed probe): with every bundle target's
+        created_at missing, pair_recall must be EMPTY (null) with a
+        no_ground_truth label — not 0.0 over an un-hittable pair."""
+        import shutil
+
+        from fixtures import FakeGitHubSource, issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "nulstamps.db"
+        conn = connect(db_path)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        src.add_issue(
+            issue(801, title="half one", body="half one text", created_at="2026-06-01T00:00:00Z")
+        )
+        src.add_issue(
+            issue(802, title="half two", body="half two text", created_at="2026-06-01T00:00:00Z")
+        )
+        merged = pull(810, merged=True)
+        merged["merged_at"] = "2026-06-03T00:00:00Z"
+        src.add_pr(
+            issue(810, title="merger", body="", kind="pr", created_at="2026-06-02T00:00:00Z"),
+            merged,
+            files=[pr_file("src/p.py"), pr_file("src/q.py")],
+        )
+        sync_repo(conn, src, REPO)
+        _insert_edge(conn, REPO, 810, "closes", 801, source="closing_ref")
+        _insert_edge(conn, REPO, 810, "closes", 802, source="closing_ref")
+        conn.commit()
+        conn.execute("UPDATE items SET created_at = NULL WHERE number IN ('801', '802')")
+        conn.commit()
+        conn.close()
+        ro = open_existing(db_path)
+        try:
+            result = run_eval(ro, REPO, "bundle")
+        finally:
+            ro.close()
+        self.assertIsNone(result["metrics"]["pair_recall"])
+        self.assertEqual(result["metrics"]["eligible_targets"], 0)
+        self.assertIn("no_ground_truth", result["labels"])
+        self.assertIn("801", result["with_leakage"])
+
+    def test_half_excluded_bundle_yields_fully_empty_metrics(self) -> None:
+        """pr43 round-2 gate probe: ONE excluded truth endpoint must null
+        BOTH metrics (precision over proposals with no scoreable truth is
+        not a measurement), not pair_recall null beside pair_precision
+        0.0."""
+        import shutil
+
+        from fixtures import FakeGitHubSource, issue, pr_file, pull
+        from fixtures_eval import _insert_edge
+        from zaxbygraph.sync import sync_repo
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        db_path = Path(td.name) / "halfstamps.db"
+        conn = connect(db_path)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        src.add_issue(
+            issue(821, title="half one", body="half one text", created_at="2026-06-01T00:00:00Z")
+        )
+        src.add_issue(
+            issue(822, title="half two", body="half two text", created_at="2026-06-01T00:00:00Z")
+        )
+        merged = pull(830, merged=True)
+        merged["merged_at"] = "2026-06-03T00:00:00Z"
+        src.add_pr(
+            issue(830, title="merger", body="", kind="pr", created_at="2026-06-02T00:00:00Z"),
+            merged,
+            files=[pr_file("src/p.py"), pr_file("src/q.py")],
+        )
+        sync_repo(conn, src, REPO)
+        _insert_edge(conn, REPO, 830, "closes", 821, source="closing_ref")
+        _insert_edge(conn, REPO, 830, "closes", 822, source="closing_ref")
+        conn.commit()
+        conn.execute("UPDATE items SET created_at = NULL WHERE number = '821'")
+        conn.commit()
+        conn.close()
+        ro = open_existing(db_path)
+        try:
+            result = run_eval(ro, REPO, "bundle")
+        finally:
+            ro.close()
+        self.assertIsNone(result["metrics"]["pair_recall"])
+        self.assertIsNone(result["metrics"]["pair_precision"])
+        self.assertEqual(result["metrics"]["eligible_targets"], 0)
+        self.assertIn("no_ground_truth", result["labels"])
+        # 821 was excluded before scoring; 822 was scored and disclosed
+        self.assertNotIn("signature_origin_unknown", result["with_leakage"].get("821", []))
+        self.assertIn("signature_origin_unknown", result["with_leakage"].get("822", []))
+
+
+class GitLsFilesTests(unittest.TestCase):
+    """PRR-002: the ``git ls-files`` intersection is root-relative from any
+    subdirectory (and quotes nothing), and degrades to (None, None) outside
+    a checkout."""
+
+    def test_root_relative_from_subdirectory(self) -> None:
+        import os
+        import subprocess as sp
+
+        from zaxbygraph.cli import _git_ls_files
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "src" / "pkg").mkdir(parents=True)
+            (root / "src" / "pkg" / "mod.py").write_text("x = 1\n", encoding="utf-8")
+
+            def git(*argv: str, cwd: Path = root) -> None:
+                sp.run(
+                    ["git", *argv], cwd=str(cwd), check=True, capture_output=True
+                )
+
+            git("init")
+            git("-c", "user.email=t@example.com", "-c", "user.name=t", "add", ".")
+            git(
+                "-c", "user.email=t@example.com", "-c", "user.name=t",
+                "commit", "-m", "init",
+            )
+            old = os.getcwd()
+            os.chdir(root / "src" / "pkg")
+            try:
+                files, head = _git_ls_files()
+            finally:
+                os.chdir(old)
+            self.assertEqual(files, ["src/pkg/mod.py"])
+            self.assertTrue(head)
+
+    def test_outside_a_checkout_degrades(self) -> None:
+        import os
+
+        from zaxbygraph.cli import _git_ls_files
+
+        with tempfile.TemporaryDirectory() as td:
+            old = os.getcwd()
+            os.chdir(td)  # plain temp dir: no .git anywhere beneath
+            try:
+                files, head = _git_ls_files()
+            finally:
+                os.chdir(old)
+            self.assertIsNone(files)
+            self.assertIsNone(head)
+
+
+class EvalDegradationExtraTests(unittest.TestCase):
+    """PRR-011/022/027: eval survives a pre-v9 store, refuses to mint an
+    unexportable sha from a too-new store, and labels zero-ground-truth."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._td = tempfile.TemporaryDirectory()
+        cls.db_path = Path(cls._td.name) / "extra.db"
+        conn = connect(cls.db_path)
+        try:
+            init_schema(conn)
+            build_eval_store(conn)
+        finally:
+            conn.close()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._td.cleanup()
+
+    def test_eval_localize_on_pre_v9_store_degrades(self) -> None:
+        import shutil
+
+        old = Path(self._td.name) / "nopaths.db"
+        shutil.copyfile(self.db_path, old)
+        wconn = connect(old)
+        try:
+            # a true pre-v9 store: the v9 tables are absent AND the version
+            # stamp says so (the export sha gate keys off the version)
+            wconn.execute("DROP TABLE item_path_refs")
+            wconn.execute("DROP TABLE item_signatures")
+            wconn.execute("PRAGMA user_version = 9")
+            wconn.commit()
+        finally:
+            wconn.close()
+        ro = open_existing(old)
+        try:
+            # the comment-cutoff branch used to query the dropped table
+            # unconditionally and crash (PRR-011); it must degrade instead
+            result = run_eval(ro, REPO, "localize")
+            self.assertIn("store_too_old", result["labels"])
+            self.assertIsNone(result["corpus_sha256"])
+        finally:
+            ro.close()
+
+    def test_store_too_new_mints_no_sha(self) -> None:
+        import shutil
+
+        from zaxbygraph.db import CURRENT_USER_VERSION
+
+        future = Path(self._td.name) / "future.db"
+        shutil.copyfile(self.db_path, future)
+        wconn = connect(future)
+        try:
+            wconn.execute(f"PRAGMA user_version = {CURRENT_USER_VERSION + 1}")
+            wconn.commit()
+        finally:
+            wconn.close()
+        ro = open_existing(future)
+        try:
+            result = run_eval(ro, REPO, "similar")
+            self.assertIsNone(result["corpus_sha256"])
+            self.assertIn("store_too_new", result["labels"])
+        finally:
+            ro.close()
+
+    def test_zero_ground_truth_labels_no_ground_truth(self) -> None:
+        import shutil
+
+        empty = Path(self._td.name) / "empty.db"
+        shutil.copyfile(self.db_path, empty)
+        wconn = connect(empty)
+        try:
+            wconn.execute(
+                "DELETE FROM edges WHERE rel = 'duplicate_of'"
+            )
+            wconn.commit()
+        finally:
+            wconn.close()
+        ro = open_existing(empty)
+        try:
+            result = run_eval(ro, REPO, "similar")
+            self.assertEqual(result["metrics"]["targets_total"], 0)
+            self.assertEqual(result["metrics"]["eligible_targets"], 0)
+            self.assertIsNone(result["metrics"]["recall_at_5"])
+            self.assertIn("no_ground_truth", result["labels"])
+        finally:
+            ro.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

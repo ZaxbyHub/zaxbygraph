@@ -457,6 +457,7 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     try:
         data = query_fn(conn, *extra, repo=repo)
@@ -746,8 +747,11 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
     ``_run_read``, over the same ``mode=ro`` connection ``open_existing``
     already provides (temp objects work there; main-db writes are
     impossible). Query-time failures map to coded envelopes, never
-    tracebacks: unknown items to ``not_found``, configuration problems and
-    bad requests to exit 2, store-level failures to exit 1."""
+    tracebacks: unknown items to ``not_found``, weight-configuration
+    problems to ``config_error`` and other bad requests to exit 2,
+    store-level failures to ``store_unreadable``; all four commands refuse
+    an unresolved repository with the canonical ``repo_required`` code
+    instead of answering from an empty filter (pr43 review PRR-014/016)."""
     repo: str | None = None
     db_path: Path | None = None
     try:
@@ -761,6 +765,17 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
             db_path=db_path or getattr(args, "db", None),
             code_key=exc.code_key,
         )
+    if not repo:
+        conn.close()
+        return emit_failure(
+            args,
+            2,
+            "repo_required: the derived tier needs a resolved repository"
+            " (pass --repo, or sync the store so its repo can be detected)",
+            slug=getattr(args, "repo", None) or None,
+            db_path=db_path or getattr(args, "db", None),
+            code_key="repo_required",
+        )
     try:
         data = query_fn(conn, *extra, repo=repo, db_path=db_path)
         fresh = _freshness(conn, repo)
@@ -771,7 +786,9 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
         )
     except derive.ConfigError as exc:
         message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
-        return emit_failure(args, 2, message, slug=repo, db_path=db_path)
+        return emit_failure(
+            args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
+        )
     except ValueError as exc:
         return emit_failure(args, 2, str(exc), slug=repo, db_path=db_path)
     except sqlite3.Error as exc:
@@ -815,14 +832,34 @@ def _resolve_weight_config(
 def _git_ls_files() -> tuple[list[str] | None, str | None]:
     """Opt-in ``git ls-files`` of the invoking checkout plus its HEAD sha.
     Degrades to ``(None, None)`` outside a git checkout — the response then
-    carries ``ls_files_applied: false``."""
+    carries ``ls_files_applied: false``.
+
+    ``--full-name -- :/`` is load-bearing: plain ``git ls-files`` prints
+    cwd-relative names for the cwd's subtree only, so from any subdirectory
+    the intersection with the store's root-relative vocabulary would drop
+    every path while the envelope still claimed ``ls_files_applied: true``
+    (pr43 review PRR-002). ``core.quotePath=false`` keeps non-ASCII paths in
+    raw UTF-8 instead of git's octal escapes, and ``core.fsmonitor=false``
+    keeps a hostile checkout's fsmonitor hook out of a read-only listing.
+    """
     import subprocess
 
     try:
         files = subprocess.run(
-            ["git", "ls-files"],
+            [
+                "git",
+                "-c",
+                "core.quotePath=false",
+                "-c",
+                "core.fsmonitor=false",
+                "ls-files",
+                "--full-name",
+                "--",
+                ":/",
+            ],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=30,
             check=False,
         )
@@ -926,9 +963,10 @@ def _eval_query(
     from zaxbygraph import derive as _derive, evaluate as _evaluate
 
     store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
-    weights = None
-    if store_cfg or cwd_cfg or explicit:
-        weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    # Always resolved (defaults when no config source exists) so the eval
+    # envelope carries the EFFECTIVE weights, the same contract similar and
+    # explain honour (pr43 review PRR-021).
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
     return _evaluate.run_eval(conn, repo, mode, weights=weights)
 
 
@@ -969,6 +1007,7 @@ def _run_read_promote_truncated(
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     try:
         data = query_fn(conn, *extra, repo=repo)
