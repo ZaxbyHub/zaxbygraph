@@ -176,10 +176,11 @@ Scale: everything here is computed at query time from the local store — a
 in loops. The work-selection layer builds ONE shared context + coupling
 index per command (the stage-2 analog scans and bundle affinity reuse it —
 the per-row rebuild that made triage ~top_k× a `similar` read was removed),
-so `triage` costs about one `similar` context build plus a per-row scoring
-pass over the top-K rows, and `bundle` adds the pair loop over its pool
-(quadratic in pool size, bounded by `top_k`); `brief` is one `triage`
-computation over the store's open issues plus one packet.
+so `triage` costs a stage-1 feature and gate pass over EVERY open issue plus
+a per-row scoring pass over the top-K rows (one `similar` context build is
+shared), and `bundle` adds the pair loop over its pool (quadratic in pool
+size, bounded by `top_k` when no explicit `--pool` is given); `brief` is one
+`triage` computation over the store's open issues plus one packet.
 
 ### Triage, bundles and work packets — `triage`, `bundle`, `brief`
 

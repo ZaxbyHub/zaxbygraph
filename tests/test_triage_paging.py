@@ -439,3 +439,34 @@ class PreV7OpenDegradesTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["assignees"], [])
         self.assertEqual(rows[0]["linked_open_prs"], [])
+
+
+class LinkedPrChunkingTests(TempDBTest):
+    def test_linked_open_prs_beyond_400_all_present(self):
+        """A repo with >400 open items carrying linked_pr edges still gets
+        every row's linked_open_prs (chunked IN clause)."""
+        for n in range(1, 403):
+            self.conn.execute(
+                "INSERT INTO items (repo, number, kind, title, state, raw_json)"
+                " VALUES (?, ?, 'issue', ?, 'open', '{}')"
+                " ON CONFLICT (repo, number) DO NOTHING",
+                (REPO, n, f"t{n}"),
+            )
+        for n in range(1, 403):
+            self.conn.execute(
+                "INSERT INTO edges (repo, src_type, src_id, rel, dst_type,"
+                " dst_id, confidence, evidence, source)"
+                " VALUES (?, 'item', ?, 'linked_pr', 'item', ?, 'EXTRACTED', NULL, 'link')",
+                (REPO, str(n), str(500 + n)),
+            )
+            self.conn.execute(
+                "INSERT INTO items (repo, number, kind, title, state, raw_json)"
+                " VALUES (?, ?, 'pr', ?, 'open', '{}')"
+                " ON CONFLICT (repo, number) DO NOTHING",
+                (REPO, 500 + n, f"pr{n}"),
+            )
+        self.conn.commit()
+        rows = open_items(self.conn, limit=1000, repo=REPO)
+        by_number = {r["number"]: r for r in rows}
+        for n in range(1, 403):
+            self.assertEqual(by_number[n]["linked_open_prs"], [500 + n])

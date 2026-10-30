@@ -1632,6 +1632,24 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             )
         except (TypeError, ValueError):
             continue
+    # Keyword/closing-ref linked PRs, batched like the sibling lookups (one
+    # grouped query over all open issues instead of one query per row).
+    keyword_closers: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT CAST(e.dst_id AS INTEGER) AS issue, CAST(e.src_id AS INTEGER)"
+        " AS pr FROM edges e JOIN items i ON i.repo = e.repo"
+        " AND i.number = CAST(e.src_id AS INTEGER)"
+        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND e.rel IN ('closes', 'closes_keyword')"
+        " AND i.kind = 'pr' AND i.state = 'open'",
+        (repo,),
+    ):
+        try:
+            keyword_closers.setdefault(int(row["issue"]), set()).add(
+                int(row["pr"])
+            )
+        except (TypeError, ValueError):
+            continue
     # Gates first (blocking_open needs to know which blocked items are
     # themselves ungated).
     gates_by: dict[int, list[str]] = {}
@@ -1654,7 +1672,7 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             and states.get(dst, {}).get("kind") == "pr"
             for dst in linked_pr_dsts.get(number, set())
         )
-        keyword_linked = bool(_open_pr_closers(conn, repo, number))
+        keyword_linked = bool(keyword_closers.get(number))
         if direct_linked:
             gates.append("linked_pr")
         elif keyword_linked:
@@ -1771,25 +1789,6 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
         "blocked_by_out": blocked_by_out,
         "requires_notes": requires_notes,
     }
-
-
-def _open_pr_closers(conn: sqlite3.Connection, repo: str, number: int) -> set[int]:
-    """OPEN PRs with a closes/closes_keyword edge pointing at ``number``
-    (the append-only linked_pr fallback)."""
-    out: set[int] = set()
-    for row in conn.execute(
-        "SELECT CAST(e.src_id AS INTEGER) AS pr FROM edges e JOIN items i"
-        " ON i.repo = e.repo AND i.number = CAST(e.src_id AS INTEGER)"
-        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
-        " AND e.rel IN ('closes', 'closes_keyword') AND e.dst_id = ?"
-        " AND i.kind = 'pr' AND i.state = 'open'",
-        (repo, str(number)),
-    ):
-        try:
-            out.add(int(row["pr"]))
-        except (TypeError, ValueError):
-            continue
-    return out
 
 
 def _triage_normalize(name: str, raw, asof_dt: datetime | None):
@@ -2189,7 +2188,10 @@ def triage(
     return {
         "repo": repo,
         "rows": [_triage_row_payload(row) for row in page],
-        "weights": {k: v for k, v in cfg.items() if k != "_config_source"},
+        "weights": {
+            **{k: v for k, v in cfg.items() if k != "_config_source"},
+            "affinity": dict(compute["analog_weights"]),
+        },
         "config_source": cfg["_config_source"],
         "top_k": effective_top_k,
         "stage2_weight": cfg["stage2_weight"],
@@ -3161,7 +3163,10 @@ def brief(
         },
         "analog": analog_block,
         "linked_prs": linked,
-        "weights": {k: v for k, v in cfg.items() if k != "_config_source"},
+        "weights": {
+            **{k: v for k, v in cfg.items() if k != "_config_source"},
+            "affinity": dict(compute["analog_weights"]),
+        },
         "config_source": cfg["_config_source"],
         "formula_version": cfg["formula_version"],
     }
