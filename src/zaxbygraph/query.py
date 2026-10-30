@@ -1028,7 +1028,16 @@ def open_items(
     by_repo: dict[str, list[int]] = {}
     for row_repo, number in page:
         by_repo.setdefault(row_repo, []).append(number)
+    # The enrichment tables are v7/v10 additions; reads never migrate, so a
+    # store several slots behind keeps the base listing with empty enrichment
+    # instead of failing the whole command (db.py's reads-never-migrate rule).
+    have_enrichment = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name IN ('assignees', 'item_signatures')"
+    ).fetchone()[0] >= 2
     for row_repo, numbers in by_repo.items():
+        if not have_enrichment:
+            continue
         for start in range(0, len(numbers), 400):
             chunk = numbers[start : start + 400]
             placeholders = ",".join("?" * len(chunk))

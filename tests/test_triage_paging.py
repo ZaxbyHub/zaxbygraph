@@ -31,9 +31,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull
+from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pr_file, pull
 
 from zaxbygraph.db import connect, init_schema, open_existing
+from zaxbygraph.query import open_items
 from zaxbygraph.derive import ConfigError, brief, bundle, load_triage_config, triage
 from zaxbygraph.sync import sync_repo
 
@@ -392,3 +393,49 @@ class BundleFeedbackTests(_BundleableStore):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+class PreV7OpenDegradesTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "pre_v7.db"
+        self.conn = connect(self.db_path)
+        self.addCleanup(self.conn.close)
+
+    def test_open_items_on_pre_v7_store_keeps_base_listing(self):
+        """RED at base, GREEN after the fix: a store without the v7
+        enrichment tables keeps the base open listing (empty assignees)
+        instead of raising."""
+        self.conn.executescript(
+            """
+            CREATE TABLE items (
+                id INTEGER PRIMARY KEY, repo TEXT NOT NULL, number INTEGER NOT NULL,
+                kind TEXT NOT NULL, title TEXT NOT NULL, body TEXT, state TEXT NOT NULL,
+                author TEXT, created_at TEXT, updated_at TEXT, html_url TEXT,
+                UNIQUE (repo, number)
+            );
+            CREATE TABLE labels (
+                repo TEXT NOT NULL, number INTEGER NOT NULL, name TEXT NOT NULL,
+                color TEXT, UNIQUE (repo, number, name)
+            );
+            CREATE TABLE edges (
+                id INTEGER PRIMARY KEY, repo TEXT NOT NULL, src_type TEXT NOT NULL,
+                src_id TEXT NOT NULL, rel TEXT NOT NULL, dst_type TEXT NOT NULL,
+                dst_id TEXT NOT NULL, confidence TEXT NOT NULL DEFAULT 'EXTRACTED',
+                evidence TEXT, source TEXT NOT NULL DEFAULT 'keyword',
+                UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source)
+            );
+            """
+        )
+        self.conn.execute(
+            "INSERT INTO items (repo, number, kind, title, state)"
+            " VALUES (?, 1, 'issue', 't', 'open')",
+            (REPO,),
+        )
+        self.conn.commit()
+        rows = open_items(self.conn, limit=10, repo=REPO)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["assignees"], [])
+        self.assertEqual(rows[0]["linked_open_prs"], [])
