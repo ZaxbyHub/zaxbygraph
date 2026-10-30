@@ -896,7 +896,7 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "open_items",
-        "description": "Open issues and pull requests",
+        "description": "Open issues and pull requests, each row enriched with labels (name-ordered), assignees (logins), and linked_open_prs (open PRs linked per the linked_pr/open-closer rule; numbers only)",
         "inputSchema": _schema({"limit": _LIMIT, "cursor": _CURSOR, **_REPO_DB}),
     },
     {

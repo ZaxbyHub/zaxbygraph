@@ -49,6 +49,11 @@ CLI_TO_SURFACE = {
     "explain": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
     "coupling": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
     "eval": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
+    # Work-selection reads (issue #30): same lane split as the derived
+    # reads above — triage/bundle/brief stay CLI-only until #32.
+    "triage": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
+    "bundle": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
+    "brief": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
     "sync": "sync",
 }
 

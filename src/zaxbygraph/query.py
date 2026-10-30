@@ -894,28 +894,101 @@ def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | N
     }
 
 
-def churn(conn: sqlite3.Connection, limit: int = 30, repo: str | None = None) -> list[dict]:
+def churn(
+    conn: sqlite3.Connection,
+    limit: int = 30,
+    *,
+    merged_only: bool = False,
+    repo: str | None = None,
+) -> list[dict]:
+    """Files ranked by PR touch count. ``merged_only`` (default ``False`` =
+    the historical behavior: every PR with stored files counts) joins
+    ``items`` and keeps only rows whose PR actually merged, so a
+    closed-without-merging PR's files drop out (issue #30 AC7). Keyword-
+    only after ``limit``: a positional third argument used to bind
+    ``repo`` onto ``merged_only`` silently (pr45 review K03)."""
     repo = _fold_repo(repo)
     sql = """
-        SELECT path, COUNT(*) AS prs,
-               SUM(additions) AS additions, SUM(deletions) AS deletions
-        FROM pr_files
+        SELECT pf.path AS path, COUNT(*) AS prs,
+               SUM(pf.additions) AS additions, SUM(pf.deletions) AS deletions
+        FROM pr_files pf
     """
+    if merged_only:
+        sql += " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
+    clauses: list[str] = []
     params: list[object] = []
     if repo:
-        sql += " WHERE repo = ?"
+        clauses.append("pf.repo = ?")
         params.append(repo)
-    sql += " GROUP BY path ORDER BY prs DESC, path ASC LIMIT ?"
+    if merged_only:
+        clauses.append("i.merged_at IS NOT NULL")
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " GROUP BY pf.path ORDER BY prs DESC, path ASC LIMIT ?"
     params.append(_clamp_limit(limit))
     return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
+def _linked_open_pr_numbers(
+    conn: sqlite3.Connection, repo: str, numbers: list[int]
+) -> dict[int, list[int]]:
+    """Open PRs linked to each item: ``linked_pr`` edges the item owns plus
+    ``closes_keyword``/``closes`` edges from OPEN PRs pointing at it (the
+    same rule the triage ``linked_pr`` gate uses; numbers only). The input
+    is chunked at 400 like the labels/assignees enrichment — the unlimited
+    ``open`` mode passes every open item's number here, and one placeholder
+    per item would cross SQLite's host-parameter bound on large stores
+    (pr45 review K02)."""
+    out: dict[int, list[int]] = {}
+    for start in range(0, len(numbers), 400):
+        chunk = numbers[start : start + 400]
+        # edges src_id/dst_id are TEXT even for item numbers — bind strings.
+        ids = [str(n) for n in chunk]
+        placeholders = ",".join("?" * len(ids))
+        for row in conn.execute(
+            "SELECT CAST(e.src_id AS INTEGER) AS number,"
+            " CAST(e.dst_id AS INTEGER) AS pr"
+            " FROM edges e JOIN items pr ON pr.repo = e.repo AND pr.number = CAST(e.dst_id AS INTEGER)"
+            f" WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+            f" AND e.rel = 'linked_pr' AND e.src_id IN ({placeholders})"
+            " AND pr.kind = 'pr' AND pr.state = 'open'",
+            [repo, *ids],
+        ):
+            out.setdefault(row["number"], []).append(row["pr"])
+        for row in conn.execute(
+            "SELECT CAST(e.dst_id AS INTEGER) AS number,"
+            " CAST(e.src_id AS INTEGER) AS pr"
+            " FROM edges e JOIN items pr ON pr.repo = e.repo AND pr.number = CAST(e.src_id AS INTEGER)"
+            f" WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+            f" AND e.rel IN ('closes_keyword', 'closes') AND e.dst_id IN ({placeholders})"
+            " AND pr.kind = 'pr' AND pr.state = 'open'",
+            [repo, *ids],
+        ):
+            out.setdefault(row["number"], []).append(row["pr"])
+    return {n: sorted(set(prs)) for n, prs in out.items()}
+
+
 def open_items(
     conn: sqlite3.Connection,
-    repo: str | None = None,
     limit: int | None = None,
     offset: int = 0,
+    *,
+    kind: str | None = None,
+    label: str | None = None,
+    repo: str | None = None,
 ) -> list[dict]:
+    """Open issues and PRs, newest first, enriched with ``labels`` (ordered
+    by name), ``assignees`` (logins) and ``linked_open_prs`` (open PRs
+    linked per the ``linked_pr``/open-closer rule above; numbers only).
+    ``kind`` filters to ``issue``/``pr``; ``label`` keeps items carrying
+    that exact label name. ``offset`` applies even when ``limit`` is None
+    (the no-clause-preserving default governs the LIMIT only); a non-positive
+    limit is clamped, never forwarded (a negative LIMIT means unlimited in
+    SQLite). Keyword-only after ``offset``: positional flags past the
+    documented page window used to bind ``repo`` onto ``kind`` and fail
+    confusingly (pr45 review K03)."""
+    if kind is not None and kind not in ("issue", "pr"):
+        raise ValueError(f"kind must be 'issue' or 'pr', not {kind!r}")
     repo = _fold_repo(repo)
     sql = """
         SELECT repo, number, kind, title, author, updated_at, html_url
@@ -925,12 +998,72 @@ def open_items(
     if repo:
         sql += " AND repo = ?"
         params.append(repo)
+    if kind is not None:
+        sql += " AND kind = ?"
+        params.append(kind)
+    if label is not None:
+        sql += (
+            " AND EXISTS (SELECT 1 FROM labels l"
+            " WHERE l.repo = items.repo AND l.number = items.number AND l.name = ?)"
+        )
+        params.append(label)
     # (updated_at, number) is a total order, so offset pages are stable.
     sql += " ORDER BY updated_at DESC, number DESC"
+    offset = max(0, int(offset))
     if limit is not None:
         sql += " LIMIT ? OFFSET ?"
-        params.extend([int(limit), int(offset)])
-    return [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+        params.extend([_clamp_limit(limit), offset])
+    elif offset:
+        # LIMIT -1 OFFSET n is SQLite's "all rows, skip n"; OFFSET without
+        # LIMIT is not valid SQLite syntax.
+        sql += " LIMIT -1 OFFSET ?"
+        params.append(offset)
+    rows = [_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    # Row enrichment, batched per repo over the returned page only.
+    labels_by: dict[tuple[str, int], list[str]] = {}
+    assignees_by: dict[tuple[str, int], list[str]] = {}
+    linked_by: dict[tuple[str, int], list[int]] = {}
+    page: dict[tuple[str, int], dict] = {(r["repo"], r["number"]): r for r in rows}
+    by_repo: dict[str, list[int]] = {}
+    for row_repo, number in page:
+        by_repo.setdefault(row_repo, []).append(number)
+    # The enrichment tables are v7/v10 additions; reads never migrate, so a
+    # store several slots behind keeps the base listing with empty enrichment
+    # instead of failing the whole command (db.py's reads-never-migrate rule).
+    have_enrichment = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name IN ('assignees', 'item_signatures')"
+    ).fetchone()[0] >= 2
+    for row_repo, numbers in by_repo.items():
+        if not have_enrichment:
+            continue
+        for start in range(0, len(numbers), 400):
+            chunk = numbers[start : start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            for lr in conn.execute(
+                "SELECT number, name FROM labels"
+                f" WHERE repo = ? AND number IN ({placeholders})"
+                " ORDER BY number, name",
+                [row_repo, *chunk],
+            ):
+                labels_by.setdefault((row_repo, lr["number"]), []).append(lr["name"])
+            for ar in conn.execute(
+                "SELECT number, login FROM assignees"
+                f" WHERE repo = ? AND number IN ({placeholders})"
+                " ORDER BY number, login",
+                [row_repo, *chunk],
+            ):
+                assignees_by.setdefault((row_repo, ar["number"]), []).append(
+                    ar["login"]
+                )
+        for number, prs in _linked_open_pr_numbers(conn, row_repo, numbers).items():
+            linked_by[(row_repo, number)] = prs
+    for key, row in page.items():
+        row["labels"] = labels_by.get(key, [])
+        row["assignees"] = assignees_by.get(key, [])
+        row["linked_open_prs"] = linked_by.get(key, [])
+    return rows
 
 
 #: Relations the `path` BFS traverses. Every relation the extractors emit

@@ -1,5 +1,9 @@
 """Derived read tier (issue #29): similarity, coupling, and localization
-computed at query time, never written to the store.
+computed at query time, never written to the store — extended (issue #30)
+with the work-selection layer: :func:`triage`, :func:`bundle` and
+:func:`brief` rank open issues, group them into work bundles, and emit one
+issue's work packet. All of it is candidates, not facts: heuristics over
+stored evidence that no code path ever writes back.
 
 Everything in this module answers "what is related to what, and why" from
 GitHub-reported facts already in the graph. Every result carries
@@ -26,12 +30,15 @@ symmetric set operation and lexical averages both directed coverages.
 
 from __future__ import annotations
 
+import fnmatch
+import hashlib
+import json
 import math
 import re
 import sqlite3
 import tomllib
 from datetime import datetime, timedelta, timezone
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from zaxbygraph.query import _clamp_limit
 
@@ -311,6 +318,8 @@ def build_context(
     ls_files: list[str] | None = None,
     exclude_adjacency: set[frozenset[int]] | None = None,
     filtered_sources: set[str] | None = None,
+    item_cutoff: str | None = None,
+    comment_cutoff: str | None = None,
 ) -> dict:
     """Prefetch everything the signals need in one pass per table.
 
@@ -324,19 +333,34 @@ def build_context(
     so ``similar --ls-files`` and plain ``similar`` share resolution
     semantics (pr43 review PRR-017). Hub statistics are likewise computed
     over the full vocabulary before the filter thins it.
+
+    Eval-only scoping knobs (issue #44, both default ``None`` = current
+    state): ``item_cutoff`` (an ISO instant) restricts the vocabulary to
+    merged PRs with ``merged_at <= cutoff`` (ISO strings compare), and
+    ``comment_cutoff`` filters stored path references BY ORIGIN TIMESTAMP
+    for EVERY item in the context, not just a designated target — a
+    reference riding a comment/review created after the cutoff is dropped,
+    an origin whose source row cannot be found is suppressed (the
+    :func:`origin_timestamp` joins behind ``localize_files``), and ``body``
+    origins always survive (cutoff governance for the item's own text is
+    the caller's revisions check).
     """
     caps = caps or _Capabilities(conn)
     items = _load_items(conn, repo, caps)
 
     vocab_files: dict[str, set[int]] = {}
     if caps.has_pr_files:
-        for row in conn.execute(
+        vocab_sql = (
             "SELECT pf.number, pf.path FROM pr_files pf"
             " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
             " WHERE pf.repo = ? AND i.merged_at IS NOT NULL"
-            " AND (pf.status IS NULL OR pf.status != 'removed')",
-            (repo,),
-        ):
+            " AND (pf.status IS NULL OR pf.status != 'removed')"
+        )
+        vocab_params: list[object] = [repo]
+        if item_cutoff is not None:
+            vocab_sql += " AND i.merged_at <= ?"
+            vocab_params.append(item_cutoff)
+        for row in conn.execute(vocab_sql, vocab_params):
             path = _norm_path(row["path"])
             if path:
                 vocab_files.setdefault(path, set()).add(row["number"])
@@ -350,9 +374,58 @@ def build_context(
         for i in range(len(parts)):
             by_suffix.setdefault("/".join(parts[i:]), []).append(path)
 
+    comment_cutoff_dt = (
+        _parse_instant(comment_cutoff) if comment_cutoff is not None else None
+    )
     if caps.has_path_refs:
+        # comment_cutoff: bulk-load the origin timestamps once (the
+        # origin_timestamp per-ref joins, hoisted out of the row loop), so
+        # per-item reference filtering costs one pass instead of one query
+        # per stored ref.
+        comment_ts: dict[tuple[int, str, int], str | None] = {}
+        review_ts: dict[tuple[int, int], str | None] = {}
+        if comment_cutoff_dt is not None:
+            for row in conn.execute(
+                "SELECT number, kind, github_id, created_at FROM comments"
+                " WHERE repo = ?",
+                (repo,),
+            ):
+                comment_ts[(row["number"], row["kind"], row["github_id"])] = row[
+                    "created_at"
+                ]
+            for row in conn.execute(
+                "SELECT number, id, submitted_at FROM reviews WHERE repo = ?",
+                (repo,),
+            ):
+                review_ts[(row["number"], row["id"])] = row["submitted_at"]
+
+        def _ref_visible(number: int, origin: str) -> bool:
+            """The localize_files origin rule: body refs always visible;
+            comment/review refs visible at/before the cutoff; an origin
+            whose source row is missing — or whose timestamp cannot be
+            parsed — is suppressed (conservative: scoped evidence fails
+            CLOSED, so post-cutoff evidence can never ride an unparseable
+            stamp through the filter; pr45 review CUB#48fdf186)."""
+            if comment_cutoff_dt is None:
+                return True
+            prefix, _, id_part = origin.partition(":")
+            if prefix == "body":
+                return True
+            if not id_part or not id_part.isdigit():
+                return False
+            if prefix in ("issue_comment", "review_comment"):
+                ts = comment_ts.get((number, prefix, int(id_part)), None)
+            elif prefix == "review":
+                ts = review_ts.get((number, int(id_part)), None)
+            else:
+                return False
+            if ts is None:
+                return False
+            ts_dt = _parse_instant(ts)
+            return ts_dt is not None and ts_dt <= comment_cutoff_dt
+
         for row in conn.execute(
-            "SELECT number, path FROM item_path_refs WHERE repo = ?",
+            "SELECT number, path, origin FROM item_path_refs WHERE repo = ?",
             (repo,),
         ):
             data = items.get(row["number"])
@@ -360,6 +433,8 @@ def build_context(
                 continue
             ref = _norm_path(row["path"])
             if not ref:
+                continue
+            if not _ref_visible(row["number"], row["origin"]):
                 continue
             resolved = _resolve_ref(ref, vocab_files, by_suffix)
             if resolved is not None:
@@ -412,11 +487,25 @@ def build_context(
                 items[dst].neighbors.add(src)
 
     # Hub statistics over the FULL resolved vocabulary: a path touching a
-    # large share of items carries less discriminating evidence. Computed
-    # before the ls-files filter so the checkout never changes evidence
-    # weight, only which paths can score.
+    # large share of the merged-PR population carries less discriminating
+    # evidence. The denominator counts EVERY merged PR in scope — including
+    # zero-file merges (issue #44 AC2: dividing by the item count let the
+    # knob fire only on stores with few non-PR items). Computed before the
+    # ls-files filter so the checkout never changes evidence weight, only
+    # which paths can score.
+    merged_population = 0
+    population_sql = (
+        "SELECT COUNT(*) FROM items WHERE repo = ? AND merged_at IS NOT NULL"
+    )
+    population_params: list[object] = [repo]
+    if item_cutoff is not None:
+        population_sql += " AND merged_at <= ?"
+        population_params.append(item_cutoff)
+    row = conn.execute(population_sql, population_params).fetchone()
+    if row is not None:
+        merged_population = int(row[0])
     hub = {
-        p: len(nums) / max(1, len(items)) for p, nums in vocab_files.items()
+        p: len(nums) / max(1, merged_population) for p, nums in vocab_files.items()
     }
 
     # The ls-files intersection is applied LAST — after suffix resolution
@@ -434,13 +523,13 @@ def build_context(
         "repo": repo,
         "items": items,
         "vocab": set(vocab_files),
-        "hub_share_of_items": hub,
+        "hub_share_of_population": hub,
         "caps": caps,
     }
 
 
 def _file_weight(path: str, ctx: dict, weights: dict) -> float:
-    share = ctx["hub_share_of_items"].get(path, 0.0)
+    share = ctx["hub_share_of_population"].get(path, 0.0)
     if share and share >= weights["hub_share"]:
         return weights["hub_floor"]
     return 1.0
@@ -598,60 +687,33 @@ def _total_score(components: dict, weights: dict) -> float:
     )
 
 
-def _anchor_fired(components: dict) -> str | None:
-    for name in sorted(ANCHOR_SIGNALS):
+def _anchor_fired(components: dict, exclude: frozenset[str] = frozenset()) -> str | None:
+    for name in sorted(ANCHOR_SIGNALS - exclude):
         comp = components.get(name)
         if comp and comp["score"] > 0:
             return name
     return None
 
 
-def similar(
-    conn: sqlite3.Connection,
-    repo: str,
+def _rank_candidates(
+    ctx: dict,
+    weights: dict,
     number: int,
-    limit: int | None = 20,
-    weights: dict | None = None,
-    ls_files: list[str] | None = None,
-    exclude_adjacency: set[frozenset[int]] | None = None,
-    filtered_sources: set[str] | None = None,
-    suppress_signals: set[str] | None = None,
-) -> dict:
-    """Rank items related to ``number`` with per-signal evidence.
-
-    Raises LookupError when the item does not exist in ``repo``. The target
-    itself is never a candidate. A candidate pair is admitted only when an
-    anchor signal fired (AC3's guard); raisers then lift its score.
-    ``limit=None`` returns the complete ranked pool — the eval harness uses
-    it to apply its own visibility filters BEFORE taking a top-N, so a
-    post-cutoff leader can never crowd a pre-cutoff partner out of the
-    window (pr43 review PRR-006).
-    ``exclude_adjacency`` (eval) removes specific item pairs from the
-    structural adjacency; ``filtered_sources`` (eval) drops keyword-derived
-    edges from adjacency so comment-cutoff controls stay honest;
-    ``suppress_signals`` (eval) zeroes named components — the harness
-    suppresses ``signature`` because ``item_signatures`` rows carry no
-    origin and a cutoff-visible subset cannot be reconstructed.
-    """
-    weights = weights or load_weights()
-    caps = _Capabilities(conn)
-    ctx = build_context(
-        conn,
-        repo,
-        caps,
-        ls_files=ls_files,
-        exclude_adjacency=exclude_adjacency,
-        filtered_sources=filtered_sources,
-    )
-    index, file_support, _population = _coupling_index(conn, repo, caps)
-    ctx["coupling_support"] = index
-    ctx["coupling_filesupport"] = file_support
+    limit: int | None,
+    suppressed: frozenset[str],
+    scoped: bool,
+) -> list[dict]:
+    """similar()'s scoring core over a PREBUILT context (coupling keys
+    already attached). Split out so the work-selection layer can rank
+    candidates against one shared context instead of rebuilding
+    ``build_context`` + ``_coupling_index`` per row (pr45 review K04);
+    ``similar`` and the analog scan therefore share one code path and
+    cannot diverge. Raises LookupError when the item is absent."""
     items = ctx["items"]
     target = items.get(number)
     if target is None:
         raise LookupError(f"item not found: #{number}")
 
-    suppressed = suppress_signals or frozenset()
     candidates = []
     for other in items.values():
         if other.number == number:
@@ -662,6 +724,10 @@ def similar(
             if name in components:
                 components[name] = {"score": 0.0, "evidence": {"suppressed": True}}
         anchor = _anchor_fired(components)
+        if anchor == "cochange" and scoped:
+            # Scoped read: cochange may only raise, never create (see
+            # similar's docstring) — fall through to the next anchor, if any.
+            anchor = _anchor_fired(components, exclude=frozenset({"cochange"}))
         if anchor is None:
             continue
         total = _total_score(components, weights)
@@ -686,6 +752,74 @@ def similar(
     candidates.sort(key=lambda c: (-c["total_score"], c["number"]))
     if limit is not None:
         candidates = candidates[: _clamp_limit(limit)]
+    return candidates
+
+
+def similar(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    limit: int | None = 20,
+    weights: dict | None = None,
+    ls_files: list[str] | None = None,
+    exclude_adjacency: set[frozenset[int]] | None = None,
+    filtered_sources: set[str] | None = None,
+    suppress_signals: set[str] | None = None,
+    item_cutoff: str | None = None,
+    comment_cutoff: str | None = None,
+) -> dict:
+    """Rank items related to ``number`` with per-signal evidence.
+
+    Raises LookupError when the item does not exist in ``repo``. The target
+    itself is never a candidate. A candidate pair is admitted only when an
+    anchor signal fired (AC3's guard); raisers then lift its score.
+    ``limit=None`` returns the complete ranked pool — the eval harness uses
+    it to apply its own visibility filters BEFORE taking a top-N, so a
+    post-cutoff leader can never crowd a pre-cutoff partner out of the
+    window (pr43 review PRR-006).
+    ``exclude_adjacency`` (eval) removes specific item pairs from the
+    structural adjacency; ``filtered_sources`` (eval) drops keyword-derived
+    edges from adjacency so comment-cutoff controls stay honest;
+    ``suppress_signals`` (eval) zeroes named components — the harness
+    suppresses ``signature`` because ``item_signatures`` rows carry no
+    origin and a cutoff-visible subset cannot be reconstructed.
+    ``item_cutoff``/``comment_cutoff`` (eval-only, default ``None`` =
+    current state) scope the path evidence (issue #44): the vocabulary and
+    the co-change population keep only merged PRs from before the item
+    cutoff, and every scored item's comment/review-derived path references
+    are cut at the comment cutoff. Under scoping the cochange signal also
+    loses its pair-CREATING vote (it still scores, over the cutoff-scoped
+    population, and raises an already-anchored pair): ``pr_files`` rows
+    carry no per-file origin, so a cutoff-visible co-change subset cannot
+    be reconstructed — the same conservative anchor suppression the eval
+    applies to origin-less ``item_signatures`` rows.
+    """
+    weights = weights or load_weights()
+    caps = _Capabilities(conn)
+    ctx = build_context(
+        conn,
+        repo,
+        caps,
+        ls_files=ls_files,
+        exclude_adjacency=exclude_adjacency,
+        filtered_sources=filtered_sources,
+        item_cutoff=item_cutoff,
+        comment_cutoff=comment_cutoff,
+    )
+    index, file_support, _population = _coupling_index(
+        conn, repo, caps, item_cutoff=item_cutoff
+    )
+    ctx["coupling_support"] = index
+    ctx["coupling_filesupport"] = file_support
+    scoped = item_cutoff is not None or comment_cutoff is not None
+    candidates = _rank_candidates(
+        ctx,
+        weights,
+        number,
+        limit,
+        frozenset(suppress_signals or ()),
+        scoped,
+    )
     return {
         "target": number,
         "repo": repo,
@@ -784,7 +918,10 @@ def _merged_pr_paths(
 
 
 def _coupling_index(
-    conn: sqlite3.Connection, repo: str, caps: _Capabilities
+    conn: sqlite3.Connection,
+    repo: str,
+    caps: _Capabilities,
+    item_cutoff: str | None = None,
 ) -> tuple[dict[str, list[tuple[str, float, int]]], dict[str, int], int]:
     """Co-change index over merged PRs touching 2-50 distinct files.
 
@@ -795,18 +932,24 @@ def _coupling_index(
     the per-file support(A) counts are returned alongside (they cannot be
     recovered from the pair index — averaging pair supports is not file
     support). Returns ``(index, file_support, population_n)``. Unmerged PRs
-    are excluded by construction.
+    are excluded by construction. ``item_cutoff`` (eval-only, default
+    ``None``) keeps only PRs merged at/before the cutoff, so post-cutoff
+    co-change support can never anchor a pair (issue #44 AC1).
     """
     if not caps.has_pr_files:
         return {}, {}, 0
     pr_paths: dict[int, set[str]] = {}
-    for row in conn.execute(
+    coupling_sql = (
         "SELECT pf.number, pf.path FROM pr_files pf"
         " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
         " WHERE pf.repo = ? AND i.merged_at IS NOT NULL"
-        " AND (pf.status IS NULL OR pf.status != 'removed')",
-        (repo,),
-    ):
+        " AND (pf.status IS NULL OR pf.status != 'removed')"
+    )
+    coupling_params: list[object] = [repo]
+    if item_cutoff is not None:
+        coupling_sql += " AND i.merged_at <= ?"
+        coupling_params.append(item_cutoff)
+    for row in conn.execute(coupling_sql, coupling_params):
         path = _norm_path(row["path"])
         if path:
             pr_paths.setdefault(row["number"], set()).add(path)
@@ -1108,3 +1251,1997 @@ def localize_files(
         "leakage_notes": sorted(set(leakage_notes)),
         "derived": True,
     }
+
+
+# ==== issue #30: triage / bundle / brief (the work-selection layer) =========
+
+#: Default ``[triage]`` table (AC9's blessed values, issue 30 comment
+#: 6510715064). Overrides live in the same TOML chain as ``[derive]``:
+#: ``<store>/config.toml`` -> ``.zaxbygraph.toml`` (cwd) -> ``--config``.
+TRIAGE_DEFAULTS = {
+    "demand": 1.0,
+    "leverage": 1.0,
+    "risk": 1.0,
+    "priority": 1.0,
+    "stage2_weight": 0.25,
+    "top_k": 50,
+    "affinity_floor": 3.0,
+    "max_files": 12,
+    "test_globs": ["tests/*"],
+    "formula_version": "triage.v1",
+}
+
+#: [triage] map tables (exact name -> weight; the weight clamps to [0, 1]
+#: AT SCORING TIME so the payload echo keeps the configured magnitude).
+_TRIAGE_MAP_KEYS = ("labels", "types", "fields")
+
+_TRIAGE_REQUIRES = {
+    "reactions_plus1": "requires: reactions object absent from the stored payload",
+    "milestone_due": "requires: milestone due_on absent from the stored payload",
+    "sub_issue_gap": "requires: sub_issues_summary absent from the stored payload",
+    "reopens": "requires: item_events table absent (pre-v10 store)",
+    "issue_type": "requires: item_type absent or [triage.types] map not configured",
+    "label_weight": "requires: no labels on the item or [triage.labels] map not configured",
+    "field_weight": "requires: no issue field values or [triage.fields] map not configured",
+}
+
+
+def _triage_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_bounded_triage_number(value: object) -> bool:
+    """True when ``value`` is finite AND within the ``_MAX_WEIGHT`` magnitude
+    cap — the mirror of [derive]'s PRR-013 guard. An unbounded [triage]
+    weight turns ``stage1`` into ``inf``, which ``json.dump`` emits as bare
+    ``Infinity`` (not valid RFC 8259); ``math.isfinite`` raises
+    ``OverflowError`` (not ValueError) on ints too large for float, so the
+    magnitude check needs its own try/except (pr45 review K13)."""
+    try:
+        return math.isfinite(value) and value <= _MAX_WEIGHT
+    except OverflowError:
+        return False
+
+
+def load_triage_config(
+    store_config: str | None = None,
+    cwd_config: str | None = None,
+    explicit_config: str | None = None,
+) -> dict:
+    """Resolve the effective ``[triage]`` table: defaults, then store, then
+    cwd, then an explicit ``--config`` path — scalars merge per key and the
+    label/type/field maps merge PER NAME (later sources win per name, never
+    replacing the whole map). Raises :class:`ConfigError` naming the file
+    for malformed TOML, unknown keys, invalid value types, or weights past
+    the ``_MAX_WEIGHT`` magnitude cap (the mirror of [derive]'s PRR-013
+    guard — an unbounded weight overflows ``stage1`` to a bare JSON
+    ``Infinity``; pr45 review K13).
+
+    Returns the effective table, always carrying every default key plus the
+    three maps (empty dicts when unconfigured) — this dict is the payload
+    ``weights`` echo and the input to bundle_id's config hash, and its
+    ``_config_source`` key names which level supplied the table
+    (``explicit``/``cwd``/``store``/``defaults``).
+    """
+    cfg = dict(TRIAGE_DEFAULTS)
+    maps = {key: {} for key in _TRIAGE_MAP_KEYS}
+    cfg.update(maps)
+    supplied: str | None = None
+    sources = [
+        ("store", store_config),
+        ("cwd", cwd_config),
+        ("explicit", explicit_config),
+    ]
+    for label, path in sources:
+        if not path:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                data = tomllib.load(fh)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(
+                f"malformed TOML in {label} config: {exc}", path=path
+            ) from exc
+        except OSError as exc:
+            raise ConfigError(f"cannot read {label} config: {exc}", path=path) from exc
+        table = data.get("triage", {})
+        if not isinstance(table, dict):
+            raise ConfigError("[triage] must be a TOML table", path=path)
+        if table:
+            supplied = label
+        for key, value in table.items():
+            if key in _TRIAGE_MAP_KEYS:
+                if not isinstance(value, dict):
+                    raise ConfigError(f"[triage] {key} must be a TOML table", path=path)
+                for name, weight in value.items():
+                    if (
+                        not _triage_number(weight)
+                        or not _is_bounded_triage_number(weight)
+                        or weight < 0
+                    ):
+                        raise ConfigError(
+                            f"[triage] {key}.{name} must be a finite non-negative"
+                            f" number <= {_MAX_WEIGHT}",
+                            path=path,
+                        )
+                    maps[key][name] = float(weight)
+            elif key in ("demand", "leverage", "risk", "priority", "stage2_weight",
+                         "affinity_floor"):
+                if not _triage_number(value) or not _is_bounded_triage_number(value) or value < 0:
+                    raise ConfigError(
+                        f"[triage] {key} must be a finite non-negative number"
+                        f" <= {_MAX_WEIGHT}",
+                        path=path,
+                    )
+                cfg[key] = float(value)
+            elif key in ("top_k", "max_files"):
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                    raise ConfigError(
+                        f"[triage] {key} must be a positive integer", path=path
+                    )
+                cfg[key] = int(value)
+            elif key == "test_globs":
+                if not isinstance(value, list) or not all(
+                    isinstance(g, str) for g in value
+                ):
+                    raise ConfigError(
+                        "[triage] test_globs must be a list of fnmatch patterns",
+                        path=path,
+                    )
+                cfg[key] = list(value)
+            elif key == "formula_version":
+                if not isinstance(value, str) or not value:
+                    raise ConfigError(
+                        "[triage] formula_version must be a non-empty string",
+                        path=path,
+                    )
+                cfg[key] = value
+            else:
+                raise ConfigError(
+                    f"unknown [triage] key {key!r}"
+                    f" (allowed: {sorted(set(TRIAGE_DEFAULTS) | set(_TRIAGE_MAP_KEYS))})",
+                    path=path,
+                )
+    cfg.update(maps)
+    cfg["_config_source"] = supplied or "defaults"
+    return cfg
+
+
+def _triage_config_chain(
+    conn: sqlite3.Connection, explicit: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """The load_triage_config source chain discovered from a read
+    connection: ``<store>/config.toml`` (via PRAGMA database_list — the
+    derived functions never receive the db path), ``.zaxbygraph.toml`` in
+    the cwd, then the explicit ``--config`` path."""
+    store_cfg: str | None = None
+    try:
+        for _seq, name, file in conn.execute("PRAGMA database_list"):
+            if name == "main" and file:
+                candidate = Path(file).parent / "config.toml"
+                if candidate.is_file():
+                    store_cfg = str(candidate)
+                break
+    except sqlite3.Error:
+        store_cfg = None
+    cwd_cfg = None
+    candidate = Path(".zaxbygraph.toml")
+    if candidate.is_file():
+        cwd_cfg = str(candidate)
+    return store_cfg, cwd_cfg, explicit
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
+
+
+def _item_state_map(conn: sqlite3.Connection, repo: str) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for row in conn.execute(
+        "SELECT number, kind, state FROM items WHERE repo = ?", (repo,)
+    ):
+        out[row["number"]] = {"kind": row["kind"], "state": row["state"]}
+    return out
+
+
+def _synced_at(conn: sqlite3.Connection, repo: str) -> str | None:
+    """The store's latest sync stamp: last_incr_sync_at falling back to
+    last_full_sync_at — the triage/hotspot as-of anchor, so ranking is
+    wall-clock independent and deterministic per store state."""
+    row = conn.execute(
+        "SELECT last_incr_sync_at, last_full_sync_at FROM sync_state WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row["last_incr_sync_at"] or row["last_full_sync_at"]
+
+
+def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
+    """Stage-1 raw features and gates for EVERY open issue: demand
+    (reactions/participants/comments/duplicates/mentions), leverage
+    (blocking/sub-issue gap/milestone), risk (reopens/file reverts) and the
+    gate shapes (blocked/assigned/linked_pr/locked). Reactions and the
+    milestone due date parse Python-side from ``raw_json`` — no JSON1.
+
+    Pre-v7 capability gating (pr45 review K01): reads never migrate a
+    store, so the v7 items columns (``comment_count``, ``item_type``,
+    ``sub_issues_*``, ``dependencies_*``) and the ``assignees`` table are
+    probed (PRAGMA table_info / sqlite_master) before any SELECT names
+    them. On a pre-v7 store the affected features report ``None`` (the
+    blessed missing-feature rule: excluded from the group mean, surfaced
+    with a ``requires`` note naming the absent column) and the ``assigned``
+    gate simply cannot fire — the same degradation the #29 siblings'
+    ``_Capabilities`` serve, never an ``OperationalError``."""
+    has_events = _table_exists(conn, "item_events")
+    has_field_values = _table_exists(conn, "issue_field_values")
+    has_assignees = _table_exists(conn, "assignees")
+    item_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(items)")
+    }
+    has_comment_count = "comment_count" in item_cols
+    has_item_type = "item_type" in item_cols
+    has_sub_issues = (
+        "sub_issues_total" in item_cols and "sub_issues_completed" in item_cols
+    )
+    has_dependencies = (
+        "dependencies_blocked_by" in item_cols
+        and "dependencies_blocking" in item_cols
+    )
+
+    # Column list assembled per capability: absent v7 columns select NULL so
+    # the feature lands MISSING downstream instead of crashing the read.
+    cols = ["number", "title", "author", "locked", "raw_json"]
+    cols.append("comment_count" if has_comment_count else "NULL AS comment_count")
+    cols.append("item_type" if has_item_type else "NULL AS item_type")
+    cols.append("sub_issues_total" if has_sub_issues else "NULL AS sub_issues_total")
+    cols.append(
+        "sub_issues_completed" if has_sub_issues
+        else "NULL AS sub_issues_completed"
+    )
+    cols.append(
+        "dependencies_blocked_by" if has_dependencies
+        else "NULL AS dependencies_blocked_by"
+    )
+    cols.append(
+        "dependencies_blocking" if has_dependencies
+        else "NULL AS dependencies_blocking"
+    )
+
+    rows: dict[int, dict] = {}
+    for row in conn.execute(
+        f"SELECT {', '.join(cols)} FROM items"
+        " WHERE repo = ? AND kind = 'issue' AND state = 'open'",
+        (repo,),
+    ):
+        rows[row["number"]] = dict(row)
+
+    comment_authors: dict[int, set[str]] = {}
+    for row in conn.execute(
+        "SELECT number, author FROM comments WHERE repo = ? AND author IS NOT NULL",
+        (repo,),
+    ):
+        comment_authors.setdefault(row["number"], set()).add(row["author"])
+    review_authors: dict[int, set[str]] = {}
+    for row in conn.execute(
+        "SELECT number, author FROM reviews WHERE repo = ? AND author IS NOT NULL",
+        (repo,),
+    ):
+        review_authors.setdefault(row["number"], set()).add(row["author"])
+
+    inbound_dups: dict[int, int] = {}
+    for row in conn.execute(
+        "SELECT dst_id, COUNT(DISTINCT src_id) AS n FROM edges"
+        " WHERE repo = ? AND rel IN ('duplicate_of', 'duplicate_keyword')"
+        " AND src_type = 'item' AND dst_type = 'item' GROUP BY dst_id",
+        (repo,),
+    ):
+        try:
+            inbound_dups[int(row["dst_id"])] = int(row["n"])
+        except (TypeError, ValueError):
+            continue
+    inbound_mentions: dict[int, int] = {}
+    for row in conn.execute(
+        "SELECT dst_id, COUNT(DISTINCT src_id) AS n FROM edges"
+        " WHERE repo = ? AND rel = 'mentions'"
+        " AND src_type = 'item' AND dst_type = 'item' GROUP BY dst_id",
+        (repo,),
+    ):
+        try:
+            inbound_mentions[int(row["dst_id"])] = int(row["n"])
+        except (TypeError, ValueError):
+            continue
+
+    blocked_by_edges: list[tuple[int, int]] = []
+    any_blocked_by = False
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'blocked_by'"
+        " AND src_type = 'item' AND dst_type = 'item'",
+        (repo,),
+    ):
+        any_blocked_by = True
+        try:
+            blocked_by_edges.append((int(row["src_id"]), int(row["dst_id"])))
+        except (TypeError, ValueError):
+            continue
+    states = _item_state_map(conn, repo)
+
+    reverted_prs: set[int] = set()
+    for row in conn.execute(
+        "SELECT DISTINCT dst_id FROM edges WHERE repo = ? AND rel = 'reverts'"
+        " AND src_type = 'item' AND dst_type = 'item'",
+        (repo,),
+    ):
+        try:
+            reverted_prs.add(int(row["dst_id"]))
+        except (TypeError, ValueError):
+            continue
+
+    reopens: dict[int, int] = {}
+    if has_events:
+        for row in conn.execute(
+            "SELECT number, COUNT(*) AS n FROM item_events"
+            " WHERE repo = ? AND type = 'reopened' GROUP BY number",
+            (repo,),
+        ):
+            reopens[row["number"]] = int(row["n"])
+
+    assignees: set[int] = set()
+    if has_assignees:
+        for row in conn.execute(
+            "SELECT DISTINCT number FROM assignees WHERE repo = ?", (repo,)
+        ):
+            assignees.add(row["number"])
+
+    field_values: dict[int, list[str]] = {}
+    if has_field_values:
+        for row in conn.execute(
+            "SELECT number, value FROM issue_field_values WHERE repo = ?", (repo,)
+        ):
+            if row["value"] is not None:
+                field_values.setdefault(row["number"], []).append(row["value"])
+
+    # Per-item blocking: the edge stream wins when it carries any rows,
+    # else the dependencies_blocking column (echoed as blocking_source).
+    # blocking_open counts open AND UNGATED blocked items — rankable work N
+    # unblocks. Counting a gated blocked item would float a blocker of
+    # already-excluded work above every other row without unblocking
+    # anything the ranking could act on.
+    blocking_open_edges: dict[int, int] = {}
+    blocked_by_out: dict[int, set[int]] = {}
+    for src, dst in blocked_by_edges:
+        blocked_by_out.setdefault(src, set()).add(dst)
+
+    linked_pr_dsts: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'linked_pr'"
+        " AND src_type = 'item' AND dst_type = 'item'",
+        (repo,),
+    ):
+        try:
+            linked_pr_dsts.setdefault(int(row["src_id"]), set()).add(
+                int(row["dst_id"])
+            )
+        except (TypeError, ValueError):
+            continue
+    # Keyword/closing-ref linked PRs, batched like the sibling lookups (one
+    # grouped query over all open issues instead of one query per row).
+    keyword_closers: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT CAST(e.dst_id AS INTEGER) AS issue, CAST(e.src_id AS INTEGER)"
+        " AS pr FROM edges e JOIN items i ON i.repo = e.repo"
+        " AND i.number = CAST(e.src_id AS INTEGER)"
+        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND e.rel IN ('closes', 'closes_keyword')"
+        " AND i.kind = 'pr' AND i.state = 'open'",
+        (repo,),
+    ):
+        try:
+            keyword_closers.setdefault(int(row["issue"]), set()).add(
+                int(row["pr"])
+            )
+        except (TypeError, ValueError):
+            continue
+    # Gates first (blocking_open needs to know which blocked items are
+    # themselves ungated).
+    gates_by: dict[int, list[str]] = {}
+    for number, row in rows.items():
+        gates: list[str] = []
+        if any_blocked_by:
+            is_blocked = any(
+                states.get(dst, {}).get("state") == "open"
+                for dst in blocked_by_out.get(number, set())
+            )
+        else:
+            dep_blocked = row["dependencies_blocked_by"]
+            is_blocked = bool(dep_blocked and int(dep_blocked) > 0)
+        if is_blocked:
+            gates.append("blocked")
+        if number in assignees:
+            gates.append("assigned")
+        direct_linked = any(
+            states.get(dst, {}).get("state") == "open"
+            and states.get(dst, {}).get("kind") == "pr"
+            for dst in linked_pr_dsts.get(number, set())
+        )
+        keyword_linked = bool(keyword_closers.get(number))
+        if direct_linked:
+            gates.append("linked_pr")
+        elif keyword_linked:
+            gates.append("linked_pr (append-only evidence; may be stale)")
+        if row["locked"]:
+            gates.append("locked")
+        gates_by[number] = gates
+
+    for src, dst in blocked_by_edges:
+        src_state = states.get(src)
+        if (
+            src_state
+            and src_state["state"] == "open"
+            and src_state.get("kind") == "issue"
+            and not gates_by.get(src)
+        ):
+            blocking_open_edges[dst] = blocking_open_edges.get(dst, 0) + 1
+
+    out: dict[int, dict] = {}
+    for number, row in rows.items():
+        try:
+            raw = json.loads(row["raw_json"])
+        except (TypeError, ValueError):
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+
+        reactions = raw.get("reactions")
+        if isinstance(reactions, dict):
+            plus1 = reactions.get("+1", 0)
+            reactions_raw: int | None = plus1 if isinstance(plus1, int) else 0
+        else:
+            reactions_raw = None
+
+        milestone = raw.get("milestone")
+        if isinstance(milestone, dict) and milestone.get("due_on"):
+            milestone_due: str | None = str(milestone["due_on"])
+        else:
+            milestone_due = None
+
+        participants = set(comment_authors.get(number, set()))
+        participants |= review_authors.get(number, set())
+        if row["author"]:
+            participants.add(row["author"])
+
+        blocking_open: int | None
+        if any_blocked_by:
+            blocking_open = blocking_open_edges.get(number, 0)
+        elif not has_dependencies:
+            # Pre-v7 store: the dependency columns were never extracted, so
+            # the feature is MISSING, not zero.
+            blocking_open = None
+        elif row["dependencies_blocking"] is not None:
+            blocking_open = int(row["dependencies_blocking"])
+        else:
+            blocking_open = 0
+
+        if row["sub_issues_total"] is None:
+            gap: int | None = None
+        else:
+            gap = max(
+                0, int(row["sub_issues_total"]) - int(row["sub_issues_completed"] or 0)
+            )
+
+        comments: int | None = (
+            int(row["comment_count"] or 0)
+            if row["comment_count"] is not None
+            else None
+        )
+
+        gates = gates_by[number]
+
+        out[number] = {
+            "number": number,
+            "title": row["title"],
+            "item_type": row["item_type"],
+            "reactions_plus1": reactions_raw,
+            "milestone_due": milestone_due,
+            "participants": len(participants),
+            "comments": comments,
+            "inbound_duplicates": inbound_dups.get(number, 0),
+            "inbound_mentions": inbound_mentions.get(number, 0),
+            "blocking_open": blocking_open,
+            "sub_issue_gap": gap,
+            "reopens": reopens.get(number, 0) if has_events else None,
+            "field_values": field_values.get(number, []),
+            "reverted_prs": reverted_prs,
+            "gates": gates,
+        }
+    requires_notes: dict[str, str] = {}
+    if not has_comment_count:
+        requires_notes["comments"] = (
+            "requires: items.comment_count column absent (pre-v7 store)"
+        )
+    if not has_dependencies:
+        requires_notes["blocking_open"] = (
+            "requires: items dependency columns absent (pre-v7 store)"
+        )
+    if not has_sub_issues:
+        requires_notes["sub_issue_gap"] = (
+            "requires: items.sub_issues_* columns absent (pre-v7 store)"
+        )
+    if not has_item_type:
+        requires_notes["issue_type"] = (
+            "requires: items.item_type column absent (pre-v7 store)"
+        )
+    return {
+        "features": out,
+        "blocking_source": (
+            "edges" if any_blocked_by
+            else "dependencies_blocking" if has_dependencies
+            else "absent (pre-v7 store)"
+        ),
+        "blocked_by_out": blocked_by_out,
+        "requires_notes": requires_notes,
+    }
+
+
+def _triage_normalize(name: str, raw, asof_dt: datetime | None):
+    """One feature's normalized [0, 1] value; None when the feature is
+    missing (04-root-cause.md section 2's documented calibrations:
+    reactions /3, participants /3, comments /5, duplicates 0/1,
+    mentions /10, blocking /3, gap /3, milestone 14-day window vs
+    triage_asof, reopens /1, file_reverts /1, priority weights clamped)."""
+    if raw is None:
+        return None
+    if name in ("reactions_plus1", "participants"):
+        return min(1.0, raw / 3.0)
+    if name == "comments":
+        return min(1.0, raw / 5.0)
+    if name == "inbound_duplicates":
+        return 1.0 if raw >= 1 else 0.0
+    if name == "inbound_mentions":
+        return min(1.0, raw / 10.0)
+    if name in ("blocking_open", "sub_issue_gap"):
+        return min(1.0, raw / 3.0)
+    if name == "milestone_due":
+        if asof_dt is None:
+            return None
+        due = _parse_instant(raw)
+        if due is None:
+            return 0.0
+        if due < asof_dt or due <= asof_dt + timedelta(days=14):
+            return 1.0
+        return 0.0
+    if name in ("reopens", "file_reverts"):
+        return min(1.0, raw / 1.0)
+    if name in ("issue_type", "label_weight", "field_weight"):
+        return _clamp01(raw)
+    raise ValueError(f"unknown triage feature {name!r}")
+
+
+_TRIAGE_GROUPS = {
+    "demand": ("reactions_plus1", "participants", "comments",
+               "inbound_duplicates", "inbound_mentions"),
+    "leverage": ("blocking_open", "sub_issue_gap", "milestone_due"),
+    "risk": ("reopens", "file_reverts"),
+    "priority": ("issue_type", "label_weight", "field_weight"),
+}
+
+
+def _triage_row_scores(
+    feat: dict,
+    cfg: dict,
+    asof_dt: datetime | None,
+    requires_overrides: dict[str, str] | None = None,
+) -> dict:
+    """Group means over PRESENT features (missing excluded from the mean;
+    an all-missing group contributes 0) and the stage-1 sum. The raw echo
+    carries the SOURCE data (the item_type string; the matched map weights
+    for label/field); normalization reads the configured weights.
+    ``requires_overrides`` carries capability-absence notes (pre-v7 stores)
+    that name the actual cause — the absent column — instead of the
+    payload-side ``_TRIAGE_REQUIRES`` wording."""
+    raw = {
+        "reactions_plus1": feat["reactions_plus1"],
+        "participants": feat["participants"],
+        "comments": feat["comments"],
+        "inbound_duplicates": feat["inbound_duplicates"],
+        "inbound_mentions": feat["inbound_mentions"],
+        "blocking_open": feat["blocking_open"],
+        "sub_issue_gap": feat["sub_issue_gap"],
+        "milestone_due": feat["milestone_due"],
+        "reopens": feat["reopens"],
+        "file_reverts": feat["file_reverts"],
+        "issue_type": feat["item_type"],
+        "label_weight": feat["label_weight"],
+        "field_weight": feat["field_weight"],
+    }
+    scoring_source = dict(raw)
+    scoring_source["issue_type"] = feat["issue_type_weight"]
+    normalized = {
+        name: _triage_normalize(name, scoring_source[name], asof_dt)
+        for name in raw
+    }
+    groups = {}
+    for group, names in _TRIAGE_GROUPS.items():
+        present = [normalized[n] for n in names if normalized[n] is not None]
+        groups[group] = (
+            cfg[group] * (sum(present) / len(present)) if present else 0.0
+        )
+    overrides = requires_overrides or {}
+    missing = {
+        name: overrides.get(name)
+        or _TRIAGE_REQUIRES[name]
+        for name, value in normalized.items()
+        if value is None
+        and (name in overrides or name in _TRIAGE_REQUIRES)
+    }
+    if asof_dt is None:
+        # Without an as-of stamp the milestone window cannot fire even when
+        # a due date exists; the reason must name the actual cause.
+        missing["milestone_due"] = "requires: triage_asof (sync stamp) unknown"
+    return {
+        "stage1": sum(groups.values()),
+        "groups": groups,
+        "features_raw": raw,
+        "features_normalized": normalized,
+        "features_missing": missing,
+    }
+
+
+def _analog_for(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    reverted_prs: set[int],
+    ctx: dict | None = None,
+    weights: dict | None = None,
+) -> tuple[dict | None, int]:
+    """The issue's best PR analog: the top ``similar`` candidate of kind
+    'pr' under the effective [derive] weights (capped scan). Returns
+    ``(analog_evidence, regression_flag)`` — regression fires when the
+    analog PR has an inbound 'reverts' edge (a reverted fix). ``ctx`` is a
+    PREBUILT context (coupling keys attached) reused across the top-K rows
+    — the per-row ``similar`` rebuild cost top_k full context builds
+    (pr45 review K04); when absent one is built here, so a bare library
+    call behaves exactly like ``similar``."""
+    weights = weights or load_weights()
+    if ctx is None or "coupling_support" not in ctx:
+        caps = _Capabilities(conn)
+        ctx = build_context(conn, repo, caps)
+        index, file_support, _population = _coupling_index(conn, repo, caps)
+        ctx["coupling_support"] = index
+        ctx["coupling_filesupport"] = file_support
+    for cand in _rank_candidates(ctx, weights, number, 20, frozenset(), False):
+        if cand.get("kind") == "pr":
+            analog = {"number": cand["number"], "anchor": cand["anchor"]}
+            return analog, 1 if cand["number"] in reverted_prs else 0
+    return None, 0
+
+
+def _triage_compute(
+    conn: sqlite3.Connection,
+    repo: str,
+    cfg: dict,
+    top_k: int,
+    weights: dict | None = None,
+) -> dict:
+    """The full two-stage triage computation shared by triage/bundle/brief:
+    stage-1 features + gates for every open issue, stage-2 (hotspot,
+    regression, analog) for the top-K UNGATED rows only (gated rows never
+    consume stage-2 slots). ONE context + coupling index is built here and
+    shared by every stage-2 analog scan (the per-row ``similar`` rebuild
+    cost one full context per row — pr45 review K04); ``weights`` is the
+    effective [derive] table for those scans (None -> load_weights()
+    defaults, preserving bare library-call behavior)."""
+    caps = _Capabilities(conn)
+    ctx = build_context(conn, repo, caps)
+    index, file_support, _population = _coupling_index(conn, repo, caps)
+    ctx["coupling_support"] = index
+    ctx["coupling_filesupport"] = file_support
+    analog_weights = weights or load_weights()
+    asof = _synced_at(conn, repo)
+    asof_dt = _parse_instant(asof)
+
+    # path -> merged PR numbers (the vocabulary map build_context keeps
+    # internally; rebuilt here for the hotspot arithmetic) + PR merge stamps.
+    path_prs: dict[str, set[int]] = {}
+    if caps.has_pr_files:
+        for row in conn.execute(
+            "SELECT pf.number, pf.path FROM pr_files pf"
+            " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
+            " WHERE pf.repo = ? AND i.merged_at IS NOT NULL"
+            " AND (pf.status IS NULL OR pf.status != 'removed')",
+            (repo,),
+        ):
+            path = _norm_path(row["path"])
+            if path:
+                path_prs.setdefault(path, set()).add(row["number"])
+    merged_at: dict[int, str | None] = {}
+    for row in conn.execute(
+        "SELECT number, merged_at FROM items"
+        " WHERE repo = ? AND merged_at IS NOT NULL",
+        (repo,),
+    ):
+        merged_at[row["number"]] = row["merged_at"]
+
+    base = _triage_features(conn, repo)
+    features = base["features"]
+    items = ctx["items"]
+
+    rows: list[dict] = []
+    for number, feat in features.items():
+        item = items.get(number)
+        labels = set(item.labels) if item is not None else set()
+        # Priority features — the blessed missing-feature rule: source data
+        # absent -> missing; configured map with no match -> present 0.0;
+        # map weights clamp [0, 1] at scoring, raw values echo unclamped.
+        if feat["item_type"] is None or not cfg["types"]:
+            feat["issue_type_weight"] = None
+        else:
+            feat["issue_type_weight"] = cfg["types"].get(feat["item_type"], 0.0)
+        if not labels or not cfg["labels"]:
+            feat["label_weight"] = None
+        else:
+            feat["label_weight"] = max(
+                (cfg["labels"].get(name, 0.0) for name in labels), default=0.0
+            )
+        if not feat["field_values"] or not cfg["fields"]:
+            feat["field_weight"] = None
+        else:
+            feat["field_weight"] = max(
+                (cfg["fields"].get(value, 0.0) for value in feat["field_values"]),
+                default=0.0,
+            )
+        resolved = set(item.paths) if item is not None else set()
+        feat["file_reverts"] = len(
+            {
+                pr
+                for path in resolved
+                for pr in path_prs.get(path, set())
+                if pr in feat["reverted_prs"]
+            }
+        )
+        scores = _triage_row_scores(
+            feat, cfg, asof_dt, requires_overrides=base["requires_notes"]
+        )
+        rows.append(
+            {
+                "number": number,
+                "title": feat["title"],
+                "gates": list(feat["gates"]),
+                "ranked": not feat["gates"],
+                "scores": scores,
+                "resolved_paths": sorted(resolved),
+                "stage1": scores["stage1"],
+            }
+        )
+    rows.sort(key=lambda r: (-r["stage1"], r["number"]))
+    ungated = [r for r in rows if r["ranked"]]
+
+    # Stage 2 for the top-K UNGATED rows only.
+    for row in ungated[: max(1, top_k)]:
+        number = row["number"]
+        hotspot = 0.0
+        if asof_dt is not None:
+            seen_prs = {
+                pr
+                for path in row["resolved_paths"]
+                for pr in path_prs.get(path, set())
+            }
+            recency = 0.0
+            for pr in seen_prs:
+                merged = _parse_instant(merged_at.get(pr))
+                if merged is None:
+                    continue
+                recency += 1.0 if (asof_dt - merged) <= timedelta(days=90) else 0.5
+            hotspot = min(1.0, recency / 10.0)
+        analog, regression = _analog_for(
+            conn,
+            repo,
+            number,
+            features[number]["reverted_prs"],
+            ctx=ctx,
+            weights=analog_weights,
+        )
+        bonus = cfg["stage2_weight"] * (hotspot + regression) / 2.0
+        row["hotspot"] = hotspot
+        row["regression"] = regression
+        row["analog"] = analog
+        row["stage2"] = bonus
+        row["total_score"] = row["stage1"] + bonus
+    for row in ungated[max(1, top_k):]:
+        row["hotspot"] = None
+        row["regression"] = None
+        row["analog"] = None
+        row["stage2"] = None
+        row["note"] = "not_computed (outside top_k)"
+        row["total_score"] = row["stage1"]
+    for row in rows:
+        if not row["ranked"]:
+            row["hotspot"] = None
+            row["regression"] = None
+            row["analog"] = None
+            row["stage2"] = None
+            row["note"] = "not_computed (gated)"
+            row["total_score"] = row["stage1"]
+
+    return {
+        "rows": rows,
+        "ungated": ungated,
+        "asof": asof,
+        "blocking_source": base["blocking_source"],
+        "blocked_by_out": base["blocked_by_out"],
+        "ctx": ctx,
+        "caps": caps,
+        "features": features,
+        "path_prs": path_prs,
+        "merged_at": merged_at,
+        "analog_weights": analog_weights,
+    }
+
+
+def _triage_row_payload(row: dict) -> dict:
+    return {
+        "number": row["number"],
+        "title": row["title"],
+        "gates": list(row["gates"]),
+        "ranked": row["ranked"],
+        "scores": {
+            "stage1": row["scores"]["stage1"],
+            "groups": row["scores"]["groups"],
+            "features_raw": row["scores"]["features_raw"],
+            "features_normalized": row["scores"]["features_normalized"],
+            "features_missing": row["scores"]["features_missing"],
+        },
+        "total_score": row["total_score"],
+        "stage2": row["stage2"],
+        "hotspot": row["hotspot"],
+        "regression": row["regression"],
+        "analog": row["analog"],
+        "resolved_paths": row["resolved_paths"],
+        **({"note": row["note"]} if "note" in row else {}),
+    }
+
+
+def _cursor_key(total: float, number: int) -> str:
+    return f"{round(total, 9):.9f}:{number}"
+
+
+def triage(
+    conn: sqlite3.Connection,
+    repo: str,
+    limit: int = 20,
+    cursor: str | None = None,
+    top_k: int | None = None,
+    include_gated: bool = False,
+    config: str | None = None,
+    weights: dict | None = None,
+) -> dict:
+    """Two-stage triage of every open issue (issue #30, 04-root-cause.md
+    section 2). Read-only; ``config`` is an explicit ``[triage]`` TOML path
+    (highest precedence over the store/cwd chain); ``weights`` is the
+    effective ``[derive]`` table for the stage-2 analog scans (None ->
+    ``load_weights()`` defaults, preserving bare library-call behavior).
+    Gated rows (blocked by an open item, assigned, linked to an open PR,
+    locked) are excluded from the default ranking — the observable
+    default-exclusion contract — and return with ``ranked: false`` under
+    ``include_gated``. The gate vocabulary is exactly ``blocked``,
+    ``assigned``, ``linked_pr``,
+    ``linked_pr (append-only evidence; may be stale)`` and ``locked`` (the
+    fifth value marks keyword/closing-ref linked-PR evidence, which is
+    append-only and may lag a re-sync). ORDER:
+    total_score DESC, number ASC. ``cursor`` is
+    validated whole: an unknown number, or a total half that no longer
+    matches that row's current total, restarts from the top (the README's
+    documented restart); a malformed cursor raises ``ValueError``."""
+    cfg = load_triage_config(*_triage_config_chain(conn, config))
+    effective_top_k = top_k if top_k is not None else cfg["top_k"]
+    if not isinstance(effective_top_k, int) or effective_top_k < 1:
+        raise ValueError(f"top_k must be a positive integer, not {effective_top_k!r}")
+    compute = _triage_compute(conn, repo, cfg, effective_top_k, weights=weights)
+
+    def _sort_key(row: dict) -> tuple[float, int]:
+        return (-row["total_score"], row["number"])
+
+    if include_gated:
+        ordered = sorted(compute["rows"], key=_sort_key)
+    else:
+        ordered = sorted((r for r in compute["rows"] if r["ranked"]), key=_sort_key)
+
+    start = 0
+    if cursor:
+        # Both halves are validated, not just parsed: the cursor is a hint
+        # about a position in THIS ranking, so a number that left the
+        # ranking (or whose total half no longer matches the row's current
+        # total — the ranking moved under a re-sync) restarts from the top,
+        # the README's documented restart, instead of resuming mid-ranking
+        # after a stale number (pr45 review K10).
+        total_text, _, number_text = cursor.partition(":")
+        try:
+            cursor_number = int(number_text)
+            float(total_text)
+        except ValueError:
+            raise ValueError(f"invalid cursor: {cursor!r}") from None
+        for index, row in enumerate(ordered):
+            if row["number"] == cursor_number:
+                # Fresh only when the total half equals the row's CURRENT
+                # total, minted exactly the way _cursor_key mints it.
+                if f"{round(row['total_score'], 9):.9f}" == total_text:
+                    start = index + 1
+                break
+
+    page_limit = _clamp_limit(limit)
+    page = ordered[start : start + page_limit]
+    truncated = start + page_limit < len(ordered)
+    next_cursor = (
+        _cursor_key(page[-1]["total_score"], page[-1]["number"])
+        if truncated and page
+        else None
+    )
+    return {
+        "repo": repo,
+        "rows": [_triage_row_payload(row) for row in page],
+        "weights": {
+            **{k: v for k, v in cfg.items() if k != "_config_source"},
+            "affinity": dict(compute["analog_weights"]),
+        },
+        "config_source": cfg["_config_source"],
+        "top_k": effective_top_k,
+        "stage2_weight": cfg["stage2_weight"],
+        "formula_version": cfg["formula_version"],
+        "triage_asof": compute["asof"],
+        "hotspot_asof": compute["asof"],
+        "blocking_source": compute["blocking_source"],
+        "cursor": next_cursor,
+        "truncated": truncated,
+        "derived": True,
+    }
+
+
+def _parse_size(size: str) -> tuple[int, int]:
+    """Bundle size range: ``"2-3"`` -> (2, 3), ``"3"`` -> (3, 3)."""
+    try:
+        if "-" in size:
+            lo_text, hi_text = size.split("-", 1)
+            lo, hi = int(lo_text), int(hi_text)
+        else:
+            lo = hi = int(size)
+    except ValueError:
+        raise ValueError(f"invalid bundle size {size!r} (expected N or N-M)") from None
+    if lo < 2 or hi < lo:
+        raise ValueError(
+            f"invalid bundle size {size!r} (min 2 members, max >= min)"
+        ) from None
+    return lo, hi
+
+
+def _bundle_config_hash(cfg: dict) -> str:
+    echo = {k: v for k, v in cfg.items() if k != "_config_source"}
+    canonical = json.dumps(echo, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()
+
+
+def _open_pr_files(conn: sqlite3.Connection, repo: str) -> dict[str, set[int]]:
+    """Open PRs' file sets — the collision surface."""
+    out: dict[str, set[int]] = {}
+    for row in conn.execute(
+        "SELECT pf.number, pf.path FROM pr_files pf"
+        " JOIN items i ON i.repo = pf.repo AND i.number = pf.number"
+        " WHERE pf.repo = ? AND i.kind = 'pr' AND i.state = 'open'",
+        (repo,),
+    ):
+        path = _norm_path(row["path"])
+        if path:
+            out.setdefault(path, set()).add(row["number"])
+    return out
+
+
+def _pair_evidence(info: dict) -> dict:
+    return {
+        "components": {
+            name: {"score": round(comp["score"], 6)}
+            for name, comp in info["components"].items()
+        },
+        "evidence": {
+            name: comp["evidence"] for name, comp in info["components"].items()
+        },
+        "anchor": info["anchor"],
+        "title": {
+            "similarity": round(info["title_sim"], 6),
+            "metric": "overlap coefficient over lowercase word tokens",
+        },
+    }
+
+
+def _has_dup_edge(conn: sqlite3.Connection, repo: str, a: int, b: int, rel: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM edges WHERE repo = ? AND rel = ?"
+        " AND src_type = 'item' AND dst_type = 'item'"
+        " AND ((src_id = ? AND dst_id = ?) OR (src_id = ? AND dst_id = ?))",
+        (repo, rel, str(a), str(b), str(b), str(a)),
+    ).fetchone()
+    return row is not None
+
+
+def bundle(
+    conn: sqlite3.Connection,
+    repo: str,
+    size: str = "2-3",
+    count: int = 5,
+    pool: list[int] | None = None,
+    exclude: list[int] | None = None,
+    allow_shared_files: bool = False,
+    max_files: int | None = None,
+    config: str | None = None,
+    budget_tokens: int | None = None,
+    weights: dict | None = None,
+) -> dict:
+    """Greedy work bundles over the triage pool (issue #30, 04-root-cause.md
+    section 3). Pool = the top-K UNGATED triage rows (or the named
+    ``pool``) minus ``exclude``, with in-pool blocker relaxation
+    (blocked-only items whose blockers are all in the pool stay,
+    ``gate_relaxed: true``); ``--exclude`` wins over pool membership and the
+    relaxation alike. Pool members absent from the ranked pool are dropped
+    silently — the echoed ``pool`` array is the disclosure. Pair affinity
+    and the stage-2 analog scans run under ``weights`` — the effective
+    ``[derive]`` table (None -> ``load_weights()`` defaults, preserving
+    bare library-call behavior) — over the exact pipeline
+    ``pair_components -> _apply_cochange -> _total_score`` (one shared
+    context + coupling index per call, pr45 review K04/K05); an edge
+    requires affinity >= ``affinity_floor`` AND a fired anchor; duplicate
+    pairs (edges or the >= 0.9 title-overlap possible_duplicate predicate)
+    collapse to ``merge_candidates`` and are never co-bundled;
+    anchor-failing floor-passing text pairs land in
+    ``related_not_bundleable``. Selection is greedy: highest unused
+    triage total seeds (ties number ASC), then the member maximizing
+    triage_total x mean pair affinity, subject to the size range, the
+    file-set cap and cross-bundle file disjointness — the cap and the
+    disjointness are computed over each member's DIRECT resolved paths
+    only; ``linked``/``analog`` evidence paths are reported but never
+    constrain selection (unless
+    ``allow_shared_files``). Read-only. ``budget_tokens`` (chars/4, a
+    positive integer) caps the WHOLE serialized payload: bundles are
+    dropped first, then the tails of ``merge_candidates``/
+    ``related_not_bundleable``, then the ``pool`` echo; ``truncated: true``
+    marks any payload that needed it, including one still over budget only
+    because of its mandatory echoes. The payload's ``weights`` echo is the
+    effective ``[triage]`` table PLUS the effective affinity weights under
+    an ``affinity`` key, and ``bundle_id``'s config hash folds that whole
+    echo in — two different ``[derive]`` tables can never mint the same
+    bundle_id."""
+    if budget_tokens is not None and budget_tokens <= 0:
+        # Mirrors --size: a non-positive budget is a bad request, never a
+        # silently-disabled cap (pr45 review K09).
+        raise ValueError("budget-tokens must be a positive integer")
+    cfg = load_triage_config(*_triage_config_chain(conn, config))
+    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    size_min, size_max = _parse_size(size)
+    file_cap = max_files if max_files is not None else cfg["max_files"]
+    excluded = sorted({int(n) for n in (exclude or [])})
+
+    ranked_map = {r["number"]: r for r in compute["ungated"]}
+    if pool is not None:
+        members = {int(n) for n in pool if int(n) in ranked_map}
+    else:
+        members = {r["number"] for r in compute["ungated"][: cfg["top_k"]]}
+    members -= set(excluded)
+
+    # In-pool blocker relaxation (fixpoint: a relaxed member can unblock the
+    # next hop). Excluded blockers are already gone, so excluding the
+    # blocker collapses the relaxation behind it.
+    relaxed: set[int] = set()
+    blocked_by_out = compute["blocked_by_out"]
+    all_rows = {r["number"]: r for r in compute["rows"]}
+    changed = True
+    while changed:
+        changed = False
+        for number, row in all_rows.items():
+            if number in members or number in excluded or row["ranked"]:
+                continue
+            if list(row["gates"]) != ["blocked"]:
+                continue
+            blockers = blocked_by_out.get(number, set())
+            if blockers and blockers <= members:
+                members.add(number)
+                relaxed.add(number)
+                changed = True
+
+    ctx = compute["ctx"]
+    # The context arrives with the coupling index already attached (built
+    # once inside _triage_compute) — the affinity pipeline and every analog
+    # scan share it instead of rebuilding per pair/per row (pr45 K04).
+    affinity_weights = compute["analog_weights"]
+    items = ctx["items"]
+
+    # The bundle echo carries the [triage] table PLUS the effective
+    # affinity weights under an "affinity" key, and bundle_id's config hash
+    # folds this WHOLE echo in: two different [derive] tables can never
+    # mint the same bundle_id (pr45 review K05). The acceptance checks
+    # recompute the id from the echo, so echo and hash input are the same
+    # dict by construction.
+    weights_echo = {k: v for k, v in cfg.items() if k != "_config_source"}
+    weights_echo["affinity"] = dict(affinity_weights)
+
+    dup_edge_pairs: set[frozenset[int]] = set()
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ?"
+        " AND rel IN ('duplicate_of', 'duplicate_keyword')"
+        " AND src_type = 'item' AND dst_type = 'item'",
+        (repo,),
+    ):
+        try:
+            dup_edge_pairs.add(frozenset((int(row["src_id"]), int(row["dst_id"]))))
+        except (TypeError, ValueError):
+            continue
+
+    def _pool_total(number: int) -> float:
+        row = ranked_map.get(number) or all_rows[number]
+        return row["total_score"]
+
+    order = sorted(members, key=lambda n: (-_pool_total(n), n))
+
+    pair_cache: dict[frozenset[int], dict] = {}
+    merge_candidates: list[dict] = []
+    related_not_bundleable: list[dict] = []
+    edge_weight: dict[frozenset[int], float] = {}
+
+    member_list = sorted(members)
+    for i, a in enumerate(member_list):
+        for b in member_list[i + 1:]:
+            key = frozenset((a, b))
+            components = pair_components(items[a], items[b], ctx, affinity_weights)
+            _apply_cochange(items[a], items[b], ctx, components)
+            total = _total_score(components, affinity_weights)
+            anchor = _anchor_fired(components)
+            title_sim = components["title"]["score"]
+            info = {
+                "a": a,
+                "b": b,
+                "components": components,
+                "total": total,
+                "anchor": anchor,
+                "title_sim": title_sim,
+            }
+            pair_cache[key] = info
+            if key in dup_edge_pairs:
+                rel = (
+                    "duplicate_of"
+                    if _has_dup_edge(conn, repo, a, b, "duplicate_of")
+                    else "duplicate_keyword"
+                )
+                merge_candidates.append(
+                    {
+                        "numbers": sorted((a, b)),
+                        "kind": rel,
+                        "affinity": round(total, 6),
+                        "evidence": _pair_evidence(info),
+                    }
+                )
+            elif anchor is None and title_sim >= 0.9:
+                # possible_duplicate: near-identical titles with NO anchor
+                # signal — text look-alikes, offered as merge candidates
+                # instead of a bundle edge. An anchored pair with an
+                # identical title (a whole family crash-named the same)
+                # still bundles through its anchor evidence.
+                merge_candidates.append(
+                    {
+                        "numbers": sorted((a, b)),
+                        "kind": "possible_duplicate",
+                        "affinity": round(total, 6),
+                        "evidence": _pair_evidence(info),
+                    }
+                )
+            elif total >= cfg["affinity_floor"] and anchor is not None:
+                edge_weight[key] = total
+            elif total >= cfg["affinity_floor"] and title_sim < 0.9:
+                related_not_bundleable.append(
+                    {
+                        "numbers": sorted((a, b)),
+                        "affinity": round(total, 6),
+                        "title_similarity": round(title_sim, 6),
+                        "scores": {
+                            name: round(comp["score"], 6)
+                            for name, comp in components.items()
+                        },
+                        "evidence": _pair_evidence(info),
+                    }
+                )
+
+    open_prs = _open_pr_files(conn, repo)
+
+    def _direct_paths(number: int) -> set[str]:
+        item = items.get(number)
+        return set(item.paths) if item is not None else set()
+
+    used: set[int] = set()
+    skipped: set[int] = set()
+    used_files: set[str] = set()
+    bundles_payload: list[dict] = []
+
+    while (
+        len(bundles_payload) < max(0, count)
+        and len(used) + len(skipped) < len(members)
+    ):
+        available = [n for n in order if n not in used and n not in skipped]
+        if not available:
+            break
+        current_seed = available[0]
+
+        group = [current_seed]
+        group_files = _direct_paths(current_seed)
+        why: str | None = None
+        while len(group) < size_max:
+            candidates = [n for n in available if n not in group]
+            if not candidates:
+                # No unused pool member remains to consider: the pool is
+                # exhausted under the group (this, not a normal size exit,
+                # is what "pool exhausted" names).
+                why = "pool exhausted"
+                break
+            best = None
+            best_key = None
+            blocked_by_shared = False
+            blocked_by_cap = False
+            for cand in candidates:
+                affinities = [
+                    edge_weight.get(frozenset((member, cand)), 0.0)
+                    for member in group
+                ]
+                mean_affinity = (
+                    sum(affinities) / len(affinities) if affinities else 0.0
+                )
+                if mean_affinity <= 0:
+                    continue
+                cand_files = _direct_paths(cand)
+                if len(group_files | cand_files) > file_cap:
+                    blocked_by_cap = True
+                    continue
+                if not allow_shared_files and (cand_files & used_files):
+                    blocked_by_shared = True
+                    continue
+                collisions = bool(cand_files & set(open_prs))
+                score = _pool_total(cand) * mean_affinity
+                key_tuple = (-round(score, 9), collisions, cand)
+                if best_key is None or key_tuple < best_key:
+                    best_key = key_tuple
+                    best = (cand, cand_files)
+            if best is None:
+                # Reason order: the file cap is the tighter constraint and
+                # names a size limit the caller controls, so it reports
+                # ahead of the shared-file conflict (pr45 review K06).
+                if blocked_by_cap:
+                    why = f"file cap (max_files={file_cap})"
+                elif blocked_by_shared:
+                    why = "shared-file conflict"
+                elif any(
+                    frozenset((member, cand)) in dup_edge_pairs
+                    or pair_cache.get(frozenset((member, cand)), {}).get(
+                        "title_sim", 0.0
+                    )
+                    >= 0.9
+                    for member in group
+                    for cand in candidates
+                ):
+                    why = "duplicate collapse"
+                else:
+                    why = "affinity floor"
+                break
+            cand, cand_files = best
+            group.append(cand)
+            group_files |= cand_files
+        else:
+            # Normal exit: the group grew to size_max — the common case —
+            # and must not inherit a stale "pool exhausted" default
+            # (pr45 review K06).
+            why = "membership cap (reached target size)"
+        if why is None:  # pragma: no cover - the loop always sets or breaks
+            why = "pool exhausted"
+        if len(group) >= size_min:
+            bundles_payload.append(
+                _bundle_payload(
+                    conn, repo, group, compute, pair_cache, edge_weight, cfg,
+                    weights_echo, open_prs, relaxed, why, ctx,
+                )
+            )
+            used |= set(group)
+            used_files |= group_files
+        else:
+            skipped.add(current_seed)
+
+    payload = {
+        "repo": repo,
+        "bundles": bundles_payload,
+        "merge_candidates": merge_candidates,
+        "related_not_bundleable": related_not_bundleable,
+        "excluded": excluded,
+        "pool": sorted(members),
+        "weights": weights_echo,
+        "config_source": cfg["_config_source"],
+        "formula_version": cfg["formula_version"],
+        "derived": True,
+    }
+    if budget_tokens is not None:
+        budget = budget_tokens * 4
+
+        def _size() -> int:
+            return len(
+                json.dumps(
+                    payload, sort_keys=True, ensure_ascii=True,
+                    separators=(",", ":"),
+                )
+            )
+
+        if _size() > budget:
+            # The cap binds the WHOLE payload, not just the bundles list:
+            # whole bundles drop first, then the tails of merge_candidates
+            # and related_not_bundleable, and only as the last resort the
+            # pool echo (a convenience copy, not evidence). The flag is set
+            # up front so a payload that stays over budget purely through
+            # its mandatory echoes (weights, excluded) is still marked.
+            payload["truncated"] = True
+            for section in ("bundles", "merge_candidates",
+                            "related_not_bundleable"):
+                while payload[section] and _size() > budget:
+                    payload[section].pop()
+            if _size() > budget:
+                payload["pool"] = []
+    return payload
+
+
+def _bundle_payload(
+    conn: sqlite3.Connection,
+    repo: str,
+    group: list[int],
+    compute: dict,
+    pair_cache: dict,
+    edge_weight: dict,
+    cfg: dict,
+    weights_echo: dict,
+    open_prs: dict[str, set[int]],
+    relaxed: set[int],
+    why: str,
+    ctx: dict,
+) -> dict:
+    all_rows = {r["number"]: r for r in compute["rows"]}
+    items = ctx["items"]
+
+    members = []
+    for number in group:
+        row = all_rows[number]
+        member = {
+            "number": number,
+            "title": row["title"],
+            "triage_total": row["total_score"],
+            "stage1": row["stage1"],
+            "gates": list(row["gates"]),
+        }
+        if number in relaxed:
+            member["gate_relaxed"] = True
+        members.append(member)
+
+    direct = sorted(
+        {p for n in group for p in (items[n].paths if n in items else set())}
+    )
+
+    linked_items: set[int] = set()
+    for n in group:
+        linked_items |= items[n].neighbors if n in items else set()
+    linked_items -= set(group)
+    linked = sorted(
+        {p for n in linked_items if n in items for p in items[n].paths} - set(direct)
+    )
+
+    analog_files: list[dict] = []
+    seen_analog: set[str] = set()
+    for n in group:
+        analog = all_rows[n].get("analog")
+        if not analog:
+            continue
+        pr = analog["number"]
+        for row in conn.execute(
+            "SELECT path FROM pr_files WHERE repo = ? AND number = ?"
+            " AND (status IS NULL OR status != 'removed')",
+            (repo, pr),
+        ):
+            path = _norm_path(row["path"])
+            if path and path not in direct and path not in seen_analog:
+                seen_analog.add(path)
+                analog_files.append({"path": path, "via": f"#{pr}"})
+    analog_files.sort(key=lambda e: e["path"])
+
+    file_set = set(direct) | set(linked) | {e["path"] for e in analog_files}
+    index = ctx.get("coupling_support") or {}
+    cochanged: set[str] = set()
+    for path in file_set:
+        for other, _conf, _sup in index.get(path, []):
+            if any(fnmatch.fnmatchcase(other, g) for g in cfg["test_globs"]):
+                cochanged.add(other)
+
+    collisions = [
+        {"path": path, "prs": sorted(open_prs[path])}
+        for path in sorted(file_set & set(open_prs))
+    ]
+
+    # In-pool blocked_by topological order (ties number ASC): a member
+    # blocked by another member sorts after its blocker.
+    members_set = set(group)
+    blockers_in = {
+        n: {b for b in compute["blocked_by_out"].get(n, set()) if b in members_set}
+        for n in group
+    }
+    remaining = sorted(group)
+    placed: list[int] = []
+    placed_set: set[int] = set()
+    while remaining:
+        progressed = False
+        for n in list(remaining):
+            if blockers_in[n] <= placed_set:
+                placed.append(n)
+                placed_set.add(n)
+                remaining.remove(n)
+                progressed = True
+        if not progressed:  # cycle: fall back to number order
+            placed.extend(sorted(remaining))
+            break
+
+    pair_scores = []
+    affinities = []
+    for i, a in enumerate(sorted(group)):
+        for b in sorted(group)[i + 1:]:
+            key = frozenset((a, b))
+            info = pair_cache.get(key)
+            if info is None:
+                continue
+            weight = edge_weight.get(key, 0.0)
+            affinities.append(weight)
+            pair_scores.append(
+                {
+                    "a": a,
+                    "b": b,
+                    "affinity": round(weight, 6),
+                    "anchor": info["anchor"],
+                    "components": {
+                        name: {"score": round(comp["score"], 6)}
+                        for name, comp in info["components"].items()
+                    },
+                    "evidence": {
+                        name: comp["evidence"]
+                        for name, comp in info["components"].items()
+                    },
+                }
+            )
+    cohesion = sum(affinities) / len(affinities) if affinities else 0.0
+
+    risk_features = {
+        name: max(
+            (all_rows[n]["scores"]["features_raw"].get(name) or 0) for n in group
+        )
+        for name in ("reopens", "file_reverts")
+    }
+    risk_summary = {
+        "max_risk_features": risk_features,
+        "hotspot": max(all_rows[n].get("hotspot") or 0.0 for n in group),
+        "regression": max(all_rows[n].get("regression") or 0 for n in group),
+        "open_pr_collisions": len(collisions),
+    }
+
+    # bundle_id = sha1("zaxbygraph.bundle.v1|" + members + "|" + config_hash)
+    # where config_hash covers the payload's whole weights echo — the
+    # effective [triage] table plus the effective affinity weights under
+    # the "affinity" key — so a [derive] change can never reuse another
+    # table's id (pr45 review K05; the v1 salt and formula shape are the
+    # ones the acceptance checks recompute from the echo).
+    bundle_id = hashlib.sha1(
+        (
+            "zaxbygraph.bundle.v1|"
+            + ",".join(str(n) for n in sorted(group))
+            + "|"
+            + _bundle_config_hash(weights_echo)
+        ).encode("utf-8")
+    ).hexdigest()
+
+    return {
+        "bundle_id": bundle_id,
+        "members": members,
+        "pairs": pair_scores,
+        "files": {"direct": direct, "linked": linked, "analog": analog_files},
+        "cochanged_tests": sorted(cochanged),
+        "open_pr_collisions": collisions,
+        "order": placed,
+        "risk_summary": risk_summary,
+        "cohesion": round(cohesion, 6),
+        "why_not_bigger": why,
+    }
+
+
+_UNTRUSTED_NOTE = "untrusted: GitHub user content"
+
+
+def _untrusted(value: str) -> dict:
+    """The AC6 wrapper: every GitHub-authored string in a brief packet
+    travels inside an ``untrusted_text`` object."""
+    return {"untrusted_text": value}
+
+
+def _association_rank(value: str | None) -> int:
+    """Comment ordering rank: MEMBER/OWNER/COLLABORATOR first, then every
+    other known association, then NONE (and NULL)."""
+    if value in ("MEMBER", "OWNER", "COLLABORATOR"):
+        return 0
+    if value is None or value == "NONE":
+        return 2
+    return 1
+
+
+#: Truncation marker for the brief body's character-level cap of last
+#: resort (the same "…" the README documents for the packet budget).
+_ELLIPSIS = "…"
+
+
+def _hard_cap(text: str, allowance: int, marker: str = _ELLIPSIS) -> str:
+    """Character-level cap of last resort: ``text`` plus a trailing
+    ellipsis marker, cut so the JSON serialization fits ``allowance``
+    chars. The cut is computed in SERIALIZED units — under ensure_ascii a
+    multi-byte-dense payload serializes to six chars per character, so a
+    char-arithmetic cut overshoots to a negative prefix and empties the
+    result. Serialized length is strictly increasing in the prefix length
+    (every character serializes to at least one char), so a binary search
+    finds the largest prefix p >= 1 with ser(text[:p] + marker) <=
+    allowance: non-empty and marker-terminated whenever the allowance
+    covers one serialized character plus the marker; only a sub-floor
+    allowance returns the empty string (documented degenerate case)."""
+
+    def _fits(chars: int) -> bool:
+        return len(json.dumps(text[:chars] + marker)) - 2 <= allowance
+
+    if not _fits(1):
+        return ""
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + marker
+
+
+def _fit_paragraphs(body: str, allowance: int) -> str:
+    """Truncate ``body`` so its JSON serialization fits ``allowance`` chars
+    — unconditionally. Whole-paragraph (blank-line boundary) cutting is the
+    PREFERRED shape: paragraphs are kept while they fit, and the surviving
+    tail is a run of complete paragraphs. But that preference is
+    subordinate to the bound: a body with no paragraph boundaries (or whose
+    first paragraph alone exceeds the allowance) is hard-truncated at the
+    character level with a trailing ``…`` marker rather than returned whole
+    or emptied (comments/file evidence absorb the rest of the packet)."""
+    if allowance <= 0:
+        return ""
+    if len(json.dumps(body)) - 2 <= allowance:
+        return body
+    if "\n\n" in body:
+        parts = body.split("\n\n")
+        kept: list[str] = []
+        for part in parts:
+            candidate = "\n\n".join(kept + [part])
+            if len(json.dumps(candidate)) - 2 > allowance:
+                break
+            kept.append(part)
+        fitted = "\n\n".join(kept)
+        if fitted:
+            return fitted
+    return _hard_cap(body, allowance)
+
+
+def _wrap_live_entry(entry: dict, keep: tuple[str, ...]) -> dict:
+    out = {}
+    for key in keep:
+        value = entry.get(key)
+        if isinstance(value, str):
+            out[key] = _untrusted(value)
+        elif value is not None:
+            out[key] = value
+    return out
+
+
+#: Captured gh stdout is capped at this many bytes BEFORE parsing: time is
+#: already bounded (timeout=30) and this bounds the bytes — a runaway gh
+#: response must not flow into an unbounded packet. A response past the
+#: cap no longer parses and degrades the live block like any gh failure.
+_GH_STDOUT_BYTE_CAP = 262144
+
+
+def _brief_live(
+    repo: str, pr_numbers: list[int], gh_path: str
+) -> tuple[dict | None, str | None]:
+    """gh-backed live CI/review reads for the linked PRs (argv list, no
+    shell, results never stored). One cheap reachability probe runs first,
+    so a broken gh degrades the block even when there are no linked PRs to
+    read. Any failure degrades the whole live block to ``(None, error
+    note)`` — the packet still returns. Each call is bounded in time
+    (timeout=30) and in bytes: stdout is truncated to
+    ``_GH_STDOUT_BYTE_CAP`` (256 KiB) before parsing, so an oversized
+    response degrades rather than bloats the packet.
+
+    The CI leg costs TWO gh calls per PR (accepted cost, documented
+    here), both single-response surfaces: the PR record itself — whose
+    ``head.sha`` names the head commit CI ran against, read from one
+    un-paginated response — and that sha's combined status, the real CI
+    state surface. The head sha therefore always comes from the PR
+    record, so ``live_ci`` is always the HEAD's CI state, never a
+    mid-PR commit's. It reports real fields only: ``{"sha", "state",
+    "contexts"}``, where contexts are the combined status's per-check
+    entries reduced to ``{"state", "context"}`` and capped at the first
+    10. The reviews leg is one more call per PR (real review objects
+    carry ``state``/``body``)."""
+    import subprocess
+
+    def _gh(api_path: str):
+        proc = subprocess.run(
+            [gh_path, "api", api_path],
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"gh api {api_path} exited {proc.returncode}")
+        capped = proc.stdout[:_GH_STDOUT_BYTE_CAP]
+        return json.loads(capped.decode("utf-8", "replace"))
+
+    try:
+        _gh(f"repos/{repo}")
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+        return None, f"gh probe failed: {exc}"
+
+    prs: list[dict] = []
+    for pr in pr_numbers:
+        entry: dict = {"number": pr}
+        pr_path = f"repos/{repo}/pulls/{pr}"
+        try:
+            pr_record = _gh(pr_path)
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            return None, f"gh api {pr_path} failed: {exc}"
+        if not isinstance(pr_record, dict):
+            return None, f"gh api {pr_path}: unexpected payload shape"
+        # The head sha comes from the PR record's head.sha — one
+        # un-paginated response. A commits LIST page only names the head
+        # in its LAST element while that one page covers every commit
+        # (GitHub's default per_page=30); past that count the page ends
+        # mid-PR and the last element stops being the head.
+        head_obj = pr_record.get("head")
+        head = head_obj.get("sha") if isinstance(head_obj, dict) else None
+        if not isinstance(head, str):
+            # a PR with no commits has no CI surface to report
+            entry["live_ci"] = None
+        else:
+            status_path = f"repos/{repo}/commits/{head}/status"
+            try:
+                combined = _gh(status_path)
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                return None, f"gh api {status_path} failed: {exc}"
+            if not isinstance(combined, dict):
+                return None, f"gh api {status_path}: unexpected payload shape"
+            raw_statuses = combined.get("statuses")
+            entry["live_ci"] = {
+                "sha": _untrusted(head),
+                "state": _wrap_live_entry(combined, ("state",)).get("state"),
+                "contexts": [
+                    _wrap_live_entry(s, ("state", "context"))
+                    for s in (
+                        raw_statuses if isinstance(raw_statuses, list) else []
+                    )[:10]
+                    if isinstance(s, dict)
+                ],
+            }
+        reviews_path = f"repos/{repo}/pulls/{pr}/reviews"
+        try:
+            reviews = _gh(reviews_path)
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            return None, f"gh api {reviews_path} failed: {exc}"
+        if not isinstance(reviews, list):
+            return None, f"gh api {reviews_path}: unexpected payload shape"
+        entry["live_review"] = [
+            _wrap_live_entry(e, ("state", "body"))
+            for e in reviews
+            if isinstance(e, dict)
+        ]
+        prs.append(entry)
+    return {"prs": prs}, None
+
+
+def brief(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    budget_tokens: int = 4000,
+    config: str | None = None,
+    live: bool = False,
+    gh_path: str = "gh",
+    weights: dict | None = None,
+) -> dict:
+    """The work packet for one issue (issue #30, 04-root-cause.md section
+    4): the triage feature row, the body truncated at paragraph boundaries,
+    top comments (max 5, ordered by author_association rank then recency
+    DESC), implicated files with resolution evidence, the closest PR analog
+    with its fix diffstat, and linked PRs — plus the AC9 echo every derived
+    payload carries (the effective ``weights``, ``config_source``, and
+    ``formula_version``). ``weights`` is the effective ``[derive]`` table
+    for the analog scan (None -> ``load_weights()`` defaults, preserving
+    bare library-call behavior). Only OPEN issues have packets: a number
+    that exists but is not an open issue raises LookupError with "is not
+    an open issue" (pr45 review K11). Every GitHub-authored string (title,
+    body, comment bodies, live gh text) is wrapped as
+    ``{"untrusted_text": ...}`` and the packet carries ``content_trust``.
+    Budget: chars/4 of the serialized packet <= ``budget_tokens`` whenever
+    the budget is at or above the packet's skeleton floor —
+    ``budget_tokens`` must be a positive integer (a non-positive value is
+    a ``ValueError`` before any work, never a silently-disabled cap; pr45
+    review K09). That floor is
+    title-dependent — roughly 470-650 tokens for a bare issue with the
+    default [triage] echo, ~480 for a short title — because the title
+    rides in the skeleton untruncated; the exact bound is per-packet, so
+    a long-titled issue sits near the top of the range. Smaller budgets
+    return the skeleton with ``truncated: true``. The mandatory
+    ``truncated``/``derived`` echoes are counted inside the envelope
+    (their width is reserved before the body allowance is computed). The
+    envelope covers the complete packet:
+    the ``--live`` block attaches before enforcement, and a live block
+    that cannot fit inside the envelope even over an empty body degrades
+    to ``live: null`` + a ``live_error`` budget note before the allowance
+    is computed. Truncation order: comments capped at the top-5 first,
+    then the body cut at paragraph boundaries (a body that cannot fit any
+    whole paragraph under the allowance — including a single-paragraph
+    body — is hard-truncated at the character level with a trailing
+    ``…``), then comments drop from the tail, then file evidence.
+    ``truncated`` is set whenever any of that fired — including the
+    top-5 comment cap itself on a packet with more than five comments,
+    budget or not (pr45 review CUB#4de28cd7).
+    ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR CI
+    state/reviews; any failure degrades to ``live: null`` +
+    ``live_error``. Read-only."""
+    if budget_tokens is None or budget_tokens <= 0:
+        # Mirrors --size: a non-positive budget is a bad request, never a
+        # silently-disabled cap (pr45 review K09).
+        raise ValueError("budget-tokens must be a positive integer")
+    cfg = load_triage_config(*_triage_config_chain(conn, config))
+    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    all_rows = {r["number"]: r for r in compute["rows"]}
+    row = all_rows.get(number)
+    if row is None:
+        # K11: distinguish "never stored" from "stored but not an open
+        # issue" — the surface only addresses open issues, and the message
+        # must not claim absence for a closed issue or a PR.
+        exists = conn.execute(
+            "SELECT 1 FROM items WHERE repo = ? AND number = ?",
+            (repo, number),
+        ).fetchone()
+        if exists is not None:
+            raise LookupError(f"item #{number} is not an open issue")
+        raise LookupError(f"item not found: #{number}")
+
+    item_row = conn.execute(
+        "SELECT title, body, author, created_at FROM items"
+        " WHERE repo = ? AND kind = 'issue' AND number = ?",
+        (repo, number),
+    ).fetchone()
+    if item_row is None:  # pragma: no cover - triage rows are open issues
+        raise LookupError(f"item not found: #{number}")
+
+    comment_rows = [
+        {
+            "author": crow["author"],
+            "author_association": crow["author_association"],
+            "created_at": crow["created_at"],
+            "body": crow["body"] or "",
+        }
+        for crow in conn.execute(
+            "SELECT author, author_association, created_at, body FROM comments"
+            " WHERE repo = ? AND number = ? AND kind = 'issue_comment'",
+            (repo, number),
+        )
+    ]
+    ranked_comments: list[dict] = []
+    for rank in (0, 1, 2):
+        bucket = [
+            c
+            for c in comment_rows
+            if _association_rank(c["author_association"]) == rank
+        ]
+        bucket.sort(key=lambda c: c["created_at"] or "", reverse=True)
+        ranked_comments.extend(bucket)
+    kept_comments = ranked_comments[:5]
+    # The top-5 cap is itself a trim: a packet with more than five ranked
+    # comments is truncated even when the budget never binds (CUB#4de28cd7).
+    comments_capped = len(ranked_comments) > 5
+
+    resolved = row["resolved_paths"]
+    unresolved_count = 0
+    item_data = compute["ctx"]["items"].get(number)
+    if item_data is not None:
+        unresolved_count = len(item_data.unresolved_refs)
+
+    analog, _regression = _analog_for(
+        conn,
+        repo,
+        number,
+        compute["features"][number]["reverted_prs"],
+        ctx=compute["ctx"],
+        weights=compute["analog_weights"],
+    )
+    analog_block = None
+    if analog:
+        arow = conn.execute(
+            "SELECT number, additions, deletions FROM items"
+            " WHERE repo = ? AND number = ?",
+            (repo, analog["number"]),
+        ).fetchone()
+        if arow is not None:
+            analog_block = {
+                "number": arow["number"],
+                "anchor": analog["anchor"],
+                "additions": arow["additions"],
+                "deletions": arow["deletions"],
+            }
+
+    linked: list[dict] = []
+    seen_prs: set[int] = set()
+    # linked_pr: the issue (src) points at its linked PR (dst); the closes
+    # fallback: the PR (src) points at the issue (dst).
+    for erow in conn.execute(
+        "SELECT CAST(e.dst_id AS INTEGER) AS pr, i.title AS pr_title,"
+        " i.state AS pr_state FROM edges e JOIN items i"
+        " ON i.repo = e.repo AND i.number = CAST(e.dst_id AS INTEGER)"
+        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND e.rel = 'linked_pr' AND e.src_id = ? AND i.kind = 'pr'",
+        (repo, str(number)),
+    ):
+        pr = erow["pr"]
+        if pr is None or pr in seen_prs:
+            continue
+        seen_prs.add(pr)
+        linked.append(
+            {
+                "number": pr,
+                "state": erow["pr_state"],
+                "title": _untrusted(erow["pr_title"] or ""),
+            }
+        )
+    for erow in conn.execute(
+        "SELECT CAST(e.src_id AS INTEGER) AS pr, i.title AS pr_title,"
+        " i.state AS pr_state FROM edges e JOIN items i"
+        " ON i.repo = e.repo AND i.number = CAST(e.src_id AS INTEGER)"
+        " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND e.rel IN ('closes', 'closes_keyword') AND e.dst_id = ?"
+        " AND i.kind = 'pr'",
+        (repo, str(number)),
+    ):
+        pr = erow["pr"]
+        if pr is None or pr in seen_prs:
+            continue
+        seen_prs.add(pr)
+        linked.append(
+            {
+                "number": pr,
+                "state": erow["pr_state"],
+                "title": _untrusted(erow["pr_title"] or ""),
+            }
+        )
+    linked.sort(key=lambda e: e["number"])
+
+    features = _triage_row_payload(row)
+    features["title"] = _untrusted(features["title"])
+
+    packet: dict = {
+        "repo": repo,
+        "number": number,
+        "features": features,
+        "content_trust": _UNTRUSTED_NOTE,
+        "comments": [
+            {
+                "author": c["author"],
+                "author_association": c["author_association"],
+                "created_at": c["created_at"],
+                "body": _untrusted(c["body"]),
+            }
+            for c in kept_comments
+        ],
+        "body": _untrusted(item_row["body"] or ""),
+        "files": {
+            "resolved": list(resolved),
+            "unresolved_count": unresolved_count,
+        },
+        "analog": analog_block,
+        "linked_prs": linked,
+        "weights": {
+            **{k: v for k, v in cfg.items() if k != "_config_source"},
+            "affinity": dict(compute["analog_weights"]),
+        },
+        "config_source": cfg["_config_source"],
+        "formula_version": cfg["formula_version"],
+    }
+
+    # The live block attaches BEFORE the budget enforcement so the envelope
+    # covers the complete packet, --live content included.
+    if live:
+        live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
+        packet["live"] = live_block
+        if live_error is not None:
+            packet["live_error"] = live_error
+
+    if comments_capped:
+        packet["truncated"] = True
+
+    if budget_tokens:
+        budget_chars = budget_tokens * 4
+
+        def _size(pkt: dict) -> int:
+            return len(
+                json.dumps(
+                    pkt, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+                )
+            )
+
+        if packet.get("live"):
+            # A live block that cannot fit inside the envelope even over an
+            # empty body can never ship: degrade it up front to the
+            # documented live:null + note shape, so the body allowance is
+            # measured against a skeleton that actually can.
+            probe_live = dict(packet)
+            probe_live["body"] = _untrusted("")
+            probe_live["derived"] = True
+            probe_live["truncated"] = True
+            if _size(probe_live) > budget_chars:
+                packet["live"] = None
+                packet["live_error"] = "live block dropped: packet budget"
+                packet["truncated"] = True
+
+        probe = dict(packet)
+        probe["body"] = _untrusted("")
+        # The mandatory echoes ride inside the envelope, not after it:
+        # `derived` serializes onto every packet and `truncated` onto any
+        # packet a trim touched, so both widths are reserved BEFORE the
+        # body allowance is computed — with zero comments nothing absorbs
+        # them, and a body filled to exactly the bound overflows it once
+        # the flags serialize in.
+        probe["derived"] = True
+        probe["truncated"] = True
+        allowance = budget_chars - _size(probe)
+        body_text = packet["body"]["untrusted_text"]
+        fitted = _fit_paragraphs(body_text, allowance)
+        if fitted != body_text:
+            packet["truncated"] = True
+        packet["body"] = _untrusted(fitted)
+        # derived is stamped before the backstop loops so their size
+        # checks measure the FINAL packet shape, flags included.
+        packet["derived"] = True
+        while _size(packet) > budget_chars and packet["comments"]:
+            packet["comments"].pop()
+            packet["truncated"] = True
+        if _size(packet) > budget_chars:
+            # File backstop: keep the files SHAPE stable under truncation —
+            # unresolved_count survives — and keep trimming the resolved
+            # tail while the packet is still over budget, so the backstop
+            # cannot return an oversized packet it had room to fix
+            # (pr45 review K15 / CUB#72fbe41d). A budget below the packet's
+            # skeleton floor bottoms out here with truncated: true.
+            packet["files"] = {
+                "resolved": packet["files"]["resolved"][:5],
+                "unresolved_count": packet["files"]["unresolved_count"],
+            }
+            packet["truncated"] = True
+            while packet["files"]["resolved"] and _size(packet) > budget_chars:
+                packet["files"]["resolved"] = packet["files"]["resolved"][:-1]
+
+    packet["derived"] = True
+    return packet

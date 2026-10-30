@@ -692,11 +692,19 @@ query that *matches* millions of rows does not materialize them all. A
 non-positive `--limit` is clamped rather than passed through, because a negative
 `LIMIT` means *unlimited* in SQLite.
 
-## Derived reads (issue #29)
+## Derived reads (issues #29, #30)
 
-`similar`, `explain`, `coupling`, and `eval` (whose `localize` mode ranks
-files) are **derived reads**: they are computed at query time from the tables
-above and never stored. Every result carries `derived: true`. The invariants:
+Seven commands are **derived reads**: `similar`, `explain`, `coupling`,
+and `eval` (whose `localize` mode ranks files) from issue #29, joined by
+the work-selection layer of issue #30 — `triage` (two-stage ranking of
+open issues), `bundle` (greedy work bundles over the triage pool), and
+`brief` (one issue's work packet). All seven are computed at query time
+from the tables above and never stored (one exception reads past the
+store: `brief --live` fetches linked-PR CI state/reviews through `gh` at
+query time and stores nothing — the store-only claim holds for every
+command run without `--live`), under the same never-written /
+never-stored invariants as their #29 siblings. Every result carries
+`derived: true`. The invariants:
 
 - The derived tier opens the store through the same read-only connection
   reads use (`db.open_existing`, `mode=ro`); per-query scratch (the path
@@ -706,8 +714,8 @@ above and never stored. Every result carries `derived: true`. The invariants:
   never shares a connection factory with the tier.
 - No new relations: derived pairs never enter `edges` (whose rows remain
   EXTRACTED, GitHub-reported facts only), and the feature needs no schema
-  migration. The four commands are not on the MCP surface yet — that
-  surfacing is issue #32's lane.
+  migration. None of the seven commands is on the MCP surface yet — that
+  surfacing of all seven is issue #32's lane.
 - Raw path strings in `item_path_refs` are resolved at read time against a
   vocabulary built from merged-PR `pr_files` paths (minus `removed`), by
   exact or unique-suffix match in either direction; unresolved mentions

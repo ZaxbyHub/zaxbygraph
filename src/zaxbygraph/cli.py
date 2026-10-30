@@ -463,6 +463,19 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
         data = query_fn(conn, *extra, repo=repo)
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
+    except sqlite3.Error as exc:
+        # A store that cannot be read mid-query (a pre-v7 store hitting a
+        # v7-only table, a corrupt page, a read-only directory blocking the
+        # -shm) is a coded store_unreadable, matching the derived-read
+        # runner — never a raw traceback (pr45 review K01).
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
     finally:
         conn.close()
     emit_result(
@@ -731,11 +744,30 @@ def cmd_related(args: argparse.Namespace) -> int:
 
 
 def cmd_churn(args: argparse.Namespace) -> int:
-    return _run_read(args, churn, args.limit)
+    # churn/open_items are keyword-only after their positional page window
+    # (pr45 review K03), so the flags ride a closure instead of _run_read's
+    # positional *extra.
+    limit = args.limit
+    merged_only = bool(getattr(args, "merged_only", False))
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        return churn(conn, limit, merged_only=merged_only, repo=repo)
+
+    return _run_read(args, _query)
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    return _run_read(args, open_items)
+    limit = getattr(args, "limit", None)
+    offset = getattr(args, "offset", 0)
+    kind = getattr(args, "kind", None)
+    label = getattr(args, "label", None)
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        return open_items(
+            conn, limit, offset, kind=kind, label=label, repo=repo
+        )
+
+    return _run_read(args, _query)
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -749,9 +781,10 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
     impossible). Query-time failures map to coded envelopes, never
     tracebacks: unknown items to ``not_found``, weight-configuration
     problems to ``config_error`` and other bad requests to exit 2,
-    store-level failures to ``store_unreadable``; all four commands refuse
-    an unresolved repository with the canonical ``repo_required`` code
-    instead of answering from an empty filter (pr43 review PRR-014/016)."""
+    store-level failures to ``store_unreadable``; every command routed
+    here refuses an unresolved repository with the canonical
+    ``repo_required`` code instead of answering from an empty filter
+    (pr43 review PRR-014/016)."""
     repo: str | None = None
     db_path: Path | None = None
     try:
@@ -993,6 +1026,154 @@ def cmd_coupling(args: argparse.Namespace) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     return _run_derived_read(args, _eval_query, args.mode, args.config)
+
+
+def _triage_query(
+    conn: sqlite3.Connection,
+    limit: int,
+    cursor: str | None,
+    top_k: int | None,
+    include_gated: bool,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    # The [derive] weights ride the same store/cwd/explicit chain as
+    # similar's --config: the stage-2 analog scan must score under the
+    # caller's effective table, not silently the defaults (pr45 K05).
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    return _derive.triage(
+        conn,
+        repo,
+        limit=limit,
+        cursor=cursor,
+        top_k=top_k,
+        include_gated=include_gated,
+        config=config,
+        weights=weights,
+    )
+
+
+def _bundle_query(
+    conn: sqlite3.Connection,
+    size: str,
+    count: int,
+    pool_raw: str | None,
+    exclude_raw: str | None,
+    allow_shared_files: bool,
+    max_files: int | None,
+    budget_tokens: int | None,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    # Parsed INSIDE the derived-read runner's protected try (an invalid
+    # --pool/--exclude value is a bad_request envelope at exit 2, never a
+    # traceback — the same contract --size already has through _parse_size).
+    pool = _csv_numbers(pool_raw, "--pool")
+    exclude = _csv_numbers(exclude_raw, "--exclude")
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    return _derive.bundle(
+        conn,
+        repo,
+        size=size,
+        count=count,
+        pool=pool,
+        exclude=exclude,
+        allow_shared_files=allow_shared_files,
+        max_files=max_files,
+        config=config,
+        budget_tokens=budget_tokens,
+        weights=weights,
+    )
+
+
+def _brief_query(
+    conn: sqlite3.Connection,
+    number: int,
+    budget_tokens: int,
+    live: bool,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
+    return _derive.brief(
+        conn,
+        repo,
+        number,
+        budget_tokens=budget_tokens,
+        config=config,
+        live=live,
+        weights=weights,
+    )
+
+
+def _csv_numbers(raw: str | None, flag: str) -> list[int] | None:
+    """Parse a comma-separated number list. A BLANK value is treated as
+    absent (None -> the default pool), so `--pool ""` cannot silently mean
+    "an explicit empty pool" (pr45 review CUB#b08069ad)."""
+    if raw is None or not str(raw).strip():
+        return None
+    out: list[int] = []
+    for piece in str(raw).replace(" ", "").split(","):
+        if not piece:
+            continue
+        try:
+            out.append(int(piece))
+        except ValueError:
+            raise ValueError(f"invalid {flag} value: {raw!r}") from None
+    return out
+
+
+def cmd_triage(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args,
+        _triage_query,
+        args.limit,
+        args.cursor,
+        args.top_k,
+        bool(getattr(args, "include_gated", False)),
+        args.config,
+    )
+
+
+def cmd_bundle(args: argparse.Namespace) -> int:
+    # --pool/--exclude travel as RAW strings: they are parsed inside
+    # _bundle_query, within _run_derived_read's protected try, so invalid
+    # values answer the coded bad_request envelope instead of a traceback.
+    return _run_derived_read(
+        args,
+        _bundle_query,
+        args.size,
+        args.count,
+        args.pool,
+        args.exclude,
+        bool(getattr(args, "allow_shared_files", False)),
+        args.max_files,
+        args.budget_tokens,
+        args.config,
+    )
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args,
+        _brief_query,
+        args.number,
+        args.budget_tokens,
+        bool(getattr(args, "live", False)),
+        args.config,
+    )
 
 
 def _run_read_promote_truncated(
@@ -1645,10 +1826,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("churn", help="Files ranked by PR touch count")
     add_common(sp)
     sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument(
+        "--merged-only",
+        dest="merged_only",
+        action="store_true",
+        help="Count only PRs that actually merged (drop closed-unmerged work)",
+    )
     sp.set_defaults(func=cmd_churn)
 
     sp = sub.add_parser("open", help="Open issues and pull requests")
     add_common(sp)
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Page size (default: every open item)",
+    )
+    sp.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip the first N rows (applies with or without --limit)",
+    )
+    sp.add_argument(
+        "--kind",
+        choices=("issue", "pr"),
+        default=None,
+        help="Restrict to issues or pull requests",
+    )
+    sp.add_argument(
+        "--label",
+        default=None,
+        help="Only items carrying this exact label name",
+    )
     sp.set_defaults(func=cmd_open)
 
     sp = sub.add_parser("path", help="Undirected path between two item numbers or file paths")
@@ -1698,6 +1908,64 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("mode", choices=["similar", "localize", "bundle"])
     sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
     sp.set_defaults(func=cmd_eval)
+
+    sp = sub.add_parser(
+        "triage",
+        help="Rank open issues by demand/leverage/risk/priority (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("--limit", type=int, default=20, help="Page size (default 20)")
+    sp.add_argument("--cursor", default=None, metavar="T:N", help="Page cursor from a previous payload")
+    sp.add_argument(
+        "--top-k", dest="top_k", type=int, default=None,
+        help="Stage-2 fan over the top-K ungated rows (default: [triage] top_k)",
+    )
+    sp.add_argument(
+        "--include-gated", dest="include_gated", action="store_true",
+        help="Keep gated rows in the response (ranked: false, gates named)",
+    )
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_triage)
+
+    sp = sub.add_parser(
+        "bundle",
+        help="Greedy work bundles over the triage pool (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("--size", default="2-3", metavar="N-M", help="Bundle size range (default 2-3)")
+    sp.add_argument("--count", type=int, default=5, help="Maximum bundles (default 5)")
+    sp.add_argument("--pool", default=None, metavar="N,M", help="Explicit pool member numbers")
+    sp.add_argument(
+        "--exclude", default=None, metavar="N,M",
+        help="Remove these numbers from the pool entirely",
+    )
+    sp.add_argument(
+        "--allow-shared-files", dest="allow_shared_files", action="store_true",
+        help="Permit bundles to share files across bundles",
+    )
+    sp.add_argument("--max-files", dest="max_files", type=int, default=None,
+                    help="Bundle file-set cap (default: [triage] max_files)")
+    sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
+                    help="Cap the serialized payload at N tokens (chars/4; positive integer)")
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_bundle)
+
+    sp = sub.add_parser(
+        "brief",
+        help="One issue's work packet: features, body, comments, files, analog (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("number", type=int)
+    sp.add_argument(
+        "--budget-tokens", dest="budget_tokens", type=int, default=4000,
+        help="Packet budget in tokens (chars/4; positive integer, default 4000)",
+    )
+    sp.add_argument(
+        "--live", action="store_true",
+        help="Also read linked-PR CI state/reviews via gh (never stored; failures degrade)",
+    )
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_brief)
 
     sp = sub.add_parser("sql", help="Read-only SQL (SELECT/WITH/EXPLAIN)")
     add_common(sp)
