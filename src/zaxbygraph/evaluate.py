@@ -7,13 +7,17 @@ touched (localization), and the issue sets single merged PRs closed (bundles).
 Per target, the harness applies AC6's controls — candidates restricted to
 items that existed at the target's creation, the target's closing PRs and
 their edges excluded, PRs merged after the target's creation excluded, and
-the target–partner edges themselves excluded. Comment-origin scoping of
-rolled-up path references (origin-timestamp joins) is applied in the
-localize mode, which is where the plan's fix-PR comment cutoff is defined;
-the similar/bundle modes scope their candidate and vocabulary pools by the
-item-visibility cutoff but do not re-scope stored path references by comment
-time — a disclosed scoping decision, recorded in the PR #43 closure ledger.
-Signature components are suppressed in eval
+the target–partner edges themselves excluded. Since issue #44, the
+similar/bundle modes scope the path evidence itself like the localize mode:
+``item_cutoff`` = the target's ``created_at`` restricts the merged-PR
+vocabulary and the co-change population, and ``comment_cutoff`` = the
+earliest closing PR's creation (falling back to the target's ``created_at``
+when no closer exists — with no fix PR there is no later anchor) filters
+every scored item's comment/review-derived path references by origin
+timestamp. Because scoped reads cannot reconstruct a cutoff-visible
+co-change subset (``pr_files`` rows carry no per-file origin), the
+cochange signal loses its pair-creating vote there exactly like the
+suppressed signature component. Signature components are suppressed in eval
 scoring by construction: ``item_signatures`` rows carry no origin, so a
 cutoff-visible signature set cannot be reconstructed (conservative
 suppression beats a leaky signal). Every scored target is therefore labelled
@@ -140,6 +144,27 @@ def _revised_after(
         if ts is not None and ts > cutoff_dt:
             return True, True
     return False, True
+
+
+def _comment_cutoff(
+    conn: sqlite3.Connection, repo: str, closing: list[int], fallback: str | None
+) -> str | None:
+    """The #44 comment-scoping anchor for one eval target: the EARLIEST
+    closing PR's creation when closers exist, else the target's own
+    ``created_at`` (documented fallback — with no fix PR there is no later
+    anchor to scoping the target's evidence)."""
+    stamps = [
+        row["created_at"]
+        for row in (
+            conn.execute(
+                "SELECT created_at FROM items WHERE repo = ? AND number = ?",
+                (repo, pr),
+            ).fetchone()
+            for pr in closing
+        )
+        if row is not None and row["created_at"]
+    ]
+    return min(stamps) if stamps else fallback
 
 
 def _duplicate_pairs(conn: sqlite3.Connection, repo: str) -> dict[int, set[int]]:
@@ -289,6 +314,8 @@ def _eval_similar(
                 exclude_adjacency=excluded_adjacency,
                 filtered_sources={"keyword"},
                 suppress_signals={"signature"},
+                item_cutoff=cutoff,
+                comment_cutoff=_comment_cutoff(conn, repo, closing, cutoff),
             )
         except LookupError:
             leakage.setdefault(target, []).append("target_missing")
@@ -533,6 +560,8 @@ def _eval_bundle(
                 exclude_adjacency=excluded_adjacency,
                 filtered_sources={"keyword"},
                 suppress_signals={"signature"},
+                item_cutoff=cutoff,
+                comment_cutoff=_comment_cutoff(conn, repo, closing, cutoff),
             )
         except LookupError:
             leakage.setdefault(target, []).append("target_missing")

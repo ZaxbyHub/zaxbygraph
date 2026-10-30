@@ -731,11 +731,18 @@ def cmd_related(args: argparse.Namespace) -> int:
 
 
 def cmd_churn(args: argparse.Namespace) -> int:
-    return _run_read(args, churn, args.limit)
+    return _run_read(args, churn, args.limit, bool(getattr(args, "merged_only", False)))
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    return _run_read(args, open_items)
+    return _run_read(
+        args,
+        open_items,
+        getattr(args, "limit", None),
+        getattr(args, "offset", 0),
+        getattr(args, "kind", None),
+        getattr(args, "label", None),
+    )
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -993,6 +1000,131 @@ def cmd_coupling(args: argparse.Namespace) -> int:
 
 def cmd_eval(args: argparse.Namespace) -> int:
     return _run_derived_read(args, _eval_query, args.mode, args.config)
+
+
+def _triage_query(
+    conn: sqlite3.Connection,
+    limit: int,
+    cursor: str | None,
+    top_k: int | None,
+    include_gated: bool,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    return _derive.triage(
+        conn,
+        repo,
+        limit=limit,
+        cursor=cursor,
+        top_k=top_k,
+        include_gated=include_gated,
+        config=config,
+    )
+
+
+def _bundle_query(
+    conn: sqlite3.Connection,
+    size: str,
+    count: int,
+    pool: list[int] | None,
+    exclude: list[int] | None,
+    allow_shared_files: bool,
+    max_files: int | None,
+    budget_tokens: int | None,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    return _derive.bundle(
+        conn,
+        repo,
+        size=size,
+        count=count,
+        pool=pool,
+        exclude=exclude,
+        allow_shared_files=allow_shared_files,
+        max_files=max_files,
+        config=config,
+        budget_tokens=budget_tokens,
+    )
+
+
+def _brief_query(
+    conn: sqlite3.Connection,
+    number: int,
+    budget_tokens: int,
+    live: bool,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    from zaxbygraph import derive as _derive
+
+    return _derive.brief(
+        conn,
+        repo,
+        number,
+        budget_tokens=budget_tokens,
+        config=config,
+        live=live,
+    )
+
+
+def _csv_numbers(raw: str | None, flag: str) -> list[int] | None:
+    if raw is None:
+        return None
+    out: list[int] = []
+    for piece in str(raw).replace(" ", "").split(","):
+        if not piece:
+            continue
+        try:
+            out.append(int(piece))
+        except ValueError:
+            raise ValueError(f"invalid {flag} value: {raw!r}") from None
+    return out
+
+
+def cmd_triage(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args,
+        _triage_query,
+        args.limit,
+        args.cursor,
+        args.top_k,
+        bool(getattr(args, "include_gated", False)),
+        args.config,
+    )
+
+
+def cmd_bundle(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args,
+        _bundle_query,
+        args.size,
+        args.count,
+        _csv_numbers(args.pool, "--pool"),
+        _csv_numbers(args.exclude, "--exclude"),
+        bool(getattr(args, "allow_shared_files", False)),
+        args.max_files,
+        args.budget_tokens,
+        args.config,
+    )
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    return _run_derived_read(
+        args,
+        _brief_query,
+        args.number,
+        args.budget_tokens,
+        bool(getattr(args, "live", False)),
+        args.config,
+    )
 
 
 def _run_read_promote_truncated(
@@ -1645,10 +1777,39 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("churn", help="Files ranked by PR touch count")
     add_common(sp)
     sp.add_argument("--limit", type=int, default=30)
+    sp.add_argument(
+        "--merged-only",
+        dest="merged_only",
+        action="store_true",
+        help="Count only PRs that actually merged (drop closed-unmerged work)",
+    )
     sp.set_defaults(func=cmd_churn)
 
     sp = sub.add_parser("open", help="Open issues and pull requests")
     add_common(sp)
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Page size (default: every open item)",
+    )
+    sp.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Skip the first N rows (applies with or without --limit)",
+    )
+    sp.add_argument(
+        "--kind",
+        choices=("issue", "pr"),
+        default=None,
+        help="Restrict to issues or pull requests",
+    )
+    sp.add_argument(
+        "--label",
+        default=None,
+        help="Only items carrying this exact label name",
+    )
     sp.set_defaults(func=cmd_open)
 
     sp = sub.add_parser("path", help="Undirected path between two item numbers or file paths")
@@ -1698,6 +1859,64 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("mode", choices=["similar", "localize", "bundle"])
     sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
     sp.set_defaults(func=cmd_eval)
+
+    sp = sub.add_parser(
+        "triage",
+        help="Rank open issues by demand/leverage/risk/priority (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("--limit", type=int, default=20, help="Page size (default 20)")
+    sp.add_argument("--cursor", default=None, metavar="T:N", help="Page cursor from a previous payload")
+    sp.add_argument(
+        "--top-k", dest="top_k", type=int, default=None,
+        help="Stage-2 fan over the top-K ungated rows (default: [triage] top_k)",
+    )
+    sp.add_argument(
+        "--include-gated", dest="include_gated", action="store_true",
+        help="Keep gated rows in the response (ranked: false, gates named)",
+    )
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_triage)
+
+    sp = sub.add_parser(
+        "bundle",
+        help="Greedy work bundles over the triage pool (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("--size", default="2-3", metavar="N-M", help="Bundle size range (default 2-3)")
+    sp.add_argument("--count", type=int, default=5, help="Maximum bundles (default 5)")
+    sp.add_argument("--pool", default=None, metavar="N,M", help="Explicit pool member numbers")
+    sp.add_argument(
+        "--exclude", default=None, metavar="N,M",
+        help="Remove these numbers from the pool entirely",
+    )
+    sp.add_argument(
+        "--allow-shared-files", dest="allow_shared_files", action="store_true",
+        help="Permit bundles to share files across bundles",
+    )
+    sp.add_argument("--max-files", dest="max_files", type=int, default=None,
+                    help="Bundle file-set cap (default: [triage] max_files)")
+    sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
+                    help="Cap the serialized payload at N tokens (chars/4)")
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_bundle)
+
+    sp = sub.add_parser(
+        "brief",
+        help="One issue's work packet: features, body, comments, files, analog (derived, read-only)",
+    )
+    add_common(sp)
+    sp.add_argument("number", type=int)
+    sp.add_argument(
+        "--budget-tokens", dest="budget_tokens", type=int, default=4000,
+        help="Packet budget in tokens (chars/4, default 4000)",
+    )
+    sp.add_argument(
+        "--live", action="store_true",
+        help="Also read linked-PR checks/reviews via gh (never stored; failures degrade)",
+    )
+    sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_brief)
 
     sp = sub.add_parser("sql", help="Read-only SQL (SELECT/WITH/EXPLAIN)")
     add_common(sp)

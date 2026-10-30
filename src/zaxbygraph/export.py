@@ -582,9 +582,13 @@ def write_corpus(
 
     fd, spool_path = tempfile.mkstemp(prefix="zaxbygraph-export-")
     os.close(fd)
-    fd, manifest_path = tempfile.mkstemp(prefix="zaxbygraph-export-manifest-")
-    os.close(fd)
+    manifest_path: str | None = None
     try:
+        # Inside the try (44-AC3): when the manifest tempfile fails, the
+        # finally below still unlinks the spool — a pre-try allocation here
+        # leaked the spool on exactly that failure.
+        fd, manifest_path = tempfile.mkstemp(prefix="zaxbygraph-export-manifest-")
+        os.close(fd)
         # Snapshot phase: BEGIN DEFERRED is taken before the first read and
         # held across every read of one export (spool + manifest), then
         # RELEASED before the destination-copy phase — a WAL read-mark is
@@ -761,6 +765,8 @@ def write_corpus(
         return manifest
     finally:
         for path in (spool_path, manifest_path):
+            if path is None:
+                continue
             try:
                 os.unlink(path)
             except OSError:

@@ -79,6 +79,11 @@ def _guardrail_commands() -> list[list[str]]:
         ["overlap", "10", "1"],
         ["file-history", "src/store.py"],
         ["what-closed", "1"],
+        # issue #30 work-selection reads against the same seed corpus (open
+        # issues 1/2): all exit 0.
+        ["triage"],
+        ["bundle"],
+        ["brief", "1"],
     ]
 
 
