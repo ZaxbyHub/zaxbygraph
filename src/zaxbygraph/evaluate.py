@@ -153,8 +153,8 @@ def _comment_cutoff(
     closing PR's creation when closers exist, else the target's own
     ``created_at`` (documented fallback — with no fix PR there is no later
     anchor to scoping the target's evidence)."""
-    stamps = [
-        row["created_at"]
+    rows = [
+        row
         for row in (
             conn.execute(
                 "SELECT created_at FROM items WHERE repo = ? AND number = ?",
@@ -162,8 +162,15 @@ def _comment_cutoff(
             ).fetchone()
             for pr in closing
         )
-        if row is not None and row["created_at"]
     ]
+    # A closer with an unknown stamp makes the min of the rest too LATE
+    # (evidence after that PR's creation would leak into the score), so the
+    # conservative anchor is the target's own creation instead.
+    if len(rows) != len(closing) or any(
+        row is None or not row["created_at"] for row in rows
+    ):
+        return fallback
+    stamps = [row["created_at"] for row in rows]
     return min(stamps) if stamps else fallback
 
 
