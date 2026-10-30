@@ -1313,11 +1313,11 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
         with tempfile.TemporaryDirectory() as td:
             shim = Path(td)
             fat_body = "LIVEMARK-fat " + "x" * 40000
-            shim.joinpath("gh.commits").write_text(
+            shim.joinpath("gh.pr").write_text(
                 json.dumps(
-                    [{"sha": "cafebafe", "commit": {"message": "m"},
-                      "url": "https://api.github.com/repos/acme/forgegate"
-                             "/commits/cafebafe", "parents": []}]
+                    {"number": 732,
+                     "head": {"ref": "feat/echolive", "sha": "deadbeef"},
+                     "base": {"ref": "main"}}
                 ),
                 encoding="ascii", newline="\n",
             )
@@ -1337,8 +1337,8 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
                 stub.write_text(
                     "#!/bin/sh\n"
                     'case "$*" in\n'
-                    '  *pulls/732/commits) cat "$0.commits" ;;\n'
-                    '  *commits/cafebafe/status) cat "$0.status" ;;\n'
+                    '  *pulls/732) cat "$0.pr" ;;\n'
+                    '  *commits/deadbeef/status) cat "$0.status" ;;\n'
                     '  *pulls/732/reviews) cat "$0.reviews" ;;\n'
                     "  *) printf '{}\\n' ;;\n"
                     "esac\n",
@@ -1351,12 +1351,7 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
                 stub = shim / "gh.bat"
                 stub.write_text(
                     "@echo off\r\n"
-                    'echo %*| findstr /C:"pulls/732/commits" >nul\r\n'
-                    "if not errorlevel 1 (\r\n"
-                    'type "%~dp0%~n0.commits"\r\n'
-                    "exit /b 0\r\n"
-                    ")\r\n"
-                    'echo %*| findstr /C:"commits/cafebafe/status" >nul\r\n'
+                    'echo %*| findstr /C:"commits/deadbeef/status" >nul\r\n'
                     "if not errorlevel 1 (\r\n"
                     'type "%~dp0%~n0.status"\r\n'
                     "exit /b 0\r\n"
@@ -1364,6 +1359,11 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
                     'echo %*| findstr /C:"pulls/732/reviews" >nul\r\n'
                     "if not errorlevel 1 (\r\n"
                     'type "%~dp0%~n0.reviews"\r\n'
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    'echo %*| findstr /C:"pulls/732" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    'type "%~dp0%~n0.pr"\r\n'
                     "exit /b 0\r\n"
                     ")\r\n"
                     "echo {}\r\n",

@@ -463,6 +463,19 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
         data = query_fn(conn, *extra, repo=repo)
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
+    except sqlite3.Error as exc:
+        # A store that cannot be read mid-query (a pre-v7 store hitting a
+        # v7-only table, a corrupt page, a read-only directory blocking the
+        # -shm) is a coded store_unreadable, matching the derived-read
+        # runner — never a raw traceback (pr45 review K01).
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
     finally:
         conn.close()
     emit_result(
@@ -731,18 +744,30 @@ def cmd_related(args: argparse.Namespace) -> int:
 
 
 def cmd_churn(args: argparse.Namespace) -> int:
-    return _run_read(args, churn, args.limit, bool(getattr(args, "merged_only", False)))
+    # churn/open_items are keyword-only after their positional page window
+    # (pr45 review K03), so the flags ride a closure instead of _run_read's
+    # positional *extra.
+    limit = args.limit
+    merged_only = bool(getattr(args, "merged_only", False))
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        return churn(conn, limit, merged_only=merged_only, repo=repo)
+
+    return _run_read(args, _query)
 
 
 def cmd_open(args: argparse.Namespace) -> int:
-    return _run_read(
-        args,
-        open_items,
-        getattr(args, "limit", None),
-        getattr(args, "offset", 0),
-        getattr(args, "kind", None),
-        getattr(args, "label", None),
-    )
+    limit = getattr(args, "limit", None)
+    offset = getattr(args, "offset", 0)
+    kind = getattr(args, "kind", None)
+    label = getattr(args, "label", None)
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        return open_items(
+            conn, limit, offset, kind=kind, label=label, repo=repo
+        )
+
+    return _run_read(args, _query)
 
 
 def cmd_path(args: argparse.Namespace) -> int:
@@ -1015,6 +1040,11 @@ def _triage_query(
 ) -> dict:
     from zaxbygraph import derive as _derive
 
+    # The [derive] weights ride the same store/cwd/explicit chain as
+    # similar's --config: the stage-2 analog scan must score under the
+    # caller's effective table, not silently the defaults (pr45 K05).
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
     return _derive.triage(
         conn,
         repo,
@@ -1023,6 +1053,7 @@ def _triage_query(
         top_k=top_k,
         include_gated=include_gated,
         config=config,
+        weights=weights,
     )
 
 
@@ -1046,6 +1077,8 @@ def _bundle_query(
     # traceback — the same contract --size already has through _parse_size).
     pool = _csv_numbers(pool_raw, "--pool")
     exclude = _csv_numbers(exclude_raw, "--exclude")
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
     return _derive.bundle(
         conn,
         repo,
@@ -1057,6 +1090,7 @@ def _bundle_query(
         max_files=max_files,
         config=config,
         budget_tokens=budget_tokens,
+        weights=weights,
     )
 
 
@@ -1071,6 +1105,8 @@ def _brief_query(
 ) -> dict:
     from zaxbygraph import derive as _derive
 
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
     return _derive.brief(
         conn,
         repo,
@@ -1078,11 +1114,15 @@ def _brief_query(
         budget_tokens=budget_tokens,
         config=config,
         live=live,
+        weights=weights,
     )
 
 
 def _csv_numbers(raw: str | None, flag: str) -> list[int] | None:
-    if raw is None:
+    """Parse a comma-separated number list. A BLANK value is treated as
+    absent (None -> the default pool), so `--pool ""` cannot silently mean
+    "an explicit empty pool" (pr45 review CUB#b08069ad)."""
+    if raw is None or not str(raw).strip():
         return None
     out: list[int] = []
     for piece in str(raw).replace(" ", "").split(","):
@@ -1906,7 +1946,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--max-files", dest="max_files", type=int, default=None,
                     help="Bundle file-set cap (default: [triage] max_files)")
     sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
-                    help="Cap the serialized payload at N tokens (chars/4)")
+                    help="Cap the serialized payload at N tokens (chars/4; positive integer)")
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_bundle)
 
@@ -1918,7 +1958,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("number", type=int)
     sp.add_argument(
         "--budget-tokens", dest="budget_tokens", type=int, default=4000,
-        help="Packet budget in tokens (chars/4, default 4000)",
+        help="Packet budget in tokens (chars/4; positive integer, default 4000)",
     )
     sp.add_argument(
         "--live", action="store_true",

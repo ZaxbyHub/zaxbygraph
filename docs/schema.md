@@ -699,7 +699,10 @@ and `eval` (whose `localize` mode ranks files) from issue #29, joined by
 the work-selection layer of issue #30 — `triage` (two-stage ranking of
 open issues), `bundle` (greedy work bundles over the triage pool), and
 `brief` (one issue's work packet). All seven are computed at query time
-from the tables above and never stored, under the same never-written /
+from the tables above and never stored (one exception reads past the
+store: `brief --live` fetches linked-PR CI state/reviews through `gh` at
+query time and stores nothing — the store-only claim holds for every
+command run without `--live`), under the same never-written /
 never-stored invariants as their #29 siblings. Every result carries
 `derived: true`. The invariants:
 
