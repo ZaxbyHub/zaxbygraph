@@ -391,8 +391,6 @@ class BundleFeedbackTests(_BundleableStore):
         )
 
 
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main()
 
 class PreV7OpenDegradesTests(unittest.TestCase):
     def setUp(self):
@@ -470,3 +468,6 @@ class LinkedPrChunkingTests(TempDBTest):
         by_number = {r["number"]: r for r in rows}
         for n in range(1, 403):
             self.assertEqual(by_number[n]["linked_open_prs"], [500 + n])
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
