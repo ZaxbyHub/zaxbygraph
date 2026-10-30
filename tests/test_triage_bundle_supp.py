@@ -10,6 +10,9 @@ Frozen check names:
     C15 test_derived_commands_never_write
     C16 test_brief_live_gh_success_leg
     C17 test_cochange_cutoff_excludes_post_cutoff_support
+    C18 test_candidate_side_comment_bait_scoped          (wave-3)
+    C19 test_bundle_pool_exclude_invalid_values_are_coded (feedback round)
+    C20 test_bundle_budget_caps_whole_payload            (feedback round)
 
 NEW-SURFACE module: collects cleanly at base (the derive symbols that arrive
 with the fix are reached via getattr inside test bodies or through the
@@ -42,6 +45,7 @@ from fixtures import (
     pull,
     scrubbed_env,
 )
+from fixtures_eval import _insert_edge
 
 from zaxbygraph.db import connect, init_schema, open_existing
 from zaxbygraph.derive import similar
@@ -197,7 +201,7 @@ class _StoreTestCase(unittest.TestCase):
 
     @classmethod
     def _build(cls, conn) -> None:  # pragma: no cover - overridden
-        raise NotImplementedError
+        raise AssertionError("_build must be overridden")
 
 
 # ==== C13: --exclude removes pool members ===================================
@@ -918,6 +922,128 @@ class CandidateSideBaitTests(_StoreTestCase):
             conn, REPO, 551, limit=50, item_cutoff=self.CUTOFF
         )
         self.assertIn(552, [c["number"] for c in item_only["candidates"]])
+
+
+# ==== C19 (feedback round): --pool/--exclude invalid values are coded ======
+
+
+class BundleBadValuesTests(_StoreTestCase):
+    """One synced open issue: enough store for the bundle command to
+    resolve the repo and reach its argument validation."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = _BulkSource()
+        src.add_issue(issue(471, title="single item", body="plain"))
+        sync_repo(conn, src, REPO)
+
+    def test_bundle_pool_exclude_invalid_values_are_coded(self) -> None:
+        """RED at base, GREEN after the fix. Review-fix regression pin
+        (feedback round): an invalid --pool or --exclude value returns the
+        coded bad_request envelope at exit 2 — never a traceback — exactly
+        like an invalid --size. At base the bundle command is absent (RED =
+        argparse invalid choice: exit 2 with usage on stderr and no JSON
+        envelope); the RED-on-revert proof is disabling the validation
+        (evaluating _csv_numbers outside _run_derived_read's protected try
+        again), which turns the envelope back into an exit-1 traceback."""
+        for flag, value in (("--pool", "abc"), ("--exclude", "1,x")):
+            rc, out, err = _run_cli(
+                "bundle", "--db", str(self.db_path), "--repo", REPO,
+                flag, value, "--format", "json",
+            )
+            self.assertEqual(
+                rc, 2,
+                f"{flag} {value!r} must exit 2 (bad_request), got {rc};"
+                f" stderr:\n{err.decode('utf-8', 'replace')}",
+            )
+            self.assertNotIn(
+                b"Traceback", err,
+                f"{flag} {value!r} must not print a traceback",
+            )
+            env = json.loads(out.decode("utf-8"))
+            self.assertIs(env["ok"], False, env)
+            self.assertIsInstance(env.get("error"), dict, env)
+            self.assertEqual(
+                env["error"].get("code"), "bad_request",
+                f"{flag} {value!r} must carry error.code bad_request",
+            )
+
+
+# ==== C20 (feedback round): --budget-tokens caps the whole payload =========
+
+
+class BundleBudgetCapTests(_StoreTestCase):
+    """Twelve duplicate_of pairs (561/562 .. 583/584) and nothing
+    bundleable: no merged PRs, so no resolved paths, no coupling, and every
+    pair's text affinity sits far below the floor — every pair lands in
+    merge_candidates and the bundles list stays EMPTY. A tiny
+    --budget-tokens can therefore only be honored by shrinking the
+    payload's non-bundle sections."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = _BulkSource()
+        for n in range(561, 585):
+            src.add_issue(
+                issue(n, title=f"Distinct report {n}", body=f"body text {n}",
+                      created_at="2027-06-01T00:00:00Z")
+            )
+        sync_repo(conn, src, REPO)
+        for i in range(12):
+            _insert_edge(conn, REPO, 561 + 2 * i, "duplicate_of", 562 + 2 * i)
+        _pin_synced_at(conn)
+
+    def test_bundle_budget_caps_whole_payload(self) -> None:
+        """RED at base, GREEN after the fix. Review-fix regression pin
+        (feedback round): --budget-tokens caps the WHOLE serialized
+        payload, not just the bundles list. With zero bundles and twelve
+        merge candidates, a 100-token budget must shrink merge_candidates
+        (they drop from the tail) and leave a payload that either fits
+        the budget (chars/4 <= 100) or carries truncated: true. At base
+        the bundle command is absent (RED = invalid choice); the
+        RED-on-revert proof is bypassing the whole-payload shrink (popping
+        only bundles_payload again), which leaves the merge-candidate
+        payload over budget and unflagged."""
+        # Unbounded leg: all twelve merge candidates survive, bundles stay
+        # empty, and no truncated key is set.
+        env_full = _cli_json(
+            "bundle", "--db", str(self.db_path), "--repo", REPO,
+            "--count", "5", "--format", "json",
+        )
+        self.assertTrue(env_full["ok"], env_full)
+        full = env_full["data"]
+        self.assertEqual(full["bundles"], [])
+        self.assertEqual(len(full["merge_candidates"]), 12)
+        self.assertNotIn("truncated", full)
+
+        # Tiny budget: the whole payload is capped or flagged.
+        rc, out, err = _run_cli(
+            "bundle", "--db", str(self.db_path), "--repo", REPO,
+            "--count", "5", "--budget-tokens", "100", "--format", "json",
+        )
+        self.assertEqual(rc, 0, err.decode("utf-8", "replace"))
+        env = json.loads(out.decode("utf-8"))
+        self.assertTrue(env["ok"], env)
+        data = env["data"]
+        payload_chars = len(
+            json.dumps(data, sort_keys=True, ensure_ascii=True,
+                       separators=(",", ":"))
+        )
+        self.assertTrue(
+            payload_chars <= 100 * 4 or data.get("truncated") is True,
+            f"--budget-tokens 100 must cap the whole payload"
+            f" (chars/4 = {payload_chars / 4:.0f}) or flag truncated: true,"
+            f" got truncated={data.get('truncated')!r}",
+        )
+        self.assertIs(
+            data.get("truncated"), True,
+            "a payload that needed shrinking must carry truncated: true",
+        )
+        self.assertLess(
+            len(data["merge_candidates"]), 12,
+            "the shrink must reach merge_candidates once bundles are"
+            " exhausted (zero bundles in this store)",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

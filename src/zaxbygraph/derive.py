@@ -2092,7 +2092,6 @@ def bundle(
     size: str = "2-3",
     count: int = 5,
     pool: list[int] | None = None,
-    seed: int | None = None,
     exclude: list[int] | None = None,
     allow_shared_files: bool = False,
     max_files: int | None = None,
@@ -2104,18 +2103,23 @@ def bundle(
     ``pool``) minus ``exclude``, with in-pool blocker relaxation
     (blocked-only items whose blockers are all in the pool stay,
     ``gate_relaxed: true``); ``--exclude`` wins over pool membership and the
-    relaxation alike. Pair affinity runs the exact pipeline
-    ``pair_components -> _apply_cochange -> _total_score`` (coupling index
-    built ONCE per call, default [derive] weights); an edge requires
-    affinity >= ``affinity_floor`` AND a fired anchor; duplicate pairs
-    (edges or the >= 0.9 title-overlap possible_duplicate predicate)
-    collapse to ``merge_candidates`` and are never co-bundled;
-    anchor-failing floor-passing text pairs land in
+    relaxation alike. Pool members absent from the ranked pool are dropped
+    silently — the echoed ``pool`` array is the disclosure. Pair affinity
+    runs the exact pipeline ``pair_components -> _apply_cochange ->
+    _total_score`` (coupling index built ONCE per call, default [derive]
+    weights); an edge requires affinity >= ``affinity_floor`` AND a fired
+    anchor; duplicate pairs (edges or the >= 0.9 title-overlap
+    possible_duplicate predicate) collapse to ``merge_candidates`` and are
+    never co-bundled; anchor-failing floor-passing text pairs land in
     ``related_not_bundleable``. Selection is greedy: highest unused
     triage total seeds (ties number ASC), then the member maximizing
     triage_total x mean pair affinity, subject to the size range, the
     file-set cap and cross-bundle file disjointness (unless
-    ``allow_shared_files``). Read-only."""
+    ``allow_shared_files``). Read-only. ``budget_tokens`` (chars/4) caps
+    the WHOLE serialized payload: bundles are dropped first, then the
+    tails of ``merge_candidates``/``related_not_bundleable``, then the
+    ``pool`` echo; ``truncated: true`` marks any payload that needed it,
+    including one still over budget only because of its mandatory echoes."""
     cfg = load_triage_config(*_triage_config_chain(conn, config))
     compute = _triage_compute(conn, repo, cfg, cfg["top_k"])
     size_min, size_max = _parse_size(size)
@@ -2251,7 +2255,6 @@ def bundle(
     skipped: set[int] = set()
     used_files: set[str] = set()
     bundles_payload: list[dict] = []
-    seed_consumed = seed is None
 
     while (
         len(bundles_payload) < max(0, count)
@@ -2260,11 +2263,7 @@ def bundle(
         available = [n for n in order if n not in used and n not in skipped]
         if not available:
             break
-        if not seed_consumed and seed in available:
-            current_seed = seed
-        else:
-            current_seed = available[0]
-        seed_consumed = seed_consumed or current_seed == seed
+        current_seed = available[0]
 
         group = [current_seed]
         group_files = _direct_paths(current_seed)
@@ -2345,13 +2344,29 @@ def bundle(
     }
     if budget_tokens is not None and budget_tokens > 0:
         budget = budget_tokens * 4
-        while bundles_payload and len(
-            json.dumps(
-                payload, sort_keys=True, ensure_ascii=True, separators=(",", ":")
+
+        def _size() -> int:
+            return len(
+                json.dumps(
+                    payload, sort_keys=True, ensure_ascii=True,
+                    separators=(",", ":"),
+                )
             )
-        ) > budget:
-            bundles_payload.pop()
+
+        if _size() > budget:
+            # The cap binds the WHOLE payload, not just the bundles list:
+            # whole bundles drop first, then the tails of merge_candidates
+            # and related_not_bundleable, and only as the last resort the
+            # pool echo (a convenience copy, not evidence). The flag is set
+            # up front so a payload that stays over budget purely through
+            # its mandatory echoes (weights, excluded) is still marked.
             payload["truncated"] = True
+            for section in ("bundles", "merge_candidates",
+                            "related_not_bundleable"):
+                while payload[section] and _size() > budget:
+                    payload[section].pop()
+            if _size() > budget:
+                payload["pool"] = []
     return payload
 
 
@@ -2533,21 +2548,55 @@ def _association_rank(value: str | None) -> int:
     return 1
 
 
+#: Truncation marker for the brief body's character-level cap of last
+#: resort (the same "…" the README documents for the packet budget).
+_ELLIPSIS = "…"
+
+
+def _hard_cap(text: str, allowance: int, marker: str = _ELLIPSIS) -> str:
+    """Character-level cap of last resort: ``text`` plus a trailing
+    ellipsis marker, cut so the JSON serialization fits ``allowance``
+    chars. Removing k trailing characters removes at least k serialized
+    ones (every character serializes to >= 1 char), so budgeting the
+    marker's serialized length into the cut lands under the allowance in
+    one step; the shave loop only guards pathological lone surrogates."""
+    marker_ser = len(json.dumps(marker)) - 2
+    excess = (len(json.dumps(text)) - 2) + marker_ser - allowance
+    cut = len(text) - excess
+    if cut <= 0:
+        return ""
+    candidate = text[:cut] + marker
+    while cut > 0 and len(json.dumps(candidate)) - 2 > allowance:
+        cut -= 1
+        candidate = text[:cut] + marker
+    return candidate
+
+
 def _fit_paragraphs(body: str, allowance: int) -> str:
-    """Truncate ``body`` at paragraph (blank-line) boundaries so its JSON
-    serialization fits ``allowance`` chars. Never cuts mid-paragraph: a
-    body whose first paragraph alone exceeds the allowance survives whole
-    rather than being split (comments/file evidence absorb the rest)."""
-    if "\n\n" not in body:
+    """Truncate ``body`` so its JSON serialization fits ``allowance`` chars
+    — unconditionally. Whole-paragraph (blank-line boundary) cutting is the
+    PREFERRED shape: paragraphs are kept while they fit, and the surviving
+    tail is a run of complete paragraphs. But that preference is
+    subordinate to the bound: a body with no paragraph boundaries (or whose
+    first paragraph alone exceeds the allowance) is hard-truncated at the
+    character level with a trailing ``…`` marker rather than returned whole
+    or emptied (comments/file evidence absorb the rest of the packet)."""
+    if allowance <= 0:
+        return ""
+    if len(json.dumps(body)) - 2 <= allowance:
         return body
-    parts = body.split("\n\n")
-    kept: list[str] = []
-    for part in parts:
-        candidate = "\n\n".join(kept + [part])
-        if len(json.dumps(candidate)) - 2 > allowance:
-            break
-        kept.append(part)
-    return "\n\n".join(kept)
+    if "\n\n" in body:
+        parts = body.split("\n\n")
+        kept: list[str] = []
+        for part in parts:
+            candidate = "\n\n".join(kept + [part])
+            if len(json.dumps(candidate)) - 2 > allowance:
+                break
+            kept.append(part)
+        fitted = "\n\n".join(kept)
+        if fitted:
+            return fitted
+    return _hard_cap(body, allowance)
 
 
 def _wrap_live_entry(entry: dict, keep: tuple[str, ...]) -> dict:
@@ -2561,6 +2610,13 @@ def _wrap_live_entry(entry: dict, keep: tuple[str, ...]) -> dict:
     return out
 
 
+#: Captured gh stdout is capped at this many bytes BEFORE parsing: time is
+#: already bounded (timeout=30) and this bounds the bytes — a runaway gh
+#: response must not flow into an unbounded packet. A response past the
+#: cap no longer parses and degrades the live block like any gh failure.
+_GH_STDOUT_BYTE_CAP = 262144
+
+
 def _brief_live(
     repo: str, pr_numbers: list[int], gh_path: str
 ) -> tuple[dict | None, str | None]:
@@ -2568,19 +2624,22 @@ def _brief_live(
     shell, results never stored). One cheap reachability probe runs first,
     so a broken gh degrades the block even when there are no linked PRs to
     read. Any failure degrades the whole live block to ``(None, error
-    note)`` — the packet still returns."""
+    note)`` — the packet still returns. Each call is bounded in time
+    (timeout=30) and in bytes: stdout is truncated to
+    ``_GH_STDOUT_BYTE_CAP`` (256 KiB) before parsing, so an oversized
+    response degrades rather than bloats the packet."""
     import subprocess
 
     def _gh(api_path: str):
         proc = subprocess.run(
             [gh_path, "api", api_path],
             capture_output=True,
-            text=True,
             timeout=30,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"gh api {api_path} exited {proc.returncode}")
-        return json.loads(proc.stdout)
+        capped = proc.stdout[:_GH_STDOUT_BYTE_CAP]
+        return json.loads(capped.decode("utf-8", "replace"))
 
     try:
         _gh(f"repos/{repo}")
@@ -2632,11 +2691,15 @@ def brief(
     with its fix diffstat, and linked PRs. Every GitHub-authored string
     (title, body, comment bodies, live gh text) is wrapped as
     ``{"untrusted_text": ...}`` and the packet carries ``content_trust``.
-    Budget: chars/4 of the serialized packet <= ``budget_tokens``;
-    truncation order: comments capped at the top-5 first, then the body cut
-    at paragraph boundaries, then comments drop from the tail, then file
-    evidence. ``live`` shells out to ``gh`` (argv list, no shell) for
-    linked-PR checks/reviews; any failure degrades to ``live: null`` +
+    Budget: chars/4 of the serialized packet <= ``budget_tokens``,
+    unconditionally; truncation order: comments capped at the top-5 first,
+    then the body cut at paragraph boundaries (a body that cannot fit any
+    whole paragraph under the allowance — including a single-paragraph
+    body — is hard-truncated at the character level with a trailing ``…``,
+    so the bound always holds), then comments drop from the tail, then
+    file evidence. ``truncated`` is set whenever any of that fired.
+    ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR
+    checks/reviews; any failure degrades to ``live: null`` +
     ``live_error``. Read-only."""
     cfg = load_triage_config(*_triage_config_chain(conn, config))
     compute = _triage_compute(conn, repo, cfg, cfg["top_k"])
@@ -2785,11 +2848,14 @@ def brief(
         probe = dict(packet)
         probe["body"] = _untrusted("")
         allowance = budget_chars - _size(probe)
-        packet["body"] = _untrusted(
-            _fit_paragraphs(packet["body"]["untrusted_text"], allowance)
-        )
+        body_text = packet["body"]["untrusted_text"]
+        fitted = _fit_paragraphs(body_text, allowance)
+        if fitted != body_text:
+            packet["truncated"] = True
+        packet["body"] = _untrusted(fitted)
         while _size(packet) > budget_chars and packet["comments"]:
             packet["comments"].pop()
+            packet["truncated"] = True
         if _size(packet) > budget_chars:
             packet["files"] = {"resolved": packet["files"]["resolved"][:5]}
             packet["truncated"] = True

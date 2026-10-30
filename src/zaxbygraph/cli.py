@@ -756,9 +756,10 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
     impossible). Query-time failures map to coded envelopes, never
     tracebacks: unknown items to ``not_found``, weight-configuration
     problems to ``config_error`` and other bad requests to exit 2,
-    store-level failures to ``store_unreadable``; all four commands refuse
-    an unresolved repository with the canonical ``repo_required`` code
-    instead of answering from an empty filter (pr43 review PRR-014/016)."""
+    store-level failures to ``store_unreadable``; every command routed
+    here refuses an unresolved repository with the canonical
+    ``repo_required`` code instead of answering from an empty filter
+    (pr43 review PRR-014/016)."""
     repo: str | None = None
     db_path: Path | None = None
     try:
@@ -1029,8 +1030,8 @@ def _bundle_query(
     conn: sqlite3.Connection,
     size: str,
     count: int,
-    pool: list[int] | None,
-    exclude: list[int] | None,
+    pool_raw: str | None,
+    exclude_raw: str | None,
     allow_shared_files: bool,
     max_files: int | None,
     budget_tokens: int | None,
@@ -1040,6 +1041,11 @@ def _bundle_query(
 ) -> dict:
     from zaxbygraph import derive as _derive
 
+    # Parsed INSIDE the derived-read runner's protected try (an invalid
+    # --pool/--exclude value is a bad_request envelope at exit 2, never a
+    # traceback — the same contract --size already has through _parse_size).
+    pool = _csv_numbers(pool_raw, "--pool")
+    exclude = _csv_numbers(exclude_raw, "--exclude")
     return _derive.bundle(
         conn,
         repo,
@@ -1102,13 +1108,16 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
 
 def cmd_bundle(args: argparse.Namespace) -> int:
+    # --pool/--exclude travel as RAW strings: they are parsed inside
+    # _bundle_query, within _run_derived_read's protected try, so invalid
+    # values answer the coded bad_request envelope instead of a traceback.
     return _run_derived_read(
         args,
         _bundle_query,
         args.size,
         args.count,
-        _csv_numbers(args.pool, "--pool"),
-        _csv_numbers(args.exclude, "--exclude"),
+        args.pool,
+        args.exclude,
         bool(getattr(args, "allow_shared_files", False)),
         args.max_files,
         args.budget_tokens,

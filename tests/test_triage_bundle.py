@@ -260,7 +260,7 @@ class _StoreTestCase(unittest.TestCase):
 
     @classmethod
     def _build(cls, conn) -> None:  # pragma: no cover - overridden
-        raise NotImplementedError
+        raise AssertionError("_build must be overridden")
 
 
 # ==== C1: the documented triage formula =====================================
