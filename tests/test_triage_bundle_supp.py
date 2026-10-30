@@ -472,7 +472,7 @@ class BriefLiveGhTests(_StoreTestCase):
     """Issue 961 with an open linked PR 962 (links open_prs), so brief's
     --live leg has a PR to ask gh about. The gh stub dispatches on its own
     argv and serves each endpoint canned JSON in the REAL GitHub shape
-    (the PR commit list, the head sha's combined status, the reviews)
+    (the PR record, its head sha's combined status, the reviews)
     carrying LIVEMARK strings; it also logs its argv. It is passed via the
     spec's gh_path seam as an ABSOLUTE path — a bare "gh" name on PATH
     cannot execute a script shim on Windows (CreateProcess appends .exe
@@ -525,14 +525,25 @@ class BriefLiveGhTests(_StoreTestCase):
         fields real commit objects do not carry, so against real gh every
         entry wrapped to {} with no error. The stub now serves each
         endpoint its real shape, so this pin FAILS if the CI leg ever
-        reads fields the real API does not return."""
+        reads fields the real API does not return.
+
+        Feedback-round-5 re-pin: the head sha now comes from the PR
+        record's head.sha (one un-paginated response) — the commits LIST
+        page is gone from both the code and the stub, so the old
+        last-element-of-the-page head guess (which read a MID-PR commit
+        for any PR with more than per_page commits) cannot recur; the
+        argv-log pins below FAIL if the CI leg ever pages
+        pulls/{pr}/commits again."""
         with tempfile.TemporaryDirectory() as td:
             shim = Path(td)
             # per-endpoint canned payloads in the REAL GitHub shapes
-            canned_commits = (
-                '[{"sha": "deadbeef", "commit": {"message": "m"}, '
-                '"url": "https://api.github.com/repos/acme/forgegate'
-                '/commits/deadbeef", "parents": []}]'
+            canned_pr_record = (
+                '{"url": "https://api.github.com/repos/acme/forgegate'
+                '/pulls/962", "id": 1, "number": 962, "state": "open", '
+                '"head": {"ref": "topic", "sha": "deadbeef", '
+                '"label": "o:topic", "repo": {"id": 1}}, '
+                '"base": {"ref": "main", "sha": "feedface", '
+                '"label": "o:main", "repo": {"id": 1}}}'
             )
             canned_status = (
                 '{"state": "success", "statuses": ['
@@ -548,9 +559,9 @@ class BriefLiveGhTests(_StoreTestCase):
                     "#!/bin/sh\n"
                     'printf \'"%s"\\n\' "$*" >> "$0.log"\n'
                     'case "$*" in\n'
-                    f"  *pulls/962/commits) printf '%s\\n' '{canned_commits}' ;;\n"
-                    f"  *commits/deadbeef/status) printf '%s\\n' '{canned_status}' ;;\n"
                     f"  *pulls/962/reviews) printf '%s\\n' '{canned_reviews}' ;;\n"
+                    f"  *commits/deadbeef/status) printf '%s\\n' '{canned_status}' ;;\n"
+                    f"  *pulls/962) printf '%s\\n' '{canned_pr_record}' ;;\n"
                     "  *) printf '{}\\n' ;;\n"
                     "esac\n",
                     encoding="utf-8", newline="\n",
@@ -561,9 +572,9 @@ class BriefLiveGhTests(_StoreTestCase):
                 stub.write_text(
                     "@echo off\r\n"
                     'echo %*>>"%~dp0gh.bat.log"\r\n'
-                    'echo %*| findstr /C:"pulls/962/commits" >nul\r\n'
+                    'echo %*| findstr /C:"pulls/962/reviews" >nul\r\n'
                     "if not errorlevel 1 (\r\n"
-                    f"echo {canned_commits}\r\n"
+                    f"echo {canned_reviews}\r\n"
                     "exit /b 0\r\n"
                     ")\r\n"
                     'echo %*| findstr /C:"commits/deadbeef/status" >nul\r\n'
@@ -571,9 +582,9 @@ class BriefLiveGhTests(_StoreTestCase):
                     f"echo {canned_status}\r\n"
                     "exit /b 0\r\n"
                     ")\r\n"
-                    'echo %*| findstr /C:"pulls/962/reviews" >nul\r\n'
+                    'echo %*| findstr /C:"pulls/962" >nul\r\n'
                     "if not errorlevel 1 (\r\n"
-                    f"echo {canned_reviews}\r\n"
+                    f"echo {canned_pr_record}\r\n"
                     "exit /b 0\r\n"
                     ")\r\n"
                     "echo {}\r\n",
@@ -654,6 +665,25 @@ class BriefLiveGhTests(_StoreTestCase):
         self.assertTrue(
             log_text.strip(),
             "the gh stub must have been invoked (argv log empty)",
+        )
+        # the CI leg's call sequence pins the head-sha source: the PR
+        # record (repos/{repo}/pulls/{pr}, single response) supplies the
+        # head sha, ONLY the combined-status call consumes it, and the
+        # paginated commits LIST endpoint is never queried.
+        self.assertIn(
+            "pulls/962", log_text,
+            "the CI leg must read the PR record endpoint for its head sha",
+        )
+        self.assertIn(
+            "commits/deadbeef/status", log_text,
+            "the head sha from the PR record's head.sha must drive the"
+            " combined-status call",
+        )
+        self.assertNotIn(
+            "pulls/962/commits", log_text,
+            "the CI leg must not query the commits LIST endpoint (a"
+            " per_page-bounded page names the head only in its last"
+            " element while it covers every commit)",
         )
 
 

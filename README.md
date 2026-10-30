@@ -238,9 +238,12 @@ paragraph fits — the top five comments (author-association rank, then
 recency), implicated files, the closest PR analog with its fix diffstat,
 and linked PRs, plus the `[triage]` echo every derived payload carries
 (weights, `config_source`, `formula_version`). The budget bound holds
-whenever `--budget-tokens` is at or above the packet's fixed skeleton
-floor (~480 tokens for a bare issue with the default `[triage]` echo;
-smaller budgets return the skeleton with `truncated: true`), and the
+whenever `--budget-tokens` is at or above the packet's skeleton floor.
+That floor is title-dependent — roughly 470-650 tokens for a bare issue
+with the default `[triage]` echo, ~480 for a short title — because the
+title rides in the skeleton untruncated; the exact bound is per-packet,
+so a long-titled issue sits near the top of the range. Smaller budgets
+return the skeleton with `truncated: true`, and the
 envelope covers the complete packet, `--live` content included. Issue/PR
 titles, item body text, comment bodies, and live gh output travel inside
 `{"untrusted_text": ...}`

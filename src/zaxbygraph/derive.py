@@ -2638,10 +2638,13 @@ def _brief_live(
     ``_GH_STDOUT_BYTE_CAP`` (256 KiB) before parsing, so an oversized
     response degrades rather than bloats the packet.
 
-    The CI leg costs TWO gh calls per PR (accepted cost, documented here):
-    the PR commit list — whose LAST element names the head commit CI ran
-    against — and that sha's combined status, the real CI state surface.
-    ``live_ci`` therefore reports real fields only: ``{"sha", "state",
+    The CI leg costs TWO gh calls per PR (accepted cost, documented
+    here), both single-response surfaces: the PR record itself — whose
+    ``head.sha`` names the head commit CI ran against, read from one
+    un-paginated response — and that sha's combined status, the real CI
+    state surface. The head sha therefore always comes from the PR
+    record, so ``live_ci`` is always the HEAD's CI state, never a
+    mid-PR commit's. It reports real fields only: ``{"sha", "state",
     "contexts"}``, where contexts are the combined status's per-check
     entries reduced to ``{"state", "context"}`` and capped at the first
     10. The reviews leg is one more call per PR (real review objects
@@ -2667,19 +2670,21 @@ def _brief_live(
     prs: list[dict] = []
     for pr in pr_numbers:
         entry: dict = {"number": pr}
-        commits_path = f"repos/{repo}/pulls/{pr}/commits"
+        pr_path = f"repos/{repo}/pulls/{pr}"
         try:
-            commits = _gh(commits_path)
+            pr_record = _gh(pr_path)
         except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-            return None, f"gh api {commits_path} failed: {exc}"
-        if not isinstance(commits, list):
-            return None, f"gh api {commits_path}: unexpected payload shape"
-        head: str | None = None
-        for element in reversed(commits):
-            if isinstance(element, dict) and isinstance(element.get("sha"), str):
-                head = element["sha"]
-                break
-        if head is None:
+            return None, f"gh api {pr_path} failed: {exc}"
+        if not isinstance(pr_record, dict):
+            return None, f"gh api {pr_path}: unexpected payload shape"
+        # The head sha comes from the PR record's head.sha — one
+        # un-paginated response. A commits LIST page only names the head
+        # in its LAST element while that one page covers every commit
+        # (GitHub's default per_page=30); past that count the page ends
+        # mid-PR and the last element stops being the head.
+        head_obj = pr_record.get("head")
+        head = head_obj.get("sha") if isinstance(head_obj, dict) else None
+        if not isinstance(head, str):
             # a PR with no commits has no CI surface to report
             entry["live_ci"] = None
         else:
@@ -2742,12 +2747,15 @@ def brief(
     comment bodies, live gh text) is wrapped as
     ``{"untrusted_text": ...}`` and the packet carries ``content_trust``.
     Budget: chars/4 of the serialized packet <= ``budget_tokens`` whenever
-    the budget is at or above the packet's fixed skeleton floor (~480
-    tokens for a bare issue with the default [triage] echo; smaller
-    budgets return the skeleton with ``truncated: true``), with the
-    mandatory ``truncated``/``derived``
-    echoes counted inside the envelope (their width is reserved before the
-    body allowance is computed). The envelope covers the complete packet:
+    the budget is at or above the packet's skeleton floor. That floor is
+    title-dependent — roughly 470-650 tokens for a bare issue with the
+    default [triage] echo, ~480 for a short title — because the title
+    rides in the skeleton untruncated; the exact bound is per-packet, so
+    a long-titled issue sits near the top of the range. Smaller budgets
+    return the skeleton with ``truncated: true``. The mandatory
+    ``truncated``/``derived`` echoes are counted inside the envelope
+    (their width is reserved before the body allowance is computed). The
+    envelope covers the complete packet:
     the ``--live`` block attaches before enforcement, and a live block
     that cannot fit inside the envelope even over an empty body degrades
     to ``live: null`` + a ``live_error`` budget note before the allowance
