@@ -2556,20 +2556,29 @@ _ELLIPSIS = "…"
 def _hard_cap(text: str, allowance: int, marker: str = _ELLIPSIS) -> str:
     """Character-level cap of last resort: ``text`` plus a trailing
     ellipsis marker, cut so the JSON serialization fits ``allowance``
-    chars. Removing k trailing characters removes at least k serialized
-    ones (every character serializes to >= 1 char), so budgeting the
-    marker's serialized length into the cut lands under the allowance in
-    one step; the shave loop only guards pathological lone surrogates."""
-    marker_ser = len(json.dumps(marker)) - 2
-    excess = (len(json.dumps(text)) - 2) + marker_ser - allowance
-    cut = len(text) - excess
-    if cut <= 0:
+    chars. The cut is computed in SERIALIZED units — under ensure_ascii a
+    multi-byte-dense payload serializes to six chars per character, so a
+    char-arithmetic cut overshoots to a negative prefix and empties the
+    result. Serialized length is strictly increasing in the prefix length
+    (every character serializes to at least one char), so a binary search
+    finds the largest prefix p >= 1 with ser(text[:p] + marker) <=
+    allowance: non-empty and marker-terminated whenever the allowance
+    covers one serialized character plus the marker; only a sub-floor
+    allowance returns the empty string (documented degenerate case)."""
+
+    def _fits(chars: int) -> bool:
+        return len(json.dumps(text[:chars] + marker)) - 2 <= allowance
+
+    if not _fits(1):
         return ""
-    candidate = text[:cut] + marker
-    while cut > 0 and len(json.dumps(candidate)) - 2 > allowance:
-        cut -= 1
-        candidate = text[:cut] + marker
-    return candidate
+    lo, hi = 1, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + marker
 
 
 def _fit_paragraphs(body: str, allowance: int) -> str:
@@ -2692,12 +2701,15 @@ def brief(
     (title, body, comment bodies, live gh text) is wrapped as
     ``{"untrusted_text": ...}`` and the packet carries ``content_trust``.
     Budget: chars/4 of the serialized packet <= ``budget_tokens``,
-    unconditionally; truncation order: comments capped at the top-5 first,
-    then the body cut at paragraph boundaries (a body that cannot fit any
-    whole paragraph under the allowance — including a single-paragraph
-    body — is hard-truncated at the character level with a trailing ``…``,
-    so the bound always holds), then comments drop from the tail, then
-    file evidence. ``truncated`` is set whenever any of that fired.
+    unconditionally, with the mandatory ``truncated``/``derived`` echoes
+    counted inside the envelope (their width is reserved before the body
+    allowance is computed); truncation order: comments capped at the top-5
+    first, then the body cut at paragraph boundaries (a body that cannot
+    fit any whole paragraph under the allowance — including a
+    single-paragraph body — is hard-truncated at the character level with
+    a trailing ``…``, so the bound always holds), then comments drop from
+    the tail, then file evidence. ``truncated`` is set whenever any of
+    that fired.
     ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR
     checks/reviews; any failure degrades to ``live: null`` +
     ``live_error``. Read-only."""
@@ -2847,12 +2859,23 @@ def brief(
 
         probe = dict(packet)
         probe["body"] = _untrusted("")
+        # The mandatory echoes ride inside the envelope, not after it:
+        # `derived` serializes onto every packet and `truncated` onto any
+        # packet a trim touched, so both widths are reserved BEFORE the
+        # body allowance is computed — with zero comments nothing absorbs
+        # them, and a body filled to exactly the bound overflows it once
+        # the flags serialize in.
+        probe["derived"] = True
+        probe["truncated"] = True
         allowance = budget_chars - _size(probe)
         body_text = packet["body"]["untrusted_text"]
         fitted = _fit_paragraphs(body_text, allowance)
         if fitted != body_text:
             packet["truncated"] = True
         packet["body"] = _untrusted(fitted)
+        # derived is stamped before the backstop loops so their size
+        # checks measure the FINAL packet shape, flags included.
+        packet["derived"] = True
         while _size(packet) > budget_chars and packet["comments"]:
             packet["comments"].pop()
             packet["truncated"] = True

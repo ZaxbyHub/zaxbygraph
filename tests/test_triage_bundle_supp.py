@@ -13,6 +13,7 @@ Frozen check names:
     C18 test_candidate_side_comment_bait_scoped          (wave-3)
     C19 test_bundle_pool_exclude_invalid_values_are_coded (feedback round)
     C20 test_bundle_budget_caps_whole_payload            (feedback round)
+    C21 test_brief_bare_issue_budget_bounded            (review round 2)
 
 NEW-SURFACE module: collects cleanly at base (the derive symbols that arrive
 with the fix are reached via getattr inside test bodies or through the
@@ -1043,6 +1044,113 @@ class BundleBudgetCapTests(_StoreTestCase):
             len(data["merge_candidates"]), 12,
             "the shrink must reach merge_candidates once bundles are"
             " exhausted (zero bundles in this store)",
+        )
+
+
+# ==== C21 (review round 2): bare-issue brief packet honors the budget =======
+
+
+class BriefBareIssueBudgetTests(_StoreTestCase):
+    """621: a BARE issue — zero comments, zero path refs — whose body is one
+    ~30k-char ASCII paragraph, so under --budget-tokens 4000 no whole
+    paragraph fits and the character-level hard cap is the only body trim;
+    with zero comments the comment-pop absorber is a no-op, which is exactly
+    the shape where the post-fit `truncated`/`derived` echoes used to land
+    outside the allowance. 622: the same shape with a CJK body ("文" * 7250)
+    where every character serializes to six chars under ensure_ascii and the
+    old char-arithmetic cut went negative, emptying the body."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = _BulkSource()
+        src.add_issue(
+            issue(621, title="Single paragraph wall of text",
+                  body="crash on submit filler text " * 1100,
+                  created_at="2027-06-01T00:00:00Z")
+        )
+        src.add_issue(
+            issue(622, title="CJK wall of text", body="文" * 7250,
+                  created_at="2027-06-01T00:00:00Z")
+        )
+        sync_repo(conn, src, REPO)
+
+    @staticmethod
+    def _packet_chars(pkt: dict) -> int:
+        return len(
+            json.dumps(pkt, sort_keys=True, ensure_ascii=True,
+                       separators=(",", ":"))
+        )
+
+    def test_brief_bare_issue_budget_bounded(self) -> None:
+        """RED at base, GREEN after the fix. Review-round-2 regression pin:
+        on a bare issue whose body must be hard-capped, the packet's
+        mandatory echoes (`truncated: true` whenever a trim fired,
+        `derived: true` always) ride INSIDE the budget envelope — the FINAL
+        serialized packet satisfies chars/4 <= --budget-tokens with nothing
+        left to absorb the flags. The CJK leg pins the serialized-units cut:
+        a body whose characters each serialize to six chars must come back
+        NON-EMPTY and ellipsis-terminated, never emptied. RED at base (the
+        round-1 code): the ASCII packet lands 16011 chars against the 16000
+        bound and the CJK body comes back empty. RED-on-revert proofs:
+        recomputing the body allowance without the flag reservation (FIX A)
+        fails the ASCII bound below; restoring the char-arithmetic cut in
+        _hard_cap (FIX B) fails the CJK non-empty/marker assertions."""
+        # ASCII leg: single-paragraph ~30k body, budget 4000 tokens (16000
+        # serialized chars), zero comments to pop.
+        rc, out, err = _run_cli(
+            "brief", "621", "--db", str(self.db_path), "--repo", REPO,
+            "--budget-tokens", "4000", "--format", "json",
+        )
+        self.assertEqual(rc, 0, err.decode("utf-8", "replace"))
+        env = json.loads(out.decode("utf-8"))
+        self.assertTrue(env["ok"], env)
+        data = env["data"]
+        packet_chars = self._packet_chars(data)
+        self.assertLessEqual(
+            packet_chars, 4000 * 4,
+            f"ASCII leg: packet chars/4 = {packet_chars / 4:.2f} exceeds"
+            " --budget-tokens 4000 — the truncated/derived echoes must ride"
+            " inside the envelope",
+        )
+        self.assertIs(
+            data.get("truncated"), True,
+            "a hard-capped body must set truncated: true",
+        )
+        body = data["body"]["untrusted_text"]
+        self.assertTrue(body, "the hard-capped ASCII body must be non-empty")
+        self.assertTrue(
+            body.endswith("…"),
+            "a single-paragraph body is cut at the character level and"
+            " ends with the … marker",
+        )
+
+        # CJK leg: every 文 serializes to six chars (\u6587), so the cut
+        # must be computed in serialized units for the body to survive.
+        rc_c, out_c, err_c = _run_cli(
+            "brief", "622", "--db", str(self.db_path), "--repo", REPO,
+            "--budget-tokens", "4000", "--format", "json",
+        )
+        self.assertEqual(rc_c, 0, err_c.decode("utf-8", "replace"))
+        env_c = json.loads(out_c.decode("utf-8"))
+        self.assertTrue(env_c["ok"], env_c)
+        data_c = env_c["data"]
+        packet_chars_c = self._packet_chars(data_c)
+        self.assertLessEqual(
+            packet_chars_c, 4000 * 4,
+            f"CJK leg: packet chars/4 = {packet_chars_c / 4:.2f} exceeds"
+            " --budget-tokens 4000",
+        )
+        self.assertIs(
+            data_c.get("truncated"), True,
+            "CJK leg: a hard-capped body must set truncated: true",
+        )
+        body_c = data_c["body"]["untrusted_text"]
+        self.assertTrue(
+            body_c, "CJK leg: the hard cap must not empty the body"
+        )
+        self.assertTrue(
+            body_c.endswith("…"),
+            "CJK leg: the hard-capped body ends with the … marker",
         )
 
 
