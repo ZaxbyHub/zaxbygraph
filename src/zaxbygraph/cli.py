@@ -1922,7 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument(
         "--live", action="store_true",
-        help="Also read linked-PR checks/reviews via gh (never stored; failures degrade)",
+        help="Also read linked-PR CI state/reviews via gh (never stored; failures degrade)",
     )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_brief)

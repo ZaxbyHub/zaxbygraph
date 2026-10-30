@@ -14,6 +14,7 @@ Frozen check names:
     C19 test_bundle_pool_exclude_invalid_values_are_coded (feedback round)
     C20 test_bundle_budget_caps_whole_payload            (feedback round)
     C21 test_brief_bare_issue_budget_bounded            (review round 2)
+    C22 test_brief_echoes_weights_and_formula           (review round 4)
 
 NEW-SURFACE module: collects cleanly at base (the derive symbols that arrive
 with the fix are reached via getattr inside test bodies or through the
@@ -469,8 +470,10 @@ class NeverWriteSuppTests(_StoreTestCase):
 
 class BriefLiveGhTests(_StoreTestCase):
     """Issue 961 with an open linked PR 962 (links open_prs), so brief's
-    --live leg has a PR to ask gh about. The gh stub prints canned JSON
-    carrying LIVEMARK strings and logs its argv; it is passed via the
+    --live leg has a PR to ask gh about. The gh stub dispatches on its own
+    argv and serves each endpoint canned JSON in the REAL GitHub shape
+    (the PR commit list, the head sha's combined status, the reviews)
+    carrying LIVEMARK strings; it also logs its argv. It is passed via the
     spec's gh_path seam as an ABSOLUTE path — a bare "gh" name on PATH
     cannot execute a script shim on Windows (CreateProcess appends .exe
     only), so the check drives the same argv-list subprocess path the
@@ -509,24 +512,47 @@ class BriefLiveGhTests(_StoreTestCase):
     def test_brief_live_gh_success_leg(self) -> None:
         """RED at base, GREEN after the fix. With a WORKING gh stub the
         --live leg returns the packet WITH a live block (not the
-        degradation shape); BOTH live_ci AND live_review fields are present
-        with parsed content tied to the canned response (both canned
-        LIVEMARK values round-trip into the live fields); both canned
-        strings occur inside untrusted_text and NOWHERE outside it. gh is
-        invoked through an argv list (no shell), proven by the stub's argv
-        log."""
+        degradation shape); BOTH live_ci AND live_review fields are present;
+        live_ci carries the REAL combined-status fields — the head commit
+        sha, the combined state, and the per-check contexts — round-tripping
+        the canned values (deadbeef / success / ci/test); both canned
+        LIVEMARK strings occur inside untrusted_text and NOWHERE outside
+        it. gh is invoked through an argv list (no shell), proven by the
+        stub's argv log.
+
+        Review-round-4 re-pin: the round-3 stub fed ONE canned list to
+        every endpoint and the CI leg kept ("name","state","conclusion") —
+        fields real commit objects do not carry, so against real gh every
+        entry wrapped to {} with no error. The stub now serves each
+        endpoint its real shape, so this pin FAILS if the CI leg ever
+        reads fields the real API does not return."""
         with tempfile.TemporaryDirectory() as td:
             shim = Path(td)
-            canned = (
-                '[{"name": "LIVEMARK-ci", "state": "SUCCESS", '
-                '"conclusion": "success", "body": "LIVEMARK-review attached note"}]'
+            # per-endpoint canned payloads in the REAL GitHub shapes
+            canned_commits = (
+                '[{"sha": "deadbeef", "commit": {"message": "m"}, '
+                '"url": "https://api.github.com/repos/acme/forgegate'
+                '/commits/deadbeef", "parents": []}]'
+            )
+            canned_status = (
+                '{"state": "success", "statuses": ['
+                '{"state": "success", "context": "ci/test"}, '
+                '{"state": "success", "context": "ci/LIVEMARK-ci"}]}'
+            )
+            canned_reviews = (
+                '[{"state": "APPROVED", "body": "LIVEMARK-review attached note"}]'
             )
             if os.name == "posix":
                 stub = shim / "gh"
                 stub.write_text(
                     "#!/bin/sh\n"
                     'printf \'"%s"\\n\' "$*" >> "$0.log"\n'
-                    f"printf '%s\\n' '{canned}'\n",
+                    'case "$*" in\n'
+                    f"  *pulls/962/commits) printf '%s\\n' '{canned_commits}' ;;\n"
+                    f"  *commits/deadbeef/status) printf '%s\\n' '{canned_status}' ;;\n"
+                    f"  *pulls/962/reviews) printf '%s\\n' '{canned_reviews}' ;;\n"
+                    "  *) printf '{}\\n' ;;\n"
+                    "esac\n",
                     encoding="utf-8", newline="\n",
                 )
                 stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -535,7 +561,22 @@ class BriefLiveGhTests(_StoreTestCase):
                 stub.write_text(
                     "@echo off\r\n"
                     'echo %*>>"%~dp0gh.bat.log"\r\n'
-                    f"echo {canned}\r\n",
+                    'echo %*| findstr /C:"pulls/962/commits" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    f"echo {canned_commits}\r\n"
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    'echo %*| findstr /C:"commits/deadbeef/status" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    f"echo {canned_status}\r\n"
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    'echo %*| findstr /C:"pulls/962/reviews" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    f"echo {canned_reviews}\r\n"
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    "echo {}\r\n",
                     encoding="ascii", newline="",
                 )
             stub_path = stub
@@ -570,25 +611,31 @@ class BriefLiveGhTests(_StoreTestCase):
         self.assertIn(
             "live_review", blob, "the packet must label its live review field live_review"
         )
-        # the canned values ROUND-TRIP into the live fields: the live
-        # subtree (the live block plus any top-level live_ci/live_review
-        # fields) carries both canned strings.
-        live_blob = json.dumps(
-            {
-                "live": out.get("live"),
-                "live_ci": out.get("live_ci"),
-                "live_review": out.get("live_review"),
-            }
+        # live_ci carries the REAL combined-status fields only, and the
+        # canned values round-trip into them: the head sha (deadbeef), the
+        # combined state (success), and the per-check contexts (ci/test).
+        ci_entries = [
+            p.get("live_ci")
+            for p in out["live"].get("prs", [])
+            if isinstance(p.get("live_ci"), dict)
+        ]
+        self.assertTrue(
+            ci_entries,
+            "the live block must carry a populated live_ci per linked PR",
         )
-        self.assertIn(
-            "LIVEMARK-ci", live_blob,
-            "the canned check name must round-trip into the live_ci content",
+        self.assertEqual(
+            set(ci_entries[0]), {"sha", "state", "contexts"},
+            "live_ci reports the real combined-status fields only"
+            f" (got {sorted(ci_entries[0])})",
         )
-        self.assertIn(
-            "LIVEMARK-review", live_blob,
-            "the canned review body must round-trip into the live_review content",
-        )
-        # BOTH canned strings occur inside untrusted_text and NOWHERE
+        ci_blob = json.dumps(ci_entries)
+        for value in ("deadbeef", "success", "ci/test"):
+            self.assertIn(
+                value, ci_blob,
+                f"the canned combined-status value {value!r} must round-trip"
+                " into live_ci",
+            )
+        # BOTH canned markers occur inside untrusted_text and NOWHERE
         # outside it (the walkers classify every string in the packet).
         untrusted: list[str] = []
         others: list[str] = []
@@ -1151,6 +1198,185 @@ class BriefBareIssueBudgetTests(_StoreTestCase):
         self.assertTrue(
             body_c.endswith("…"),
             "CJK leg: the hard-capped body ends with the … marker",
+        )
+
+
+# ==== C22 (review round 4): brief echoes + the budget covers --live ========
+
+
+class BriefEchoAndLiveBudgetTests(_StoreTestCase):
+    """731: a plain issue (two-paragraph body, one comment) with an open
+    linked PR 732, so one fixture serves both legs of the check — the AC9
+    echo on the brief packet, and the budget's coverage of the --live
+    block (a gh stub serves each endpoint its real shape, with a reviews
+    payload whose body is >= 40k chars)."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = _BulkSource()
+        rec = issue(
+            731, title="Echo and live budget item",
+            body="first paragraph of the echo item\n\nsecond paragraph",
+            created_at="2027-06-01T00:00:00Z",
+        )
+        src.add_issue(rec)
+        src.comment_on(731, "a comment on the echo item", author="bob")
+        src.add_pr(
+            issue(732, title="open pull for echo live", body="", kind="pr"),
+            pull(732, merged=False),
+            files=[pr_file("src/echolive.py")],
+        )
+        src.links[731] = _links(open_prs=(_node(732),))
+        sync_repo(conn, src, REPO)
+
+    @staticmethod
+    def _packet_chars(pkt: dict) -> int:
+        return len(
+            json.dumps(pkt, sort_keys=True, ensure_ascii=True,
+                       separators=(",", ":"))
+        )
+
+    def test_brief_echoes_weights_and_formula(self) -> None:
+        """RED at base, GREEN after the fix. Review-round-4 pin, two legs.
+        Echo leg (AC9: the effective config is echoed in EVERY payload):
+        the brief packet carries weights (a dict including the
+        demand/leverage/risk/priority keys), config_source (a str), and
+        formula_version == "triage.v1" — the same echo triage/bundle
+        carry. Live leg: with --live driven by a stub whose reviews
+        payload is a >=40k-char body, the FINAL serialized packet still
+        meets --budget-tokens 4000 (the enforcement runs AFTER the live
+        block attaches): the unholdable live block degrades to live:null +
+        a live_error budget note with truncated:true, and the body
+        survives. RED-on-revert proofs: removing the brief echo fields
+        fails the echo leg; moving the budget section back before the live
+        attach fails the live leg's bound (the fat block lands outside the
+        envelope)."""
+        # ---- echo leg: the AC9 echo on the brief packet ----------------
+        rc, out, err = _run_cli(
+            "brief", "731", "--db", str(self.db_path), "--repo", REPO,
+            "--format", "json",
+        )
+        self.assertEqual(rc, 0, err.decode("utf-8", "replace"))
+        env = json.loads(out.decode("utf-8"))
+        self.assertTrue(env["ok"], env)
+        data = env["data"]
+        weights = data.get("weights")
+        self.assertIsInstance(
+            weights, dict,
+            "the brief packet must echo the effective [triage] weights",
+        )
+        for key in ("demand", "leverage", "risk", "priority"):
+            self.assertIn(
+                key, weights,
+                f"the echoed weights must carry the {key} axis",
+            )
+        self.assertIsInstance(
+            data.get("config_source"), str,
+            "the brief packet must echo config_source (a str)",
+        )
+        self.assertEqual(
+            data.get("formula_version"), "triage.v1",
+            "the brief packet must echo formula_version triage.v1",
+        )
+
+        # ---- live leg: the budget covers the attached live block --------
+        with tempfile.TemporaryDirectory() as td:
+            shim = Path(td)
+            fat_body = "LIVEMARK-fat " + "x" * 40000
+            shim.joinpath("gh.commits").write_text(
+                json.dumps(
+                    [{"sha": "cafebafe", "commit": {"message": "m"},
+                      "url": "https://api.github.com/repos/acme/forgegate"
+                             "/commits/cafebafe", "parents": []}]
+                ),
+                encoding="ascii", newline="\n",
+            )
+            shim.joinpath("gh.status").write_text(
+                json.dumps(
+                    {"state": "success",
+                     "statuses": [{"state": "success", "context": "ci/test"}]}
+                ),
+                encoding="ascii", newline="\n",
+            )
+            shim.joinpath("gh.reviews").write_text(
+                json.dumps([{"state": "COMMENTED", "body": fat_body}]),
+                encoding="ascii", newline="\n",
+            )
+            if os.name == "posix":
+                stub = shim / "gh"
+                stub.write_text(
+                    "#!/bin/sh\n"
+                    'case "$*" in\n'
+                    '  *pulls/732/commits) cat "$0.commits" ;;\n'
+                    '  *commits/cafebafe/status) cat "$0.status" ;;\n'
+                    '  *pulls/732/reviews) cat "$0.reviews" ;;\n'
+                    "  *) printf '{}\\n' ;;\n"
+                    "esac\n",
+                    encoding="utf-8", newline="\n",
+                )
+                stub.chmod(
+                    stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+                )
+            else:
+                stub = shim / "gh.bat"
+                stub.write_text(
+                    "@echo off\r\n"
+                    'echo %*| findstr /C:"pulls/732/commits" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    'type "%~dp0%~n0.commits"\r\n'
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    'echo %*| findstr /C:"commits/cafebafe/status" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    'type "%~dp0%~n0.status"\r\n'
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    'echo %*| findstr /C:"pulls/732/reviews" >nul\r\n'
+                    "if not errorlevel 1 (\r\n"
+                    'type "%~dp0%~n0.reviews"\r\n'
+                    "exit /b 0\r\n"
+                    ")\r\n"
+                    "echo {}\r\n",
+                    encoding="ascii", newline="",
+                )
+            stub_path = stub
+
+            import zaxbygraph.derive as derive_mod
+
+            brief = getattr(derive_mod, "brief")
+            conn = open_existing(self.db_path)
+            try:
+                live_out = brief(
+                    conn, REPO, 731,
+                    budget_tokens=4000, live=True, gh_path=str(stub_path),
+                )
+            finally:
+                conn.close()
+
+        packet_chars = self._packet_chars(live_out)
+        self.assertLessEqual(
+            packet_chars, 4000 * 4,
+            f"live leg: packet chars/4 = {packet_chars / 4:.2f} exceeds"
+            " --budget-tokens 4000 — the envelope must cover the complete"
+            " packet, --live content included",
+        )
+        self.assertIs(
+            live_out.get("truncated"), True,
+            "dropping the live block for budget is a trim: truncated must"
+            " be true",
+        )
+        self.assertIsNone(
+            live_out.get("live"),
+            "a live block the budget cannot hold degrades to live: null",
+        )
+        self.assertIn(
+            "budget", live_out.get("live_error", ""),
+            "the degradation note must name the budget drop",
+        )
+        self.assertTrue(
+            live_out["body"]["untrusted_text"],
+            "the body must survive when the live block is the budget"
+            " offender",
         )
 
 

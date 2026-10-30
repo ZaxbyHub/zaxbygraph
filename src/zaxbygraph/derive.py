@@ -2636,7 +2636,16 @@ def _brief_live(
     note)`` — the packet still returns. Each call is bounded in time
     (timeout=30) and in bytes: stdout is truncated to
     ``_GH_STDOUT_BYTE_CAP`` (256 KiB) before parsing, so an oversized
-    response degrades rather than bloats the packet."""
+    response degrades rather than bloats the packet.
+
+    The CI leg costs TWO gh calls per PR (accepted cost, documented here):
+    the PR commit list — whose LAST element names the head commit CI ran
+    against — and that sha's combined status, the real CI state surface.
+    ``live_ci`` therefore reports real fields only: ``{"sha", "state",
+    "contexts"}``, where contexts are the combined status's per-check
+    entries reduced to ``{"state", "context"}`` and capped at the first
+    10. The reviews leg is one more call per PR (real review objects
+    carry ``state``/``body``)."""
     import subprocess
 
     def _gh(api_path: str):
@@ -2658,28 +2667,58 @@ def _brief_live(
     prs: list[dict] = []
     for pr in pr_numbers:
         entry: dict = {"number": pr}
-        for field, api_path in (
-            ("live_ci", f"repos/{repo}/pulls/{pr}/commits"),
-            ("live_review", f"repos/{repo}/pulls/{pr}/reviews"),
-        ):
+        commits_path = f"repos/{repo}/pulls/{pr}/commits"
+        try:
+            commits = _gh(commits_path)
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            return None, f"gh api {commits_path} failed: {exc}"
+        if not isinstance(commits, list):
+            return None, f"gh api {commits_path}: unexpected payload shape"
+        head: str | None = None
+        for element in reversed(commits):
+            if isinstance(element, dict) and isinstance(element.get("sha"), str):
+                head = element["sha"]
+                break
+        if head is None:
+            # a PR with no commits has no CI surface to report
+            entry["live_ci"] = None
+        else:
+            status_path = f"repos/{repo}/commits/{head}/status"
             try:
-                data = _gh(api_path)
-            except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
-                return None, f"gh api {api_path} failed: {exc}"
-            if not isinstance(data, list):
-                return None, f"gh api {api_path}: unexpected payload shape"
-            if field == "live_ci":
-                entry[field] = [
-                    _wrap_live_entry(e, ("name", "state", "conclusion"))
-                    for e in data
-                    if isinstance(e, dict)
-                ]
-            else:
-                entry[field] = [
-                    _wrap_live_entry(e, ("state", "body"))
-                    for e in data
-                    if isinstance(e, dict)
-                ]
+                combined = _gh(status_path)
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                return None, f"gh api {status_path} failed: {exc}"
+            if not isinstance(combined, dict):
+                return None, f"gh api {status_path}: unexpected payload shape"
+            raw_statuses = combined.get("statuses")
+            entry["live_ci"] = {
+                "sha": _untrusted(head),
+                "state": _wrap_live_entry(combined, ("state",)).get("state"),
+                "contexts": [
+                    _wrap_live_entry(s, ("state", "context"))
+                    for s in (
+                        raw_statuses if isinstance(raw_statuses, list) else []
+                    )[:10]
+                    if isinstance(s, dict)
+                ],
+            }
+        reviews_path = f"repos/{repo}/pulls/{pr}/reviews"
+        try:
+            reviews = _gh(reviews_path)
+        except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
+            return None, f"gh api {reviews_path} failed: {exc}"
+        if not isinstance(reviews, list):
+            return None, f"gh api {reviews_path}: unexpected payload shape"
+        entry["live_review"] = [
+            _wrap_live_entry(e, ("state", "body"))
+            for e in reviews
+            if isinstance(e, dict)
+        ]
         prs.append(entry)
     return {"prs": prs}, None
 
@@ -2697,21 +2736,29 @@ def brief(
     4): the triage feature row, the body truncated at paragraph boundaries,
     top comments (max 5, ordered by author_association rank then recency
     DESC), implicated files with resolution evidence, the closest PR analog
-    with its fix diffstat, and linked PRs. Every GitHub-authored string
-    (title, body, comment bodies, live gh text) is wrapped as
+    with its fix diffstat, and linked PRs — plus the AC9 echo every derived
+    payload carries (the effective ``weights``, ``config_source``, and
+    ``formula_version``). Every GitHub-authored string (title, body,
+    comment bodies, live gh text) is wrapped as
     ``{"untrusted_text": ...}`` and the packet carries ``content_trust``.
-    Budget: chars/4 of the serialized packet <= ``budget_tokens``,
-    unconditionally, with the mandatory ``truncated``/``derived`` echoes
-    counted inside the envelope (their width is reserved before the body
-    allowance is computed); truncation order: comments capped at the top-5
-    first, then the body cut at paragraph boundaries (a body that cannot
-    fit any whole paragraph under the allowance — including a
-    single-paragraph body — is hard-truncated at the character level with
-    a trailing ``…``, so the bound always holds), then comments drop from
-    the tail, then file evidence. ``truncated`` is set whenever any of
-    that fired.
-    ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR
-    checks/reviews; any failure degrades to ``live: null`` +
+    Budget: chars/4 of the serialized packet <= ``budget_tokens`` whenever
+    the budget is at or above the packet's fixed skeleton floor (~480
+    tokens for a bare issue with the default [triage] echo; smaller
+    budgets return the skeleton with ``truncated: true``), with the
+    mandatory ``truncated``/``derived``
+    echoes counted inside the envelope (their width is reserved before the
+    body allowance is computed). The envelope covers the complete packet:
+    the ``--live`` block attaches before enforcement, and a live block
+    that cannot fit inside the envelope even over an empty body degrades
+    to ``live: null`` + a ``live_error`` budget note before the allowance
+    is computed. Truncation order: comments capped at the top-5 first,
+    then the body cut at paragraph boundaries (a body that cannot fit any
+    whole paragraph under the allowance — including a single-paragraph
+    body — is hard-truncated at the character level with a trailing
+    ``…``), then comments drop from the tail, then file evidence.
+    ``truncated`` is set whenever any of that fired.
+    ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR CI
+    state/reviews; any failure degrades to ``live: null`` +
     ``live_error``. Read-only."""
     cfg = load_triage_config(*_triage_config_chain(conn, config))
     compute = _triage_compute(conn, repo, cfg, cfg["top_k"])
@@ -2845,7 +2892,18 @@ def brief(
         },
         "analog": analog_block,
         "linked_prs": linked,
+        "weights": {k: v for k, v in cfg.items() if k != "_config_source"},
+        "config_source": cfg["_config_source"],
+        "formula_version": cfg["formula_version"],
     }
+
+    # The live block attaches BEFORE the budget enforcement so the envelope
+    # covers the complete packet, --live content included.
+    if live:
+        live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
+        packet["live"] = live_block
+        if live_error is not None:
+            packet["live_error"] = live_error
 
     if budget_tokens and budget_tokens > 0:
         budget_chars = budget_tokens * 4
@@ -2856,6 +2914,20 @@ def brief(
                     pkt, sort_keys=True, ensure_ascii=True, separators=(",", ":")
                 )
             )
+
+        if packet.get("live"):
+            # A live block that cannot fit inside the envelope even over an
+            # empty body can never ship: degrade it up front to the
+            # documented live:null + note shape, so the body allowance is
+            # measured against a skeleton that actually can.
+            probe_live = dict(packet)
+            probe_live["body"] = _untrusted("")
+            probe_live["derived"] = True
+            probe_live["truncated"] = True
+            if _size(probe_live) > budget_chars:
+                packet["live"] = None
+                packet["live_error"] = "live block dropped: packet budget"
+                packet["truncated"] = True
 
         probe = dict(packet)
         probe["body"] = _untrusted("")
@@ -2882,12 +2954,6 @@ def brief(
         if _size(packet) > budget_chars:
             packet["files"] = {"resolved": packet["files"]["resolved"][:5]}
             packet["truncated"] = True
-
-    if live:
-        live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
-        packet["live"] = live_block
-        if live_error is not None:
-            packet["live_error"] = live_error
 
     packet["derived"] = True
     return packet
