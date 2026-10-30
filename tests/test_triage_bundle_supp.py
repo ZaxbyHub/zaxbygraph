@@ -609,23 +609,39 @@ class BriefLiveGhTests(_StoreTestCase):
 
 
 class CochangeCutoffTests(_StoreTestCase):
-    """Two paths whose ONLY cochange support is a merged PR merged AFTER
-    the eval cutoff (issue 981's created_at):
+    """Two path families pin both cutoff shapes (issue 981's created_at is
+    the cutoff, 2027-01-10):
 
+    x/y family — the anchored-survivor (RAISE) shape:
     - PR 9811 merged 2027-01-05 (pre-cutoff): [src/px/x_widget.py, src/px/filler_a.py]
     - PR 9812 merged 2027-01-06 (pre-cutoff): [src/py/y_widget.py, src/py/filler_b.py]
     - PR 9813 merged 2027-01-20 (POST-cutoff): [src/px/x_widget.py, src/py/y_widget.py]
-    - issue 981 created 2027-01-10 (the cutoff): body refs src/px/x_widget.py
-    - issue 982 created 2027-01-10: body refs src/py/y_widget.py
+    - issue 981 created 2027-01-10 (the cutoff): body refs BOTH x and y
+    - issue 982 created 2027-01-10: body refs BOTH x and y
 
-    Direct read (no cutoffs): coupling population {9811, 9812, 9813};
+    Direct read (no cutoffs): coupling population {9811..9816};
     support(x_widget, y_widget) = 1 (only PR 9813), support(x_widget) = 2,
     support(y_widget) = 2, so the symmetric confidence is 1/max(2,2) = 0.5
     -> the cochange component scores 0.5 (weight-free, so hub floors never
-    touch it) and anchors the anchor-less pair. With item_cutoff =
-    comment_cutoff = 2027-01-10 the coupling population excludes PR 9813
-    (revised section 8: the _coupling_index call inside similar gains the
-    cutoff), support(x,y) drops to 0 and the pair has NO anchor left."""
+    touch it). Both items also resolve BOTH paths from pre-cutoff body
+    refs, so files_direct fires as a second, scoping-proof anchor: with
+    item_cutoff = comment_cutoff = 2027-01-10 the pair REMAINS (files_direct)
+    while the scoped coupling population excludes PR 9813 (revised section
+    8: the _coupling_index call inside similar gains the cutoff) and ZEROES
+    the cochange component — cochange may raise an anchored pair, never
+    create one.
+
+    u/v family — the drop shape (the original no-other-anchor leg):
+    - PR 9814 merged 2027-01-05 (pre-cutoff): [src/pu/u_gear.py, src/pu/filler_c.py]
+    - PR 9815 merged 2027-01-06 (pre-cutoff): [src/pv/v_gear.py, src/pv/filler_d.py]
+    - PR 9816 merged 2027-01-20 (POST-cutoff): [src/pu/u_gear.py, src/pv/v_gear.py]
+    - issue 983 created 2027-01-10: body refs src/pu/u_gear.py only
+    - issue 984 created 2027-01-10: body refs src/pv/v_gear.py only
+
+    Direct read: support(u,v) = 1 (only PR 9816), support(u) = support(v)
+    = 2 -> symmetric confidence 0.5 anchors the otherwise anchor-less pair.
+    Under the cutoffs PR 9816 leaves the coupling population, the support
+    vanishes, and no other anchor exists — 984 drops out entirely."""
 
     CUTOFF = "2027-01-10T00:00:00Z"
 
@@ -650,28 +666,66 @@ class CochangeCutoffTests(_StoreTestCase):
             _merged_pull(9813, "2027-01-20T00:00:00Z"),
             files=[pr_file("src/px/x_widget.py"), pr_file("src/py/y_widget.py")],
         )
+        src.add_pr(
+            issue(9814, title="pu history", body="", kind="pr", state="closed",
+                  created_at="2027-01-01T00:00:00Z"),
+            _merged_pull(9814, "2027-01-05T00:00:00Z"),
+            files=[pr_file("src/pu/u_gear.py"), pr_file("src/pu/filler_c.py")],
+        )
+        src.add_pr(
+            issue(9815, title="pv history", body="", kind="pr", state="closed",
+                  created_at="2027-01-01T00:00:00Z"),
+            _merged_pull(9815, "2027-01-06T00:00:00Z"),
+            files=[pr_file("src/pv/v_gear.py"), pr_file("src/pv/filler_d.py")],
+        )
+        src.add_pr(
+            issue(9816, title="cross gear change", body="", kind="pr",
+                  state="closed", created_at="2027-01-15T00:00:00Z"),
+            _merged_pull(9816, "2027-01-20T00:00:00Z"),
+            files=[pr_file("src/pu/u_gear.py"), pr_file("src/pv/v_gear.py")],
+        )
+        # x/y family: BOTH items carry pre-cutoff body refs to BOTH paths,
+        # so files_direct anchors the pair and survives scoping.
         src.add_issue(
             issue(981, title="Widget X fault",
-                  body="see src/px/x_widget.py:1:1",
+                  body="see src/px/x_widget.py:1:1 and src/py/y_widget.py:1:1",
                   created_at="2027-01-10T00:00:00Z")
         )
         src.add_issue(
             issue(982, title="Widget Y fault",
-                  body="see src/py/y_widget.py:1:1",
+                  body="see src/py/y_widget.py:1:1 and src/px/x_widget.py:1:1",
+                  created_at="2027-01-10T00:00:00Z")
+        )
+        # u/v family: single-path bodies, no anchor besides cochange.
+        src.add_issue(
+            issue(983, title="Gear U fault",
+                  body="see src/pu/u_gear.py:1:1",
+                  created_at="2027-01-10T00:00:00Z")
+        )
+        src.add_issue(
+            issue(984, title="Gear V fault",
+                  body="see src/pv/v_gear.py:1:1",
                   created_at="2027-01-10T00:00:00Z")
         )
         sync_repo(conn, src, REPO)
 
     def test_cochange_cutoff_excludes_post_cutoff_support(self) -> None:
-        """RED at base, GREEN after the fix. Two pre-cutoff paths whose only
-        cochange support comes from a merged PR merged AFTER the eval
-        target's created_at: with the eval cutoffs the pair must NOT gain
-        the cochange anchor/score; the direct read (no cutoffs) MUST."""
+        """RED at base, GREEN after the fix. Wave-4 addition additionally
+        fails on the no-index-cutoff mutant (item_cutoff dropped from the
+        similar() coupling-index call) and passes on the shipped fix. The
+        x/y pair keeps a second, scoping-proof anchor (both items carry
+        pre-cutoff body refs to both paths), so the cutoffs must zero its
+        cochange component while the pair survives on files_direct; the u/v
+        pair's only anchor is post-cutoff cochange support, so under the
+        cutoffs it drops out entirely."""
         conn = open_existing(self.db_path)
         self.addCleanup(conn.close)
 
-        # Direct read (no cutoffs): 982 anchors to 981 through cochange,
-        # with the hand-derived symmetric confidence 1/max(2,2) = 0.5.
+        # (b) RAISE path — the anchored pair. Direct read (no cutoffs): 982
+        # anchors to 981 through cochange (the sorted anchor order checks
+        # cochange first), with the hand-derived symmetric confidence
+        # 1/max(2,2) = 0.5, and the shared body-ref paths fire files_direct
+        # as the second, scoping-proof anchor.
         direct = similar(conn, REPO, 981, limit=50)
         cand = next(
             (c for c in direct["candidates"] if c["number"] == 982), None
@@ -683,22 +737,75 @@ class CochangeCutoffTests(_StoreTestCase):
             cand["components"]["cochange"]["score"], 0.5, places=6
         )
         self.assertEqual(cand["anchor"], "cochange")
+        self.assertTrue(
+            cand["components"]["cochange"]["evidence"]["pairs"],
+            "the direct cochange evidence must carry the post-cutoff pair",
+        )
+        self.assertGreater(
+            cand["components"]["files_direct"]["score"], 0.0,
+            "the x/y pair needs its second (files_direct) anchor",
+        )
 
-        # Eval-shaped read: with item_cutoff = comment_cutoff = the target's
-        # created_at, PR 9813 leaves the coupling population, the x/y pair
-        # support vanishes, and no other anchor exists — 982 must drop out
-        # entirely.
+        # Scoped read: PR 9813 leaves the coupling population, so the
+        # cochange component must ZERO while the pair REMAINS, anchored
+        # through files_direct, with every non-cochange component unchanged
+        # (an unscoped coupling index would still score 0.5 here — the
+        # wave-4 mutant kill).
         scoped = similar(
             conn, REPO, 981, limit=50,
             item_cutoff=self.CUTOFF, comment_cutoff=self.CUTOFF,
         )
-        self.assertNotIn(
-            982,
-            [c["number"] for c in scoped["candidates"]],
-            "post-cutoff cochange support must not anchor the pair",
+        scoped_cand = next(
+            (c for c in scoped["candidates"] if c["number"] == 982), None
+        )
+        self.assertIsNotNone(
+            scoped_cand,
+            "the anchored pair must survive scoping via files_direct",
+        )
+        self.assertEqual(
+            scoped_cand["components"]["cochange"]["score"], 0.0,
+            "post-cutoff cochange support must not raise a scoped pair",
+        )
+        self.assertEqual(
+            scoped_cand["components"]["cochange"]["evidence"]["pairs"], []
+        )
+        self.assertEqual(scoped_cand["anchor"], "files_direct")
+        self.assertEqual(
+            scoped_cand["components"]["files_direct"]["evidence"]["shared_paths"],
+            ["src/px/x_widget.py", "src/py/y_widget.py"],
+        )
+        self.assertEqual(
+            {k: v for k, v in scoped_cand["components"].items()
+             if k != "cochange"},
+            {k: v for k, v in cand["components"].items() if k != "cochange"},
+            "scoping must change the cochange component and nothing else",
         )
         # the pre-cutoff paths themselves stay resolvable under the cutoff.
         self.assertGreaterEqual(scoped["resolved_path_count"], 2)
+
+        # (a) DROP path — the pair whose ONLY anchor is post-cutoff
+        # cochange support: the direct read admits it, the scoped read must
+        # drop it entirely.
+        direct_uv = similar(conn, REPO, 983, limit=50)
+        cand_uv = next(
+            (c for c in direct_uv["candidates"] if c["number"] == 984), None
+        )
+        self.assertIsNotNone(
+            cand_uv, "the direct read must cochange-anchor 984 to 983"
+        )
+        self.assertAlmostEqual(
+            cand_uv["components"]["cochange"]["score"], 0.5, places=6
+        )
+        self.assertEqual(cand_uv["anchor"], "cochange")
+        scoped_uv = similar(
+            conn, REPO, 983, limit=50,
+            item_cutoff=self.CUTOFF, comment_cutoff=self.CUTOFF,
+        )
+        self.assertNotIn(
+            984,
+            [c["number"] for c in scoped_uv["candidates"]],
+            "post-cutoff cochange support must not anchor the pair",
+        )
 
 
 # ==== C18: CANDIDATE-side comment bait is scoped ============================
