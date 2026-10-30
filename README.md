@@ -38,7 +38,7 @@ Requires the [GitHub CLI](https://cli.github.com/), authenticated:
 gh auth login
 ```
 
-Tested on Windows and Linux; CI runs both on Python 3.11 and 3.12.
+Tested on Windows and Linux; CI runs both on Python 3.11 through 3.14.
 
 **SQLite 3.35.0+** (March 2021) is also required — Python links SQLite at build
 time, so this is a property of your Python, not a package you install. Any
@@ -136,6 +136,8 @@ Every command accepts:
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
+| `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
+| `--max-age D` | Read commands: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first (waiting out a concurrent writer and re-checking) and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for; a failed refresh answers the sync error, never a stale payload. Without the flag reads never write. Present on every read command (the standard reads, the derived tier, and `schema`); absent from `sql` and the export/doctor writers by design. |
 
 ### Derived reads — `similar`, `explain`, `coupling`, `eval`
 
@@ -535,8 +537,12 @@ The PRs whose `pr_files` include `path` (exact match — a directory or a
 typo'd path is a normal empty answer), newest first (`data.entries`, with
 `title`, `state`, `updated_at`, `html_url`), each entry carrying
 `closed_issues`: the deduplicated numbers of the issues that PR closed
-(`closes` edges, any `source` provenance). On a pre-v5 database the
-entries omit `source` and the payload carries `index_stale: true`. The
+(`closes` edges, any `source` provenance), and `keyword_closes`: the
+deduplicated numbers closed by closing keywords (REST-only stores
+whose sole closure evidence is keyword-derived answer truthfully instead
+of "closed nothing"). `closed_issues` stays GitHub-reported `closes` only.
+On a pre-v5 database the entries omit `source` and the payload carries
+`index_stale: true`. The
 riskiest-file question from `churn`, per path, with the "what did it fix"
 answers attached.
 
@@ -547,7 +553,9 @@ zaxbygraph what-closed NUMBER
 ```
 
 Closing PRs (`data.prs[]`, from `closes` edges whose destination is the
-issue) and closing commits (`data.commits[]`, from `closed_by_commit`
+issue), keyword-derived closing items (`data.keyword_closes[]`, from
+`closes_keyword` edges - kept separate from GitHub-reported `closes`), and
+closing commits (`data.commits[]`, from `closed_by_commit`
 edges), each entry carrying its edge's `source` provenance
 (`closing_ref` / `timeline`) and `evidence`. The payload reports the
 item's `kind` — a PR has no closers, and now that is visible instead of a

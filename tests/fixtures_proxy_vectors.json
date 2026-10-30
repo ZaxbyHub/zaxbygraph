@@ -1,0 +1,105 @@
+{
+  "comment": [
+    "Shared proxy-remote normalization vectors for ZaxbyHub/zaxbygraph#31 AC3.",
+    "Consumed by tests/test_read_truth.py::test_proxy_normalization_vectors.",
+    "env markers: null = ZAXBYGRAPH_PROXY_FORGE_HOST unset;",
+    "  \"valid:HOST[:PORT]\" = set to that value (port kept, folded to the",
+    "  store-safe _port form by _clean_host, e.g. gitlab.internal:8443 -> gitlab.internal_8443);",
+    "  \"unparseable\" = set to a non-empty value that cannot parse as a host;",
+    "  \"empty\" = set to empty/whitespace-only.",
+    "States: unset -> rewrite loopback to github.com; valid -> rewrite to the",
+    "forge host; unparseable -> rewrite silently DISABLED (URL keeps failing",
+    "to parse); empty -> no rewrite.",
+    "expect: null = _parse_remote_info returns None; otherwise host is exact",
+    "and slug compares case-insensitively (parse level keeps display case).",
+    "Loopback rewrite applies only when the path carries the git/ prefix",
+    "(case-insensitive); a loopback URL without it keeps base parse behavior."
+  ],
+  "vectors": [
+    {
+      "url": "http://local_proxy@127.0.0.1:41233/git/ZaxbyHub/zaxbygraph",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "zaxbyhub/zaxbygraph"}
+    },
+    {
+      "url": "http://u@localhost:41233/git/org/repo",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@[::1]:41233/git/org/repo",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@::1:41233/git/org/repo",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/GIT/org/repo",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/git/org/repo.git",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/git/org/repo",
+      "env": "valid:gitlab.internal:8443",
+      "expect": {"host": "gitlab.internal_8443", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/git/org/repo",
+      "env": "valid:gitlab.internal",
+      "expect": {"host": "gitlab.internal", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/git/org/repo",
+      "env": "unparseable",
+      "expect": null
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/git/org/repo",
+      "env": "empty",
+      "expect": null
+    },
+    {
+      "url": "https://github.com/Org/Repo.git",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "Org/Repo"}
+    },
+    {
+      "url": "https://github.com/Org/Repo",
+      "env": "valid:gitlab.internal:8443",
+      "expect": {"host": "github.com", "slug": "Org/Repo"}
+    },
+    {
+      "url": "git@github.com:org/repo.git",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "ssh://git@github.com/org/repo",
+      "env": null,
+      "expect": {"host": "github.com", "slug": "org/repo"}
+    },
+    {
+      "url": "http://u@127.0.0.1:41233/org/repo",
+      "env": null,
+      "expect": {"host": "127.0.0.1_41233", "slug": "org/repo"}
+    },
+    {
+      "url": "http://ghe.corp:8443/org/repo",
+      "env": null,
+      "expect": {"host": "ghe.corp_8443", "slug": "org/repo"}
+    },
+    {
+      "url": "not a remote url at all",
+      "env": null,
+      "expect": null
+    }
+  ]
+}

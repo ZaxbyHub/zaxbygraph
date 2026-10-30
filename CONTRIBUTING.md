@@ -136,6 +136,7 @@ This section covers work found during a PR review or a PR-feedback round that th
 
 ### Repo notes (zaxbygraph)
 
-- **argv conventions for this repo**: checks run as `python -m pytest <file> -q`.
+- **argv conventions for this repo**: single-file checks run as `python -m pytest <file> -q` and single modules as `python -m unittest tests.<module>` (both collect `from fixtures import` correctly; tests/__init__.py puts the tests directory on sys.path for every documented form).
+  The canonical full suite is `python -m unittest discover -s tests -b`.
 - **Upstream fragility**: this tool depends on the installed gh CLI's GraphQL grammar, which can break across gh upgrades — `argv` must not depend on a live `gh` call; bind checks to cached fixtures/snapshots and label any live-gh AC as INFERENCE-dependent.
 - A `NEW-SURFACE` argv naming a spec absent at base fails with pytest's file-not-found class — write the real signature verbatim in `expect`.

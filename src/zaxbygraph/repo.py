@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -68,6 +69,12 @@ def _parse_remote_info(url: str) -> tuple[str, str] | None:
     hosts). Hosts are lowercased and charset-validated by _clean_host; the
     slug keeps REPO_SLUG_RE's charset and is case-folded later by
     validate_slug.
+
+    A loopback git-proxy origin (`http://user@127.0.0.1:<port>/git/<o>/<r>`
+    and its localhost/::1/[::1] spellings) resolves to the forge host the
+    proxy fronts instead of the ephemeral loopback key (issue #31 AC3);
+    ZAXBYGRAPH_PROXY_FORGE_HOST has zmem's four states (see
+    _loopback_proxy_forge).
     """
     url = url.strip()
     if not url:
@@ -92,11 +99,91 @@ def _parse_remote_info(url: str) -> tuple[str, str] | None:
                 rest = rest[4:]
             host_raw, _, path = rest.partition("/")
             path = path.strip("/")
+            authority = host_raw.rsplit("@", 1)[-1]
+            forge = _loopback_proxy_forge(authority)
+            if forge is not None and path[:4].lower() == "git/":
+                slug = path[4:].strip("/")
+                if REPO_SLUG_RE.match(slug):
+                    host = _clean_host(forge)
+                    if host is not None:
+                        return (host, slug)
             host = _clean_host(host_raw)
             if host is None or not REPO_SLUG_RE.match(path):
                 return None
             return (host, path)
     return None
+
+
+#: The loopback spellings a git proxy uses as its host. An unbracketed
+#: `::1:port` is recognized too: a trailing 1-5-digit port is stripped
+#: before the match, matching zmem's documented rule (issue #31 AC3).
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+#: ZAXBYGRAPH_PROXY_FORGE_HOST grammar (mirrors zmem's documented rule):
+#: host[:port] — the optional port is 1-5 digits, and the host is one or
+#: more dot-separated labels, each matching this pattern (hyphens only
+#: inside labels, no empty labels; `a..b`, `-a.com`, `a-.com` are invalid).
+_FORGE_LABEL_RE = re.compile(r"[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?", re.ASCII)
+
+_PROXY_ENV_VAR = "ZAXBYGRAPH_PROXY_FORGE_HOST"
+
+
+def _loopback_authority(authority: str) -> bool:
+    """True when a URL authority (userinfo stripped) is a loopback proxy host.
+
+    Recognizes 127.0.0.1[:port], localhost[:port], ::1, and [::1][:port];
+    a trailing 1-5-digit port is stripped first, so the unbracketed
+    `::1:41233` spelling resolves as well."""
+    host = authority.strip().lower()
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS:
+        return True
+    if host.startswith("["):
+        inner, sep, after = host[1:].partition("]")
+        if not sep:
+            return False
+        if after and not re.fullmatch(r":\d{1,5}", after):
+            return False
+        return f"[{inner}]" in _LOOPBACK_HOSTS
+    left, sep, right = host.rpartition(":")
+    if sep and right.isdigit() and len(right) <= 5:
+        return left in _LOOPBACK_HOSTS
+    return False
+
+
+def _valid_forge_host(value: str) -> bool:
+    """True when `value` parses as host[:port] per the documented grammar."""
+    host = value.strip().lower()
+    if ":" in host:
+        host, _, port = host.rpartition(":")
+        if not port.isdigit() or len(port) > 5:
+            return False
+    if not host:
+        return False
+    return all(
+        _FORGE_LABEL_RE.fullmatch(label) is not None for label in host.split(".")
+    )
+
+
+def _loopback_proxy_forge(authority: str) -> str | None:
+    """Forge host for a loopback proxy authority, or None (no rewrite).
+
+    ZAXBYGRAPH_PROXY_FORGE_HOST states (zmem's documented rule): unset ->
+    DEFAULT_HOST (github.com; the CCR proxy fronts GitHub); set to a valid
+    `host[:port]` -> that value verbatim (lowercased); set non-empty but
+    unparseable, or empty/whitespace -> None, silently disabling the
+    rewrite so the remote keeps its literal loopback key."""
+    if not _loopback_authority(authority):
+        return None
+    override = os.environ.get(_PROXY_ENV_VAR)
+    if override is None:
+        return DEFAULT_HOST
+    if not override.strip():
+        return None
+    if not _valid_forge_host(override):
+        return None
+    return override.strip().lower()
 
 
 def _parse_remote_url(url: str) -> str | None:

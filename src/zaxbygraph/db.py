@@ -64,6 +64,29 @@ def connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+def assert_fts5_available(conn: sqlite3.Connection) -> None:
+    """Fail legibly when this SQLite build lacks FTS5 (issue #31 AC2).
+
+    The corpus schema creates fts5 virtual tables (items_fts, comments_fts,
+    reviews_fts), so on a build without FTS5 every read would surface as a
+    bare "no such module: fts5" SQL error mid-query. The compile-option
+    probe is a plain read (SQLITE_FUNCTION allows non-extension functions,
+    so it also passes the `sql` command's default-deny authorizer) and is
+    validated across the supported CI matrix (win/ubuntu x 3.11-3.14). A
+    corrupt file raises sqlite3.DatabaseError from the probe untouched —
+    the store_unreadable contract, never a guard misclassification."""
+    row = conn.execute(
+        "SELECT sqlite_compileoption_used('ENABLE_FTS5')"
+    ).fetchone()
+    if not row or not row[0]:
+        raise RuntimeError(
+            "zaxbygraph requires a SQLite build with FTS5 enabled, but this"
+            f" Python is linked against {sqlite3.sqlite_version} without"
+            " SQLITE_ENABLE_FTS5. Use a Python/SQLite build compiled with"
+            " FTS5."
+        )
+
+
 #: PRAGMAs that a read-only query is allowed to trigger indirectly (never
 #: written by user SQL, since PRAGMA cannot appear inside a SELECT/WITH/
 #: EXPLAIN statement, but issued internally by SQLite/FTS5 while resolving
@@ -119,6 +142,7 @@ def connect_readonly_query(db_path: Path) -> sqlite3.Connection:
     never share this connection factory with the read/write paths."""
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
+    assert_sqlite_supported()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
@@ -130,6 +154,11 @@ def connect_readonly_query(db_path: Path) -> sqlite3.Connection:
     except sqlite3.OperationalError:
         pass
     conn.set_authorizer(_deny_write_authorizer)
+    try:
+        assert_fts5_available(conn)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -141,13 +170,21 @@ def open_existing(db_path: Path) -> sqlite3.Connection:
     materialize -shm/-wal beside it (documented; those are the store's own
     files and hold no new data — legacy candidates that must not be touched
     at all are read from temp copies by doctor/where). Raises
-    FileNotFoundError when the file is absent; a corrupt file surfaces as
+    FileNotFoundError when the file is absent, RuntimeError from the
+    SQLite-floor guard or the FTS5 probe (issue #31 AC2) when the runtime
+    cannot serve the corpus, and a corrupt file surfaces as
     sqlite3.DatabaseError from the first statement.
     """
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
+    assert_sqlite_supported()
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
+    try:
+        assert_fts5_available(conn)
+    except BaseException:
+        conn.close()
+        raise
     conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 

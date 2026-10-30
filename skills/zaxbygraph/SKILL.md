@@ -6,6 +6,7 @@ description: >
   history question, recurrence hunt, regression archaeology, or "what touched this file"
   task for a GitHub repo.
 ---
+<!-- zaxbygraph skill-version: 0.4.0 -->
 
 # ZaxbyGraph
 
