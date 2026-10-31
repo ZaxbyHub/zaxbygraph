@@ -535,10 +535,17 @@ class AsciiStrictnessTests(unittest.TestCase):
             _redact_url("https://user:pass@github.com/owner/repo"),
             "https://***@github.com/owner/repo",
         )
+        # A credential @ inside the "password" must not leak the tail past
+        # the first @ (cubic round 2 on PR #47).
+        self.assertEqual(
+            _redact_url("user:p@ss@host.corp:owner/repo"),
+            "***@host.corp:owner/repo",
+        )
+        # The passwordless scp form is masked too, consistent with the
+        # scheme form masking any userinfo.
         self.assertEqual(
             _redact_url("git@github.com:org/repo"),
-            "git@github.com:org/repo",
-            "the passwordless scp form must stay readable",
+            "***@github.com:org/repo",
         )
 
 

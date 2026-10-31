@@ -207,8 +207,14 @@ def _redact_url(url: str) -> str:
     masked = re.sub(r"//[^/]*@", "//***@", url)
     if "://" in masked:
         return masked
-    # scp-like origins carry no scheme: mask a user:password@ prefix.
-    return re.sub(r"^(?:[^@/:\s]+:[^@\s]*@)+", "***@", masked)
+    # scp-like origins carry no scheme: mask the whole authority prefix
+    # through the LAST @ before the path, so `user:p@ss@host` cannot leak a
+    # credential tail past the first @ (cubic round 2 on PR #47). The
+    # passwordless `git@host` form is masked too, matching the scheme form.
+    head, sep, tail = masked.partition("/")
+    if "@" in head:
+        return "***@" + head.rsplit("@", 1)[1] + sep + tail
+    return masked
 
 
 def slug_from_git(cwd: Path | None = None) -> str:

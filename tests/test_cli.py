@@ -363,12 +363,16 @@ class _Issue2Harness(unittest.TestCase):
     def _issue2_entries_under(self, root):
         if not root.exists():
             return []
-        # Git housekeeping files (e.g. .git/objects/maintenance.lock that
-        # newer git creates in the background while this harness runs git)
-        # are not zaxbygraph's creations; the property under test is what
-        # the CLI itself adds (PR #47 review: windows/ubuntu 3.13 legs).
+        # Volatile git housekeeping locks (e.g. .git/objects/maintenance.lock
+        # that newer git creates in the background while this harness runs
+        # git) are not zaxbygraph's creations. Only lock files are excluded:
+        # any OTHER change under .git still fails the nothing-created
+        # property (cubic round 2 on PR #47).
+        def _volatile(p):
+            return ".git" in p.parts and p.name.endswith(".lock")
+
         return sorted(
-            str(p) for p in root.rglob("*") if ".git" not in p.parts
+            str(p) for p in root.rglob("*") if not _volatile(p)
         )
 
 

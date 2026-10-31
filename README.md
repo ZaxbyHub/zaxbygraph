@@ -762,8 +762,9 @@ Machine-readable rules, worth knowing before scripting against this:
   additionally emits `repo_required`, `bad_include`, `out_is_database`,
   `store_too_old`, `store_too_new`, `incomplete_store`; the derived reads add
   `config_error` for `[derive]` weight problems, and every store-opening read
-  emits `store_unreadable`, `environment_guard` (SQLite floor / FTS5 rejected the
-open; exit 2) and `refresh_failed` (a `--max-age` refresh failed; exit 1) when the store cannot be opened) to
+  emits `store_unreadable` or `environment_guard` (SQLite floor / FTS5
+rejected the open; exit 2) when the store cannot be opened, and a
+`--max-age` read emits `refresh_failed` (exit 1) when its refresh fails, to
   **stdout**, so `json.load(stdin)`
   never sees an empty stream. The same `error: MESSAGE` one-liner is still
   printed to stderr for humans; argparse usage errors remain plain stderr.
