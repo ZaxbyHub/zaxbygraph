@@ -455,6 +455,44 @@ class RefreshContractTests(_CliStore):
         self.assertEqual((payload or {}).get("error", {}).get("code"),
                          "environment_guard")
 
+    def test_transient_lock_under_lock_is_refresh_failed(self) -> None:
+        # Cubic run 3: the under-lock recheck's transient-fault arm must
+        # answer refresh_failed, not the corrupt-file store_unreadable.
+        from zaxbygraph import cli as cli_mod
+
+        self._set_stamp(10_000)
+        real_freshness = cli_mod._freshness
+        calls = []
+
+        def freshness(conn, slug):
+            calls.append(1)
+            if len(calls) == 1:
+                return real_freshness(conn, slug)  # pre-lock: stale
+            if len(calls) == 2:
+                # The under-lock recheck: transient fault.
+                raise sqlite3.OperationalError("database is locked")
+            # Later calls (e.g. the error envelope's own freshness read)
+            # must not raise again.
+            return {"synced_at": None, "age_s": None, "complete": False}
+
+        class _FakeLock:
+            def release_owned(self):
+                pass
+
+        with mock.patch.object(cli_mod, "_freshness", side_effect=freshness), \
+                mock.patch.object(cli_mod, "acquire_sync_lock",
+                                  return_value=_FakeLock()):
+            code, payload, _out, err = self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", self.db,
+                 "--format", "json", "--max-age", "60"]
+            )
+        self.assertEqual(code, 1)
+        self.assertNotIn("Traceback", err)
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["error"]["code"], "refresh_failed")
+        self.assertIn("database is locked", payload["error"]["message"])
+        self.assertGreaterEqual(len(calls), 2, "the under-lock recheck must run")
+
     def test_foreign_file_journal_mode_untouched(self) -> None:
         import sqlite3 as _sq
 

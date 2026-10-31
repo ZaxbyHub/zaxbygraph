@@ -840,7 +840,7 @@ rewrite at another forge, with four states:
 | `ZAXBYGRAPH_PROXY_FORGE_HOST` | Behavior |
 |---|---|
 | unset | Rewrite to `github.com/<org>/<repo>` (the default; proxies front GitHub today). |
-| valid `host[:port]` | Rewrite to `<value>/<org>/<repo>` verbatim (lowercased, port kept), e.g. `gitlab.internal:8443`. |
+| valid `host[:port]` | Rewrite to `<value>/<org>/<repo>` (lowercased); a port folds into the path-safe store key with an underscore, e.g. `gitlab.internal:8443` stores under `gitlab.internal_8443/<org>/<repo>`. |
 | set, non-empty, unparseable | Rewrite disabled; the remote parses (or fails to) exactly as without the variable. |
 | set but empty/whitespace | Opt out — same as unparseable. |
 
