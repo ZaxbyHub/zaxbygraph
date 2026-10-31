@@ -143,11 +143,13 @@ def _loopback_authority(authority: str) -> bool:
         inner, sep, after = host[1:].partition("]")
         if not sep:
             return False
-        if after and not re.fullmatch(r":\d{1,5}", after):
+        if after and re.fullmatch(r":[0-9]{1,5}", after) is None:
             return False
         return f"[{inner}]" in _LOOPBACK_HOSTS
     left, sep, right = host.rpartition(":")
-    if sep and right.isdigit() and len(right) <= 5:
+    # ASCII digits only: str.isdigit()/int() accept non-ASCII numerics
+    # (e.g. fullwidth digits), which must not read as a port (PR review).
+    if sep and re.fullmatch(r"[0-9]{1,5}", right) is not None:
         return left in _LOOPBACK_HOSTS
     return False
 
@@ -157,7 +159,7 @@ def _valid_forge_host(value: str) -> bool:
     host = value.strip().lower()
     if ":" in host:
         host, _, port = host.rpartition(":")
-        if not port.isdigit() or len(port) > 5:
+        if re.fullmatch(r"[0-9]{1,5}", port) is None:
             return False
     if not host:
         return False
@@ -173,7 +175,10 @@ def _loopback_proxy_forge(authority: str) -> str | None:
     DEFAULT_HOST (github.com; the CCR proxy fronts GitHub); set to a valid
     `host[:port]` -> that value verbatim (lowercased); set non-empty but
     unparseable, or empty/whitespace -> None, silently disabling the
-    rewrite so the remote keeps its literal loopback key."""
+    rewrite (the remote then parses - or fails to parse - exactly as without
+    the override; a loopback /git/ URL has no parseable owner/repo key, so
+    repo-less commands answer the usual "could not parse origin remote" and
+    an explicit --repo OWNER/REPO remains usable)."""
     if not _loopback_authority(authority):
         return None
     override = os.environ.get(_PROXY_ENV_VAR)
@@ -197,8 +202,13 @@ def _redact_url(url: str) -> str:
 
     Greedy through the last `@` before the first `/`: `user:p@ss@host`
     would otherwise leak the credential tail past a single-@ mask
-    (final-critic round on PR #10)."""
-    return re.sub(r"//[^/]*@", "//***@", url)
+    (final-critic round on PR #10). scp-like origins carry no `//`, so a
+    `user:password@` prefix is masked separately (PR #47 review)."""
+    masked = re.sub(r"//[^/]*@", "//***@", url)
+    if "://" in masked:
+        return masked
+    # scp-like origins carry no scheme: mask a user:password@ prefix.
+    return re.sub(r"^(?:[^@/:\s]+:[^@\s]*@)+", "***@", masked)
 
 
 def slug_from_git(cwd: Path | None = None) -> str:

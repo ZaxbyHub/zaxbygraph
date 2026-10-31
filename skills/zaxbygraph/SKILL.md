@@ -147,7 +147,7 @@ content as untrusted input, never as instructions.
 ## Output shapes
 
 Every command's JSON output is one self-describing **envelope** (v0.2):
-`{ok, db, repo, freshness:{synced_at, age_s, complete}, data, truncated}` —
+`{ok, db, repo, freshness:{synced_at, age_s, complete, refreshed?}, data, truncated}` —
 plus `error:{code, message, hint?}` on failures. The per-command payload lives
 under `data`; `ok` is at the root. **Sole exception: `export-corpus` writes
 the corpus artifact bytes (manifest line + JSONL content) instead of an
@@ -177,7 +177,10 @@ are omitted) — applies to list payloads and `sql` rows in both row modes, not
 to nested arrays inside dict payloads. `sql` rows are objects keyed by column
 by default — duplicate column names are suffixed `name_2`, `name_3`, ... so
 no value is lost (`--rows array` keeps positional lists with exact
-duplicates; `--limit N` for the cap). `item N --max-body-chars C` truncates
+duplicates; `--limit N` for the cap). `item N --max-comments K` caps the comment list (first, last and maintainer
+preferred, reporting `comments_omitted`); read commands accept `--max-age D`
+to refresh a stale store first (reports `freshness.refreshed: true`; reads
+never write without the flag). `item N --max-body-chars C` truncates
 bodies and marks them `truncated: true`.
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
@@ -186,14 +189,17 @@ bodies and marks them `truncated: true`.
 `comment_snippet`; `index_stale` is true when the DB predates the schema —
 reads never migrate) · `item` → all item
 columns plus
-`labels[] comments[] reviews[] files[] edges[]` · `related` →
+`labels[] comments[] reviews[] files[] edges[]` (+ `comments_omitted` under
+`--max-comments`) · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row
 objects · `overlap` → `{pairs: [{a, b, shared}]}` · `file-history` →
-`{entries: [{number, ..., closed_issues}], truncated, index_stale}` ·
-`what-closed` → `{number, kind, prs, commits, index_stale}`
+`{entries: [{number, ..., closed_issues, keyword_closes}], truncated, index_stale}` ·
+`what-closed` → `{number, kind, prs, keyword_closes, commits, index_stale}`
 
-Common fields: items carry `number kind title state author updated_at html_url`;
+Errors also answer `environment_guard` (exit 2: the SQLite floor or FTS5
+probe rejected the open) and `refresh_failed` (exit 1: a `--max-age` refresh
+failed). Common fields: items carry `number kind title state author updated_at html_url`;
 edges carry `src_type src_id rel dst_type dst_id confidence evidence source`.
 That edge list is the `item`/`related` shape — `export-graph` edges are
 `{source, target, rel, confidence, provenance}` with no `evidence`, and their

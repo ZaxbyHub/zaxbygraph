@@ -363,7 +363,13 @@ class _Issue2Harness(unittest.TestCase):
     def _issue2_entries_under(self, root):
         if not root.exists():
             return []
-        return sorted(str(p) for p in root.rglob("*"))
+        # Git housekeeping files (e.g. .git/objects/maintenance.lock that
+        # newer git creates in the background while this harness runs git)
+        # are not zaxbygraph's creations; the property under test is what
+        # the CLI itself adds (PR #47 review: windows/ubuntu 3.13 legs).
+        return sorted(
+            str(p) for p in root.rglob("*") if ".git" not in p.parts
+        )
 
 
 class NoCorpusTests(_Issue2Harness):

@@ -285,12 +285,18 @@ class MaxAgeFaultPathTests(_CliStore):
     a corpus schema into a foreign SQLite file."""
 
     def test_corrupt_store_with_max_age_answers_store_unreadable(self) -> None:
+        from zaxbygraph import cli as cli_mod
+
         junk = Path(self._td.name) / "junk.db"
         junk.write_bytes(b"this is not a sqlite database at all" * 64)
-        code, payload, _out, err = self.run_cli(
-            ["item", "1", "--repo", REPO, "--db", str(junk),
-             "--format", "json", "--max-age", "60"]
-        )
+        with mock.patch.object(
+            cli_mod, "_run_refresh_sync",
+            side_effect=AssertionError("sync seam must not run on a corrupt store"),
+        ):
+            code, payload, _out, err = self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", str(junk),
+                 "--format", "json", "--max-age", "60"]
+            )
         self.assertEqual(code, 1)
         self.assertNotIn("Traceback", err)
         self.assertIsNotNone(payload)
@@ -305,10 +311,16 @@ class MaxAgeFaultPathTests(_CliStore):
         conn.execute("CREATE TABLE t (x)")
         conn.commit()
         conn.close()
-        code, payload, _out, err = self.run_cli(
-            ["item", "1", "--repo", REPO, "--db", str(foreign),
-             "--format", "json", "--max-age", "60"]
-        )
+        from zaxbygraph import cli as cli_mod
+
+        with mock.patch.object(
+            cli_mod, "_run_refresh_sync",
+            side_effect=AssertionError("sync seam must not run on a foreign file"),
+        ):
+            code, payload, _out, err = self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", str(foreign),
+                 "--format", "json", "--max-age", "60"]
+            )
         # No live sync ran (offline answer), no schema was created, and the
         # read answered the store_unreadable envelope.
         self.assertEqual(code, 1)
@@ -365,6 +377,169 @@ class MaxAgeFaultPathTests(_CliStore):
             calls, [], "a store refreshed by the waited-for writer needs no second sync"
         )
         self.assertIs((payload or {}).get("freshness", {}).get("refreshed"), True)
+
+
+class RefreshContractTests(_CliStore):
+    """PR #47 review regressions: the refresh keeps the store's own
+    retention, maps environment guards like the sync path, and never
+    mutates a file it does not refresh."""
+
+    def _set_stamp(self, seconds_ago: int) -> None:
+        stamp = (
+            datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.conn.execute(
+            "UPDATE sync_state SET last_incr_sync_at = ? WHERE repo = ?",
+            (stamp, REPO),
+        )
+        self.conn.commit()
+
+    def _set_include_patches(self, value: int) -> None:
+        self.conn.execute(
+            "UPDATE sync_state SET include_patches = ? WHERE repo = ?",
+            (value, REPO),
+        )
+        self.conn.commit()
+
+    def test_refresh_carries_include_patches(self) -> None:
+        from zaxbygraph import cli as cli_mod
+
+        self._set_stamp(10_000)
+        self._set_include_patches(1)
+        seen = {}
+
+        def runner(conn, slug, *, include_patches=False, **kw):
+            seen["include_patches"] = include_patches
+            c = sqlite3.connect(self.db)
+            try:
+                c.execute(
+                    "UPDATE sync_state SET last_incr_sync_at = ? WHERE repo = ?",
+                    (
+                        (datetime.now(timezone.utc) - timedelta(seconds=1))
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        REPO,
+                    ),
+                )
+                c.commit()
+            finally:
+                c.close()
+            return 0
+
+        with mock.patch.object(cli_mod, "_run_refresh_sync", runner):
+            code, payload, _out, err = self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", self.db,
+                 "--format", "json", "--max-age", "60"]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIs(seen.get("include_patches"), True,
+                      "a patch-synced store must not lose patch retention")
+
+    def test_refresh_store_too_new_is_environment_guard(self) -> None:
+        from zaxbygraph import cli as cli_mod
+
+        self._set_stamp(10_000)
+
+        def runner(*a, **k):
+            # Exactly what the real seam raises when init_schema sees a
+            # store newer than this build supports.
+            raise cli_mod._EnvironmentGuard(
+                "database schema version 99 is newer than this build supports"
+            )
+
+        with mock.patch.object(cli_mod, "_run_refresh_sync", runner):
+            code, payload, _out, err = self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", self.db,
+                 "--format", "json", "--max-age", "60"]
+            )
+        self.assertEqual(code, 2, "store_too_new must exit 2 like the sync path")
+        self.assertEqual((payload or {}).get("error", {}).get("code"),
+                         "environment_guard")
+
+    def test_foreign_file_journal_mode_untouched(self) -> None:
+        import sqlite3 as _sq
+
+        foreign = Path(self._td.name) / "foreign2.db"
+        conn = _sq.connect(str(foreign))
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("PRAGMA journal_mode = DELETE")
+        before = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        conn.close()
+        self.assertEqual(before, "delete")
+        from zaxbygraph import cli as cli_mod
+
+        with mock.patch.object(
+            cli_mod, "_run_refresh_sync",
+            side_effect=AssertionError("sync seam must not run"),
+        ):
+            self.run_cli(
+                ["item", "1", "--repo", REPO, "--db", str(foreign),
+                 "--format", "json", "--max-age", "60"]
+            )
+        conn = _sq.connect(str(foreign))
+        try:
+            after = conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+        finally:
+            conn.close()
+        self.assertEqual(
+            after, "delete",
+            "a declined refresh must not convert a foreign file to WAL",
+        )
+
+
+class AsciiStrictnessTests(unittest.TestCase):
+    """PR #47 review: non-ASCII digits and int() laxity must not parse."""
+
+    def test_fullwidth_digit_ports_rejected(self) -> None:
+        from zaxbygraph.repo import _loopback_authority, _valid_forge_host
+
+        self.assertFalse(_loopback_authority("127.0.0.1:١٢٣"))
+        self.assertFalse(_loopback_authority("[::1]:١٢٣"))
+        self.assertFalse(_valid_forge_host("host:١٢"))
+
+    def test_max_age_strict_forms(self) -> None:
+        from argparse import ArgumentTypeError
+        from zaxbygraph.cli import _parse_max_age
+
+        for bad in ("1_0", "+5", " 5 ", "١٠", "1.5h"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ArgumentTypeError):
+                    _parse_max_age(bad)
+        self.assertEqual(_parse_max_age("90"), 90)
+        self.assertEqual(_parse_max_age("2h"), 7200)
+
+    def test_max_comments_strict_forms(self) -> None:
+        from argparse import ArgumentTypeError
+        from zaxbygraph.cli import _parse_comment_cap
+
+        for bad in ("1_0", "+5", "-1", "abc", "١"):
+            with self.subTest(value=bad):
+                with self.assertRaises(ArgumentTypeError):
+                    _parse_comment_cap(bad)
+        self.assertEqual(_parse_comment_cap("3"), 3)
+        self.assertEqual(_parse_comment_cap("0"), 0)
+
+    def test_cap_comments_negative_k_raises(self) -> None:
+        from zaxbygraph.query import cap_comments
+
+        with self.assertRaises(ValueError):
+            cap_comments({"comments": []}, -1, "o/r")
+
+    def test_redact_url_masks_scp_credentials(self) -> None:
+        from zaxbygraph.repo import _redact_url
+
+        self.assertEqual(
+            _redact_url("user:pass@host.corp:owner/repo"),
+            "***@host.corp:owner/repo",
+        )
+        self.assertEqual(
+            _redact_url("https://user:pass@github.com/owner/repo"),
+            "https://***@github.com/owner/repo",
+        )
+        self.assertEqual(
+            _redact_url("git@github.com:org/repo"),
+            "git@github.com:org/repo",
+            "the passwordless scp form must stay readable",
+        )
 
 
 class ParserSurfacePinTests(unittest.TestCase):
@@ -439,11 +614,16 @@ class MaxAgeBoundaryTests(_CliStore):
         )
         self.conn.commit()
 
-    def test_boundary_age_equals_budget_does_not_refresh(self) -> None:
+    def test_age_within_budget_does_not_refresh(self) -> None:
+        # Deterministic margin instead of an exact-equality boundary: the
+        # age is second-truncated wall clock re-read inside the CLI, so an
+        # exact ==-budget stamp flips with sub-second startup latency (the
+        # windows-3.13 CI red). 30s of margin still proves the "<= means no
+        # refresh" comparison without racing the clock (PR #47 review).
         from zaxbygraph import cli as cli_mod
 
         calls = []
-        self._set_stamp(600)
+        self._set_stamp(570)
         with mock.patch.object(
             cli_mod, "_run_refresh_sync",
             side_effect=lambda *a, **k: calls.append(1) or 0,
@@ -453,7 +633,9 @@ class MaxAgeBoundaryTests(_CliStore):
                  "--format", "json", "--max-age", "600"]
             )
         self.assertEqual(code, 0, err)
-        self.assertEqual(calls, [], "age == budget is not older-than; no sync")
+        self.assertEqual(
+            calls, [], "age under budget is not older-than; no sync"
+        )
         self.assertIsNot(
             (payload or {}).get("freshness", {}).get("refreshed"), True
         )

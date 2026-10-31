@@ -378,7 +378,7 @@ def _parse_max_age(value: str) -> int:
 
     A negative or malformed value raises ArgumentTypeError, which argparse
     turns into the standard usage error (exit 2)."""
-    text = str(value).strip().lower()
+    text = str(value).lower()
     if not text:
         raise argparse.ArgumentTypeError("empty --max-age value")
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
@@ -386,15 +386,24 @@ def _parse_max_age(value: str) -> int:
         num, unit = text[:-1], text[-1]
     else:
         num, unit = text, "s"
-    try:
-        n = int(num)
-    except ValueError:
+    # ASCII digits only: int() also accepts "1_0", "+5" and non-ASCII
+    # numerics, silently reinterpreting mistyped budgets (PR review).
+    if re.fullmatch(r"[0-9]+", num) is None:
         raise argparse.ArgumentTypeError(
             f"invalid --max-age value: {value!r}"
-        ) from None
-    if n < 0:
-        raise argparse.ArgumentTypeError("--max-age must be >= 0")
-    return n * units[unit]
+        )
+    return int(num) * units[unit]
+
+
+def _parse_comment_cap(value: str) -> int:
+    """--max-comments K: ASCII non-negative integer, rejected at the parser
+    so the answer does not depend on the item existing (PR review)."""
+    text = str(value).strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-comments value: {value!r}"
+        )
+    return int(text)
 
 
 def _sync_core(
@@ -428,18 +437,33 @@ def _sync_core(
     )
 
 
-def _run_refresh_sync(conn: sqlite3.Connection, slug: str) -> int:
+class _EnvironmentGuard(RuntimeError):
+    """A non-retryable environment fault (schema newer than this build,
+    SQLite floor) raised out of the refresh seam; the caller maps it to the
+    coded environment_guard envelope, exit 2 — matching the sync path —
+    while every other refresh failure stays refresh_failed, exit 1 (the
+    frozen C11 contract)."""
+
+
+def _run_refresh_sync(
+    conn: sqlite3.Connection, slug: str, *, include_patches: bool = False
+) -> int:
     """The --max-age refresh seam (issue #31 AC5): one quiet incremental sync
     against the open writable connection, returning 0 on success and raising
     on failure (the caller reports the error envelope — never a stale answer
     with a false refreshed bit). Checks stub this module-level symbol to
-    exercise the refresh offline."""
-    init_schema(conn)
+    exercise the refresh offline. include_patches carries the store's own
+    retention so a refresh never downgrades a patch-synced store (PR review)."""
+    try:
+        init_schema(conn)
+    except RuntimeError as exc:
+        # store_too_new / floor: environment, not a sync failure.
+        raise _EnvironmentGuard(str(exc)) from exc
     _sync_core(
         conn,
         slug,
         force=False,
-        include_patches=False,
+        include_patches=include_patches,
         jsonl_path=None,
         numbers=None,
         source_name="graphql",
@@ -451,42 +475,53 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
     """--max-age D: refresh the resolved store first when it is older than D
     seconds (issue #31 AC5).
 
-    The refresh runs under the sync lock, WAITING on contention and
-    re-checking staleness after acquiring (another writer may have refreshed
-    while we waited). On success the caller's read proceeds and the envelope
-    reports freshness.refreshed: true - the store was refreshed during this
-    invocation, by this process or by the writer it waited for. On failure
-    the error is re-raised as a coded _ReadFailure: the read never answers a
-    stale payload after a failed refresh. Without the flag this is a no-op
-    and reads never write (AC12). No file on disk, or a valid SQLite file
-    that is not this repo's corpus store, is a no-op too - refresh never
-    creates or seeds a corpus; the read path's own guards answer."""
+    The staleness decision is made on a READ-ONLY open (a --max-age read
+    never touches a store it does not have to: foreign SQLite files, legacy
+    candidates and read-only media behave exactly as without the flag). The
+    writable connection is opened only under the sync lock, after the
+    under-lock re-check confirms a refresh is still needed. The refresh runs
+    with the store's own include_patches retention. On failure the error is
+    re-raised as a coded _ReadFailure: the read never answers a stale
+    payload after a failed refresh. Without the flag this is a no-op and
+    reads never write (AC12). The wait on a contended lock is unbounded by
+    design, matching `sync --wait`."""
     budget = getattr(args, "max_age", None)
     if budget is None or slug is None:
         return False
     if not db_path.exists():
         return False
     try:
-        conn = connect(db_path)
+        ro = open_existing(db_path)
     except RuntimeError as exc:
         raise _ReadFailure(2, str(exc), code_key="environment_guard")
     except sqlite3.DatabaseError as exc:
-        # A corrupt/non-store file fails on connect's first page-touching
-        # statement: the store_unreadable envelope, never a traceback - the
-        # same fault without --max-age answers the same shape (4.5 review R1).
+        # Newer SQLite raises from the first prepared statement on a corrupt
+        # file; the read path answers the same store_unreadable envelope.
         raise _ReadFailure(
             1, f"{db_path} is not a zaxbygraph database: {exc}",
             code_key="store_unreadable",
         )
     try:
-        row = conn.execute(
-            "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
-        ).fetchone()
+        try:
+            row = ro.execute(
+                "SELECT repo, include_patches FROM sync_state WHERE lower(repo) = ?",
+                (slug,),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                # A valid SQLite file that is not this repo's corpus store:
+                # refresh never seeds one; the read path's own guards answer.
+                return False
+            # A transient storage fault (e.g. a locked database): fail the
+            # read rather than silently serving a stale payload.
+            raise _ReadFailure(
+                1, f"refresh failed: {exc}", code_key="refresh_failed"
+            )
+        row = row.fetchone()
         if row is None:
-            # Not this repo's corpus store: never seed a corpus schema into
-            # a foreign file; the read path answers downstream.
             return False
-        age = _freshness(conn, slug).get("age_s")
+        include_patches = bool(row["include_patches"])
+        age = _freshness(ro, slug).get("age_s")
         if age is not None and age <= budget:
             return False
         try:
@@ -504,33 +539,47 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
             )
         try:
             # Re-check under the lock: another writer may have refreshed
-            # while we waited, so this invocation never double-syncs.
-            row = conn.execute(
+            # while we waited, so this invocation never double-syncs. (The
+            # boundary is intentionally approximate to +-1s of the budget:
+            # age is second-truncated wall-clock time, re-read here.)
+            row = ro.execute(
                 "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
             ).fetchone()
             if row is None:
                 return False
-            age = _freshness(conn, slug).get("age_s")
+            age = _freshness(ro, slug).get("age_s")
             if age is None or age > budget:
                 try:
-                    _run_refresh_sync(conn, slug)
+                    conn = connect(db_path)
+                except RuntimeError as exc:
+                    raise _ReadFailure(2, str(exc), code_key="environment_guard")
+                try:
+                    _run_refresh_sync(conn, slug, include_patches=include_patches)
+                except _EnvironmentGuard as exc:
+                    # Non-retryable environment guards (schema too new,
+                    # SQLite floor) exit 2 like the sync path (PR review);
+                    # other failures keep the frozen C11 exit-1 contract.
+                    raise _ReadFailure(2, str(exc), code_key="environment_guard")
                 except Exception as exc:
                     raise _ReadFailure(
                         1,
                         f"refresh failed: {exc}",
                         code_key="refresh_failed",
                     )
+                finally:
+                    conn.close()
             return True
         finally:
             lock.release_owned()
-    except sqlite3.DatabaseError:
-        # A valid SQLite file that is not this repo's corpus store: refresh
-        # never seeds a corpus schema into it; the read path's own
-        # no-corpus/store_unreadable guards answer downstream.
-        return False
+    except sqlite3.DatabaseError as exc:
+        # The corpus probe failed on a non-corrupt-unrelated fault: the same
+        # store_unreadable envelope the read path itself will answer.
+        raise _ReadFailure(
+            1, f"{db_path} is not a zaxbygraph database: {exc}",
+            code_key="store_unreadable",
+        )
     finally:
-        conn.close()
-
+        ro.close()
 
 def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | None, Path]:
     """Resolution + corpus guards for every read command (issue #2 AC3/AC4).
@@ -881,16 +930,6 @@ def cmd_item(args: argparse.Namespace) -> int:
         if data is not None:
             cap = getattr(args, "max_comments", None)
             if cap is not None:
-                if cap < 0:
-                    conn.close()
-                    return emit_failure(
-                        args,
-                        2,
-                        "--max-comments must be >= 0",
-                        slug=repo,
-                        db_path=db_path,
-                        code_key="bad_flags",
-                    )
                 # Cap the FINAL payload's comments array (issue #31 AC4), so
                 # item, --history and --as-of all honor the bound.
                 data = cap_comments(data, cap, repo)
@@ -1693,6 +1732,13 @@ def cmd_where(args: argparse.Namespace) -> int:
             store_error = str(exc)
             fresh = None
             line = None
+        except RuntimeError as exc:
+            # Environment guards (SQLite floor, FTS5 probe) are reported in
+            # the payload like any other store fault — where is the
+            # diagnostic a broken environment needs most (PR #47 review).
+            store_error = str(exc)
+            fresh = None
+            line = None
     elif not repo and store_path.exists():
         # Slug-less where: report file-scoped facts. items is the UNFILTERED
         # count (matching --repo '' = no-filter); watermark/complete are
@@ -1709,6 +1755,8 @@ def cmd_where(args: argparse.Namespace) -> int:
             finally:
                 conn.close()
         except sqlite3.DatabaseError as exc:
+            store_error = str(exc)
+        except RuntimeError as exc:
             store_error = str(exc)
     data = {
         "cwd": str(cwd),
@@ -2056,7 +2104,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--max-comments",
         dest="max_comments",
-        type=int,
+        type=_parse_comment_cap,
         default=None,
         metavar="K",
         help="Cap the comment list to K entries (first, last and maintainer"

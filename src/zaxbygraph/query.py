@@ -1620,6 +1620,10 @@ def cap_comments(data: dict, max_comments: int, repo: str | None = None) -> dict
     chronological (item comments are stored ORDER BY created_at).
     `comments_omitted` reports the dropped count — 0 when nothing was
     capped, and `total` when K is 0."""
+    if max_comments < 0:
+        # A negative cap is a caller bug, not a truncation request: slicing
+        # would silently keep total-1 comments with a misleading counter.
+        raise ValueError("max_comments must be >= 0")
     data["comments_omitted"] = 0
     comments = data.get("comments")
     if not isinstance(comments, list) or len(comments) <= max_comments:

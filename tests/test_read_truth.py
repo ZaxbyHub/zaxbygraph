@@ -722,6 +722,11 @@ class DocsAndCiTests(unittest.TestCase):
         env = dict(os.environ)
         env["PYTHONPATH"] = str(REPO_ROOT / "src")
         for command in commands:
+            # Skip a pytest-form command where pytest is not importable,
+            # exactly like C14: the suite is stdlib-only and CI installs
+            # pytest separately (CHECK_WRONG amendment, PR #47 review).
+            if "pytest" in command and find_spec("pytest") is None:
+                self.skipTest(f"pytest not importable; skipping {command!r}")
             with self.subTest(command=command):
                 concrete = (
                     command.replace("<file>", "tests/test_store.py")

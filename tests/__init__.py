@@ -1,10 +1,10 @@
 # Test package for unittest discovery.
 #
-# Make `from fixtures.py` importable under every documented check form
-# (issue #31): `python -m unittest tests.<module>` imports this package
-# first, and pytest package-mode collection imports it during collection —
-# both now find tests/fixtures.py. Plain discovery already inserts the
-# directory itself. Idempotent; prepends only this tests/ directory.
+# Make `from fixtures import ...` work under the check forms that import
+# this package: `python -m unittest tests.<module>` and pytest package-mode
+# collection. (Plain `unittest discover` never imports the tests package -
+# it puts the directory on sys.path itself.) Idempotent; prepends only this
+# tests/ directory.
 import os
 import sys
 
