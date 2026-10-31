@@ -571,9 +571,15 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
             return True
         finally:
             lock.release_owned()
+    except sqlite3.OperationalError as exc:
+        # A transient storage fault under the lock (e.g. database locked):
+        # fail the read loudly, but do not call a healthy store corrupt.
+        raise _ReadFailure(
+            1, f"refresh failed: {exc}", code_key="refresh_failed"
+        )
     except sqlite3.DatabaseError as exc:
-        # The corpus probe failed on a non-corrupt-unrelated fault: the same
-        # store_unreadable envelope the read path itself will answer.
+        # A corrupt/non-store file: the same store_unreadable envelope the
+        # read path itself will answer.
         raise _ReadFailure(
             1, f"{db_path} is not a zaxbygraph database: {exc}",
             code_key="store_unreadable",

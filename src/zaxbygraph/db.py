@@ -72,9 +72,13 @@ def assert_fts5_available(conn: sqlite3.Connection) -> None:
     bare "no such module: fts5" SQL error mid-query. The compile-option
     probe is a plain read (SQLITE_FUNCTION allows non-extension functions,
     so it also passes the `sql` command's default-deny authorizer) and is
-    validated across the supported CI matrix (win/ubuntu x 3.11-3.14). A
-    corrupt file raises sqlite3.DatabaseError from the probe untouched —
-    the store_unreadable contract, never a guard misclassification."""
+    validated across the supported CI matrix (win/ubuntu x 3.11-3.14). The
+    probe checks build metadata only and never touches database pages, so a
+    corrupt file does NOT raise here (on newer SQLite builds the prepared
+    statement itself fails on a corrupt header — also surfacing as
+    DatabaseError); either way corruption keeps the store_unreadable
+    contract from the first file-touching statement, never a guard
+    misclassification (PR #47 review)."""
     row = conn.execute(
         "SELECT sqlite_compileoption_used('ENABLE_FTS5')"
     ).fetchone()

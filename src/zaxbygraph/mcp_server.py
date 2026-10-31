@@ -737,7 +737,6 @@ def _tool_sql(arguments: dict, ctx) -> dict:
             db_path=db_path,
         ) from None
     except RuntimeError as exc:
-        conn.close()
         raise ToolError(
             "runtime",
             str(exc),

@@ -829,6 +829,25 @@ full history lives in the `comments` and `reviews` tables.
 
 Full column-level reference: [`docs/schema.md`](docs/schema.md).
 
+### Loopback git-proxy remotes (`ZAXBYGRAPH_PROXY_FORGE_HOST`)
+
+A remote like `http://user@127.0.0.1:<port>/git/<org>/<repo>` (a cloud/remote
+session's loopback git proxy; any of `127.0.0.1`, `localhost`, `::1`,
+`[::1]` as the host) resolves to `github.com/<org>/<repo>` instead of an
+ephemeral per-port store key. `ZAXBYGRAPH_PROXY_FORGE_HOST` redirects the
+rewrite at another forge, with four states:
+
+| `ZAXBYGRAPH_PROXY_FORGE_HOST` | Behavior |
+|---|---|
+| unset | Rewrite to `github.com/<org>/<repo>` (the default; proxies front GitHub today). |
+| valid `host[:port]` | Rewrite to `<value>/<org>/<repo>` verbatim (lowercased, port kept), e.g. `gitlab.internal:8443`. |
+| set, non-empty, unparseable | Rewrite disabled; the remote parses (or fails to) exactly as without the variable. |
+| set but empty/whitespace | Opt out — same as unparseable. |
+
+A "valid" value is `host[:port]`: ASCII dot-separated labels (`a-z0-9_`,
+hyphens inside labels), optional 1-5 digit port. Only `git/`-prefixed paths
+on loopback hosts are rewritten; every other remote parses unchanged.
+
 ### What `closes` means
 
 There are two closing relations, and they answer different questions.
