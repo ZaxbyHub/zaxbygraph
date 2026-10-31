@@ -376,6 +376,17 @@ def _open_corpus(slug: str, db_path: Path) -> sqlite3.Connection:
             slug=slug,
             db_path=db_path,
         ) from None
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, FTS5 probe) get a coded
+        # ToolError like every other fault, not the session's generic
+        # internal-error path (PR #47 review).
+        raise ToolError(
+            "runtime",
+            str(exc),
+            hint="the environment guard rejected this store open",
+            slug=slug,
+            db_path=db_path,
+        ) from None
     try:
         try:
             row = conn.execute(
@@ -725,6 +736,14 @@ def _tool_sql(arguments: dict, ctx) -> dict:
             slug=slug,
             db_path=db_path,
         ) from None
+    except RuntimeError as exc:
+        raise ToolError(
+            "runtime",
+            str(exc),
+            hint="the environment guard rejected this store open",
+            slug=slug,
+            db_path=db_path,
+        ) from None
     finally:
         conn.close()
     limit = min(_clamp_limit(_int_arg(arguments, "limit", 200)), _MAX_PAGE)
@@ -886,12 +905,12 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "file_history",
-        "description": "PRs that touched a path, newest first, each with the issues it closed",
+        "description": "PRs that touched a path, newest first, each entry carrying closed_issues (GitHub-reported) and keyword_closes (keyword-derived)",
         "inputSchema": _schema({"path": {"type": "string"}, "limit": _LIMIT, "cursor": _CURSOR, **_REPO_DB}, ["path"]),
     },
     {
         "name": "what_closed",
-        "description": "Closing PRs and commits for an issue (reports the item kind; a PR has no closers), each entry carrying its edge source provenance",
+        "description": "Closing PRs (prs), keyword-derived closing items (keyword_closes) and commits for an issue (reports the item kind; a PR has no closers), each entry carrying its edge source provenance",
         "inputSchema": _schema({"number": {"type": "integer"}, **_REPO_DB}, ["number"]),
     },
     {

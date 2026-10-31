@@ -1431,8 +1431,10 @@ def file_history(
     """The PRs that touched `path`, newest first, each with its closed issues.
 
     Newest first is items.updated_at DESC with the number as a stable
-    tiebreak. closed_issues collects the PR's `closes` edges (issue
-    endpoints, any provenance stream). Over-fetches limit+1 rows so callers
+    tiebreak. closed_issues collects the PR's `closes` edges (GitHub-reported
+    only); keyword_closes collects its `closes_keyword` edges separately, so
+    a REST-only store whose only closure evidence is keyword-derived still
+    answers truthfully (issue #31 AC1). Over-fetches limit+1 rows so callers
     can set the envelope truncated flag without a COUNT."""
     limit = _clamp_limit(limit)
     repo = _fold_repo(repo)
@@ -1471,11 +1473,23 @@ def file_history(
                 "AND rel = 'closes' AND dst_type = 'item'",
                 (repo, str(n)),
             ).fetchall()
+            kw_closes = conn.execute(
+                f"SELECT dst_id{source_col} FROM edges "
+                "WHERE repo = ? AND src_type = 'item' AND src_id = ? "
+                "AND rel = 'closes_keyword' AND dst_type = 'item'",
+                (repo, str(n)),
+            ).fetchall()
         else:
             closes = conn.execute(
                 f"SELECT dst_id{source_col} FROM edges "
                 "WHERE src_type = 'item' AND src_id = ? "
                 "AND rel = 'closes' AND dst_type = 'item'",
+                (str(n),),
+            ).fetchall()
+            kw_closes = conn.execute(
+                f"SELECT dst_id{source_col} FROM edges "
+                "WHERE src_type = 'item' AND src_id = ? "
+                "AND rel = 'closes_keyword' AND dst_type = 'item'",
                 (str(n),),
             ).fetchall()
         entries.append(
@@ -1486,6 +1500,7 @@ def file_history(
                 "updated_at": row["updated_at"],
                 "html_url": row["html_url"],
                 "closed_issues": sorted({int(c["dst_id"]) for c in closes}),
+                "keyword_closes": sorted({int(c["dst_id"]) for c in kw_closes}),
             }
         )
     return {
@@ -1505,7 +1520,11 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
     PRs come from `closes` edges whose destination is this item (the source
     endpoint is the closing PR, provenance closing_ref/timeline); commits
     come from `closed_by_commit` edges sourced at this item (destination is
-    the commit sha, provenance timeline). Every entry carries its edge's
+    the commit sha, provenance timeline). keyword_closes reports the
+    keyword-derived closures (`closes_keyword` edges) separately, so a
+    REST-only store whose only closure evidence is keyword-derived still
+    answers truthfully (issue #31 AC1); `prs` stays GitHub-reported only.
+    Every entry carries its edge's
     `source`; after reopen/re-close cycles multiple closers coexist. A
     pre-v5 database degrades with index_stale like item/related."""
     number = int(number)
@@ -1526,6 +1545,12 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
             "AND dst_type = 'item' AND dst_id = ?",
             (repo, str(number)),
         ).fetchall()
+        keyword_rows = conn.execute(
+            f"SELECT src_id, evidence{source_col} FROM edges INDEXED BY idx_edges_dst "
+            "WHERE repo = ? AND src_type = 'item' AND rel = 'closes_keyword' "
+            "AND dst_type = 'item' AND dst_id = ?",
+            (repo, str(number)),
+        ).fetchall()
         commit_rows = conn.execute(
             f"SELECT dst_id, evidence{source_col} FROM edges "
             "WHERE repo = ? AND rel = 'closed_by_commit' AND src_type = 'item' AND src_id = ?",
@@ -1535,6 +1560,12 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
         pr_rows = conn.execute(
             f"SELECT src_id, evidence{source_col} FROM edges "
             "WHERE src_type = 'item' AND rel = 'closes' "
+            "AND dst_type = 'item' AND dst_id = ?",
+            (str(number),),
+        ).fetchall()
+        keyword_rows = conn.execute(
+            f"SELECT src_id, evidence{source_col} FROM edges "
+            "WHERE src_type = 'item' AND rel = 'closes_keyword' "
             "AND dst_type = 'item' AND dst_id = ?",
             (str(number),),
         ).fetchall()
@@ -1552,6 +1583,15 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
         if source_available:
             entry["source"] = row["source"]
         prs.append(entry)
+    keyword_closes = []
+    for row in keyword_rows:
+        entry = {
+            "number": int(row["src_id"]),
+            "evidence": row["evidence"],
+        }
+        if source_available:
+            entry["source"] = row["source"]
+        keyword_closes.append(entry)
     commits = []
     for row in commit_rows:
         entry = {
@@ -1565,6 +1605,44 @@ def what_closed(conn: sqlite3.Connection, number: int, repo: str | None = None) 
         "number": number,
         "kind": kind,
         "prs": prs,
+        "keyword_closes": keyword_closes,
         "commits": commits,
         "index_stale": not source_available,
     }
+
+
+def cap_comments(data: dict, max_comments: int, repo: str | None = None) -> dict:
+    """Cap `data['comments']` to `max_comments` entries (issue #31 AC4).
+
+    Preference: the first comment, the last comment, then every maintainer
+    comment (author login equals the repo slug's owner, case-insensitive);
+    any remaining slots fill most-recent-first. The survivors stay
+    chronological (item comments are stored ORDER BY created_at).
+    `comments_omitted` reports the dropped count — 0 when nothing was
+    capped, and `total` when K is 0."""
+    if max_comments < 0:
+        # A negative cap is a caller bug, not a truncation request: slicing
+        # would silently keep total-1 comments with a misleading counter.
+        raise ValueError("max_comments must be >= 0")
+    data["comments_omitted"] = 0
+    comments = data.get("comments")
+    if not isinstance(comments, list) or len(comments) <= max_comments:
+        return data
+    total = len(comments)
+    owner = repo.split("/", 1)[0].lower() if repo and "/" in repo else None
+    maintainer = [
+        i
+        for i, c in enumerate(comments)
+        if owner is not None and str((c or {}).get("author") or "").lower() == owner
+    ]
+    seen: set[int] = set()
+    slots: list[int] = []
+    for i in (0, total - 1, *maintainer):
+        if 0 <= i < total and i not in seen:
+            seen.add(i)
+            slots.append(i)
+    slots.extend(i for i in range(total - 1, -1, -1) if i not in seen)
+    keep = set(slots[:max_comments])
+    data["comments"] = [c for i, c in enumerate(comments) if i in keep]
+    data["comments_omitted"] = total - len(data["comments"])
+    return data

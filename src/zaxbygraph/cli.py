@@ -28,6 +28,7 @@ from zaxbygraph.paths import (
 )
 from zaxbygraph.query import (
     assert_read_sql,
+    cap_comments,
     churn,
     _clamp_limit,
     export_graph,
@@ -231,6 +232,14 @@ def emit_result(
     one-line stderr error echo on
     failure (the human contract the error-channel tests pin; the structured
     envelope goes to stdout)."""
+    # --max-age refreshed the store on this invocation (issue #31 AC5): the
+    # flag is stamped by _refresh_if_stale and merged into every dispatcher's
+    # freshness block here, the one shared envelope builder.
+    if getattr(args, "_refreshed", False):
+        if freshness is None:
+            freshness = _freshness(conn, slug)
+        if freshness is not None:
+            freshness = {**freshness, "refreshed": True}
     fields = _fields_of(args)
     payload = data
     columns: list[str] | None = None
@@ -364,6 +373,220 @@ def _resolved_repo(args: argparse.Namespace) -> tuple[str | None, str]:
     return validate_slug(repo_flag), DEFAULT_HOST
 
 
+def _parse_max_age(value: str) -> int:
+    """--max-age D: integer seconds or <n><s|m|h|d> (issue #31 AC5).
+
+    A negative or malformed value raises ArgumentTypeError, which argparse
+    turns into the standard usage error (exit 2)."""
+    text = str(value).lower()
+    if not text:
+        raise argparse.ArgumentTypeError("empty --max-age value")
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if text[-1] in units and text[:-1]:
+        num, unit = text[:-1], text[-1]
+    else:
+        num, unit = text, "s"
+    # ASCII digits only: int() also accepts "1_0", "+5" and non-ASCII
+    # numerics, silently reinterpreting mistyped budgets (PR review).
+    if re.fullmatch(r"[0-9]+", num) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-age value: {value!r}"
+        )
+    return int(num) * units[unit]
+
+
+def _parse_comment_cap(value: str) -> int:
+    """--max-comments K: ASCII non-negative integer, rejected at the parser
+    so the answer does not depend on the item existing (PR review)."""
+    text = str(value).strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-comments value: {value!r}"
+        )
+    return int(text)
+
+
+def _sync_core(
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    force: bool,
+    include_patches: bool,
+    jsonl_path: Path | None,
+    numbers: list[int] | None,
+    source_name: str,
+) -> dict:
+    """One quiet sync_repo call against an open writable connection (issue #31).
+
+    cmd_sync and the --max-age refresh share this so both paths issue exactly
+    one sync_repo call. Neither path acquires the lock here — the caller owns
+    the lock and maps failures to its own reporting channel (cmd_sync to its
+    result envelope, the refresh path to a coded _ReadFailure)."""
+    if source_name == "rest":
+        source: object = GhRestSource(*slug.split("/", 1))
+    else:
+        source = GhApiSource(*slug.split("/", 1))
+    return sync_repo(
+        conn,
+        source,
+        slug,
+        force=force,
+        include_patches=include_patches,
+        jsonl_path=jsonl_path,
+        numbers=numbers,
+    )
+
+
+class _EnvironmentGuard(RuntimeError):
+    """A non-retryable environment fault (schema newer than this build,
+    SQLite floor) raised out of the refresh seam; the caller maps it to the
+    coded environment_guard envelope, exit 2 — matching the sync path —
+    while every other refresh failure stays refresh_failed, exit 1 (the
+    frozen C11 contract)."""
+
+
+def _run_refresh_sync(
+    conn: sqlite3.Connection, slug: str, *, include_patches: bool = False
+) -> int:
+    """The --max-age refresh seam (issue #31 AC5): one quiet incremental sync
+    against the open writable connection, returning 0 on success and raising
+    on failure (the caller reports the error envelope — never a stale answer
+    with a false refreshed bit). Checks stub this module-level symbol to
+    exercise the refresh offline. include_patches carries the store's own
+    retention so a refresh never downgrades a patch-synced store (PR review)."""
+    try:
+        init_schema(conn)
+    except RuntimeError as exc:
+        # store_too_new / floor: environment, not a sync failure.
+        raise _EnvironmentGuard(str(exc)) from exc
+    _sync_core(
+        conn,
+        slug,
+        force=False,
+        include_patches=include_patches,
+        jsonl_path=None,
+        numbers=None,
+        source_name="graphql",
+    )
+    return 0
+
+
+def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None) -> bool:
+    """--max-age D: refresh the resolved store first when it is older than D
+    seconds (issue #31 AC5).
+
+    The staleness decision is made on a READ-ONLY open (a --max-age read
+    never touches a store it does not have to: foreign SQLite files, legacy
+    candidates and read-only media behave exactly as without the flag). The
+    writable connection is opened only under the sync lock, after the
+    under-lock re-check confirms a refresh is still needed. The refresh runs
+    with the store's own include_patches retention. On failure the error is
+    re-raised as a coded _ReadFailure: the read never answers a stale
+    payload after a failed refresh. Without the flag this is a no-op and
+    reads never write (AC12). The wait on a contended lock is unbounded by
+    design, matching `sync --wait`."""
+    budget = getattr(args, "max_age", None)
+    if budget is None or slug is None:
+        return False
+    if not db_path.exists():
+        return False
+    try:
+        ro = open_existing(db_path)
+    except RuntimeError as exc:
+        raise _ReadFailure(2, str(exc), code_key="environment_guard")
+    except sqlite3.DatabaseError as exc:
+        # Newer SQLite raises from the first prepared statement on a corrupt
+        # file; the read path answers the same store_unreadable envelope.
+        raise _ReadFailure(
+            1, f"{db_path} is not a zaxbygraph database: {exc}",
+            code_key="store_unreadable",
+        )
+    try:
+        try:
+            row = ro.execute(
+                "SELECT repo, include_patches FROM sync_state WHERE lower(repo) = ?",
+                (slug,),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                # A valid SQLite file that is not this repo's corpus store:
+                # refresh never seeds one; the read path's own guards answer.
+                return False
+            # A transient storage fault (e.g. a locked database): fail the
+            # read rather than silently serving a stale payload.
+            raise _ReadFailure(
+                1, f"refresh failed: {exc}", code_key="refresh_failed"
+            )
+        row = row.fetchone()
+        if row is None:
+            return False
+        include_patches = bool(row["include_patches"])
+        age = _freshness(ro, slug).get("age_s")
+        if age is not None and age <= budget:
+            return False
+        try:
+            lock = acquire_sync_lock(db_path, wait=True)
+        except OSError as exc:
+            raise _ReadFailure(
+                1, f"refresh failed: {exc}", code_key="refresh_failed"
+            )
+        if lock is None:
+            raise _ReadFailure(
+                1,
+                "could not acquire the sync lock for the --max-age refresh"
+                " (another zaxbygraph process holds it)",
+                code_key="refresh_failed",
+            )
+        try:
+            # Re-check under the lock: another writer may have refreshed
+            # while we waited, so this invocation never double-syncs. (The
+            # boundary is intentionally approximate to +-1s of the budget:
+            # age is second-truncated wall-clock time, re-read here.)
+            row = ro.execute(
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?", (slug,)
+            ).fetchone()
+            if row is None:
+                return False
+            age = _freshness(ro, slug).get("age_s")
+            if age is None or age > budget:
+                try:
+                    conn = connect(db_path)
+                except RuntimeError as exc:
+                    raise _ReadFailure(2, str(exc), code_key="environment_guard")
+                try:
+                    _run_refresh_sync(conn, slug, include_patches=include_patches)
+                except _EnvironmentGuard as exc:
+                    # Non-retryable environment guards (schema too new,
+                    # SQLite floor) exit 2 like the sync path (PR review);
+                    # other failures keep the frozen C11 exit-1 contract.
+                    raise _ReadFailure(2, str(exc), code_key="environment_guard")
+                except Exception as exc:
+                    raise _ReadFailure(
+                        1,
+                        f"refresh failed: {exc}",
+                        code_key="refresh_failed",
+                    )
+                finally:
+                    conn.close()
+            return True
+        finally:
+            lock.release_owned()
+    except sqlite3.OperationalError as exc:
+        # A transient storage fault under the lock (e.g. database locked):
+        # fail the read loudly, but do not call a healthy store corrupt.
+        raise _ReadFailure(
+            1, f"refresh failed: {exc}", code_key="refresh_failed"
+        )
+    except sqlite3.DatabaseError as exc:
+        # A corrupt/non-store file: the same store_unreadable envelope the
+        # read path itself will answer.
+        raise _ReadFailure(
+            1, f"{db_path} is not a zaxbygraph database: {exc}",
+            code_key="store_unreadable",
+        )
+    finally:
+        ro.close()
+
 def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | None, Path]:
     """Resolution + corpus guards for every read command (issue #2 AC3/AC4).
 
@@ -381,6 +604,11 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
         db_path, _chain = resolve_db(repo, explicit=explicit, host=host)
     except RepoError as exc:
         raise _ReadFailure(2, str(exc))
+    if repo is not None and getattr(args, "max_age", None) is not None:
+        # --max-age D (issue #31 AC5): refresh a stale store before reading.
+        # Scoped to repo-resolved reads; the no-filter branch below skips it
+        # because a sync needs a slug to scope to.
+        setattr(args, "_refreshed", _refresh_if_stale(args, db_path, repo))
     if repo is None:
         # Explicit no-filter: open whatever file was named, guards skipped.
         try:
@@ -390,6 +618,19 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
                 3,
                 f"no database at {db_path}; run: zaxbygraph sync --repo OWNER/REPO",
             )
+        except RuntimeError as exc:
+            # Environment guards (SQLite floor, FTS5 probe, issue #31 AC2)
+            # can never succeed on retry: coded bad_request, matching the
+            # sync path's exit-2 contract.
+            raise _ReadFailure(2, str(exc), code_key="environment_guard")
+        except sqlite3.DatabaseError as exc:
+            # A corrupt/non-store file raises from the first page-touching
+            # statement (now the FTS5 probe): keep the store_unreadable
+            # contract wherever the first failing statement sits.
+            raise _ReadFailure(
+                1, f"no database at {db_path}: {exc}",
+                code_key="store_unreadable",
+            )
     slug = repo
     try:
         conn = open_existing(db_path)
@@ -398,6 +639,19 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
             3,
             f"no graph for {slug}; resolved database: {db_path}; "
             f"run: zaxbygraph sync --repo {slug}",
+        )
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, FTS5 probe, issue #31 AC2) can
+        # never succeed on retry: coded bad_request, matching the sync
+        # path's exit-2 contract.
+        raise _ReadFailure(2, str(exc), code_key="environment_guard")
+    except sqlite3.DatabaseError as exc:
+        # A corrupt/non-store file raises from the first page-touching
+        # statement (now the FTS5 probe): keep the store_unreadable
+        # contract wherever the first failing statement sits.
+        raise _ReadFailure(
+            1, f"{db_path} is not a zaxbygraph database: {exc}",
+            code_key="store_unreadable",
         )
     try:
         try:
@@ -564,19 +818,17 @@ def cmd_sync(args: argparse.Namespace) -> int:
         jsonl = default_jsonl_dir(db_path)
     try:
         # Default source is the GraphQL bulk source (issue #5); `--source rest`
-        # keeps the plain REST source (now page-streaming).
-        if getattr(args, "source", "graphql") == "rest":
-            source: object = GhRestSource(*slug.split("/", 1))
-        else:
-            source = GhApiSource(*slug.split("/", 1))
-        result = sync_repo(
+        # keeps the plain REST source (now page-streaming). The call goes
+        # through the shared quiet core (issue #31) so the --max-age refresh
+        # path issues exactly the same one sync_repo call.
+        result = _sync_core(
             conn,
-            source,
             slug,
             force=args.force,
             include_patches=args.include_patches,
             jsonl_path=jsonl,
             numbers=numbers,
+            source_name=getattr(args, "source", "graphql"),
         )
     except SyncError as exc:
         emit_result(
@@ -648,6 +900,7 @@ def cmd_item(args: argparse.Namespace) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     try:
         at: datetime | None = None
@@ -681,6 +934,11 @@ def cmd_item(args: argparse.Namespace) -> int:
             elif getattr(args, "history", False):
                 data = item_history(conn, args.number, repo=repo)
         if data is not None:
+            cap = getattr(args, "max_comments", None)
+            if cap is not None:
+                # Cap the FINAL payload's comments array (issue #31 AC4), so
+                # item, --history and --as-of all honor the bound.
+                data = cap_comments(data, cap, repo)
             truncated = _truncate_bodies(data, args.max_body_chars)
             fresh = _freshness(conn, repo)
             line = _identity_line(conn, repo, db_path)
@@ -1345,6 +1603,7 @@ def cmd_sql(args: argparse.Namespace) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     conn.close()
     try:
@@ -1352,6 +1611,21 @@ def cmd_sql(args: argparse.Namespace) -> int:
     except (ValueError, FileNotFoundError) as exc:
         code = 3 if isinstance(exc, FileNotFoundError) else 2
         return emit_failure(args, code, str(exc), slug=repo, db_path=db_path)
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, FTS5 probe, issue #31 AC2) on the
+        # sql command's second connection surface as coded bad_request like
+        # every other read, never a traceback.
+        return emit_failure(
+            args, 2, str(exc), slug=repo, db_path=db_path,
+            code_key="environment_guard",
+        )
+    except sqlite3.Error as exc:
+        # A corrupt/non-store file raises from the first page-touching
+        # statement: the store_unreadable envelope, never a traceback.
+        return emit_failure(
+            args, 1, f"store unreadable: {exc}", slug=repo,
+            db_path=db_path, code_key="store_unreadable",
+        )
     try:
         try:
             data = run_sql(ro_conn, args.statement, limit=args.limit, repo=repo)
@@ -1464,6 +1738,13 @@ def cmd_where(args: argparse.Namespace) -> int:
             store_error = str(exc)
             fresh = None
             line = None
+        except RuntimeError as exc:
+            # Environment guards (SQLite floor, FTS5 probe) are reported in
+            # the payload like any other store fault — where is the
+            # diagnostic a broken environment needs most (PR #47 review).
+            store_error = str(exc)
+            fresh = None
+            line = None
     elif not repo and store_path.exists():
         # Slug-less where: report file-scoped facts. items is the UNFILTERED
         # count (matching --repo '' = no-filter); watermark/complete are
@@ -1480,6 +1761,8 @@ def cmd_where(args: argparse.Namespace) -> int:
             finally:
                 conn.close()
         except sqlite3.DatabaseError as exc:
+            store_error = str(exc)
+        except RuntimeError as exc:
             store_error = str(exc)
     data = {
         "cwd": str(cwd),
@@ -1558,6 +1841,7 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     if repo is None:
         # Explicit --repo "" skips every corpus guard in _open_for_read; the
@@ -1667,6 +1951,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     try:
         data = export_graph(conn, repo=repo)
@@ -1694,6 +1979,7 @@ def cmd_schema(args: argparse.Namespace) -> int:
             exc.message,
             slug=repo or getattr(args, "repo", None) or None,
             db_path=db_path or getattr(args, "db", None),
+            code_key=exc.code_key,
         )
     try:
         try:
@@ -1725,7 +2011,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"zaxbygraph {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    def add_common(sp: argparse.ArgumentParser, *, repo: bool = True) -> None:
+    def add_common(
+        sp: argparse.ArgumentParser, *, repo: bool = True, max_age: bool = False
+    ) -> None:
         sp.add_argument("--db", help="SQLite path (default: user-level store for the repo)")
         sp.add_argument(
             "--format",
@@ -1740,6 +2028,22 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if repo:
             sp.add_argument("--repo", help="OWNER/REPO (default: git origin)")
+        if max_age:
+            # --max-age D (issue #31 AC5): reads may bound staleness and pay
+            # one locked incremental sync for freshness. Off by default —
+            # without the flag reads never write (AC12). Deliberately absent
+            # from `sql` and the export/doctor writers: the sql escape hatch
+            # must never write, and the writers manage their own freshness.
+            sp.add_argument(
+                "--max-age",
+                dest="max_age",
+                type=_parse_max_age,
+                default=None,
+                metavar="D",
+                help="Refresh the store first when older than D seconds"
+                " (or Ns/Nm/Nh/Nd) via a locked incremental sync; reports"
+                " freshness.refreshed; without the flag reads never write",
+            )
 
     sp = sub.add_parser("sync", help="Fetch issues/PRs into the local graph")
     add_common(sp)
@@ -1776,14 +2080,14 @@ def build_parser() -> argparse.ArgumentParser:
         "status",
         help="Counts, watermark and corpus coverage (no bodies)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.set_defaults(func=cmd_status)
 
     sp = sub.add_parser(
         "search",
         help="relevance-ranked FTS search over titles, bodies, labels, comments, review bodies, and PR touched paths",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("query")
     sp.add_argument(
         "--limit",
@@ -1794,7 +2098,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("item", help="One issue/PR with comments, files, edges")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.add_argument(
         "--max-body-chars",
@@ -1802,6 +2106,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help="Truncate the item/comment/review bodies to N chars (marks truncated)",
+    )
+    sp.add_argument(
+        "--max-comments",
+        dest="max_comments",
+        type=_parse_comment_cap,
+        default=None,
+        metavar="K",
+        help="Cap the comment list to K entries (first, last and maintainer"
+        " comments preferred; reports comments_omitted)",
     )
     sp.add_argument(
         "--history",
@@ -1818,13 +2131,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_item)
 
     sp = sub.add_parser("related", help="1-hop neighborhood")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.add_argument("--depth", type=int, default=1)
     sp.set_defaults(func=cmd_related)
 
     sp = sub.add_parser("churn", help="Files ranked by PR touch count")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("--limit", type=int, default=30)
     sp.add_argument(
         "--merged-only",
@@ -1835,7 +2148,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_churn)
 
     sp = sub.add_parser("open", help="Open issues and pull requests")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument(
         "--limit",
         type=int,
@@ -1862,7 +2175,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_open)
 
     sp = sub.add_parser("path", help="Undirected path between two item numbers or file paths")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("a")
     sp.add_argument("b")
     sp.set_defaults(func=cmd_path)
@@ -1870,7 +2183,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "similar", help="Related items with per-signal evidence (derived, read-only)"
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.add_argument("--limit", type=int, default=20)
     sp.add_argument(
@@ -1884,7 +2197,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser(
         "explain", help="Full per-signal breakdown for one pair (derived, read-only)"
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("a", type=int)
     sp.add_argument("b", type=int)
     sp.add_argument("--ls-files", action="store_true")
@@ -1895,7 +2208,7 @@ def build_parser() -> argparse.ArgumentParser:
         "coupling",
         help="Files that change together with PATH (merged PRs, support/confidence/lift)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("path")
     sp.add_argument("--limit", type=int, default=20)
     sp.set_defaults(func=cmd_coupling)
@@ -1904,7 +2217,7 @@ def build_parser() -> argparse.ArgumentParser:
         "eval",
         help="Measure retrieval quality against GitHub-reported ground truth",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("mode", choices=["similar", "localize", "bundle"])
     sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
     sp.set_defaults(func=cmd_eval)
@@ -1913,7 +2226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "triage",
         help="Rank open issues by demand/leverage/risk/priority (derived, read-only)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("--limit", type=int, default=20, help="Page size (default 20)")
     sp.add_argument("--cursor", default=None, metavar="T:N", help="Page cursor from a previous payload")
     sp.add_argument(
@@ -1931,7 +2244,7 @@ def build_parser() -> argparse.ArgumentParser:
         "bundle",
         help="Greedy work bundles over the triage pool (derived, read-only)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("--size", default="2-3", metavar="N-M", help="Bundle size range (default 2-3)")
     sp.add_argument("--count", type=int, default=5, help="Maximum bundles (default 5)")
     sp.add_argument("--pool", default=None, metavar="N,M", help="Explicit pool member numbers")
@@ -1954,7 +2267,7 @@ def build_parser() -> argparse.ArgumentParser:
         "brief",
         help="One issue's work packet: features, body, comments, files, analog (derived, read-only)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.add_argument(
         "--budget-tokens", dest="budget_tokens", type=int, default=4000,
@@ -1986,7 +2299,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_sql)
 
     sp = sub.add_parser("schema", help="Table DDL and per-column notes from the live DB")
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument(
         "table",
         nargs="?",
@@ -2041,7 +2354,7 @@ def build_parser() -> argparse.ArgumentParser:
         "overlap",
         help="Shared files for each pair of PRs (the collision check)",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("numbers", type=int, nargs="+", metavar="NUMBER")
     sp.set_defaults(func=cmd_overlap)
 
@@ -2049,7 +2362,7 @@ def build_parser() -> argparse.ArgumentParser:
         "file-history",
         help="PRs that touched a path, newest first, with the issues they closed",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("path")
     sp.add_argument("--limit", type=int, default=30)
     sp.set_defaults(func=cmd_file_history)
@@ -2058,7 +2371,7 @@ def build_parser() -> argparse.ArgumentParser:
         "what-closed",
         help="Closing PRs and commits for an issue, with edge provenance",
     )
-    add_common(sp)
+    add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.set_defaults(func=cmd_what_closed)
 

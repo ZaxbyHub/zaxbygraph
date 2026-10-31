@@ -118,7 +118,7 @@ shouldn't.
 ### Portability
 
 - Windows is a first-class platform, not an afterthought — it is where this
-  mostly runs. CI covers Windows and Linux on 3.11 and 3.12. A test that
+  mostly runs. CI covers Windows and Linux on 3.11 through 3.14. A test that
   short-circuits on Windows is worse than no test, because it reports green
   while asserting nothing.
 - The SQLite floor is real and version-dependent (see `db.py`). If you use a

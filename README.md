@@ -38,13 +38,15 @@ Requires the [GitHub CLI](https://cli.github.com/), authenticated:
 gh auth login
 ```
 
-Tested on Windows and Linux; CI runs both on Python 3.11 and 3.12.
+Tested on Windows and Linux; CI runs both on Python 3.11 through 3.14.
 
 **SQLite 3.35.0+** (March 2021) is also required — Python links SQLite at build
 time, so this is a property of your Python, not a package you install. Any
 current platform satisfies it; a very old Linux (Ubuntu 20.04 ships SQLite
 3.31) does not. The CLI checks on connect and fails with an explicit message
-rather than a confusing SQL syntax error.
+rather than a confusing SQL syntax error. Python's SQLite must also be
+built with FTS5 - the standard CPython Windows and Ubuntu builds are - and
+every read checks that on open the same way.
 
 ## Quickstart
 
@@ -136,6 +138,8 @@ Every command accepts:
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
+| `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
+| `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the default (GraphQL) source. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
 
 ### Derived reads — `similar`, `explain`, `coupling`, `eval`
 
@@ -535,8 +539,12 @@ The PRs whose `pr_files` include `path` (exact match — a directory or a
 typo'd path is a normal empty answer), newest first (`data.entries`, with
 `title`, `state`, `updated_at`, `html_url`), each entry carrying
 `closed_issues`: the deduplicated numbers of the issues that PR closed
-(`closes` edges, any `source` provenance). On a pre-v5 database the
-entries omit `source` and the payload carries `index_stale: true`. The
+(`closes` edges, any `source` provenance), and `keyword_closes`: the
+deduplicated numbers closed by keyword evidence. A REST-only store whose
+only closure evidence is keyword-derived therefore answers truthfully
+instead of "closed nothing". `closed_issues` stays GitHub-reported `closes` only.
+On a pre-v5 database the entries omit `source` and the payload carries
+`index_stale: true`. The
 riskiest-file question from `churn`, per path, with the "what did it fix"
 answers attached.
 
@@ -547,9 +555,12 @@ zaxbygraph what-closed NUMBER
 ```
 
 Closing PRs (`data.prs[]`, from `closes` edges whose destination is the
-issue) and closing commits (`data.commits[]`, from `closed_by_commit`
-edges), each entry carrying its edge's `source` provenance
-(`closing_ref` / `timeline`) and `evidence`. The payload reports the
+issue), keyword-derived closing items (`data.keyword_closes[]`, from
+`closes_keyword` edges - kept separate from GitHub-reported `closes`), and
+closing commits (`data.commits[]`, from `closed_by_commit`
+edges), each entry carrying its edge's `source` provenance and `evidence` -
+`closing_ref` / `timeline` for the GitHub-reported `prs`, `keyword` for
+`keyword_closes` entries. The payload reports the
 item's `kind` — a PR has no closers, and now that is visible instead of a
 confident empty. On a pre-v5 database the entries omit `source` and
 `index_stale` is `true`. After reopen/re-close cycles multiple closers
@@ -691,7 +702,8 @@ Machine-readable rules, worth knowing before scripting against this:
 
 - **One envelope (v0.2, breaking).** Every command's JSON output is a single
   self-describing object: `{"ok": true|false, "db": "<path>", "repo": "<slug>",
-  "freshness": {"synced_at": iso|null, "age_s": secs|null, "complete": bool},
+  "freshness": {"synced_at": iso|null, "age_s": secs|null, "complete": bool,
+                 "refreshed": true only after a --max-age refresh},
   "data": <payload>, "truncated": bool}` - plus `"error": {"code", "message",
   "hint"?}` on failures. The payload you used to get at the top level now lives
   under `data`; `ok` is still at the root. `churn` and `open` payloads are
@@ -750,7 +762,9 @@ Machine-readable rules, worth knowing before scripting against this:
   additionally emits `repo_required`, `bad_include`, `out_is_database`,
   `store_too_old`, `store_too_new`, `incomplete_store`; the derived reads add
   `config_error` for `[derive]` weight problems, and every store-opening read
-  emits `store_unreadable` when the store cannot be opened) to
+  emits `store_unreadable` or `environment_guard` (SQLite floor / FTS5
+rejected the open; exit 2) when the store cannot be opened, and a
+`--max-age` read emits `refresh_failed` (exit 1) when its refresh fails, to
   **stdout**, so `json.load(stdin)`
   never sees an empty stream. The same `error: MESSAGE` one-liner is still
   printed to stderr for humans; argparse usage errors remain plain stderr.
@@ -814,6 +828,25 @@ Actor `commented`/`reviewed` edges are **collapsed** to one per actor×item; the
 full history lives in the `comments` and `reviews` tables.
 
 Full column-level reference: [`docs/schema.md`](docs/schema.md).
+
+### Loopback git-proxy remotes (`ZAXBYGRAPH_PROXY_FORGE_HOST`)
+
+A remote like `http://user@127.0.0.1:<port>/git/<org>/<repo>` (a cloud/remote
+session's loopback git proxy; any of `127.0.0.1`, `localhost`, `::1`,
+`[::1]` as the host) resolves to `github.com/<org>/<repo>` instead of an
+ephemeral per-port store key. `ZAXBYGRAPH_PROXY_FORGE_HOST` redirects the
+rewrite at another forge, with four states:
+
+| `ZAXBYGRAPH_PROXY_FORGE_HOST` | Behavior |
+|---|---|
+| unset | Rewrite to `github.com/<org>/<repo>` (the default; proxies front GitHub today). |
+| valid `host[:port]` | Rewrite to `<value>/<org>/<repo>` (lowercased); a port folds into the path-safe store key with an underscore, e.g. `gitlab.internal:8443` stores under `gitlab.internal_8443/<org>/<repo>`. |
+| set, non-empty, unparseable | Rewrite disabled; the remote parses (or fails to) exactly as without the variable. |
+| set but empty/whitespace | Opt out — same as unparseable. |
+
+A "valid" value is `host[:port]`: ASCII dot-separated labels (`a-z0-9_`,
+hyphens inside labels), optional 1-5 digit port. Only `git/`-prefixed paths
+on loopback hosts are rewritten; every other remote parses unchanged.
 
 ### What `closes` means
 
