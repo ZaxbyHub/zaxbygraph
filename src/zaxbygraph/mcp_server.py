@@ -976,8 +976,9 @@ def _tool_triage(arguments: dict, ctx) -> dict:
         cursor = arguments.get("cursor")
         if cursor is not None and not isinstance(cursor, str):
             raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
-        top_k = _int_arg(arguments, "top_k", -1)
-        top_k = top_k if top_k > 0 else None
+        top_k = arguments.get("top_k")
+        if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int)):
+            raise ToolError("bad_request", "top_k must be an integer", hint="pass top_k as an integer")
         include_gated = _bool_arg(arguments, "include_gated")
         data = _translated_derive(
             _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated, None
@@ -998,10 +999,12 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
         pool = _int_array_csv(arguments, "pool")
         exclude = _int_array_csv(arguments, "exclude")
         allow_shared_files = _bool_arg(arguments, "allow_shared_files")
-        max_files = _int_arg(arguments, "max_files", -1)
-        max_files = max_files if max_files > 0 else None
-        budget_tokens = _int_arg(arguments, "budget_tokens", -1)
-        budget_tokens = budget_tokens if budget_tokens > 0 else None
+        max_files = arguments.get("max_files")
+        if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
+            raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
+        budget_tokens = arguments.get("budget_tokens")
+        if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
+            raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
         data = _translated_derive(
             _bundle_query, conn, slug, db_path,
             size if size is not None else "2-3", count, pool, exclude,
@@ -1038,7 +1041,22 @@ def _tool_churn(arguments: dict, ctx) -> dict:
     try:
         limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
         merged_only = _bool_arg(arguments, "merged_only")
-        data = churn(conn, limit, merged_only=merged_only, repo=slug)
+        try:
+            data = churn(conn, limit, merged_only=merged_only, repo=slug)
+        except sqlite3.Error as exc:
+            # churn skips _translated_derive (it is a query.py read, not a
+            # derived wrapper) but carries the SAME coded vocabulary and
+            # identity as the CLI's churn runner: a store fault is a
+            # store_unreadable envelope, never the generic runtime path.
+            raise ToolError(
+                "store_unreadable", f"store unreadable: {exc}",
+                hint="check the database file", slug=slug, db_path=db_path,
+            ) from exc
+        except ValueError as exc:
+            raise ToolError(
+                "bad_request", str(exc), hint="fix the tool arguments",
+                slug=slug, db_path=db_path,
+            ) from exc
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
         conn.close()
@@ -1486,26 +1504,29 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
     if declared is not None and declared != _MODERN_PROTOCOL_VERSION:
         # An unsupported declared modern version: UnsupportedProtocolVersionError
         # (2026-07-28 versioning) listing what this server CAN speak.
-        _error_data(
-            stdout,
-            req_id,
-            -32022,
-            "Unsupported protocol version",
-            {
-                "supported": [_MODERN_PROTOCOL_VERSION, *_PROTOCOL_VERSIONS],
-                "requested": declared,
-            },
-        )
+        # Notifications (no id) get no error reply, like the fallthrough.
+        if has_id:
+            _error_data(
+                stdout,
+                req_id,
+                -32022,
+                "Unsupported protocol version",
+                {
+                    "supported": [_MODERN_PROTOCOL_VERSION, *_PROTOCOL_VERSIONS],
+                    "requested": declared,
+                },
+            )
         return
     modern = declared == _MODERN_PROTOCOL_VERSION
     if modern and not isinstance(_modern_capabilities(params), dict):
-        _error(
-            stdout,
-            req_id,
-            _JSONRPC_INVALID_PARAMS,
-            "modern requests must carry io.modelcontextprotocol/clientCapabilities "
-            "as an object",
-        )
+        if has_id:
+            _error(
+                stdout,
+                req_id,
+                _JSONRPC_INVALID_PARAMS,
+                "modern requests must carry io.modelcontextprotocol/clientCapabilities "
+                "as an object",
+            )
         return
     # The era is a property of THIS request; the next message overwrites it.
     ctx.modern = modern

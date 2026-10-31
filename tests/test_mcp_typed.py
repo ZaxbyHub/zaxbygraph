@@ -40,6 +40,7 @@ similar_items data carries an "items" key.
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -497,6 +498,54 @@ class TestMcpTypedToolSurface(unittest.TestCase):
                     f"coded error when the CLI itself fails (tool="
                     f"{(structured.get('error') or {}).get('code')!r} cli={cli_code!r})",
                 )
+        session.stop()
+
+    def test_churn_store_fault_is_coded(self) -> None:
+        """AC13 (implementation-review finding): a churn store fault answers
+        the CLI's coded store_unreadable envelope with identity, never the
+        generic runtime path - churn skips _translated_derive (it is a
+        query.py read), so its translation lives in the handler.
+
+        RED at base (no churn tool: the call answers a JSON-RPC error);
+        GREEN after the fix translates churn's store faults."""
+        session = self._session()
+        session.initialize()
+        # Break the store the way a corrupt/clobbered file does: drop a
+        # table every schema version has carried (a post-open fault on the
+        # next handler's own connection).
+        fault_conn = sqlite3.connect(str(self.db_path))
+        fault_conn.execute("DROP TABLE pr_files")
+        fault_conn.commit()
+        fault_conn.close()
+        reply = session.call_tool("churn", {})
+        result = reply.get("result")
+        structured = (result or {}).get("structuredContent")
+        self.assertIsInstance(
+            structured,
+            dict,
+            "AC13 churn store fault: the churn call must answer a "
+            "structuredContent envelope",
+        )
+        self.assertIs(
+            structured.get("ok"),
+            False,
+            f"AC13 churn store fault: must answer ok=false: {structured}",
+        )
+        self.assertEqual(
+            (structured.get("error") or {}).get("code"),
+            "store_unreadable",
+            "AC13 churn store fault: must carry the coded store_unreadable error; got "
+            f"{(structured.get('error') or {}).get('code')!r}",
+        )
+        self.assertEqual(
+            structured.get("repo"),
+            REPO,
+            "AC13 churn store fault: identity lost (repo)",
+        )
+        self.assertIsNotNone(
+            structured.get("db"),
+            "AC13 churn store fault: identity lost (db)",
+        )
         session.stop()
 
 
