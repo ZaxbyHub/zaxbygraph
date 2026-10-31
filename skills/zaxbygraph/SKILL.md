@@ -64,9 +64,9 @@ prefer its typed tools over shelling out to the CLI: same data, same envelope,
 no cwd/column/shape guessing. `claude mcp add zaxbygraph -- zaxbygraph mcp`
 registers it.
 
-- Tools: `bundle`, `brief`, `churn`, `file_history`, `get_item`, `graph_status`,
-  `open_items`, `path`, `pr_overlap`, `related`, `search`, `similar_items`,
-  `sql`, `sync`, `triage`, `what_closed`. Every tool declares an `outputSchema`
+- Tools (sorted): `brief`, `bundle`, `churn`, `file_history`, `get_item`,
+  `graph_status`, `open_items`, `path`, `pr_overlap`, `related`, `search`,
+  `similar_items`, `sql`, `sync`, `triage`, `what_closed`. Every tool declares an `outputSchema`
   and `annotations` (`readOnlyHint` true except `sync`), and every result also
   carries `structuredContent` — the parsed envelope, validating against the
   outputSchema. Each tool result's text parses to the same JSON envelope the

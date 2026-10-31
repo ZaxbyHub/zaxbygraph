@@ -668,15 +668,15 @@ envelope inside the tool result text, structured errors included.
 zaxbygraph mcp [--stale-seconds N]
 ```
 
-- **Tools** (16): `bundle`, `brief`, `churn`, `file_history`, `get_item`,
+- **Tools** (16, sorted): `brief`, `bundle`, `churn`, `file_history`, `get_item`,
   `graph_status`, `open_items`, `path`, `pr_overlap`, `related`,
   `search`, `similar_items`, `sql`, `sync`, `triage`, `what_closed`.
   Every tool declares a permissive `outputSchema` and `annotations`
   (`readOnlyHint: true` on all but `sync`), and every tool result carries
   `structuredContent` — the parsed envelope — alongside the text block
   (issue #32). The five work-selection/derived tools call the same query
-  layer as their CLI commands, so envelopes match byte-for-byte on the same
-  store; `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
+  layer as their CLI commands, so data payloads match the CLI exactly on the
+  same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
   it returns a job id and `graph_status` reports progress.
 - **Protocol eras**: the server speaks legacy revisions (`2025-11-25`,
   `2025-06-18`, `2025-03-26`, `2024-11-05`, negotiated by `initialize`,
