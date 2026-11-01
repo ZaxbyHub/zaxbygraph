@@ -702,7 +702,9 @@ class RevisionCoverageTests(TempDBTest):
 class AppendOnlyGuardTests(TempDBTest):
     def test_no_update_or_delete_targets_revisions(self) -> None:
         """Guardrail: the ingest path never rewrites history. Only doctor's
-        consolidation (a whole-snapshot replacement) may touch revisions."""
+        consolidation may touch revisions, and only in its two sanctioned
+        shapes: the copy-loop slug delete (per-table, revisions exempt
+        since issue #40) and the per-item covered-item delete."""
         src = Path(__file__).parent.parent / "src" / "zaxbygraph"
         offenders = []
         for path in src.glob("*.py"):
@@ -712,6 +714,8 @@ class AppendOnlyGuardTests(TempDBTest):
                 if ("UPDATE REVISIONS" in up or "DELETE FROM REVISIONS" in up):
                     if path.name == "doctor.py" and "DELETE FROM {table}" in line:
                         continue  # the sanctioned copy-loop delete
+                    if path.name == "doctor.py" and "number = ?" in line:
+                        continue  # the sanctioned per-item delete (issue #40)
                     offenders.append(f"{path.name}:{lineno}: {line.strip()}")
         self.assertEqual(offenders, [])
 
@@ -1069,6 +1073,13 @@ class ConsolidationRevisionTests(unittest.TestCase):
         self.candidate_db = Path(td.name) / "candidate.db"
 
     def test_consolidation_adopts_revisions_fresh_ids_in_order(self) -> None:
+        """RED at base, GREEN at head (amended per the collated contract,
+        issue #40: the candidate's revisions table is an observation, not
+        the truth). The destination holds STALE rows for number 1, which
+        the candidate never observes: at base, replace-the-slug deletes
+        them; at head, per-item scoping preserves them while the covered
+        item's rows adopt with fresh ids in the candidate's sequence
+        order, and other repos' history is untouched."""
         from zaxbygraph.doctor import consolidate
 
         # Destination store: stale revisions for the slug under adoption,
@@ -1104,14 +1115,19 @@ class ConsolidationRevisionTests(unittest.TestCase):
                 " ORDER BY id"
             )
         ]
-        # Fresh ids: the adopted pair is appended after the surviving
-        # other-repo row, in candidate sequence order; the stale slug rows
-        # are gone.
+        # Number 1's STALE rows survive (the candidate never observed item
+        # 1); the adopted pair is appended after them, in candidate
+        # sequence order; the other-repo row is untouched.
         self.assertEqual(
             [(r[1], r[2], r[3], r[4]) for r in rows],
-            [("other/repo", 1, "item_body", "KEEP"),
+            [(REPO, 1, "item_body", "STALE-OLD"),
+             (REPO, 1, "item_body", "STALE-NEW"),
+             ("other/repo", 1, "item_body", "KEEP"),
              (REPO, 7, "item_body", "CAND-A"),
              (REPO, 7, "item_body", "CAND-B")],
+            "STALE-UNOBSERVED-ROWS-DELETED: the candidate holds no revision"
+            " rows for number 1, so the store's STALE rows for it must"
+            " survive the adoption (per-item scope, issue #40)",
         )
         self.assertEqual([r[0] for r in rows], sorted(r[0] for r in rows))
         dest.close()

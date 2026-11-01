@@ -49,9 +49,13 @@ REPO = "acme/forgegate"
 FLAT_RATIO = 1.25
 
 #: Corpus sizes for the per-item cost check (direct SQL seeding; the cost of
-#: building the corpus must not be part of what is measured).
-CORPUS_SMALL = 2000
-CORPUS_LARGE = 4000
+#: building the corpus must not be part of what is measured). Issue #36 AC3
+#: shrunk these from 2000/4000 to 1000/2000: the run is fsync-bound and the
+#: RED/GREEN separation is identical at half size (pin-reverted mutant ratios
+#: 1.961/1.8377 vs head 1.0000/1.0006 at 1k/2k, probed in the PR #35 review
+#: and re-demonstrated by the #22 trace's base replay at these constants).
+CORPUS_SMALL = 1000
+CORPUS_LARGE = 2000
 
 #: Listing page size for the whole-run amortized leg of the cost check.
 PAGE_SIZE = 250
@@ -296,21 +300,66 @@ class IngestScaleChecks(unittest.TestCase):
     # --- AC2: revert-title lookup plan ------------------------------------
 
     def test_title_lookup_plan_uses_title_index(self) -> None:
-        """RED at base, GREEN after the fix. The revert-title lookup
-        (store.py rebuild_edges: SELECT number FROM items WHERE repo = ? AND
-        title = ? AND number != ?) must be served by an index whose constraint
-        list binds title=; at base only idx_items_repo_merge (repo=?) serves
-        it, so every items row (raw_json included) is read per lookup. The
-        check deliberately does not name the new index - any items index that
-        seeks on title satisfies it."""
-        details = [
-            row[3].strip()
-            for row in self.conn.execute(
-                "EXPLAIN QUERY PLAN SELECT number FROM items "
-                "WHERE repo = ? AND title = ? AND number != ?",
-                (REPO, "some title", 1),
+        """GREEN at base and head; the amendment buys discrimination
+        against runtime query drift (issue #36 AC1). The revert-title
+        lookup (store.py rebuild_edges: SELECT number FROM items WHERE
+        repo = ? AND title = ? AND number != ?) is captured from the
+        connection trace of a REAL ingest (a merged revert-titled PR
+        resolves its target through the stored-titles lookup), so only the
+        statement the code actually executes can satisfy this check - a
+        mutant rewriting the shipped lookup to an unindexable
+        LOWER(title) = LOWER(?) predicate turns this check RED where the
+        pre-amendment copied-literal form stayed GREEN (probe of record in
+        the PR #35 review, test-infrastructure lane). The EXPLAIN runs as
+        a stats-independent oracle (C1's pattern): any sqlite_stat1 the
+        shipped finish-time PRAGMA optimize created is cleared first and
+        the plan is read on a FRESH connection. The check deliberately
+        does not name the index - any items index that seeks on title
+        satisfies it."""
+        src = FakeSource()
+        src.add_pr(
+            issue(2, title='Revert "pr-1"', kind="pr", state="closed",
+                  updated_at=ts(900_002)),
+            pull(2, merged=True),
+            [],
+        )
+        src.pages = [[issue(1, title="pr-1"), src.issues[2]]]
+        captured: list[str] = []
+        self.conn.set_trace_callback(captured.append)
+        try:
+            self.sync(src)
+        finally:
+            self.conn.set_trace_callback(None)
+
+        def _is_title_lookup(stmt: str) -> bool:
+            # The trace hands back parameter-expanded text (observed on
+            # this build), so match the family by shape, placeholders or
+            # literals alike - exactly the shipped title_lookup statement.
+            n = " ".join(stmt.split()).upper()
+            return (
+                n.startswith("SELECT NUMBER FROM ITEMS WHERE REPO = ")
+                and " AND TITLE = " in n
+                and " AND NUMBER != " in n
             )
-        ]
+
+        lookups = [s for s in captured if _is_title_lookup(s)]
+        self.assertTrue(
+            lookups,
+            "TITLE-LOOKUP-PLAN: no runtime revert-title SELECT captured from the ingest trace",
+        )
+        if self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone() is not None:
+            self.conn.execute("DELETE FROM sqlite_stat1")
+            self.conn.commit()
+        plan_conn = sqlite3.connect(str(self.db_path))
+        try:
+            details = [
+                row[3].strip()
+                for row in plan_conn.execute("EXPLAIN QUERY PLAN " + lookups[0])
+            ]
+        finally:
+            plan_conn.close()
         ok = any(
             re.search(r"USING (COVERING )?INDEX [^ ]+ \([^)]*title=\?", d)
             for d in details
@@ -481,22 +530,25 @@ class IngestScaleChecks(unittest.TestCase):
         """RED at base, GREEN after the fix. Two legs, both deterministic
         VDBE step counts (never wall time).
         Item-transaction leg: ingesting one structurally identical item must
-        cost the same order of VDBE steps at 4k corpus size as at 2k; at
+        cost the same order of VDBE steps at 2k corpus size as at 1k; at
         base the per-item transaction scans the whole corpus (actor-edge
         DELETE, two title lookups, three COUNT aggregates) and doubles.
         Whole-run leg: total steps per ingested item across a FULL sync of
         each corpus must also stay within the same factor, so quadratic
         work cannot hide outside the item transaction (for example in
         per-page recounting) - the issue's headline claim is that the whole
-        cold sync is linear, not just the per-item transaction."""
+        cold sync is linear, not just the per-item transaction. Corpus
+        sizes are the CORPUS_SMALL/CORPUS_LARGE constants (issue #36 AC3:
+        1000/2000; identical RED/GREEN separation at half the pre-#36
+        cost)."""
         small = self._corpus_item_txn_steps(CORPUS_SMALL)
         large = self._corpus_item_txn_steps(CORPUS_LARGE)
-        self.assertGreater(small, 0, "RATIO UNDEFINED: zero steps measured at 2k corpus")
+        self.assertGreater(small, 0, "RATIO UNDEFINED: zero steps measured at the small corpus")
         self.assertLessEqual(
             large,
             FLAT_RATIO * small,
             f"RATIO {large / small:.3f} > {FLAT_RATIO} "
-            f"(steps-4k={large} steps-2k={small}): per-item ingest cost grows with corpus size",
+            f"(steps-large={large} steps-small={small}): per-item ingest cost grows with corpus size",
         )
         small_ticks, small_items = self._full_sync_amortized_ticks(CORPUS_SMALL)
         large_ticks, large_items = self._full_sync_amortized_ticks(CORPUS_LARGE)
@@ -516,7 +568,7 @@ class IngestScaleChecks(unittest.TestCase):
             per_large,
             FLAT_RATIO * per_small,
             f"RATIO {per_large / per_small:.3f} > {FLAT_RATIO} "
-            f"(whole-run amortized: per-item-4k={per_large:.1f} "
+            f"(whole-run amortized: per-item-large={per_large:.1f} "
             f"per-item-2k={per_small:.1f} progress ticks): total sync cost "
             "grows super-linearly with corpus size",
         )
@@ -683,9 +735,19 @@ class IngestScaleChecks(unittest.TestCase):
     # --- AC6: sync runs PRAGMA optimize ------------------------------------
 
     def test_sync_runs_pragma_optimize(self) -> None:
-        """RED at base, GREEN after the fix. sync_repo must issue PRAGMA
-        optimize on its write connection before finishing; at base no such
-        statement appears in the connection trace."""
+        """GREEN at base and head; the amendment buys discrimination
+        against placement drift (issue #36 AC2). sync_repo must issue
+        PRAGMA optimize on its write connection AFTER the finish
+        transaction's COMMIT, and the traced statement ORDER is pinned: a
+        variant issuing the statement at the start of sync_repo turns this
+        check RED where the pre-amendment presence-only form stayed GREEN
+        (mutant probe of record in the PR #35 review). PRAGMA optimize is
+        the run's final, best-effort statement, so the finish transaction's
+        COMMIT is the LAST commit in the trace; the assertion is therefore:
+        a COMMIT is traced, and the FIRST `pragma optimize` occurrence
+        comes after that last COMMIT (every commit precedes the
+        maintenance statement, which must never precede or gate the data
+        path)."""
         src = FakeSource()
         src.pages = [[issue(1), issue(2)]]
         traced: list[str] = []
@@ -694,10 +756,26 @@ class IngestScaleChecks(unittest.TestCase):
             self.sync(src)
         finally:
             self.conn.set_trace_callback(None)
-        normalized = [" ".join(s.split()).lower() for s in traced]
+        normalized = [" ".join(s.split()).lower().rstrip(";") for s in traced]
         self.assertTrue(
             any("pragma optimize" in s for s in normalized),
             "PRAGMA OPTIMIZE MISSING: sync_repo finished without issuing PRAGMA optimize",
+        )
+        commit_indexes = [i for i, s in enumerate(normalized) if s == "commit"]
+        self.assertTrue(
+            commit_indexes,
+            "PRAGMA OPTIMIZE MISSING: no COMMIT traced, so the finish"
+            " transaction is not observable",
+        )
+        optimize_indexes = [i for i, s in enumerate(normalized) if "pragma optimize" in s]
+        first_optimize = min(optimize_indexes)
+        last_commit = max(commit_indexes)
+        self.assertLess(
+            last_commit,
+            first_optimize,
+            f"PRAGMA OPTIMIZE MISPLACED: first occurrence at traced index"
+            f" {first_optimize} does not follow the finish COMMIT at index"
+            f" {last_commit}",
         )
 
 

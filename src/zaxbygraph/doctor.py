@@ -186,8 +186,8 @@ def _migrated_copy(path: Path):
         copy.close()
 
 
-def consolidate(store_db: Path, path: Path, repo: str) -> None:
-    """Adopt one candidate into the store: REPLACE-THE-SLUG.
+def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
+    """Adopt one candidate into the store: REPLACE-THE-SLUG, revisions scoped per item.
 
     One transaction: delete every store row whose repo is the folded slug,
     then insert the candidate's rows with repo lowered - omitting
@@ -196,6 +196,24 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
     ids (items.id, releases.id, reviews.id). sync_state is replaced and counts recomputed. Plain
     INSERTs only: post-delete there is nothing to conflict with, and
     INSERT OR REPLACE's double-unique semantics could silently drop rows.
+
+    Revisions (issue #40) are the exception to replace-the-slug: the
+    candidate's `revisions` table is an OBSERVATION, not the truth —
+    a pre-v8 candidate migrated in by _MigratedCopy carries an empty,
+    backfill-impossible table, so deleting the store's history for items
+    the candidate never observed destroys evidence that cannot be
+    re-derived (edit history is unobservable after the fact; ingest is
+    append-only and this loop is the only revisions DELETE in the tree).
+    The delete is therefore scoped per item: covered items (the candidate
+    has rows for them) whose candidate rows are payload-identical to the
+    stored rows are left untouched (a same-candidate re-adoption writes
+    no rows and deletes none); covered items with different rows are
+    replaced (within-item depth loss for a shallower candidate remains a
+    recorded boundary — the candidate's rows are a real observation for
+    that item); uncovered items' history is preserved. Returns
+    (adopted_rows, preserved_rows): adopted = rows copied from the
+    candidate; preserved = stored rows left in place that the candidate
+    never observed.
     """
     repo_l = repo.lower()
     with _migrated_copy(path) as source:
@@ -206,10 +224,75 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
             dst.execute("BEGIN IMMEDIATE")
             try:
                 for table, autoinc_pk in _COPY_TABLES:
-                    dst.execute(f"DELETE FROM {table} WHERE repo = ?", (repo_l,))
+                    if table == "revisions":
+                        continue  # per-item scoping below (issue #40)
+                    dst.execute(
+                        f"DELETE FROM {table} WHERE repo = ?", (repo_l,)
+                    )
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
+                # Issue #40: revisions adopt per item. A covered item whose
+                # candidate rows are payload-identical to the stored rows is
+                # skipped entirely (AC6: a same-candidate re-adoption is a
+                # no-op); a covered item with different rows is replaced;
+                # uncovered items are never touched (AC1/AC2).
+                covered = [
+                    int(r[0])
+                    for r in src.execute(
+                        "SELECT DISTINCT number FROM revisions WHERE lower(repo) = ?",
+                        (repo_l,),
+                    )
+                ]
+                rev_payload_cols = (
+                    "entity", "entity_id", "kind", "origin", "content",
+                    "valid_from", "valid_to",
+                )
+                adopted_rows = 0
+                preserved_rows = 0
+                for number in covered:
+                    cand_rows = src.execute(
+                        "SELECT " + ", ".join(rev_payload_cols)
+                        + " FROM revisions WHERE lower(repo) = ? AND number = ?"
+                        " ORDER BY id",
+                        (repo_l, number),
+                    ).fetchall()
+                    stored_rows = dst.execute(
+                        "SELECT " + ", ".join(rev_payload_cols)
+                        + " FROM revisions WHERE repo = ? AND number = ?"
+                        " ORDER BY id",
+                        (repo_l, number),
+                    ).fetchall()
+                    if [tuple(r) for r in cand_rows] == [tuple(r) for r in stored_rows]:
+                        continue  # same observation: no-op (AC6)
+                    dst.execute(
+                        "DELETE FROM revisions WHERE repo = ? AND number = ?",
+                        (repo_l, number),
+                    )
+                    insert_sql = (
+                        f"INSERT INTO revisions ({', '.join(rev_payload_cols)}, repo, number) "
+                        f"VALUES ({', '.join('?' for _ in rev_payload_cols)}, ?, ?)"
+                    )
+                    dst.executemany(
+                        insert_sql,
+                        [tuple(r) + (repo_l, number) for r in cand_rows],
+                    )
+                    adopted_rows += len(cand_rows)
+                if covered:
+                    placeholders = ",".join("?" for _ in covered)
+                    preserved_rows = dst.execute(
+                        "SELECT COUNT(*) FROM revisions"
+                        f" WHERE repo = ? AND number NOT IN ({placeholders})",
+                        (repo_l, *covered),
+                    ).fetchone()[0]
+                else:
+                    preserved_rows = dst.execute(
+                        "SELECT COUNT(*) FROM revisions WHERE repo = ?",
+                        (repo_l,),
+                    ).fetchone()[0]
+
                 for table, autoinc_pk in _COPY_TABLES:
+                    if table == "revisions":
+                        continue  # adopted per item above (issue #40)
                     cols = [
                         row[1] for row in src.execute(f"PRAGMA table_info({table})")
                     ]
@@ -226,8 +309,8 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                     placeholders = ", ".join("?" for _ in cols)
                     # Ordered by the omitted pk (issue #25): destination ids
                     # are fresh, so insertion order is the only place the
-                    # source sequence survives — required for revisions,
-                    # deterministic for the other omit-pk tables.
+                    # source sequence survives — deterministic for the
+                    # omit-pk tables.
                     order_by = f" ORDER BY {autoinc_pk}" if autoinc_pk else ""
                     rows = src.execute(
                         f"SELECT {select_cols} FROM {table}"
@@ -261,7 +344,11 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                     )
                     # The candidate may predate schema v4: copy the rate-limit
                     # columns only when the source actually carries them, so
-                    # consolidation never silently nulls newer state.
+                    # consolidation never silently nulls newer state. fetch_source
+                    # (schema v11, issue #48) carries the same way: a pre-v11
+                    # candidate leaves the column NULL (unset → the documented
+                    # graphql default), a post-v11 candidate's recorded profile
+                    # adopts with the row.
                     src_cols = {
                         row[1] for row in src.execute("PRAGMA table_info(sync_state)")
                     }
@@ -275,6 +362,11 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
                                 state["rate_limit_reset_at"],
                                 repo_l,
                             ),
+                        )
+                    if "fetch_source" in src_cols:
+                        dst.execute(
+                            "UPDATE sync_state SET fetch_source = ? WHERE repo = ?",
+                            (state["fetch_source"], repo_l),
                         )
                 # actors is a global login->url table (no repo column), so it
                 # is copied wholesale despite the slug-scoped delete above.
@@ -292,6 +384,7 @@ def consolidate(store_db: Path, path: Path, repo: str) -> None:
         finally:
             dst.close()
             src.close()
+    return (adopted_rows, preserved_rows)
 
 
 def doctor(
@@ -318,7 +411,18 @@ def doctor(
                 best = (key, entry)
     if consolidate_flag and best is not None:
         winner = best[1]
-        consolidate(store_db, Path(winner["path"]), repo_l)
+        rev_adopted, rev_preserved = consolidate(
+            store_db, Path(winner["path"]), repo_l
+        )
         winner["adopted"] = True
         adopted = winner["path"]
-    return {"ok": True, "adopted": adopted, "scanned": scanned}
+    else:
+        rev_adopted = 0
+        rev_preserved = 0
+    return {
+        "ok": True,
+        "adopted": adopted,
+        "revisions_adopted": rev_adopted,
+        "revisions_preserved": rev_preserved,
+        "scanned": scanned,
+    }

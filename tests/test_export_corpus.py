@@ -30,6 +30,7 @@ from fixtures import (
 )
 from zaxbygraph import export as export_mod
 from zaxbygraph.db import connect, init_schema, open_existing
+from zaxbygraph.db import CURRENT_USER_VERSION
 from zaxbygraph.sync import sync_repo
 
 #: Pinned cross-platform / replay golden hashes. These constants are part of
@@ -864,7 +865,10 @@ class GuardTests(TempDBTest):
         CLI as structured envelopes (the schema-notes carve-out credits
         these pins)."""
         self._synced()
-        for version, expected_code in ((11, "store_too_new"), (9, "store_too_old")):
+        # "Newer than this build" tracks the build's own version (schema
+        # bumps move it; a hardcode goes stale exactly when a slot lands).
+        too_new = CURRENT_USER_VERSION + 1
+        for version, expected_code in ((too_new, "store_too_new"), (9, "store_too_old")):
             self.conn.execute(f"PRAGMA user_version = {version}")
             self.conn.commit()
             proc = subprocess.run(

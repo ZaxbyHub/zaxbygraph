@@ -47,8 +47,11 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "comments": {
         "author_association": "v7. REST supplies it natively; GraphQL maps authorAssociation when the capability probe reports the field. A probe-degraded re-ingest preserves the stored value via the pre-replacement snapshot",
     },
+    "sync_state": {
+        "fetch_source": "v11. The fetch source this store's profile deliberately uses (graphql/rest), stamped at listing-sync start; NULL = unset, the documented graphql default. The --max-age refresh re-reads it under the sync lock; consolidation adopts a post-v11 candidate's value, a pre-v11 candidate leaves it NULL",
+    },
     "revisions": {
-        "id": "v8. Sequence order for one item's displaced-text history; assigned at insert and never updated. doctor --consolidate is the one sanctioned rewrite (fresh ids, per-item order preserved)",
+        "id": "v8. Sequence order for one item's displaced-text history; assigned at insert and never updated. doctor --consolidate is the one sanctioned rewrite, scoped per item (issue #40): payload-identical covered items are left untouched (same-candidate re-adoption writes and deletes nothing), differently-covered items are replaced with fresh ids in sequence order, and items the candidate never observed keep their stored history; within-item depth loss for a shallower candidate remains a recorded boundary",
         "content": "Exactly the displaced stored value - a pre-image, so first ingest writes nothing and unchanged re-ingests write nothing. NULL is legal and meaningful: the text was absent before this version",
         "origin": "'edit' (replaced by a newer payload) or 'deleted' (vanished from a fetch whose children_complete flag was True). A degraded fetch never writes tombstones, and a degraded absence still replaces children - so an absence first seen degraded leaves no trace for a later complete fetch to tombstone (documented boundary)",
         "valid_from": "GitHub time this version became current: updated_at else created_at (items/comments); submitted_at else the owning item's created_at (reviews). Never the sync wall clock",

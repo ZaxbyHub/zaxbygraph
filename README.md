@@ -139,7 +139,7 @@ Every command accepts:
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
 | `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
-| `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the default (GraphQL) source. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
+| `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the store's recorded fetch source (issue #48: `sync_state.fetch_source`, stamped at listing-sync start; `NULL`/unset keeps the default GraphQL source, so a store deliberately kept on `--source rest` never profile-drifts). Both refresh settings are re-read under the sync lock, so a concurrent writer's changes are honored, never reverted. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
 
 ### Derived reads — `similar`, `explain`, `coupling`, `eval`
 
@@ -868,6 +868,8 @@ rewrite at another forge, with four states:
 | valid `host[:port]` | Rewrite to `<value>/<org>/<repo>` (lowercased); a port folds into the path-safe store key with an underscore, e.g. `gitlab.internal:8443` stores under `gitlab.internal_8443/<org>/<repo>`. |
 | set, non-empty, unparseable | Rewrite disabled; the remote parses (or fails to) exactly as without the variable. |
 | set but empty/whitespace | Opt out — same as unparseable. |
+
+When a disabled state makes a `git/`-prefixed loopback remote fail to parse, the error names the variable and its state — `could not parse origin remote: '<url>' (ZAXBYGRAPH_PROXY_FORGE_HOST is set but empty, which disables the loopback rewrite this remote relies on)` — so the cause is not misread as a malformed remote. A loopback URL that fails to parse even with the rewrite enabled names no variable.
 
 A "valid" value is `host[:port]`: ASCII dot-separated labels (`a-z0-9_`,
 hyphens inside labels), optional 1-5 digit port. Only `git/`-prefixed paths

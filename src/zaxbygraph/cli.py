@@ -434,6 +434,7 @@ def _sync_core(
         include_patches=include_patches,
         jsonl_path=jsonl_path,
         numbers=numbers,
+        fetch_source=source_name,
     )
 
 
@@ -446,14 +447,21 @@ class _EnvironmentGuard(RuntimeError):
 
 
 def _run_refresh_sync(
-    conn: sqlite3.Connection, slug: str, *, include_patches: bool = False
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    include_patches: bool = False,
+    source_name: str | None = None,
 ) -> int:
     """The --max-age refresh seam (issue #31 AC5): one quiet incremental sync
     against the open writable connection, returning 0 on success and raising
     on failure (the caller reports the error envelope — never a stale answer
     with a false refreshed bit). Checks stub this module-level symbol to
     exercise the refresh offline. include_patches carries the store's own
-    retention so a refresh never downgrades a patch-synced store (PR review)."""
+    retention so a refresh never downgrades a patch-synced store (PR review).
+    source_name carries the store's recorded fetch_source (issue #48) —
+    NULL/unset keeps the documented graphql default; a store deliberately
+    kept on `--source rest` refreshes over REST instead of profile-drifting."""
     try:
         init_schema(conn)
     except RuntimeError as exc:
@@ -466,7 +474,7 @@ def _run_refresh_sync(
         include_patches=include_patches,
         jsonl_path=None,
         numbers=None,
-        source_name="graphql",
+        source_name="graphql" if not source_name else source_name,
     )
     return 0
 
@@ -554,7 +562,34 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
                 except RuntimeError as exc:
                     raise _ReadFailure(2, str(exc), code_key="environment_guard")
                 try:
-                    _run_refresh_sync(conn, slug, include_patches=include_patches)
+                    # Issue #48 AC2: the refresh configuration is re-read
+                    # UNDER the lock, on the writable connection, AFTER
+                    # init_schema has migrated it to v11 — a concurrent
+                    # writer that changed fetch_source or include_patches
+                    # (or migrated a v10 store) while this read waited on
+                    # the lock must never be reverted by the waiting
+                    # refresh. The pre-lock `include_patches` above stays
+                    # v10-compatible and decides only whether a refresh is
+                    # worth starting, never the refresh's arguments.
+                    try:
+                        init_schema(conn)
+                    except RuntimeError as exc:
+                        raise _EnvironmentGuard(str(exc)) from exc
+                    cfg = conn.execute(
+                        "SELECT include_patches, fetch_source FROM sync_state"
+                        " WHERE lower(repo) = ?",
+                        (slug,),
+                    ).fetchone()
+                    if cfg is None:
+                        return False
+                    refresh_patches = bool(cfg["include_patches"])
+                    refresh_source = cfg["fetch_source"]
+                    _run_refresh_sync(
+                        conn,
+                        slug,
+                        include_patches=refresh_patches,
+                        source_name=refresh_source,
+                    )
                 except _EnvironmentGuard as exc:
                     # Non-retryable environment guards (schema too new,
                     # SQLite floor) exit 2 like the sync path (PR review);

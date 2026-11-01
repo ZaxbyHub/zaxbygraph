@@ -25,7 +25,9 @@ def _v8_store(path) -> sqlite3.Connection:
     migration path, not the forward one)."""
     conn = connect(path)
     init_schema(conn)
-    conn.execute(f"PRAGMA user_version = {CURRENT_USER_VERSION - 2}")
+    # Pinned to the literal v8 slot (a CURRENT-relative offset assumed the
+    # backfill stays two slots back, which schema v11 broke).
+    conn.execute("PRAGMA user_version = 8")
     conn.commit()
     return conn
 
@@ -87,9 +89,12 @@ class MigrationBackfillTests(TempDBTest):
 
         # A fresh store is born at the current version; the migration chain
         # must actually RUN here, so stamp the store back to v8 first (the
-        # v9/v10 tables are additive -- a v8-stamped build ignores them, which
-        # is exactly the migrated-store shape the backfill must serve).
-        self.conn.execute(f"PRAGMA user_version = {CURRENT_USER_VERSION - 2}")
+        # v9/v10/v11 tables are additive -- a v8-stamped build ignores them,
+        # which is exactly the migrated-store shape the backfill must
+        # serve). Pinned to the literal slot the backfill migration runs
+        # FROM: a CURRENT-relative offset assumes the backfill stays two
+        # slots back, which schema v11 broke.
+        self.conn.execute("PRAGMA user_version = 8")
         self.conn.commit()
         version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
         for target, migrate in MIGRATIONS:

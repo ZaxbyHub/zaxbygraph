@@ -731,14 +731,30 @@ def _write_jsonl(handle: TextIO | None, resource: str, payload: object) -> None:
     handle.flush()
 
 
-def _ensure_state_row(conn: sqlite3.Connection, repo: str, include_patches: bool) -> None:
+def _ensure_state_row(
+    conn: sqlite3.Connection,
+    repo: str,
+    include_patches: bool,
+    fetch_source: str = "graphql",
+) -> None:
+    """Create/refresh the slug's sync_state profile row.
+
+    Stamps the fetch source REQUESTED for this listing run (issue #48):
+    the store's fetch profile is the operator's deliberate choice, so the
+    stamp is written at listing start in this dedicated prologue
+    transaction (not inside the per-item watermark transaction). A mid-run
+    GraphQL-to-REST degradation is a transient fact of one run — disclosed
+    in the run result, never written back over the requested stamp.
+    """
     conn.execute(
         """
-        INSERT INTO sync_state(repo, include_patches)
-        VALUES (?, ?)
-        ON CONFLICT(repo) DO UPDATE SET include_patches = excluded.include_patches
+        INSERT INTO sync_state(repo, include_patches, fetch_source)
+        VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET
+            include_patches = excluded.include_patches,
+            fetch_source = excluded.fetch_source
         """,
-        (repo, 1 if include_patches else 0),
+        (repo, 1 if include_patches else 0, fetch_source),
     )
     conn.commit()
 
@@ -842,13 +858,19 @@ def sync_repo(
     include_patches: bool = False,
     jsonl_path: Path | None = None,
     numbers: list[int] | None = None,
+    fetch_source: str = "graphql",
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction.
 
     With `numbers` (sync --numbers, issue #23) this is a TARGETED refresh of
     exactly those items: the watermark never moves, no full sync starts or
     completes, the deletion oracle never runs, and a targeted finalizer
-    clears last_error without touching freshness stamps."""
+    clears last_error without touching freshness stamps. `fetch_source`
+    (issue #48) stamps the source REQUESTED for this run — targeted runs
+    stamp too (an explicit operator source choice); the watermark still
+    never moves for them. Callers that construct the source directly (the
+    MCP surface) keep the graphql default, matching the documented
+    CLI-side-only boundary for fetch-source persistence."""
     # Everything that touches the database lives inside the try: the recorder
     # must see prologue failures too (force reset, state-row ensure, pending
     # marker) — a lock or disk fault landing there is still a failed sync and
@@ -868,7 +890,7 @@ def sync_repo(
                 (repo,),
             )
             conn.commit()
-        _ensure_state_row(conn, repo, include_patches)
+        _ensure_state_row(conn, repo, include_patches, fetch_source)
 
         row = conn.execute(
             "SELECT issues_since, full_sync_pending, last_full_sync_at FROM sync_state WHERE repo = ?",
