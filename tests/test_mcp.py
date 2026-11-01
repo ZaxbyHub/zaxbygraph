@@ -93,6 +93,11 @@ EXPECTED_TOOLS = {
     "open_items",
     "sql",
     "sync",
+    "similar_items",
+    "triage",
+    "bundle",
+    "brief",
+    "churn",
 }
 
 OTHER_SLUG = "acme/other"

@@ -2858,6 +2858,13 @@ def _wrap_live_entry(entry: dict, keep: tuple[str, ...]) -> dict:
 _GH_STDOUT_BYTE_CAP = 262144
 
 
+#: Aggregate bound on the inline gh fan (pr49 review PRR-010): every call
+#: is individually time- and byte-bounded, but 1+3N calls run in the
+#: caller's loop, so the PR list is capped to its last members and the
+#: live block discloses the trim instead of silently dropping PRs.
+_BRIEF_LIVE_MAX_PRS = 10
+
+
 def _brief_live(
     repo: str, pr_numbers: list[int], gh_path: str
 ) -> tuple[dict | None, str | None]:
@@ -2898,6 +2905,15 @@ def _brief_live(
         _gh(f"repos/{repo}")
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         return None, f"gh probe failed: {exc}"
+
+    # Aggregate bound on the inline gh fan (pr49 review PRR-010): each call
+    # is individually time- and byte-bounded, but 1+3N calls run in the
+    # caller's loop, so the PR list is capped to its last members and the
+    # live block discloses the trim instead of silently dropping PRs.
+    omitted_prs = 0
+    if len(pr_numbers) > _BRIEF_LIVE_MAX_PRS:
+        omitted_prs = len(pr_numbers) - _BRIEF_LIVE_MAX_PRS
+        pr_numbers = pr_numbers[-_BRIEF_LIVE_MAX_PRS:]
 
     prs: list[dict] = []
     for pr in pr_numbers:
@@ -2957,7 +2973,7 @@ def _brief_live(
             if isinstance(e, dict)
         ]
         prs.append(entry)
-    return {"prs": prs}, None
+    return {"prs": prs, "omitted_prs": omitted_prs}, None
 
 
 def brief(
@@ -3176,6 +3192,11 @@ def brief(
     if live:
         live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
         packet["live"] = live_block
+        if live_block is not None and live_block.get("omitted_prs"):
+            # The live fan is aggregate-capped (pr49 review PRR-010); the
+            # packet must not look complete when linked PRs were trimmed
+            # (cubic r2, comment 4434043108).
+            packet["truncated"] = True
         if live_error is not None:
             packet["live_error"] = live_error
 

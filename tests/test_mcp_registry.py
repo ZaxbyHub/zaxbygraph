@@ -34,26 +34,25 @@ CLI_TO_SURFACE = {
     "open": "open_items",
     "sql": "sql",
     "schema": "resource",
-    # Documented gaps: churn/export-graph are aggregation surfaces an
-    # agent consumes through a tool result anyway (no arguments beyond a
-    # limit); `where` and `doctor` are host-resolution/maintenance
-    # commands for the human operating a shell.
-    "churn": "documented-gap: aggregation view, read it via the sql tool (SELECT path, COUNT(*) FROM pr_files ...)",
+    # Documented gaps: export-graph is a bulk export for graph viewers, not
+    # an agent query; `where` and `doctor` are host-resolution/maintenance
+    # commands for the human operating a shell. (churn left the gap list in
+    # issue #32: it is the churn tool now.)
+    "churn": "churn",
     "export-graph": "documented-gap: bulk export for graph viewers, not an agent query",
     "export-corpus": "documented-gap: deterministic canonical-JSONL corpus snapshot for pins/audits, written by a shell; not an agent query",
     "where": "documented-gap: prints the resolution chain for a shell checkout",
     "doctor": "documented-gap: store maintenance for a human",
-    # Derived reads (issue #29): typed MCP tools for the derived tier are
-    # issue #32's lane; until then the CLI surface is the only one.
-    "similar": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
-    "explain": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
-    "coupling": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
-    "eval": "documented-gap: derived-read tier (issue #29); MCP surfacing is issue #32's lane",
-    # Work-selection reads (issue #30): same lane split as the derived
-    # reads above — triage/bundle/brief stay CLI-only until #32.
-    "triage": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
-    "bundle": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
-    "brief": "documented-gap: work-selection tier (issue #30); MCP surfacing is issue #32's lane",
+    # Derived reads (issue #29): similar is the similar_items tool as of
+    # issue #32; explain/coupling/eval stay CLI-only documented gaps.
+    "similar": "similar_items",
+    "explain": "documented-gap: derived-read tier (issue #29); MCP surfacing is a future lane",
+    "coupling": "documented-gap: derived-read tier (issue #29); MCP surfacing is a future lane",
+    "eval": "documented-gap: derived-read tier (issue #29); MCP surfacing is a future lane",
+    # Work-selection reads (issue #30): exposed by issue #32.
+    "triage": "triage",
+    "bundle": "bundle",
+    "brief": "brief",
     "sync": "sync",
 }
 
@@ -71,6 +70,11 @@ TOOL_TO_CLI = {
     "open_items": "open",
     "sql": "sql",
     "sync": "sync",
+    "similar_items": "similar",
+    "triage": "triage",
+    "bundle": "bundle",
+    "brief": "brief",
+    "churn": "churn",
 }
 
 

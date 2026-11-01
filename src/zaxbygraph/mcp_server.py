@@ -38,13 +38,24 @@ import urllib.request
 from pathlib import Path
 
 from zaxbygraph import __version__
-from zaxbygraph.cli import _freshness, _item_count, _truncate_bodies, build_envelope
+from zaxbygraph.cli import (
+    _brief_query,
+    _bundle_query,
+    _freshness,
+    _item_count,
+    _similar_query,
+    _triage_query,
+    _truncate_bodies,
+    build_envelope,
+)
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
+from zaxbygraph.derive import ConfigError as DeriveConfigError
 from zaxbygraph.graphql import GraphQLSource as GhApiSource
 from zaxbygraph.paths import resolve_db
 from zaxbygraph.query import (
     _clamp_limit,
     assert_read_sql,
+    churn,
     file_history,
     item,
     open_items,
@@ -62,8 +73,29 @@ from zaxbygraph.sync import acquire_sync_lock, read_lock_observer, sync_repo
 
 #: Protocol revisions this server can speak. initialize echoes the
 #: client's requested version when we serve it, else the latest one.
-_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+#: 2026-07-28 is NOT negotiated here — it is a per-request `_meta` revision
+#: (see _MODERN_PROTOCOL_VERSION); a modern-marked `initialize` request is
+#: still answered with the latest legacy revision.
+_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 _LATEST_PROTOCOL_VERSION = _PROTOCOL_VERSIONS[0]
+
+#: The modern, stateless revision: the protocol version and client
+#: capabilities ride EVERY request's `_meta` (namespaced keys per the
+#: official 2026-07-28 RequestMetaObject); there is no initialize handshake
+#: and no ping on this era.
+_MODERN_PROTOCOL_VERSION = "2026-07-28"
+_META_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
+#: Sentinel for "namespaced key absent" in _era_of: key-present-with-null
+#: is malformed modern metadata (-32602), never a silent legacy downgrade
+#: (fix-round probe P14).
+_MODERN_ABSENT = object()
+_META_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
+
+#: Cache hints (the official CacheableResult fields) for results that are
+#: cheap to recompute but stable within a process: the tool registry is
+#: static per server, per-resource reads are private to the caller.
+_LISTING_TTL_MS = 300000
+_RESOURCE_READ_TTL_MS = 60000
 
 #: Staleness threshold default: the issue's proposed 15 minutes.
 _DEFAULT_STALE_AFTER_S = 900
@@ -74,6 +106,7 @@ _DEFAULT_STALE_AFTER_S = 900
 _MAX_PAGE = 500
 _MAX_CURSOR = 10000
 _MAX_DEPTH = 5
+_MAX_TOP_K = 50
 _MAX_NUMBERS = 64
 _STALE_ENV = "ZAXBYGRAPH_MCP_STALE_SECONDS"
 
@@ -89,6 +122,61 @@ _JSONRPC_INTERNAL_ERROR = -32603
 def _log(message: str) -> None:
     """Protocol discipline: logs go to stderr, never to stdout."""
     print(f"zaxbygraph-mcp: {message}", file=sys.stderr, flush=True)
+
+
+class _InputRequired(Exception):
+    """A modern (2026-07-28) call cannot resolve a repository and must
+    answer an InputRequiredResult naming `repo` instead of round-tripping
+    roots. Raised by _resolve_target on the modern path only; the legacy
+    path keeps the roots handshake (AC12)."""
+
+    REQUEST_STATE = "zaxbygraph:repo-required"
+
+    def hint_text(self, *, resources_channel: bool = False) -> str:
+        # resources/read has NO arguments channel (params are uri + _meta),
+        # so "pass repo" is unactionable there — name the real remedies
+        # instead (pr49 review PRR-009).
+        if resources_channel:
+            return (
+                "repo required: start the server with --repo/--db, or use the "
+                "tools (which accept a repo argument)"
+            )
+        return (
+            "repo required: pass repo as OWNER/REPO (no explicit repo argument "
+            "and no server --repo pin resolved one)"
+        )
+
+
+def _era_of(params: dict) -> tuple[str, str | None]:
+    """(era, declared) for this request's era classification.
+
+    "modern" — the namespaced protocolVersion key carries "2026-07-28";
+    "unsupported" — it carries another string (declared but not served on
+    the per-request channel; -32022); "malformed" — present but not a
+    string (the 2026-07-28 table types it string/required, so this is
+    malformed modern metadata: -32602, never a silent legacy downgrade —
+    pr49 review PRR-004); "legacy" — no namespaced declaration at all
+    (including any legacy _meta shape)."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        return "legacy", None
+    declared = meta.get(_META_VERSION_KEY, _MODERN_ABSENT)
+    if declared is _MODERN_ABSENT:
+        return "legacy", None
+    if not isinstance(declared, str):
+        return "malformed", None
+    if declared != _MODERN_PROTOCOL_VERSION:
+        return "unsupported", declared
+    return "modern", declared
+
+
+def _modern_capabilities(params):
+    """The clientCapabilities object of a modern request (checked by the
+    caller to have declared a served modern version first)."""
+    meta = (params or {}).get("_meta")
+    if not isinstance(meta, dict):
+        return None
+    return meta.get(_META_CAPABILITIES_KEY)
 
 
 class ToolError(Exception):
@@ -314,7 +402,9 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
     resolve_db chain the CLI uses, so a linked worktree and its main
     checkout resolve one DB and reads never create. The database itself
     is operator-pinned (--db / ZAXBYGRAPH_DB); tool calls cannot choose
-    it."""
+    it. On the modern (2026-07-28) path the roots round-trip never runs:
+    a repo-less, un-pinned call raises _InputRequired so the dispatcher
+    answers an InputRequiredResult naming repo."""
     repo_arg = arguments.get("repo")
     if repo_arg is None:
         repo_arg = ctx.default_repo
@@ -331,6 +421,11 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
                 "bad_request", f"invalid repo argument ({exc})", hint="pass repo as OWNER/REPO"
             ) from exc
         host: str | None = DEFAULT_HOST
+    elif getattr(ctx, "modern", False):
+        # The modern era dropped Roots: never send a server-initiated
+        # roots/list. An unresolved repository becomes an InputRequiredResult
+        # at the dispatch layer.
+        raise _InputRequired()
     else:
         pairs = _roots_slugs(ctx)
         if len(pairs) > 1:
@@ -503,11 +598,32 @@ def _bool_arg(arguments: dict, key: str) -> bool:
 def _int_cursor(raw) -> int:
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # int(1e999) raises OverflowError, not ValueError — a wire-reachable
+        # JSON float infinity must be a structured cursor reset, never a
+        # runtime envelope (pr49 review PRR-013).
         return 0
     if value <= 0:
         return 0
     return min(value, _MAX_CURSOR)
+
+
+def _item_number(arguments: dict, tool: str) -> int:
+    """A typed item number in SQLite's signed-64-bit range: a wrong type or
+    an out-of-range magnitude is a structured bad_request, never a raw
+    sqlite bind OverflowError surfacing as runtime (pr49 review PRR-013)."""
+    number = arguments.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise ToolError(
+            "bad_request", f"{tool} needs an integer number",
+            hint=f'try {tool} {{"number": 12}}',
+        )
+    if not 1 <= number <= 2**63 - 1:
+        raise ToolError(
+            "bad_request", f"{tool} number is out of range",
+            hint="pass the item number as a positive integer",
+        )
+    return number
 
 
 # ---------------------------------------------------------------------------
@@ -558,9 +674,7 @@ def _tool_search(arguments: dict, ctx) -> dict:
 
 
 def _tool_get_item(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "get_item needs an integer number", hint='try get_item {"number": 12}')
+    number = _item_number(arguments, "get_item")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -582,9 +696,7 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
 
 
 def _tool_related(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "related needs an integer number", hint='try related {"number": 12}')
+    number = _item_number(arguments, "related")
     depth = _int_arg(arguments, "depth", 1)
     if depth < 1:
         raise ToolError(
@@ -622,7 +734,8 @@ def _tool_path(arguments: dict, ctx) -> dict:
 def _tool_pr_overlap(arguments: dict, ctx) -> dict:
     numbers = arguments.get("numbers")
     if not isinstance(numbers, list) or not all(
-        isinstance(n, int) and not isinstance(n, bool) for n in numbers
+        isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 2**63 - 1
+        for n in numbers
     ):
         raise ToolError(
             "bad_request",
@@ -676,9 +789,7 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
 
 
 def _tool_what_closed(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "what_closed needs an integer number", hint='try what_closed {"number": 5}')
+    number = _item_number(arguments, "what_closed")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -792,6 +903,15 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     numbers_raw = arguments.get("numbers")
     numbers: list[int] | None = None
     if numbers_raw is not None:
+        if force:
+            # Mirror the CLI's own cross-flag contract (cmd_sync rejects
+            # the pair outright; sync_repo would silently drop force —
+            # pr49 review PRR-012).
+            raise ToolError(
+                "bad_request",
+                "force cannot be combined with numbers",
+                hint="a targeted refresh never touches the watermark; drop force",
+            )
         if not isinstance(numbers_raw, list) or not numbers_raw or not all(
             isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in numbers_raw
         ):
@@ -799,6 +919,14 @@ def _tool_sync(arguments: dict, ctx) -> dict:
                 "bad_request",
                 "numbers must be a non-empty list of positive integers",
                 hint='e.g. "numbers": [12, 34]',
+            )
+        if len(numbers_raw) > _MAX_NUMBERS:
+            # Same ceiling as pr_overlap (pr49 review PRR-012): client-chosen
+            # numbers drive per-item fetch work on the operator's credential.
+            raise ToolError(
+                "bad_request",
+                f"numbers is capped at {_MAX_NUMBERS} items",
+                hint=f"refresh at most {_MAX_NUMBERS} items per call",
             )
         numbers = numbers_raw
     if runner is _default_sync_runner and (force or include_patches or numbers):
@@ -821,6 +949,173 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     else:
         data = {"joined": True, "job": job_id}
     return build_envelope(data, conn=None, slug=slug, db_path=db_path)
+
+
+# ---------------------------------------------------------------------------
+# Derived/work-selection tools (issues #29/#30 surfaces; #32 exposes them)
+
+def _translated_derive(fn, conn, slug: str, db_path: Path, /, *args) -> dict:
+    """Run one CLI derived-read wrapper and translate its exceptions into
+    the CLI's coded vocabulary — the same mapping _run_derived_read applies
+    (LookupError -> not_found, ConfigError -> config_error, ValueError ->
+    bad_request, sqlite -> store_unreadable), preserving slug/db identity.
+    ConfigError precedes ValueError: it IS a ValueError."""
+    try:
+        return fn(conn, *args, repo=slug, db_path=db_path)
+    except LookupError as exc:
+        raise ToolError(
+            "not_found", str(exc), hint="pass an existing item number",
+            slug=slug, db_path=db_path,
+        ) from exc
+    except DeriveConfigError as exc:
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        raise ToolError(
+            "config_error", message, hint="fix the derive weight configuration",
+            slug=slug, db_path=db_path,
+        ) from exc
+    except ValueError as exc:
+        raise ToolError(
+            "bad_request", str(exc), hint="fix the tool arguments",
+            slug=slug, db_path=db_path,
+        ) from exc
+    except sqlite3.Error as exc:
+        raise ToolError(
+            "store_unreadable", f"store unreadable: {exc}",
+            hint="check the database file", slug=slug, db_path=db_path,
+        ) from exc
+
+
+def _int_array_csv(arguments: dict, key: str) -> str | None:
+    """A strict optional int-array tool argument, carried to the query layer
+    in the CLI's canonical CSV text form (never str(list): the wrapper's
+    _csv_numbers parses CSV, and "[1, 2]" would raise)."""
+    values = arguments.get(key)
+    if values is None:
+        return None
+    if not isinstance(values, list) or any(
+        isinstance(v, bool) or not isinstance(v, int) for v in values
+    ):
+        raise ToolError(
+            "bad_request", f"{key} must be an array of integers",
+            hint=f"pass {key} as an array of integers",
+        )
+    if len(values) > _MAX_NUMBERS:
+        raise ToolError(
+            "bad_request",
+            f"{key} is capped at {_MAX_NUMBERS} numbers (the pair fan grows "
+            "quadratically; narrow the pool)",
+            hint=f"pass at most {_MAX_NUMBERS} issue numbers",
+        )
+    return ",".join(str(v) for v in values)
+
+
+def _tool_similar_items(arguments: dict, ctx) -> dict:
+    # Validate BEFORE resolving (pr49 review PRR-020): identical malformed
+    # calls answer bad_request uniformly, and identity is simply unknown at
+    # validation time on every tool.
+    number = _item_number(arguments, "similar_items")
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+    slug, db_path = _resolve_target(arguments, ctx)
+    conn = _open_corpus(slug, db_path)
+    try:
+        data = _translated_derive(_similar_query, conn, slug, db_path, number, limit, None, False)
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
+
+
+def _tool_triage(arguments: dict, ctx) -> dict:
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+    cursor = arguments.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
+    top_k = arguments.get("top_k")
+    if top_k is not None:
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ToolError("bad_request", "top_k must be an integer", hint="pass top_k as an integer")
+        top_k = min(top_k, _MAX_TOP_K)
+    include_gated = _bool_arg(arguments, "include_gated")
+    slug, db_path = _resolve_target(arguments, ctx)
+    conn = _open_corpus(slug, db_path)
+    try:
+        data = _translated_derive(
+            _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated, None
+        )
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
+
+
+def _tool_bundle(arguments: dict, ctx) -> dict:
+    size = arguments.get("size")
+    if size is not None and not isinstance(size, str):
+        raise ToolError("bad_request", "size must be a string like '2-3'", hint="pass size as a string")
+    count = _int_arg(arguments, "count", 5)
+    # pool/exclude are capped like pr_overlap's numbers (pr49 review PRR-006):
+    # the derive pair fan is quadratic in pool size, and an uncapped
+    # client-chosen pool stalls the whole serialized server.
+    pool = _int_array_csv(arguments, "pool")
+    exclude = _int_array_csv(arguments, "exclude")
+    allow_shared_files = _bool_arg(arguments, "allow_shared_files")
+    max_files = arguments.get("max_files")
+    if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
+        raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
+    budget_tokens = arguments.get("budget_tokens")
+    if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
+        raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
+    slug, db_path = _resolve_target(arguments, ctx)
+    conn = _open_corpus(slug, db_path)
+    try:
+        data = _translated_derive(
+            _bundle_query, conn, slug, db_path,
+            size if size is not None else "2-3", count, pool, exclude,
+            allow_shared_files, max_files, budget_tokens, None,
+        )
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
+
+
+def _tool_brief(arguments: dict, ctx) -> dict:
+    number = _item_number(arguments, "brief")
+    budget_tokens = _int_arg(arguments, "budget_tokens", 4000)
+    live = _bool_arg(arguments, "live")
+    slug, db_path = _resolve_target(arguments, ctx)
+    conn = _open_corpus(slug, db_path)
+    try:
+        data = _translated_derive(
+            _brief_query, conn, slug, db_path, number, budget_tokens, live, None
+        )
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
+
+
+def _tool_churn(arguments: dict, ctx) -> dict:
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
+    merged_only = _bool_arg(arguments, "merged_only")
+    slug, db_path = _resolve_target(arguments, ctx)
+    conn = _open_corpus(slug, db_path)
+    try:
+        try:
+            data = churn(conn, limit, merged_only=merged_only, repo=slug)
+        except sqlite3.Error as exc:
+            # churn skips _translated_derive (it is a query.py read, not a
+            # derived wrapper) but carries the SAME coded vocabulary and
+            # identity as the CLI's churn runner: a store fault is a
+            # store_unreadable envelope, never the generic runtime path.
+            raise ToolError(
+                "store_unreadable", f"store unreadable: {exc}",
+                hint="check the database file", slug=slug, db_path=db_path,
+            ) from exc
+        except ValueError as exc:
+            raise ToolError(
+                "bad_request", str(exc), hint="fix the tool arguments",
+                slug=slug, db_path=db_path,
+            ) from exc
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -932,14 +1227,90 @@ _TOOLS: list[dict] = [
                 "numbers": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 1},
-                    "description": "Refresh exactly these items; the watermark is untouched",
+                    "description": f"Refresh exactly these items; the watermark is untouched (at most {_MAX_NUMBERS})",
+                    "maxItems": _MAX_NUMBERS,
                 },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},
                 **_REPO_DB,
             }
         ),
     },
+    {
+        "name": "similar_items",
+        "description": "Issues related to one item with per-signal evidence (the CLI similar command; derived, read-only)",
+        "inputSchema": _schema(
+            {
+                "number": {"type": "integer"},
+                "limit": _LIMIT,
+                **_REPO_DB,
+            },
+            ["number"],
+        ),
+    },
+    {
+        "name": "triage",
+        "description": "Open issues ranked workable by the documented formula, with gate reasons (the CLI triage command; derived, read-only)",
+        "inputSchema": _schema(
+            {
+                "limit": _LIMIT,
+                "cursor": _CURSOR,
+                "top_k": {"type": "integer", "minimum": 1, "maximum": _MAX_TOP_K, "description": f"Keep only the top K ranked rows (at most {_MAX_TOP_K})"},
+                "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
+                **_REPO_DB,
+            }
+        ),
+    },
+    {
+        "name": "bundle",
+        "description": "Evidence-backed 2-3-issue work bundles over the triage pool (the CLI bundle command; derived, read-only)",
+        "inputSchema": _schema(
+            {
+                "size": {"type": "string", "description": "Bundle size range like '2-3'"},
+                "count": {"type": "integer", "minimum": 1, "description": "At most K bundles"},
+                "pool": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Restrict the pool to these issue numbers (at most {_MAX_NUMBERS})"},
+                "exclude": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Remove these numbers from the pool (at most {_MAX_NUMBERS})"},
+                "allow_shared_files": {"type": "boolean"},
+                "max_files": {"type": "integer", "minimum": 1},
+                "budget_tokens": {"type": "integer", "minimum": 1},
+                **_REPO_DB,
+            }
+        ),
+    },
+    {
+        "name": "brief",
+        "description": "The token-budgeted work packet for one issue (the CLI brief command; derived, read-only; live=true queries GitHub with the operator gh credentials)",
+        "inputSchema": _schema(
+            {
+                "number": {"type": "integer"},
+                "budget_tokens": {"type": "integer", "minimum": 1},
+                "live": {"type": "boolean", "description": "Query live CI/review state via gh"},
+                **_REPO_DB,
+            },
+            ["number"],
+        ),
+    },
+    {
+        "name": "churn",
+        "description": "Files ranked by PR touch count (the CLI churn command; aggregation surface promoted from a documented gap)",
+        "inputSchema": _schema(
+            {
+                "limit": _LIMIT,
+                "merged_only": {"type": "boolean", "description": "Count merged PRs only"},
+                **_REPO_DB,
+            }
+        ),
+    },
 ]
+
+# Issue #32: every tool declares a permissive outputSchema (results are the
+# JSON envelope, additionalProperties true) and carries annotations with
+# readOnlyHint true except sync (the only tool that mutates the store). The
+# listing is SORTED BY NAME — one deterministic order for both protocol eras
+# (the modern tools/list pins sorted order).
+for _tool in _TOOLS:
+    _tool["outputSchema"] = {"type": "object", "additionalProperties": True}
+    _tool["annotations"] = {"readOnlyHint": _tool["name"] != "sync"}
+_TOOLS.sort(key=lambda entry: entry["name"])
 
 _TOOL_HANDLERS = {
     "graph_status": _tool_graph_status,
@@ -953,6 +1324,11 @@ _TOOL_HANDLERS = {
     "open_items": _tool_open_items,
     "sql": _tool_sql,
     "sync": _tool_sync,
+    "similar_items": _tool_similar_items,
+    "triage": _tool_triage,
+    "bundle": _tool_bundle,
+    "brief": _tool_brief,
+    "churn": _tool_churn,
 }
 
 
@@ -989,6 +1365,7 @@ class _Context:
         "deferred",
         "default_repo",
         "default_db",
+        "modern",
     )
 
     def __init__(
@@ -1010,6 +1387,10 @@ class _Context:
         self.deferred: list[dict] = []
         self.default_repo = default_repo
         self.default_db = default_db
+        #: The CURRENT request's era, set by _dispatch for every message it
+        #: processes and overwritten by the next one — modern is a property
+        #: of a request, never of a session.
+        self.modern = False
 
 
 def serve(
@@ -1072,6 +1453,57 @@ def serve(
             _process(ctx.deferred.pop(0), ctx)
 
 
+def _tool_result(stdout, req_id, env: dict, modern: bool) -> None:
+    """The ONE tools/call result write: the text block plus structuredContent
+    (issue #32 AC2 — every tool answer, success or failure, carries the
+    parsed envelope structurally), and resultType complete on the modern
+    era (an isError result is still a COMPLETE call: the tool ran)."""
+    result: dict = {
+        "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
+        "isError": env.get("error") is not None,
+        "structuredContent": env,
+    }
+    if modern:
+        result["resultType"] = "complete"
+    _result(stdout, req_id, result)
+
+
+def _cacheable(result: dict, ttl_ms: int, scope: str) -> dict:
+    """Tag a modern listing/read result with the official CacheableResult
+    fields plus resultType complete (issue #33)."""
+    result["resultType"] = "complete"
+    result["ttlMs"] = int(ttl_ms)
+    result["cacheScope"] = scope
+    return result
+
+
+def _discover_result(modern: bool) -> dict:
+    """server/discover: the versions this server speaks (the modern revision
+    plus every served legacy revision, derived from the one constants seam),
+    capabilities, and the tool registry — the issue-mandated `tools` field is
+    an additive DiscoverResult extension (#33 AC9)."""
+    result = {
+        "supportedVersions": [_MODERN_PROTOCOL_VERSION, *_PROTOCOL_VERSIONS],
+        "capabilities": {
+            "tools": {"listChanged": False},
+            "resources": {"subscribe": False, "listChanged": False},
+        },
+        "tools": _TOOLS,
+    }
+    if modern:
+        _cacheable(result, _LISTING_TTL_MS, "public")
+    return result
+
+
+def _error_data(stdout, req_id, code: int, message: str, data) -> None:
+    """A JSON-RPC error with a structured data object (the modern-era
+    UnsupportedProtocolVersionError carries supported/requested)."""
+    error: dict = {"code": code, "message": message}
+    if data is not None:
+        error["data"] = data
+    _send(stdout, {"jsonrpc": "2.0", "id": req_id, "error": error})
+
+
 def _process(msg: dict, ctx: "_Context") -> None:
     """Handle one inbound message: dispatch it with full error containment."""
     method = msg.get("method")
@@ -1084,17 +1516,23 @@ def _process(msg: dict, ctx: "_Context") -> None:
     req_id = msg.get("id")
     try:
         _dispatch(msg, method, has_id, req_id, ctx)
+    except _InputRequired:
+        # Escaped _dispatch only if a future handler raises it outside the
+        # modern tools/call|resources flow: answer the input-required result
+        # rather than a protocol error (never a traceback).
+        _result(
+            stdout,
+            req_id,
+            {
+                "resultType": "input_required",
+                "requestState": _InputRequired.REQUEST_STATE,
+                "content": [{"type": "text", "text": _InputRequired().hint_text()}],
+            },
+        )
     except ToolError as exc:
         if method == "tools/call":
             env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)
-            _result(
-                stdout,
-                req_id,
-                {
-                    "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
-                    "isError": True,
-                },
-            )
+            _tool_result(stdout, req_id, env, ctx.modern)
         else:
             message = exc.message + (f" (hint: {exc.hint})" if exc.hint else "")
             _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, message)
@@ -1111,20 +1549,67 @@ def _process(msg: dict, ctx: "_Context") -> None:
                 None,
                 None,
             )
-            _result(
-                stdout,
-                req_id,
-                {
-                    "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
-                    "isError": True,
-                },
-            )
+            _tool_result(stdout, req_id, env, ctx.modern)
         elif has_id:
             _error(stdout, req_id, _JSONRPC_INTERNAL_ERROR, f"Internal error: {exc}")
 
 
 def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> None:
     stdout = ctx.stdout
+    params = msg.get("params")
+    if params is not None and not isinstance(params, dict):
+        # Non-object params are legal JSON-RPC framing but malformed for
+        # every method this server serves — invalid params, never an
+        # internal error (pr49 review PRR-001; base answered tools/list
+        # for array params, so this must not become -32603).
+        if has_id:
+            _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, "params must be an object")
+        return
+    params = params or {}
+    era, declared = _era_of(params)
+    if era == "malformed":
+        # A namespaced protocolVersion that is present but not a string is
+        # malformed modern metadata: -32602 (2026-07-28 requires the
+        # per-request version as a string; the PR body promises -32602 for
+        # exactly this shape — pr49 review PRR-004, which also stops the
+        # silent legacy downgrade from walking a modern-intent call into
+        # the roots round-trip).
+        if has_id:
+            _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, "malformed modern metadata")
+        return
+    if era == "unsupported":
+        # An unsupported declared modern version: UnsupportedProtocolVersionError
+        # (2026-07-28 versioning) listing what this server CAN speak.
+        # Notifications (no id) get no error reply, like the fallthrough.
+        if has_id:
+            _error_data(
+                stdout,
+                req_id,
+                -32022,
+                "Unsupported protocol version",
+                {
+                    "supported": [_MODERN_PROTOCOL_VERSION, *_PROTOCOL_VERSIONS],
+                    "requested": declared,
+                },
+            )
+        return
+    modern = era == "modern"
+    if modern and not isinstance(_modern_capabilities(params), dict):
+        if has_id:
+            _error(
+                stdout,
+                req_id,
+                _JSONRPC_INVALID_PARAMS,
+                "modern requests must carry io.modelcontextprotocol/clientCapabilities "
+                "as an object",
+            )
+        return
+    # The era is a property of THIS request; the next message overwrites it.
+    # Every early return above happens BEFORE this assignment, so a failed
+    # request can never leave its own era behind for the next message
+    # (pr49 review PRR-003 follow-up: assign-era-last is what makes the
+    # stale-era residue unreachable).
+    ctx.modern = modern
     if method == "initialize":
         if not has_id:
             return
@@ -1144,13 +1629,33 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
         )
         return
     if method == "ping":
+        if modern:
+            # The 2026-07-28 revision has no ping method. Notifications
+            # (no id) get no reply at all — JSON-RPC forbids answering a
+            # notification (pr49 review PRR-002), like every sibling branch.
+            if has_id:
+                _error(
+                    stdout,
+                    req_id,
+                    _JSONRPC_METHOD_NOT_FOUND,
+                    "ping is removed in the 2026-07-28 revision",
+                )
+            return
         if has_id:
             _result(stdout, req_id, {})
         return
     if method == "tools/list":
         if not has_id:
             return
-        _result(stdout, req_id, {"tools": _TOOLS})
+        result: dict = {"tools": _TOOLS}
+        if modern:
+            _cacheable(result, _LISTING_TTL_MS, "public")
+        _result(stdout, req_id, result)
+        return
+    if method == "server/discover":
+        if not has_id:
+            return
+        _result(stdout, req_id, _discover_result(modern))
         return
     if method == "tools/call":
         if not has_id:
@@ -1169,38 +1674,56 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
-        env = handler(arguments, ctx)
-        _result(
-            stdout,
-            req_id,
-            {
-                "content": [{"type": "text", "text": json.dumps(env, ensure_ascii=False)}],
-                "isError": env.get("error") is not None,
-            },
-        )
+        try:
+            env = handler(arguments, ctx)
+        except _InputRequired as required:
+            # The modern era resolves without Roots: a repo-less, un-pinned
+            # call asks the client for `repo` instead of round-tripping.
+            _result(
+                stdout,
+                req_id,
+                {
+                    "resultType": "input_required",
+                    "requestState": required.REQUEST_STATE,
+                    "content": [{"type": "text", "text": required.hint_text()}],
+                },
+            )
+            return
+        except ToolError as exc:
+            env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)
+            _tool_result(stdout, req_id, env, modern)
+            return
+        except Exception as exc:  # a tool fault is a tool answer
+            _log(traceback.format_exc())
+            env = _error_envelope(
+                "runtime", str(exc), "internal error; the server log has details", None, None
+            )
+            _tool_result(stdout, req_id, env, modern)
+            return
+        _tool_result(stdout, req_id, env, modern)
         return
     if method == "resources/list":
         if not has_id:
             return
-        _result(
-            stdout,
-            req_id,
+        result = {"resources": [
             {
-                "resources": [
-                    {
-                        "uri": _SCHEMA_RESOURCE_URI,
-                        "name": "schema",
-                        "description": "Table DDL and per-column notes for the resolved database (the schema command)",
-                        "mimeType": "application/json",
-                    }
-                ]
-            },
-        )
+                "uri": _SCHEMA_RESOURCE_URI,
+                "name": "schema",
+                "description": "Table DDL and per-column notes for the resolved database (the schema command)",
+                "mimeType": "application/json",
+            }
+        ]}
+        if modern:
+            _cacheable(result, _LISTING_TTL_MS, "public")
+        _result(stdout, req_id, result)
         return
     if method == "resources/templates/list":
         if not has_id:
             return
-        _result(stdout, req_id, {"resourceTemplates": []})
+        result = {"resourceTemplates": []}
+        if modern:
+            _cacheable(result, _LISTING_TTL_MS, "public")
+        _result(stdout, req_id, result)
         return
     if method == "resources/read":
         if not has_id:
@@ -1214,21 +1737,38 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
                 f"Unknown resource {uri!r}; resources/list names what exists",
             )
             return
-        slug, db_path = _resolve_target({}, ctx)
+        try:
+            slug, db_path = _resolve_target({}, ctx)
+        except _InputRequired as required:
+            # The modern era resolves without Roots (covers the resource
+            # sibling path too). The hint names the REAL remedies: this
+            # channel has no arguments slot, so "pass repo" would be
+            # unactionable (pr49 review PRR-009).
+            _result(
+                stdout,
+                req_id,
+                {
+                    "resultType": "input_required",
+                    "requestState": required.REQUEST_STATE,
+                    "content": [
+                        {"type": "text", "text": required.hint_text(resources_channel=True)}
+                    ],
+                },
+            )
+            return
         conn = _open_corpus(slug, db_path)
         try:
             payload = json.dumps(describe_schema(conn), ensure_ascii=False)
         finally:
             conn.close()
-        _result(
-            stdout,
-            req_id,
-            {
-                "contents": [
-                    {"uri": _SCHEMA_RESOURCE_URI, "mimeType": "application/json", "text": payload}
-                ]
-            },
-        )
+        result = {
+            "contents": [
+                {"uri": _SCHEMA_RESOURCE_URI, "mimeType": "application/json", "text": payload}
+            ]
+        }
+        if modern:
+            _cacheable(result, _RESOURCE_READ_TTL_MS, "private")
+        _result(stdout, req_id, result)
         return
     # notifications/initialized, notifications/cancelled, unknown methods
     if has_id:

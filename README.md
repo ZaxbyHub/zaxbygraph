@@ -660,29 +660,54 @@ refuses device paths (`--out NUL`).
 
 `zaxbygraph mcp` runs a stdio MCP (Model Context Protocol) server — the same
 data, exposed as typed tools so agents stop re-deriving cwd, column names and
-output shapes every session (issue #7). It is a thin adapter over the same
-query layer the CLI uses: every tool answers with the standard JSON envelope
-inside the tool result text, structured errors included.
+output shapes every session (issues #7, #32, #33). It is a thin adapter over
+the same query layer the CLI uses: every tool answers with the standard JSON
+envelope inside the tool result text, structured errors included.
 
 ```bash
 zaxbygraph mcp [--stale-seconds N]
 ```
 
-- **Tools** (11): `graph_status`, `search`, `get_item`, `related`, `path`,
-  `pr_overlap`, `file_history`, `what_closed`, `open_items`, `sql`, `sync`.
-  `sql` reuses the CLI's read-only guard stack; `sync` never blocks — it
-  returns a job id and `graph_status` reports progress.
+- **Tools** (16, sorted): `brief`, `bundle`, `churn`, `file_history`, `get_item`,
+  `graph_status`, `open_items`, `path`, `pr_overlap`, `related`,
+  `search`, `similar_items`, `sql`, `sync`, `triage`, `what_closed`.
+  Every tool declares a permissive `outputSchema` and `annotations`
+  (`readOnlyHint: true` on all but `sync`), and every COMPLETE tool result
+  carries `structuredContent` — the parsed envelope — alongside the text
+  block (issue #32). The one exception is the modern (2026-07-28)
+  `input_required` answer, whose shape is `{resultType, requestState,
+  content}` — no structuredContent, by protocol design. The five work-selection/derived tools call the same query
+  layer as their CLI commands, so data payloads match the CLI exactly on the
+  same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
+  it returns a job id and `graph_status` reports progress.
+- **Protocol eras**: the server speaks legacy revisions (`2025-11-25`,
+  `2025-06-18`, `2025-03-26`, `2024-11-05`, negotiated by `initialize`,
+  latest answered 2025-11-25) and the stateless 2026-07-28 revision
+  (issue #33): requests carry `io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities` in `_meta` — no handshake,
+  no ping (a modern-marked ping answers method-not-found), `server/discover`
+  reports `supportedVersions`/`capabilities`/`tools` with cache hints
+  (`ttlMs`/`cacheScope`), modern tool, listing, resource and discovery results carry `resultType`
+  (`complete`, or `input_required` for the repo flow); an `initialize`
+  request answered under a modern marker keeps the legacy handshake shape, and a modern request
+  that names no repo and has no server pin answers an `InputRequiredResult`
+  naming `repo` instead of round-tripping Roots. An unsupported declared
+  version answers `-32022` with the supported list; malformed modern
+  metadata answers `-32602`.
 - **Resource**: `zaxbygraph://schema` serves the same DDL and column notes as
   the `schema` command.
 - **Repo resolution**: explicit `repo` argument, then a server pin
-  (`zaxbygraph mcp --repo OWNER/REPO [--db PATH]`), then the client's MCP
-  roots, then the server cwd's git origin — resolving to the same slug-keyed
-  store as the CLI, so a worktree and its main checkout share one graph.
+  (`zaxbygraph mcp --repo OWNER/REPO`; `--db PATH` pins the database file, not the repo), then — legacy clients
+  only — the client's MCP roots, then (still legacy-only) the server cwd's git origin;
+  modern (2026-07-28) requests resolve without Roots and answer
+  `input_required` when nothing pins a repo. All paths resolve to the same
+  slug-keyed store as the CLI, so a worktree and its main checkout share one
+  graph.
 - **Staleness**: when a read answers and `freshness.age_s` exceeds the
   threshold (`--stale-seconds`, default 900, env
   `ZAXBYGRAPH_MCP_STALE_SECONDS`), the answer still comes from current data
   and one background incremental sync starts (guarded by the sync lock);
-  `freshness.refreshing` is `true` until it lands.
+  `freshness.refreshing` is `true` on the answer that started or joined a background refresh; the key is absent otherwise (it never reads `false`).
 
 Register it (Claude Code):
 
