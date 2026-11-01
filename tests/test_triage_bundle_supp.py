@@ -55,6 +55,10 @@ from zaxbygraph.sync import sync_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: hermeticity (issue #46 AC2): see test_triage_bundle.py - legs run in a
+#: dedicated temp cwd so ambient config files cannot reweight checks.
+_LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-legs-")
+
 
 # ==== shared plumbing (module-local; the supp file stays self-contained) ====
 
@@ -145,7 +149,7 @@ def _run_cli(*argv: str, path_override: str | None = None) -> tuple[int, bytes, 
         [sys.executable, "-m", "zaxbygraph", *argv],
         capture_output=True,
         env=env,
-        cwd=str(REPO_ROOT),
+        cwd=_LEG_CWD,
         timeout=120,
     )
     return proc.returncode, proc.stdout, proc.stderr

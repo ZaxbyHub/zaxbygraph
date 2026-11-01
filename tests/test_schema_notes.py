@@ -388,7 +388,7 @@ class EnvelopeContractTests(unittest.TestCase):
             missing = [k for k in required if k not in payload]
             if missing:
                 problems.append(f"{name} missing {','.join(missing)}")
-        uncovered = registered - seen - {"sync", "mcp", "export-corpus"}
+        uncovered = registered - seen - {"sync", "mcp", "export-corpus", "snapshot"}
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"
         )

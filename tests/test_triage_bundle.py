@@ -60,6 +60,12 @@ from zaxbygraph.sync import sync_repo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+#: hermeticity (issue #46 AC2): derived-tier CLI legs resolve the
+#: [triage]/[derive] config chain from the cwd, so every leg runs in a
+#: dedicated temp cwd instead of REPO_ROOT - an operator's repo-root
+#: `.zaxbygraph.toml` must never reweight a check.
+_LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-legs-")
+
 #: Deterministic "latest synced_at" anchor for every store whose stage-2
 #: hotspot the hand computation depends on (04-root-cause.md section 2:
 #: "recency = 1.0 if merged within 90 days of the LATEST synced_at (echoed
@@ -196,7 +202,7 @@ def _run_cli(*argv: str, path_override: str | None = None) -> tuple[int, bytes, 
         [sys.executable, "-m", "zaxbygraph", *argv],
         capture_output=True,
         env=env,
-        cwd=str(REPO_ROOT),
+        cwd=_LEG_CWD,
         timeout=120,
     )
     return proc.returncode, proc.stdout, proc.stderr

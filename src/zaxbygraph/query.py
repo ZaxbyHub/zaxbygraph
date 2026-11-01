@@ -181,10 +181,19 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
     ).fetchall()
     for row in states:
         row["complete"] = not row.get("full_sync_pending") and row.get("last_error") is None
+    snapshot = None
+    meta_rows = dict(conn.execute("SELECT key, value FROM meta WHERE key LIKE 'snapshot.%'").fetchall())
+    if meta_rows:
+        snapshot = {
+            "publisher": meta_rows.get("snapshot.publisher"),
+            "manifest_sha256": meta_rows.get("snapshot.manifest_sha256"),
+            "pulled_at": meta_rows.get("snapshot.pulled_at"),
+        }
     return {
         "repos": states,
         "counts": [dict(r) for r in items],
         "coverage": _coverage(conn, repo, user_version),
+        "snapshot": snapshot,
     }
 
 

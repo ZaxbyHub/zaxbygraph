@@ -14,6 +14,7 @@ from zaxbygraph import derive
 from zaxbygraph import export
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.doctor import doctor as doctor_run
+from zaxbygraph.snapshot import SnapshotError, publish as snapshot_publish, pull as snapshot_pull
 # The default sync source is the GraphQL bulk source (issue #5); it is bound
 # under the name the test suite patches (`zaxbygraph.cli.GhApiSource`), and
 # the REST fallback stays reachable as GhRestSource for `--source rest`.
@@ -1885,6 +1886,42 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_snapshot_publish(args: argparse.Namespace) -> int:
+    try:
+        if args.repo:
+            repo, host = validate_slug(args.repo), DEFAULT_HOST
+        else:
+            host, repo = remote_info()
+    except RepoError as exc:
+        return emit_failure(args, 2, str(exc), slug=None)
+    store_db = Path(args.db) if args.db else store_db_path(host, repo)
+    try:
+        result = snapshot_publish(store_db, args.target, args.publisher)
+    except SnapshotError as exc:
+        return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
+                            code_key=exc.code, hint=exc.hint)
+    emit_result(args, result, slug=repo, db_path=store_db, identity=False)
+    return 0
+
+
+def cmd_snapshot_pull(args: argparse.Namespace) -> int:
+    try:
+        if args.repo:
+            repo, host = validate_slug(args.repo), DEFAULT_HOST
+        else:
+            host, repo = remote_info()
+    except RepoError as exc:
+        return emit_failure(args, 2, str(exc), slug=None)
+    store_db = Path(args.db) if args.db else store_db_path(host, repo)
+    try:
+        result = snapshot_pull(store_db, args.source, force=args.force)
+    except SnapshotError as exc:
+        return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
+                            code_key=exc.code, hint=exc.hint)
+    emit_result(args, result, slug=repo, db_path=store_db, identity=False)
+    return 0
+
+
 def cmd_export_corpus(args: argparse.Namespace) -> int:
     repo: str | None = None
     db_path: Path | None = None
@@ -2387,6 +2424,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Refuse (exit 1) unless the store is complete and error-free",
     )
     sp.set_defaults(func=cmd_export_corpus)
+
+    sp = sub.add_parser(
+        "snapshot",
+        help="Verified snapshot transport (publish|pull; issue #34)",
+    )
+    snap_sub = sp.add_subparsers(dest="snapshot_command", required=True)
+    sp_pub = snap_sub.add_parser("publish", help="Push a verified store snapshot as one orphan commit")
+    add_common(sp_pub)
+    sp_pub.add_argument("target", help="Target git repository (path or URL)")
+    sp_pub.add_argument("--publisher", default=None, help="Publisher name recorded in the manifest")
+    sp_pub.set_defaults(func=cmd_snapshot_publish)
+    sp_pull = snap_sub.add_parser("pull", help="Verify and install a snapshot")
+    add_common(sp_pull)
+    sp_pull.add_argument("source", help="Source git repository (path or URL)")
+    sp_pull.add_argument("--force", action="store_true",
+                         help="Overwrite a newer local store")
+    sp_pull.set_defaults(func=cmd_snapshot_pull)
 
     sp = sub.add_parser("where", help="Print the resolution chain for this checkout")
     add_common(sp)

@@ -199,6 +199,12 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
     INSERTs only: post-delete there is nothing to conflict with, and
     INSERT OR REPLACE's double-unique semantics could silently drop rows.
 
+    Snapshot provenance (issue #34) is dropped by consolidation on
+    purpose: the merged corpus is not the pulled snapshot, so
+    `snapshot.*` meta keys are deleted from the target and `status`
+    reports no snapshot provenance afterward. (Disclosure per plan v4,
+    critic round 1 finding 6.)
+
     Revisions (issue #40) are the exception to replace-the-slug: the
     candidate's `revisions` table is an OBSERVATION, not the truth —
     a pre-v8 candidate migrated in by _MigratedCopy carries an empty,
@@ -233,6 +239,12 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                         f"DELETE FROM {table} WHERE repo = ?", (repo_l,)
                     )
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
+
+                # Snapshot provenance (issue #34) drops on consolidation:
+                # the merged corpus is not the pulled snapshot, and the
+                # meta table is global (not repo-scoped like the tables
+                # above), so the keys are removed directly.
+                dst.execute("DELETE FROM meta WHERE key LIKE 'snapshot.%'")
 
                 # Issue #40: revisions adopt per item. A covered number
                 # (the candidate has revision rows for it) whose candidate
