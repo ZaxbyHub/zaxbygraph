@@ -208,13 +208,19 @@ def _proxy_disabled_reason(url: str) -> str | None:
     loopback URL that fails to parse even with the rewrite enabled (no
     git/ prefix, malformed slug, no scheme) gets no attribution: the
     variable did not cause that failure. Unset and valid-host states are
-    never "disabled", so they never attribute either."""
+    never "disabled", so they never attribute either. Normalization
+    mirrors _parse_remote_info exactly (final-critic round: a trailing
+    .git is stripped first, so a .git-suffixed proxy URL that would
+    resolve through the rewrite still attributes)."""
+    url = url.strip()
+    if url.endswith(".git"):
+        url = url[:-4]
     for scheme in ("https://", "http://", "ssh://"):
-        if url.strip().startswith(scheme):
+        if url.startswith(scheme):
             break
     else:
         return None
-    rest = url.strip()[len(scheme):]
+    rest = url[len(scheme):]
     if rest.startswith("git@"):
         rest = rest[4:]
     host_raw, _, path = rest.partition("/")
