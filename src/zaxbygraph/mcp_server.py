@@ -85,6 +85,10 @@ _LATEST_PROTOCOL_VERSION = _PROTOCOL_VERSIONS[0]
 #: and no ping on this era.
 _MODERN_PROTOCOL_VERSION = "2026-07-28"
 _META_VERSION_KEY = "io.modelcontextprotocol/protocolVersion"
+#: Sentinel for "namespaced key absent" in _era_of: key-present-with-null
+#: is malformed modern metadata (-32602), never a silent legacy downgrade
+#: (fix-round probe P14).
+_MODERN_ABSENT = object()
 _META_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
 
 #: Cache hints (the official CacheableResult fields) for results that are
@@ -156,8 +160,8 @@ def _era_of(params: dict) -> tuple[str, str | None]:
     meta = params.get("_meta")
     if not isinstance(meta, dict):
         return "legacy", None
-    declared = meta.get(_META_VERSION_KEY)
-    if declared is None:
+    declared = meta.get(_META_VERSION_KEY, _MODERN_ABSENT)
+    if declared is _MODERN_ABSENT:
         return "legacy", None
     if not isinstance(declared, str):
         return "malformed", None
@@ -670,9 +674,7 @@ def _tool_search(arguments: dict, ctx) -> dict:
 
 
 def _tool_get_item(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "get_item needs an integer number", hint='try get_item {"number": 12}')
+    number = _item_number(arguments, "get_item")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -694,9 +696,7 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
 
 
 def _tool_related(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "related needs an integer number", hint='try related {"number": 12}')
+    number = _item_number(arguments, "related")
     depth = _int_arg(arguments, "depth", 1)
     if depth < 1:
         raise ToolError(
@@ -734,7 +734,8 @@ def _tool_path(arguments: dict, ctx) -> dict:
 def _tool_pr_overlap(arguments: dict, ctx) -> dict:
     numbers = arguments.get("numbers")
     if not isinstance(numbers, list) or not all(
-        isinstance(n, int) and not isinstance(n, bool) for n in numbers
+        isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= 2**63 - 1
+        for n in numbers
     ):
         raise ToolError(
             "bad_request",
@@ -788,9 +789,7 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
 
 
 def _tool_what_closed(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError("bad_request", "what_closed needs an integer number", hint='try what_closed {"number": 5}')
+    number = _item_number(arguments, "what_closed")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -1279,7 +1278,7 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "brief",
-        "description": "The token-budgeted work packet for one issue (the CLI brief command; derived, read-only)",
+        "description": "The token-budgeted work packet for one issue (the CLI brief command; derived, read-only; live=true queries GitHub with the operator gh credentials)",
         "inputSchema": _schema(
             {
                 "number": {"type": "integer"},

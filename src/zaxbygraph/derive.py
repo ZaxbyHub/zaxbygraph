@@ -2910,7 +2910,9 @@ def _brief_live(
     # is individually time- and byte-bounded, but 1+3N calls run in the
     # caller's loop, so the PR list is capped to its last members and the
     # live block discloses the trim instead of silently dropping PRs.
+    omitted_prs = 0
     if len(pr_numbers) > _BRIEF_LIVE_MAX_PRS:
+        omitted_prs = len(pr_numbers) - _BRIEF_LIVE_MAX_PRS
         pr_numbers = pr_numbers[-_BRIEF_LIVE_MAX_PRS:]
 
     prs: list[dict] = []
