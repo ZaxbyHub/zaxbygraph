@@ -34,7 +34,9 @@ join the registry, and the churn / similar_items envelopes match the
 CLI's shape on the same seeded store: churn data is a list of per-path
 rows each carrying a count-like integer field, its first row's keys
 equal to the CLI `churn` command's first-row keys on the same database;
-similar_items data carries an "items" key.
+similar_items data carries the CLI's derived payload keys (candidates,
+capabilities, derived, ...), compared dynamically against the same CLI
+call's data payload.
 """
 
 from __future__ import annotations
@@ -166,6 +168,16 @@ class TestMcpTypedToolSurface(unittest.TestCase):
         names = {t.get("name") for t in tools}
 
         with self.subTest(part="registry"):
+            # Cardinality BEFORE the set comparison: a duplicate registry
+            # entry would pass a set-equality check while advertising a
+            # broken list (pr49 review PRR-026).
+            self.assertEqual(
+                len(tools),
+                16,
+                "AC1 registry cardinality: tools/list must advertise exactly 16 "
+                f"tool entries (a duplicate entry would inflate the list); got "
+                f"{len(tools)}: {names}",
+            )
             self.assertEqual(
                 names,
                 EXPECTED_TOOLS,
@@ -182,6 +194,33 @@ class TestMcpTypedToolSurface(unittest.TestCase):
                 "dict (permissive: additionalProperties may be true); "
                 f"missing on {without}",
             )
+
+        with self.subTest(part="outputSchema content"):
+            # Presence alone is not a schema: each declared outputSchema
+            # must actually say type object and be permissive
+            # (pr49 review PRR-028).
+            for tool in tools:
+                name = tool.get("name")
+                schema = tool.get("outputSchema")
+                self.assertIsInstance(
+                    schema,
+                    dict,
+                    f"AC1 outputSchema content: tool {name!r} must declare an "
+                    "outputSchema object whose content can be checked",
+                )
+                self.assertEqual(
+                    schema.get("type"),
+                    "object",
+                    f"AC1 outputSchema content: tool {name!r} outputSchema must "
+                    f"declare type 'object'; got {schema.get('type')!r}",
+                )
+                self.assertIs(
+                    schema.get("additionalProperties"),
+                    True,
+                    f"AC1 outputSchema content: tool {name!r} outputSchema must be "
+                    f"permissive (additionalProperties true); got "
+                    f"{schema.get('additionalProperties')!r}",
+                )
 
         with self.subTest(part="annotations"):
             without = [t.get("name") for t in tools if not isinstance(t.get("annotations"), dict)]
@@ -305,6 +344,32 @@ class TestMcpTypedToolSurface(unittest.TestCase):
             "AC2 no structuredContent: the generic-exception structuredContent must "
             "be an object",
         )
+        # Presence alone is not parity on the generic path either: the
+        # generic-exception structuredContent must equal the parsed text
+        # block and carry the coded runtime error, like every other
+        # failure path (pr49 review PRR-027).
+        fault_content = result.get("content")
+        self.assertIsInstance(
+            fault_content, list, "AC2: the generic-exception result must carry content"
+        )
+        self.assertTrue(fault_content, "AC2: the generic-exception content must not be empty")
+        fault_first = fault_content[0]
+        self.assertIsInstance(
+            fault_first, dict, "AC2: the generic-exception content[0] must be an object"
+        )
+        fault_envelope = json.loads(fault_first.get("text"))
+        self.assertEqual(
+            result.get("structuredContent"),
+            fault_envelope,
+            "AC2 no structuredContent: the generic-exception structuredContent must "
+            "equal json.loads(content[0].text) (the runtime envelope)",
+        )
+        self.assertEqual(
+            ((result.get("structuredContent") or {}).get("error") or {}).get("code"),
+            "runtime",
+            "AC2 no structuredContent: the generic-exception envelope must carry "
+            "error.code 'runtime'",
+        )
         session.stop()
 
     def test_negotiates_2025_11_25(self) -> None:
@@ -360,14 +425,16 @@ class TestMcpTypedToolSurface(unittest.TestCase):
                 "AC3 unsupported negotiation broken: an unserved protocolVersion "
                 "must never be echoed back",
             )
-            # The fallback must be the server's LATEST served version: at
-            # least as new as 2025-11-25 (proven served above); protocol
-            # versions are date-form strings, so they order lexicographically.
-            self.assertGreaterEqual(
+            # The fallback must be the server's LATEST served version, pinned
+            # EXACTLY: a lexicographic >= would let any future latest (or a
+            # mis-ordered served tuple) slip through unasserted
+            # (pr49 review PRR-025).
+            self.assertEqual(
                 answered,
                 "2025-11-25",
-                "AC3 unsupported negotiation broken: an unserved version must be "
-                f"answered with the latest served version, got {answered!r}",
+                "AC3 answers 2025-06-18: an unserved protocolVersion must be "
+                "answered with the server's latest served version 2025-11-25, got "
+                f"{answered!r}",
             )
         session.stop()
 
@@ -396,6 +463,7 @@ class TestMcpTypedToolSurface(unittest.TestCase):
         # CLI commands"). Freshness/db identity fields live outside data.
         parity = (
             ("churn", {}, ["churn"]),
+            ("churn", {"merged_only": True}, ["churn", "--merged-only"]),
             ("similar_items", {"number": 1}, ["similar", "1"]),
             ("triage", {}, ["triage"]),
             ("bundle", {}, ["bundle"]),
@@ -433,6 +501,49 @@ class TestMcpTypedToolSurface(unittest.TestCase):
                     f"JSON-equal the CLI {cli_argv[0]} data payload on the same store "
                     f"(tool={json.dumps(structured.get('data'))[:200]} "
                     f"cli={json.dumps(cli_data)[:200]})",
+                )
+
+        # _COUNT_FIELD_NAMES is not dead weight: every churn row must carry
+        # an integer count field from it — the structural recognition the
+        # dynamic CLI-parity comparison cannot express alone
+        # (pr49 review PRR-029).
+        with self.subTest(part="churn count fields"):
+            reply = session.call_tool("churn", {})
+            structured = (reply.get("result") or {}).get("structuredContent")
+            self.assertIsInstance(
+                structured,
+                dict,
+                "AC4 cli envelope mismatch: the churn call must carry a "
+                "structuredContent envelope",
+            )
+            rows = structured.get("data")
+            self.assertIsInstance(
+                rows,
+                list,
+                "AC4 cli envelope mismatch: churn data must be a list of per-path "
+                f"rows; got {type(rows).__name__}",
+            )
+            self.assertTrue(
+                rows,
+                "AC4 cli envelope mismatch: the seeded store must yield churn rows",
+            )
+            for row in rows:
+                self.assertIsInstance(
+                    row,
+                    dict,
+                    "AC4 cli envelope mismatch: each churn row must be an object; "
+                    f"got {row!r}",
+                )
+                count_fields = [
+                    key
+                    for key in _COUNT_FIELD_NAMES
+                    if isinstance(row.get(key), int) and not isinstance(row.get(key), bool)
+                ]
+                self.assertTrue(
+                    count_fields,
+                    f"AC4 cli envelope mismatch: each churn row must carry an "
+                    f"integer count field from {_COUNT_FIELD_NAMES}; row keys "
+                    f"{sorted(row)}",
                 )
 
         # Failure parity: the derived tools translate the CLI's coded error
@@ -542,8 +653,9 @@ class TestMcpTypedToolSurface(unittest.TestCase):
             REPO,
             "AC13 churn store fault: identity lost (repo)",
         )
-        self.assertIsNotNone(
+        self.assertEqual(
             structured.get("db"),
+            str(self.db_path),
             "AC13 churn store fault: identity lost (db)",
         )
         session.stop()

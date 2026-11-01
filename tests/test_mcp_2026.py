@@ -11,9 +11,11 @@ can attribute each failure to exactly one contract point.
 CONTRACT PINNED (issue #33), all over the suite's McpSession harness:
 
 AC8 stateless requests: a request with NO prior initialize whose params
-carry _meta {"protocolVersion": "2026-07-28", "capabilities": {}} is
-answered with a result (never a -32601/-32602 error) that includes a
-resultType key, and its tools list equals a post-initialize tools/list.
+carry _meta with the namespaced 2026-07-28 keys
+(io.modelcontextprotocol/protocolVersion "2026-07-28" and
+io.modelcontextprotocol/clientCapabilities {}) is answered with a result
+(never a -32601/-32602 error) that includes a resultType key, and its
+tools list equals a post-initialize tools/list.
 
 AC9 server/discover: answered with no prior initialize, carrying the
 server's versions (a list including "2026-07-28" and "2025-06-18"),
@@ -183,6 +185,46 @@ class TestMcp2026StatelessSurface(unittest.TestCase):
                     "tools list to compare against a post-initialize tools/list"
                 )
 
+        # A modern-marked tools/call on the initialized session (repo
+        # pinned) must answer the full typed result too: the stateless era
+        # is not error-only (pr49 review PRR-031a).
+        with self.subTest(part="modern tools/call success"):
+            req_id = session.request(
+                "tools/call",
+                {
+                    "name": "get_item",
+                    "arguments": {"number": 1},
+                    "_meta": dict(_META_2026),
+                },
+            )
+            reply = session.wait_response(req_id)
+            self.assertIsNone(
+                reply.get("error"),
+                "AC8 stateless request rejected: a modern-marked tools/call on an "
+                f"initialized session must be answered, got error {reply.get('error')!r}",
+            )
+            call_result = reply.get("result") or {}
+            self.assertEqual(
+                call_result.get("resultType"),
+                "complete",
+                "AC8 stateless request rejected: the modern tools/call result must "
+                f"carry resultType 'complete'; got {call_result.get('resultType')!r} "
+                f"(keys {sorted(call_result)})",
+            )
+            structured = call_result.get("structuredContent")
+            self.assertIsInstance(
+                structured,
+                dict,
+                "AC8 stateless request rejected: the modern tools/call result must "
+                "carry a structuredContent envelope",
+            )
+            self.assertIs(
+                structured.get("ok"),
+                True,
+                "AC8 stateless request rejected: the modern get_item call must "
+                f"answer ok=true: {str(structured)[:160]}",
+            )
+
         # Modern-era error contracts (issue #33: ping is removed; the
         # versioning page pins the wire errors).
         with self.subTest(part="modern ping removed"):
@@ -228,6 +270,40 @@ class TestMcp2026StatelessSurface(unittest.TestCase):
                 (err.get("data") or {}).get("supported", []),
                 "AC8 stateless request rejected: the -32022 error data must list the "
                 "supported versions including 2026-07-28",
+            )
+
+        with self.subTest(part="params as array"):
+            # params must be an OBJECT: legal JSON-RPC framing, malformed
+            # for every method here — invalid-params -32602, never the
+            # internal-error -32603 the base answered (pr49 review
+            # PRR-031b; the params-object guard).
+            req_id = session.request("tools/list", ["not", "an", "object"])
+            reply = session.wait_response(req_id)
+            self.assertEqual(
+                (reply.get("error") or {}).get("code"),
+                -32602,
+                "AC8 stateless request rejected: array params must answer "
+                "invalid-params -32602, not an internal error; got "
+                f"{reply.get('error')!r}",
+            )
+
+        with self.subTest(part="non-string modern version"):
+            # A namespaced protocolVersion present as a non-string is
+            # malformed modern metadata: -32602, never a silent legacy
+            # downgrade (pr49 review PRR-031b; the era malformed leg).
+            malformed = {
+                "io.modelcontextprotocol/protocolVersion": 20260728,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+            req_id = session.request("tools/list", {"_meta": malformed})
+            reply = session.wait_response(req_id)
+            self.assertEqual(
+                (reply.get("error") or {}).get("code"),
+                -32602,
+                "AC8 stateless request rejected: a namespaced protocolVersion that "
+                "is present but not a string is malformed modern metadata and must "
+                "answer invalid-params -32602, never a silent legacy downgrade; "
+                f"got {reply.get('error')!r}",
             )
         session.stop()
 

@@ -2858,6 +2858,13 @@ def _wrap_live_entry(entry: dict, keep: tuple[str, ...]) -> dict:
 _GH_STDOUT_BYTE_CAP = 262144
 
 
+#: Aggregate bound on the inline gh fan (pr49 review PRR-010): every call
+#: is individually time- and byte-bounded, but 1+3N calls run in the
+#: caller's loop, so the PR list is capped to its last members and the
+#: live block discloses the trim instead of silently dropping PRs.
+_BRIEF_LIVE_MAX_PRS = 10
+
+
 def _brief_live(
     repo: str, pr_numbers: list[int], gh_path: str
 ) -> tuple[dict | None, str | None]:
@@ -2898,6 +2905,13 @@ def _brief_live(
         _gh(f"repos/{repo}")
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as exc:
         return None, f"gh probe failed: {exc}"
+
+    # Aggregate bound on the inline gh fan (pr49 review PRR-010): each call
+    # is individually time- and byte-bounded, but 1+3N calls run in the
+    # caller's loop, so the PR list is capped to its last members and the
+    # live block discloses the trim instead of silently dropping PRs.
+    if len(pr_numbers) > _BRIEF_LIVE_MAX_PRS:
+        pr_numbers = pr_numbers[-_BRIEF_LIVE_MAX_PRS:]
 
     prs: list[dict] = []
     for pr in pr_numbers:

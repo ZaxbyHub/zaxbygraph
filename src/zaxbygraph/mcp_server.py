@@ -102,6 +102,7 @@ _DEFAULT_STALE_AFTER_S = 900
 _MAX_PAGE = 500
 _MAX_CURSOR = 10000
 _MAX_DEPTH = 5
+_MAX_TOP_K = 50
 _MAX_NUMBERS = 64
 _STALE_ENV = "ZAXBYGRAPH_MCP_STALE_SECONDS"
 
@@ -127,29 +128,42 @@ class _InputRequired(Exception):
 
     REQUEST_STATE = "zaxbygraph:repo-required"
 
-    def hint_text(self) -> str:
+    def hint_text(self, *, resources_channel: bool = False) -> str:
+        # resources/read has NO arguments channel (params are uri + _meta),
+        # so "pass repo" is unactionable there — name the real remedies
+        # instead (pr49 review PRR-009).
+        if resources_channel:
+            return (
+                "repo required: start the server with --repo/--db, or use the "
+                "tools (which accept a repo argument)"
+            )
         return (
             "repo required: pass repo as OWNER/REPO (no explicit repo argument "
             "and no server --repo pin resolved one)"
         )
 
 
-def _modern_marker(params) -> str | None:
-    """The declared modern protocol version for this request, or None.
+def _era_of(params: dict) -> tuple[str, str | None]:
+    """(era, declared) for this request's era classification.
 
-    A request is MODERN only when the namespaced protocolVersion key is
-    present as a string. A declared-but-unsupported modern version and a
-    declared 2026-07-28 with missing/non-object clientCapabilities are era
-    errors (-32022 / -32602) raised by _dispatch before any method runs.
-    Legacy `_meta` shapes (including a bare "protocolVersion" key) select
-    the legacy path."""
-    meta = (params or {}).get("_meta")
+    "modern" — the namespaced protocolVersion key carries "2026-07-28";
+    "unsupported" — it carries another string (declared but not served on
+    the per-request channel; -32022); "malformed" — present but not a
+    string (the 2026-07-28 table types it string/required, so this is
+    malformed modern metadata: -32602, never a silent legacy downgrade —
+    pr49 review PRR-004); "legacy" — no namespaced declaration at all
+    (including any legacy _meta shape)."""
+    meta = params.get("_meta")
     if not isinstance(meta, dict):
-        return None
+        return "legacy", None
     declared = meta.get(_META_VERSION_KEY)
+    if declared is None:
+        return "legacy", None
     if not isinstance(declared, str):
-        return None
-    return declared
+        return "malformed", None
+    if declared != _MODERN_PROTOCOL_VERSION:
+        return "unsupported", declared
+    return "modern", declared
 
 
 def _modern_capabilities(params):
@@ -580,11 +594,32 @@ def _bool_arg(arguments: dict, key: str) -> bool:
 def _int_cursor(raw) -> int:
     try:
         value = int(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # int(1e999) raises OverflowError, not ValueError — a wire-reachable
+        # JSON float infinity must be a structured cursor reset, never a
+        # runtime envelope (pr49 review PRR-013).
         return 0
     if value <= 0:
         return 0
     return min(value, _MAX_CURSOR)
+
+
+def _item_number(arguments: dict, tool: str) -> int:
+    """A typed item number in SQLite's signed-64-bit range: a wrong type or
+    an out-of-range magnitude is a structured bad_request, never a raw
+    sqlite bind OverflowError surfacing as runtime (pr49 review PRR-013)."""
+    number = arguments.get("number")
+    if not isinstance(number, int) or isinstance(number, bool):
+        raise ToolError(
+            "bad_request", f"{tool} needs an integer number",
+            hint=f'try {tool} {{"number": 12}}',
+        )
+    if not 1 <= number <= 2**63 - 1:
+        raise ToolError(
+            "bad_request", f"{tool} number is out of range",
+            hint="pass the item number as a positive integer",
+        )
+    return number
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +904,15 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     numbers_raw = arguments.get("numbers")
     numbers: list[int] | None = None
     if numbers_raw is not None:
+        if force:
+            # Mirror the CLI's own cross-flag contract (cmd_sync rejects
+            # the pair outright; sync_repo would silently drop force —
+            # pr49 review PRR-012).
+            raise ToolError(
+                "bad_request",
+                "force cannot be combined with numbers",
+                hint="a targeted refresh never touches the watermark; drop force",
+            )
         if not isinstance(numbers_raw, list) or not numbers_raw or not all(
             isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in numbers_raw
         ):
@@ -876,6 +920,14 @@ def _tool_sync(arguments: dict, ctx) -> dict:
                 "bad_request",
                 "numbers must be a non-empty list of positive integers",
                 hint='e.g. "numbers": [12, 34]',
+            )
+        if len(numbers_raw) > _MAX_NUMBERS:
+            # Same ceiling as pr_overlap (pr49 review PRR-012): client-chosen
+            # numbers drive per-item fetch work on the operator's credential.
+            raise ToolError(
+                "bad_request",
+                f"numbers is capped at {_MAX_NUMBERS} items",
+                hint=f"refresh at most {_MAX_NUMBERS} items per call",
             )
         numbers = numbers_raw
     if runner is _default_sync_runner and (force or include_patches or numbers):
@@ -948,20 +1000,25 @@ def _int_array_csv(arguments: dict, key: str) -> str | None:
             "bad_request", f"{key} must be an array of integers",
             hint=f"pass {key} as an array of integers",
         )
+    if len(values) > _MAX_NUMBERS:
+        raise ToolError(
+            "bad_request",
+            f"{key} is capped at {_MAX_NUMBERS} numbers (the pair fan grows "
+            "quadratically; narrow the pool)",
+            hint=f"pass at most {_MAX_NUMBERS} issue numbers",
+        )
     return ",".join(str(v) for v in values)
 
 
 def _tool_similar_items(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError(
-            "bad_request", "similar_items needs an integer number",
-            hint='try similar_items {"number": 12}',
-        )
+    # Validate BEFORE resolving (pr49 review PRR-020): identical malformed
+    # calls answer bad_request uniformly, and identity is simply unknown at
+    # validation time on every tool.
+    number = _item_number(arguments, "similar_items")
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
         data = _translated_derive(_similar_query, conn, slug, db_path, number, limit, None, False)
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
@@ -969,17 +1026,19 @@ def _tool_similar_items(arguments: dict, ctx) -> dict:
 
 
 def _tool_triage(arguments: dict, ctx) -> dict:
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+    cursor = arguments.get("cursor")
+    if cursor is not None and not isinstance(cursor, str):
+        raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
+    top_k = arguments.get("top_k")
+    if top_k is not None:
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise ToolError("bad_request", "top_k must be an integer", hint="pass top_k as an integer")
+        top_k = min(top_k, _MAX_TOP_K)
+    include_gated = _bool_arg(arguments, "include_gated")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
-        cursor = arguments.get("cursor")
-        if cursor is not None and not isinstance(cursor, str):
-            raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
-        top_k = arguments.get("top_k")
-        if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int)):
-            raise ToolError("bad_request", "top_k must be an integer", hint="pass top_k as an integer")
-        include_gated = _bool_arg(arguments, "include_gated")
         data = _translated_derive(
             _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated, None
         )
@@ -989,22 +1048,25 @@ def _tool_triage(arguments: dict, ctx) -> dict:
 
 
 def _tool_bundle(arguments: dict, ctx) -> dict:
+    size = arguments.get("size")
+    if size is not None and not isinstance(size, str):
+        raise ToolError("bad_request", "size must be a string like '2-3'", hint="pass size as a string")
+    count = _int_arg(arguments, "count", 5)
+    # pool/exclude are capped like pr_overlap's numbers (pr49 review PRR-006):
+    # the derive pair fan is quadratic in pool size, and an uncapped
+    # client-chosen pool stalls the whole serialized server.
+    pool = _int_array_csv(arguments, "pool")
+    exclude = _int_array_csv(arguments, "exclude")
+    allow_shared_files = _bool_arg(arguments, "allow_shared_files")
+    max_files = arguments.get("max_files")
+    if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
+        raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
+    budget_tokens = arguments.get("budget_tokens")
+    if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
+        raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        size = arguments.get("size")
-        if size is not None and not isinstance(size, str):
-            raise ToolError("bad_request", "size must be a string like '2-3'", hint="pass size as a string")
-        count = _int_arg(arguments, "count", 5)
-        pool = _int_array_csv(arguments, "pool")
-        exclude = _int_array_csv(arguments, "exclude")
-        allow_shared_files = _bool_arg(arguments, "allow_shared_files")
-        max_files = arguments.get("max_files")
-        if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
-            raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
-        budget_tokens = arguments.get("budget_tokens")
-        if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
-            raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
         data = _translated_derive(
             _bundle_query, conn, slug, db_path,
             size if size is not None else "2-3", count, pool, exclude,
@@ -1016,17 +1078,12 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
 
 
 def _tool_brief(arguments: dict, ctx) -> dict:
-    number = arguments.get("number")
-    if not isinstance(number, int) or isinstance(number, bool):
-        raise ToolError(
-            "bad_request", "brief needs an integer number",
-            hint='try brief {"number": 12}',
-        )
+    number = _item_number(arguments, "brief")
+    budget_tokens = _int_arg(arguments, "budget_tokens", 4000)
+    live = _bool_arg(arguments, "live")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        budget_tokens = _int_arg(arguments, "budget_tokens", 4000)
-        live = _bool_arg(arguments, "live")
         data = _translated_derive(
             _brief_query, conn, slug, db_path, number, budget_tokens, live, None
         )
@@ -1036,11 +1093,11 @@ def _tool_brief(arguments: dict, ctx) -> dict:
 
 
 def _tool_churn(arguments: dict, ctx) -> dict:
+    limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
+    merged_only = _bool_arg(arguments, "merged_only")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
-        merged_only = _bool_arg(arguments, "merged_only")
         try:
             data = churn(conn, limit, merged_only=merged_only, repo=slug)
         except sqlite3.Error as exc:
@@ -1171,7 +1228,8 @@ _TOOLS: list[dict] = [
                 "numbers": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 1},
-                    "description": "Refresh exactly these items; the watermark is untouched",
+                    "description": "Refresh exactly these items; the watermark is untouched (at most 64)",
+                    "maxItems": 64,
                 },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},
                 **_REPO_DB,
@@ -1197,7 +1255,7 @@ _TOOLS: list[dict] = [
             {
                 "limit": _LIMIT,
                 "cursor": _CURSOR,
-                "top_k": {"type": "integer", "minimum": 1, "description": "Keep only the top K ranked rows"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Keep only the top K ranked rows (at most 50)"},
                 "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
                 **_REPO_DB,
             }
@@ -1210,8 +1268,8 @@ _TOOLS: list[dict] = [
             {
                 "size": {"type": "string", "description": "Bundle size range like '2-3'"},
                 "count": {"type": "integer", "minimum": 1, "description": "At most K bundles"},
-                "pool": {"type": "array", "items": {"type": "integer"}, "description": "Restrict the pool to these issue numbers"},
-                "exclude": {"type": "array", "items": {"type": "integer"}, "description": "Remove these numbers from the pool"},
+                "pool": {"type": "array", "items": {"type": "integer"}, "maxItems": 64, "description": "Restrict the pool to these issue numbers (at most 64)"},
+                "exclude": {"type": "array", "items": {"type": "integer"}, "maxItems": 64, "description": "Remove these numbers from the pool (at most 64)"},
                 "allow_shared_files": {"type": "boolean"},
                 "max_files": {"type": "integer", "minimum": 1},
                 "budget_tokens": {"type": "integer", "minimum": 1},
@@ -1499,9 +1557,28 @@ def _process(msg: dict, ctx: "_Context") -> None:
 
 def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> None:
     stdout = ctx.stdout
-    params = msg.get("params") or {}
-    declared = _modern_marker(params)
-    if declared is not None and declared != _MODERN_PROTOCOL_VERSION:
+    params = msg.get("params")
+    if params is not None and not isinstance(params, dict):
+        # Non-object params are legal JSON-RPC framing but malformed for
+        # every method this server serves — invalid params, never an
+        # internal error (pr49 review PRR-001; base answered tools/list
+        # for array params, so this must not become -32603).
+        if has_id:
+            _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, "params must be an object")
+        return
+    params = params or {}
+    era, declared = _era_of(params)
+    if era == "malformed":
+        # A namespaced protocolVersion that is present but not a string is
+        # malformed modern metadata: -32602 (2026-07-28 requires the
+        # per-request version as a string; the PR body promises -32602 for
+        # exactly this shape — pr49 review PRR-004, which also stops the
+        # silent legacy downgrade from walking a modern-intent call into
+        # the roots round-trip).
+        if has_id:
+            _error(stdout, req_id, _JSONRPC_INVALID_PARAMS, "malformed modern metadata")
+        return
+    if era == "unsupported":
         # An unsupported declared modern version: UnsupportedProtocolVersionError
         # (2026-07-28 versioning) listing what this server CAN speak.
         # Notifications (no id) get no error reply, like the fallthrough.
@@ -1517,7 +1594,7 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
                 },
             )
         return
-    modern = declared == _MODERN_PROTOCOL_VERSION
+    modern = era == "modern"
     if modern and not isinstance(_modern_capabilities(params), dict):
         if has_id:
             _error(
@@ -1529,6 +1606,10 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
             )
         return
     # The era is a property of THIS request; the next message overwrites it.
+    # Every early return above happens BEFORE this assignment, so a failed
+    # request can never leave its own era behind for the next message
+    # (pr49 review PRR-003 follow-up: assign-era-last is what makes the
+    # stale-era residue unreachable).
     ctx.modern = modern
     if method == "initialize":
         if not has_id:
@@ -1550,13 +1631,16 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
         return
     if method == "ping":
         if modern:
-            # The 2026-07-28 revision has no ping method.
-            _error(
-                stdout,
-                req_id,
-                _JSONRPC_METHOD_NOT_FOUND,
-                "ping is removed in the 2026-07-28 revision",
-            )
+            # The 2026-07-28 revision has no ping method. Notifications
+            # (no id) get no reply at all — JSON-RPC forbids answering a
+            # notification (pr49 review PRR-002), like every sibling branch.
+            if has_id:
+                _error(
+                    stdout,
+                    req_id,
+                    _JSONRPC_METHOD_NOT_FOUND,
+                    "ping is removed in the 2026-07-28 revision",
+                )
             return
         if has_id:
             _result(stdout, req_id, {})
@@ -1658,14 +1742,18 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
             slug, db_path = _resolve_target({}, ctx)
         except _InputRequired as required:
             # The modern era resolves without Roots (covers the resource
-            # sibling path too).
+            # sibling path too). The hint names the REAL remedies: this
+            # channel has no arguments slot, so "pass repo" would be
+            # unactionable (pr49 review PRR-009).
             _result(
                 stdout,
                 req_id,
                 {
                     "resultType": "input_required",
                     "requestState": required.REQUEST_STATE,
-                    "content": [{"type": "text", "text": required.hint_text()}],
+                    "content": [
+                        {"type": "text", "text": required.hint_text(resources_channel=True)}
+                    ],
                 },
             )
             return

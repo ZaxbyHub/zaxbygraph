@@ -67,30 +67,33 @@ registers it.
 - Tools (sorted): `brief`, `bundle`, `churn`, `file_history`, `get_item`,
   `graph_status`, `open_items`, `path`, `pr_overlap`, `related`, `search`,
   `similar_items`, `sql`, `sync`, `triage`, `what_closed`. Every tool declares an `outputSchema`
-  and `annotations` (`readOnlyHint` true except `sync`), and every result also
-  carries `structuredContent` — the parsed envelope, validating against the
-  outputSchema. Each tool result's text parses to the same JSON envelope the
+  and `annotations` (`readOnlyHint` true except `sync`), and every COMPLETE result also
+  carries `structuredContent` — the parsed envelope (the modern
+  `input_required` answer is the exception: `{resultType, requestState,
+  content}` by protocol design). Each tool result's text parses to the same JSON envelope the
   CLI prints; errors arrive as `isError: true` with the `error{code, message,
   hint}` object. The five derived/work-selection tools (`similar_items`,
-  `triage`, `bundle`, `brief`, `churn`) answer with the SAME envelopes as
-  their CLI commands. List tools take `limit`/`cursor` and emit `truncated` +
-  `data.next_cursor`; the MCP `sql` tool returns rows as positional arrays
+  `triage`, `bundle`, `brief`, `churn`) answer with the same DATA payloads as
+  their CLI commands (envelope identity/freshness fields are per-surface). List tools take `limit`/`cursor`; `search`/`file_history`/`open_items`
+  emit `data.next_cursor` while triage pages via `data.cursor`; the MCP `sql` tool returns rows as positional arrays
   (the CLI defaults to objects).
 - Resource `zaxbygraph://schema` carries the DDL + column notes.
 - Protocol eras: legacy revisions negotiate via `initialize` (latest answered
   2025-11-25); 2026-07-28 clients are stateless — version + capabilities ride
   every request's `_meta`, `server/discover` lists
-  `supportedVersions`/`capabilities`/`tools` with cache hints, results carry
-  `resultType` (`complete`, or `input_required` when a repo must be named),
+  `supportedVersions`/`capabilities`/`tools` with cache hints, tool, listing, resource and discovery results carry
+  `resultType` (`complete`, or `input_required` when a repo must be named;
+  an initialize request keeps the legacy handshake shape),
   and there is no handshake and no ping.
 - Repo resolution: explicit `repo` argument, then the server's `--repo`/`--db`
-  pin, then — legacy clients only — client roots, then the server cwd's git
-  origin; modern (2026-07-28) requests resolve WITHOUT Roots and answer an
+  pin, then — legacy clients only — client roots, then (still legacy-only) the
+  server cwd's git origin; modern (2026-07-28) requests resolve WITHOUT Roots and answer an
   `InputRequiredResult` naming `repo` when nothing pins one — the same
   slug-keyed store the CLI resolves, so a worktree and its main checkout share
   one graph. Pass `repo` explicitly when your roots span more than one
-  checkout. (Legacy note: the server asks the client for roots on every
-  repo-less call; a client that never answers that request stalls that call.)
+  checkout. (Legacy note: the server asks the client for roots on every repo-less
+call that no `--repo` pin resolves; a client that never answers that
+request stalls that call.)
 - Stale reads (default threshold 15 minutes) answer immediately and start one
   background sync; `freshness.refreshing: true` tells you new data is landing.
   Use `graph_status` for sync progress. Note the `sync` tool's own envelope
