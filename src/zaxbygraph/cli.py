@@ -415,13 +415,17 @@ def _sync_core(
     jsonl_path: Path | None,
     numbers: list[int] | None,
     source_name: str,
+    stamp_source: str | None = None,
 ) -> dict:
     """One quiet sync_repo call against an open writable connection (issue #31).
 
     cmd_sync and the --max-age refresh share this so both paths issue exactly
     one sync_repo call. Neither path acquires the lock here — the caller owns
     the lock and maps failures to its own reporting channel (cmd_sync to its
-    result envelope, the refresh path to a coded _ReadFailure)."""
+    result envelope, the refresh path to a coded _ReadFailure). source_name
+    constructs the fetch source (graphql default); stamp_source is what the
+    run records as its requested profile — None (an unstated source) leaves
+    any recorded value untouched (issue #48, cubic re-review)."""
     if source_name == "rest":
         source: object = GhRestSource(*slug.split("/", 1))
     else:
@@ -434,7 +438,7 @@ def _sync_core(
         include_patches=include_patches,
         jsonl_path=jsonl_path,
         numbers=numbers,
-        fetch_source=source_name,
+        fetch_source=stamp_source,
     )
 
 
@@ -475,6 +479,7 @@ def _run_refresh_sync(
         jsonl_path=None,
         numbers=None,
         source_name="graphql" if not source_name else source_name,
+        stamp_source=source_name,
     )
     return 0
 
@@ -589,9 +594,12 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
                     # Out-of-domain stored values (a tampered or foreign
                     # candidate-adopted row) heal to the documented graphql
                     # default instead of silently persisting through the
-                    # refresh's re-stamp (review PRR-021).
+                    # refresh's re-stamp (review PRR-021). The refresh
+                    # always re-stamps the concrete value it honored, so a
+                    # profile only ever moves to a value a source actually
+                    # fetched with.
                     refresh_source = (
-                        raw_source if raw_source in ("graphql", "rest") else None
+                        raw_source if raw_source in ("graphql", "rest") else "graphql"
                     )
                     _run_refresh_sync(
                         conn,
@@ -864,7 +872,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
         # Default source is the GraphQL bulk source (issue #5); `--source rest`
         # keeps the plain REST source (now page-streaming). The call goes
         # through the shared quiet core (issue #31) so the --max-age refresh
-        # path issues exactly the same one sync_repo call.
+        # path issues exactly the same one sync_repo call. The CONSTRUCTION
+        # source defaults to graphql, but only an explicitly stated source is
+        # forwarded as the stamp (issue #48: an incidental default-source sync
+        # never rewrites the store's recorded profile).
         result = _sync_core(
             conn,
             slug,
@@ -872,7 +883,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             include_patches=args.include_patches,
             jsonl_path=jsonl,
             numbers=numbers,
-            source_name=getattr(args, "source", "graphql"),
+            source_name=getattr(args, "source", None) or "graphql",
+            stamp_source=getattr(args, "source", None),
         )
     except SyncError as exc:
         emit_result(
@@ -2102,8 +2114,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--source",
         choices=("graphql", "rest"),
-        default="graphql",
-        help="Fetch source: graphql bulk pages (default) or plain REST pages",
+        default=None,
+        help="Fetch source: graphql bulk pages (default) or plain REST"
+        " pages. Only an explicitly stated source re-stamps the store's"
+        " recorded fetch profile (issue #48)",
     )
     sp.add_argument(
         "--jsonl",

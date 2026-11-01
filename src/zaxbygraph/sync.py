@@ -735,27 +735,44 @@ def _ensure_state_row(
     conn: sqlite3.Connection,
     repo: str,
     include_patches: bool,
-    fetch_source: str = "graphql",
+    fetch_source: str | None = None,
 ) -> None:
     """Create/refresh the slug's sync_state profile row.
 
-    Stamps the fetch source REQUESTED for this listing run (issue #48):
-    the store's fetch profile is the operator's deliberate choice, so the
-    stamp is written at listing start in this dedicated prologue
-    transaction (not inside the per-item watermark transaction). A mid-run
-    GraphQL-to-REST degradation is a transient fact of one run — disclosed
-    in the run result, never written back over the requested stamp.
+    Stamps the fetch source EXPLICITLY requested for this listing run
+    (issue #48): the store's fetch profile is the operator's deliberate
+    choice, so only an operator-stated source rewrites the stamp — a run
+    that did not choose (the default-source path, or a caller with no
+    source choice at all such as the MCP surface) leaves the recorded
+    profile untouched (cubic re-review + review PRR-001-residual: an
+    incidental sync must never silently flip a deliberately-rest store).
+    The stamp is written at listing start in this dedicated prologue
+    transaction (not inside the per-item watermark transaction). A
+    mid-run GraphQL-to-REST degradation is a transient fact of one run —
+    disclosed in the run result, never written back over the requested
+    stamp.
     """
-    conn.execute(
-        """
-        INSERT INTO sync_state(repo, include_patches, fetch_source)
-        VALUES (?, ?, ?)
-        ON CONFLICT(repo) DO UPDATE SET
-            include_patches = excluded.include_patches,
-            fetch_source = excluded.fetch_source
-        """,
-        (repo, 1 if include_patches else 0, fetch_source),
-    )
+    if fetch_source is None:
+        conn.execute(
+            """
+            INSERT INTO sync_state(repo, include_patches)
+            VALUES (?, ?)
+            ON CONFLICT(repo) DO UPDATE SET
+                include_patches = excluded.include_patches
+            """,
+            (repo, 1 if include_patches else 0),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO sync_state(repo, include_patches, fetch_source)
+            VALUES (?, ?, ?)
+            ON CONFLICT(repo) DO UPDATE SET
+                include_patches = excluded.include_patches,
+                fetch_source = excluded.fetch_source
+            """,
+            (repo, 1 if include_patches else 0, fetch_source),
+        )
     conn.commit()
 
 
@@ -858,7 +875,7 @@ def sync_repo(
     include_patches: bool = False,
     jsonl_path: Path | None = None,
     numbers: list[int] | None = None,
-    fetch_source: str = "graphql",
+    fetch_source: str | None = None,
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction.
 
@@ -866,11 +883,13 @@ def sync_repo(
     exactly those items: the watermark never moves, no full sync starts or
     completes, the deletion oracle never runs, and a targeted finalizer
     clears last_error without touching freshness stamps. `fetch_source`
-    (issue #48) stamps the source REQUESTED for this run — targeted runs
-    stamp too (an explicit operator source choice); the watermark still
-    never moves for them. Callers that construct the source directly (the
-    MCP surface) keep the graphql default, matching the documented
-    CLI-side-only boundary for fetch-source persistence."""
+    (issue #48) stamps the source EXPLICITLY requested for this run —
+    targeted runs stamp too when the operator stated a source; the
+    watermark still never moves for them. None (the default) rewrites
+    nothing: callers that construct the source directly (the MCP surface)
+    or run on the CLI default leave the recorded profile exactly as the
+    operator set it, so a deliberately-rest store never silently flips
+    (cubic re-review)."""
     # Everything that touches the database lives inside the try: the recorder
     # must see prologue failures too (force reset, state-row ensure, pending
     # marker) — a lock or disk fault landing there is still a failed sync and

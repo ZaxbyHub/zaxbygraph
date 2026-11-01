@@ -265,10 +265,10 @@ class LegacyV10RefreshTests(_CliStore):
         self.assertEqual(code, 0, err)
         self.assertNotIn("no such column", err)
         self.assertTrue(calls.get("ran"), "the refresh must run")
-        # Post-migration read: the migrated column is NULL. The raw NULL
-        # reaches the seam; _run_refresh_sync maps it to the graphql default
-        # for _sync_core.
-        self.assertIsNone(calls.get("source_name"))
+        # Post-migration read: the migrated column is NULL; the under-lock
+        # read heals it to the concrete graphql default, which both drives
+        # construction and re-stamps (PRR-021 normalization).
+        self.assertEqual(calls.get("source_name"), "graphql")
         # The store migrated to the current schema under the writable open.
         vc = sqlite3.connect(self.db)
         try:
@@ -336,6 +336,23 @@ class SyncStampingTests(unittest.TestCase):
             self._stamped(), "graphql",
             "the ON CONFLICT arm must re-stamp when the operator changes the"
             " requested source",
+        )
+
+    def test_implicit_sync_never_rewrites_profile(self):
+        """Cubic re-review scenario: a store deliberately stamped rest must
+        keep its profile through runs that did not state a source - the
+        sync_repo default (as the MCP surface calls it) and a CLI sync
+        without --source construct GraphQL but never rewrite the stamp."""
+        # Store deliberately stamped rest by an explicit run.
+        self._sync(self._source(), "rest")
+        self.assertEqual(self._stamped(), "rest")
+        # An incidental run with NO stated source (the sync_repo default;
+        # exactly how mcp_server's sync runner calls it) must not flip it.
+        self._sync(self._source(), None)
+        self.assertEqual(
+            self._stamped(), "rest",
+            "PROFILE-FLIPPED: a run that did not state a source rewrote the"
+            " recorded fetch profile - only an operator-stated source may",
         )
 
     def test_failed_sync_keeps_start_stamp(self):
