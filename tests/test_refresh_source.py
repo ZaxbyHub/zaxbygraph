@@ -278,5 +278,82 @@ class LegacyV10RefreshTests(_CliStore):
         self.assertEqual(version, 11)
 
 
+class SyncStampingTests(unittest.TestCase):
+    """Reviewer round 1, Finding 1: the stamping WRITE path is executable.
+    A listing sync stamps the requested fetch_source at start; a
+    conflicting re-sync re-stamps via the ON CONFLICT arm; a failed sync
+    leaves the start stamp in place. The finish-stamp and no-stamp mutants
+    of _ensure_state_row both die here."""
+
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        self.db = Path(td.name) / "history.db"
+
+    def _sync(self, source, fetch_source):
+        from zaxbygraph.sync import sync_repo
+
+        conn = connect(self.db)
+        init_schema(conn)
+        try:
+            return sync_repo(conn, source, REPO, fetch_source=fetch_source)
+        finally:
+            conn.close()
+
+    def _stamped(self):
+        conn = connect(self.db)
+        try:
+            row = conn.execute(
+                "SELECT fetch_source FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchone()
+            return None if row is None else row[0]
+        finally:
+            conn.close()
+
+    def _source(self):
+        from fixtures import FakeGitHubSource, issue
+
+        src = FakeGitHubSource()
+        src.add_issue(
+            issue(1, title="one", body="b", updated_at="2026-03-01T12:00:30Z")
+        )
+        return src
+
+    def test_listing_sync_stamps_requested_source_at_start(self):
+        result = self._sync(self._source(), "rest")
+        self.assertEqual(result["ingested"], 1)
+        self.assertEqual(
+            self._stamped(), "rest",
+            "STAMP-MISSING: a listing sync requesting rest must stamp"
+            " fetch_source='rest' at listing start",
+        )
+
+    def test_conflicting_resync_restamps(self):
+        self._sync(self._source(), "rest")
+        self.assertEqual(self._stamped(), "rest")
+        self._sync(self._source(), "graphql")
+        self.assertEqual(
+            self._stamped(), "graphql",
+            "the ON CONFLICT arm must re-stamp when the operator changes the"
+            " requested source",
+        )
+
+    def test_failed_sync_keeps_start_stamp(self):
+        from fixtures import FakeGitHubSource
+
+        class FailingSource(FakeGitHubSource):
+            def list_issues(self, since=None):
+                raise RuntimeError("STAMP-FAIL-MARKER")
+
+        with self.assertRaises(Exception):
+            self._sync(FailingSource(), "rest")
+        self.assertEqual(
+            self._stamped(), "rest",
+            "STAMP-AT-FINISH-MUTANT: a failed sync must leave the START"
+            " stamp in place - the stamp is the requested source, written"
+            " before listing",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -369,6 +369,60 @@ class RevisionPreservationTests(unittest.TestCase):
         self.assertEqual(result["revisions_adopted"], 0)
         self.assertEqual(result["revisions_preserved"], store_total)
 
+    def test_covered_item_differing_only_in_valid_to_is_replaced(self):
+        """Reviewer round 1, Finding 2: the payload comparison spans all
+        seven columns (entity, entity_id, kind, origin, content,
+        valid_from, valid_to). A covered item whose candidate rows differ
+        from the stored rows ONLY in valid_to is REPLACED, not skipped -
+        narrowing the comparison to content alone survives the suite
+        (oracle-breadth mutant of record in 08b) and this test kills it."""
+        from zaxbygraph.doctor import consolidate
+
+        store = connect(self.store_db)
+        init_schema(store)
+        store.executemany(
+            "INSERT INTO items(id, repo, number, kind, title, state, raw_json)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(1001, REPO, 1, "issue", "item 1", "open", "{}")],
+        )
+        store.execute(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, 1, 'item_body', 'edit', ?,"
+            " ?, ?)",
+            (REPO, "STORE-A", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+        )
+        store.commit()
+
+        cand = connect(self.candidate_db)
+        init_schema(cand)
+        cand.executemany(
+            "INSERT INTO items(id, repo, number, kind, title, state, raw_json)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(1001, REPO, 1, "issue", "item 1", "open", "{}")],
+        )
+        # Identical except valid_to (2026-09-09 vs the store's 2026-01-02).
+        cand.execute(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, 1, 'item_body', 'edit', ?,"
+            " ?, ?)",
+            (REPO, "STORE-A", "2026-01-01T00:00:00Z", "2026-09-09T00:00:00Z"),
+        )
+        cand.commit()
+        cand.close()
+
+        consolidate(self.store_db, self.candidate_db, REPO)
+        valid_to = store.execute(
+            "SELECT valid_to FROM revisions WHERE repo = ? AND number = 1",
+            (REPO,),
+        ).fetchone()[0]
+        self.assertEqual(
+            valid_to, "2026-09-09T00:00:00Z",
+            "COMPARISON-NARROWED: a covered item differing only in valid_to"
+            " must be replaced (the seven-column payload comparison was"
+            " narrowed; content-only mutants survive without this pin)",
+        )
+        store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

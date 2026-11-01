@@ -122,7 +122,7 @@ def main() -> int:
             raise AssertionError(
                 "doctor result payload reports the wrong revision counts: "
                 f"revisions_preserved={preserved} (want 1: item 3's unobserved"
-                " row), revisions_adopted={adopted} (want 2: item 2's rows)"
+                f" row), revisions_adopted={adopted} (want 2: item 2's rows)"
             )
         print(f"REPORT-FIELDS-OK revisions_preserved={preserved} revisions_adopted={adopted}")
         return 0
