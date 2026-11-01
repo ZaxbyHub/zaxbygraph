@@ -365,6 +365,94 @@ class RevisionPreservationTests(unittest.TestCase):
         self.assertEqual(result["revisions_adopted"], 0)
         self.assertEqual(result["revisions_preserved"], store_total)
 
+    def test_counts_with_mixed_covered_states(self):
+        """Review round 2 (PRR-005 regression pin): one adoption covering
+        all three states - a payload-identical covered number (no-op), an
+        uncovered number (preserved), and a differently-covered number
+        (adopted). preserved counts ONLY the uncovered number's rows: a
+        skip is neither adopted nor preserved."""
+        from zaxbygraph.doctor import doctor
+
+        store = connect(self.store_db)
+        init_schema(store)
+        store.executemany(
+            "INSERT INTO items(id, repo, number, kind, title, state, raw_json)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(1000 + n, REPO, n, "issue", f"item {n}", "open", "{}")
+             for n in (1, 2, 3)],
+        )
+        # n1: two rows the candidate will mirror identically (skip).
+        # n2: two rows the candidate never covers (preserved).
+        # n3: one row the candidate will replace (adopted).
+        store.executemany(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, ?, 'item_body', 'edit', ?,"
+            " ?, ?)",
+            [(REPO, 1, "SAME-1", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+             (REPO, 1, "SAME-2", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+             (REPO, 2, "KEEP-1", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+             (REPO, 2, "KEEP-2", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+             (REPO, 3, "OLD-3", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")],
+        )
+        store.commit()
+        store.close()
+        cand = connect(self.candidate_db)
+        init_schema(cand)
+        cand.executemany(
+            "INSERT INTO items(id, repo, number, kind, title, state, raw_json)"
+            " VALUES (?,?,?,?,?,?,?)",
+            [(1000 + n, REPO, n, "issue", f"item {n}", "open", "{}")
+             for n in (1, 2, 3)],
+        )
+        cand.executemany(
+            "INSERT INTO revisions(repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (?, ?, 'item_body', 'edit', ?,"
+            " ?, ?)",
+            [(REPO, 1, "SAME-1", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+             (REPO, 1, "SAME-2", "2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"),
+             (REPO, 3, "NEW-3", "2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z")],
+        )
+        cand.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches,"
+            " full_sync_pending)"
+            " VALUES (?, '2026-03-01T00:00:00Z', '2026-03-01T00:00:00Z',"
+            " '2026-03-01T00:00:00Z', NULL, 0, 0)",
+            (REPO,),
+        )
+        cand.commit()
+        cand.close()
+        result = doctor(
+            None, REPO, self.store_db,
+            extra_scans=[self.candidate_db], consolidate_flag=True,
+        )
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(
+            result["revisions_adopted"], 1, result,
+        )
+        self.assertEqual(
+            result["revisions_preserved"], 2,
+            f"COUNTS-MIXED: preserved must count only uncovered numbers'"
+            f" rows (n2's two rows), not the skipped n1 rows; got"
+            f" {result['revisions_preserved']}",
+        )
+        # And the store holds exactly: n1's two identical rows, n2's two
+        # preserved rows, n3's one adopted row.
+        s2 = connect(self.store_db)
+        try:
+            contents = sorted(
+                r[0] for r in s2.execute(
+                    "SELECT content FROM revisions WHERE repo = ? ORDER BY id",
+                    (REPO,),
+                )
+            )
+        finally:
+            s2.close()
+        self.assertEqual(
+            contents,
+            sorted(["SAME-1", "SAME-2", "KEEP-1", "KEEP-2", "NEW-3"]),
+        )
+
     def test_covered_item_differing_only_in_valid_to_is_replaced(self):
         """Reviewer round 1, Finding 2: the payload comparison spans all
         seven columns (entity, entity_id, kind, origin, content,
@@ -437,6 +525,7 @@ class RevisionPreservationTests(unittest.TestCase):
             ("valid_from", "2026-05-05T00:00:00Z"),
             ("valid_to", "2026-06-06T00:00:00Z"),
         ]
+        col_index = {name: i for i, (name, _) in enumerate(variants)}
         for col, value in variants:
             store = connect(self.store_db)
             init_schema(store)
@@ -448,7 +537,7 @@ class RevisionPreservationTests(unittest.TestCase):
             )
             store.commit()
             cand_row = list(stored_row)
-            cand_row[variants.index((col, value))] = value
+            cand_row[col_index[col]] = value
             cand = connect(self.candidate_db)
             init_schema(cand)
             cand.execute(
@@ -460,16 +549,21 @@ class RevisionPreservationTests(unittest.TestCase):
             cand.commit()
             cand.close()
             consolidate(self.store_db, self.candidate_db, REPO)
-            content = store.execute(
-                "SELECT content FROM revisions WHERE repo = ? AND number = 1",
+            # The VARIED column must carry the candidate's value after the
+            # adoption: a comparison narrowed to exclude `col` treats the
+            # row as payload-identical, skips the replace, and leaves the
+            # STORED value - which fails here (review PRR-016 round 2:
+            # asserting only `content` could not observe the skip for the
+            # five non-content columns).
+            observed = store.execute(
+                f"SELECT {col} FROM revisions WHERE repo = ? AND number = 1",
                 (REPO,),
             ).fetchone()[0]
-            expected = "STORE-A-CHANGED" if col == "content" else "STORE-A"
             self.assertEqual(
-                content, expected,
+                observed, value,
                 f"COMPARISON-NARROWED: a comparison excluding {col} treats a"
                 f" {col}-only difference as payload-identical and skips the"
-                f" replacement",
+                f" replacement (stored value survived: {observed!r})",
             )
             store.close()
             # Reset both fixtures for the next variant.

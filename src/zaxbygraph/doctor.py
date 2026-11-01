@@ -212,10 +212,11 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
     no rows and deletes none); covered items with different rows are
     replaced (within-item depth loss for a shallower candidate remains a
     recorded boundary — the candidate's rows are a real observation for
-    that item); uncovered items' history is preserved. Returns
+    that item); uncovered numbers' history is preserved. Returns
     (adopted_rows, preserved_rows): adopted = rows copied from the
-    candidate; preserved = stored rows left in place that the candidate
-    never observed.
+    candidate; preserved = stored rows for numbers the candidate holds no
+    revision rows for (a payload-identical covered number is a no-op —
+    its rows are neither adopted nor preserved).
     """
     repo_l = repo.lower()
     with _migrated_copy(path) as source:
@@ -261,7 +262,7 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                     "SELECT COUNT(*) FROM revisions WHERE repo = ?", (repo_l,)
                 ).fetchone()[0]
                 adopted_rows = 0
-                replaced_rows = 0
+                covered_stored = 0
                 for number in sorted(covered_rows):
                     cand_rows = covered_rows[number]
                     stored_rows = dst.execute(
@@ -270,8 +271,10 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                         " ORDER BY id",
                         (repo_l, number),
                     ).fetchall()
+                    covered_stored += len(stored_rows)
                     if cand_rows == [tuple(r) for r in stored_rows]:
-                        continue  # same observation: no-op (AC6)
+                        continue  # same observation: no-op (AC6); its rows
+                        # are neither adopted nor preserved
                     dst.execute(
                         "DELETE FROM revisions WHERE repo = ? AND number = ?",
                         (repo_l, number),
@@ -285,12 +288,13 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                         [tuple(r) + (repo_l, number) for r in cand_rows],
                     )
                     adopted_rows += len(cand_rows)
-                    replaced_rows += len(stored_rows)
                 # Preserved = stored rows for numbers the candidate holds no
-                # revision rows for, by arithmetic — an unbounded NOT IN
-                # placeholder list hits SQLite's host-parameter ceiling on
-                # very large corpora (review PRR-005).
-                preserved_rows = store_revs_before - replaced_rows
+                # revision rows for: store total minus EVERY covered number's
+                # stored rows, counted BEFORE the skip decision (so a
+                # payload-identical skip is neither adopted nor preserved).
+                # Arithmetic replaces the unbounded NOT IN placeholder list,
+                # which hit SQLite's host-parameter ceiling (review PRR-005).
+                preserved_rows = store_revs_before - covered_stored
 
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":

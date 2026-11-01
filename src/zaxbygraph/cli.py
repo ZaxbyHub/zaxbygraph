@@ -575,9 +575,9 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
                     # writer that changed fetch_source or include_patches
                     # (or migrated a v10 store) while this read waited on
                     # the lock must never be reverted by the waiting
-                    # refresh. The pre-lock `include_patches` above stays
-                    # v10-compatible and decides only whether a refresh is
-                    # worth starting, never the refresh's arguments.
+                    # refresh. The pre-lock query is a v10-compatible
+                    # store-identity probe only; nothing about the refresh
+                    # is decided from it (review PRR-020).
                     try:
                         init_schema(conn)
                     except RuntimeError as exc:
