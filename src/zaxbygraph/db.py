@@ -11,24 +11,26 @@ from zaxbygraph.extract import (
 )
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "11"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 10
+CURRENT_USER_VERSION = 11
 
 #: Feature gates compare against the slot that INTRODUCED a capability, never
 #: against CURRENT_USER_VERSION: a read-only store several slots behind must
 #: keep every feature its own schema supports (reads never migrate). v7
 #: payload-signal reads gate on _V7_USER_VERSION; v8 revision history on
 #: _V8_USER_VERSION; v9 text-derived references and v10 link events/commits
-#: on their own slots. A v11 slot MUST re-pin all four to their slots.
+#: on their own slots; v11 fetch-source persistence gates on
+#: _V11_USER_VERSION. A v12 slot MUST re-pin all five to their slots.
 _V7_USER_VERSION = 7
 _V8_USER_VERSION = 8
 _V9_USER_VERSION = 9
 _V10_USER_VERSION = 10
+_V11_USER_VERSION = 11
 
 #: `upsert_item_row` in store.py uses two ON CONFLICT clauses in one INSERT,
 #: which SQLite only parses from 3.35.0 (2021-03-12). Without this check an
@@ -1175,6 +1177,19 @@ def migrate_v9_to_v10(conn: sqlite3.Connection) -> None:
     )
 
 
+def migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
+    """v10 -> v11: fetch-source persistence (issue #48).
+
+    Additive only: one nullable sync_state column, stamped at listing-sync
+    start by the sync path. No backfill is possible — the requested source
+    was never recorded before this slot, so a migrated store's column is
+    NULL, which every reader treats as the documented graphql default.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+    if "fetch_source" not in cols:
+        conn.execute("ALTER TABLE sync_state ADD COLUMN fetch_source TEXT")
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -1187,6 +1202,7 @@ MIGRATIONS = [
     (8, migrate_v7_to_v8),
     (9, migrate_v8_to_v9),
     (10, migrate_v9_to_v10),
+    (11, migrate_v10_to_v11),
 ]
 
 

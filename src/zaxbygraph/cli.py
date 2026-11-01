@@ -415,13 +415,17 @@ def _sync_core(
     jsonl_path: Path | None,
     numbers: list[int] | None,
     source_name: str,
+    stamp_source: str | None = None,
 ) -> dict:
     """One quiet sync_repo call against an open writable connection (issue #31).
 
     cmd_sync and the --max-age refresh share this so both paths issue exactly
     one sync_repo call. Neither path acquires the lock here — the caller owns
     the lock and maps failures to its own reporting channel (cmd_sync to its
-    result envelope, the refresh path to a coded _ReadFailure)."""
+    result envelope, the refresh path to a coded _ReadFailure). source_name
+    constructs the fetch source (graphql default); stamp_source is what the
+    run records as its requested profile — None (an unstated source) leaves
+    any recorded value untouched (issue #48, cubic re-review)."""
     if source_name == "rest":
         source: object = GhRestSource(*slug.split("/", 1))
     else:
@@ -434,6 +438,7 @@ def _sync_core(
         include_patches=include_patches,
         jsonl_path=jsonl_path,
         numbers=numbers,
+        fetch_source=stamp_source,
     )
 
 
@@ -446,14 +451,21 @@ class _EnvironmentGuard(RuntimeError):
 
 
 def _run_refresh_sync(
-    conn: sqlite3.Connection, slug: str, *, include_patches: bool = False
+    conn: sqlite3.Connection,
+    slug: str,
+    *,
+    include_patches: bool = False,
+    source_name: str | None = None,
 ) -> int:
     """The --max-age refresh seam (issue #31 AC5): one quiet incremental sync
     against the open writable connection, returning 0 on success and raising
     on failure (the caller reports the error envelope — never a stale answer
     with a false refreshed bit). Checks stub this module-level symbol to
     exercise the refresh offline. include_patches carries the store's own
-    retention so a refresh never downgrades a patch-synced store (PR review)."""
+    retention so a refresh never downgrades a patch-synced store (PR review).
+    source_name carries the store's recorded fetch_source (issue #48) —
+    NULL/unset keeps the documented graphql default; a store deliberately
+    kept on `--source rest` refreshes over REST instead of profile-drifting."""
     try:
         init_schema(conn)
     except RuntimeError as exc:
@@ -466,7 +478,8 @@ def _run_refresh_sync(
         include_patches=include_patches,
         jsonl_path=None,
         numbers=None,
-        source_name="graphql",
+        source_name="graphql" if not source_name else source_name,
+        stamp_source=source_name,
     )
     return 0
 
@@ -504,7 +517,7 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
     try:
         try:
             row = ro.execute(
-                "SELECT repo, include_patches FROM sync_state WHERE lower(repo) = ?",
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?",
                 (slug,),
             )
         except sqlite3.OperationalError as exc:
@@ -520,7 +533,9 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
         row = row.fetchone()
         if row is None:
             return False
-        include_patches = bool(row["include_patches"])
+        # The pre-lock query is a store-identity probe only (repo row
+        # exists); the refresh's actual configuration is read under the
+        # lock below, never from this snapshot (review PRR-020).
         age = _freshness(ro, slug).get("age_s")
         if age is not None and age <= budget:
             return False
@@ -554,7 +569,44 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
                 except RuntimeError as exc:
                     raise _ReadFailure(2, str(exc), code_key="environment_guard")
                 try:
-                    _run_refresh_sync(conn, slug, include_patches=include_patches)
+                    # Issue #48 AC2: the refresh configuration is re-read
+                    # UNDER the lock, on the writable connection, AFTER
+                    # init_schema has migrated it to v11 — a concurrent
+                    # writer that changed fetch_source or include_patches
+                    # (or migrated a v10 store) while this read waited on
+                    # the lock must never be reverted by the waiting
+                    # refresh. The pre-lock query is a v10-compatible
+                    # store-identity probe only; nothing about the refresh
+                    # is decided from it (review PRR-020).
+                    try:
+                        init_schema(conn)
+                    except RuntimeError as exc:
+                        raise _EnvironmentGuard(str(exc)) from exc
+                    cfg = conn.execute(
+                        "SELECT include_patches, fetch_source FROM sync_state"
+                        " WHERE lower(repo) = ?",
+                        (slug,),
+                    ).fetchone()
+                    if cfg is None:
+                        return False
+                    refresh_patches = bool(cfg["include_patches"])
+                    raw_source = cfg["fetch_source"]
+                    # Out-of-domain stored values (a tampered or foreign
+                    # candidate-adopted row) heal to the documented graphql
+                    # default instead of silently persisting through the
+                    # refresh's re-stamp (review PRR-021). The refresh
+                    # always re-stamps the concrete value it honored, so a
+                    # profile only ever moves to a value a source actually
+                    # fetched with.
+                    refresh_source = (
+                        raw_source if raw_source in ("graphql", "rest") else "graphql"
+                    )
+                    _run_refresh_sync(
+                        conn,
+                        slug,
+                        include_patches=refresh_patches,
+                        source_name=refresh_source,
+                    )
                 except _EnvironmentGuard as exc:
                     # Non-retryable environment guards (schema too new,
                     # SQLite floor) exit 2 like the sync path (PR review);
@@ -820,7 +872,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
         # Default source is the GraphQL bulk source (issue #5); `--source rest`
         # keeps the plain REST source (now page-streaming). The call goes
         # through the shared quiet core (issue #31) so the --max-age refresh
-        # path issues exactly the same one sync_repo call.
+        # path issues exactly the same one sync_repo call. The CONSTRUCTION
+        # source defaults to graphql, but only an explicitly stated source is
+        # forwarded as the stamp (issue #48: an incidental default-source sync
+        # never rewrites the store's recorded profile).
         result = _sync_core(
             conn,
             slug,
@@ -828,7 +883,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             include_patches=args.include_patches,
             jsonl_path=jsonl,
             numbers=numbers,
-            source_name=getattr(args, "source", "graphql"),
+            source_name=getattr(args, "source", None) or "graphql",
+            stamp_source=getattr(args, "source", None),
         )
     except SyncError as exc:
         emit_result(
@@ -2058,8 +2114,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--source",
         choices=("graphql", "rest"),
-        default="graphql",
-        help="Fetch source: graphql bulk pages (default) or plain REST pages",
+        default=None,
+        help="Fetch source: graphql bulk pages (default) or plain REST"
+        " pages. Only an explicitly stated source re-stamps the store's"
+        " recorded fetch profile (issue #48)",
     )
     sp.add_argument(
         "--jsonl",

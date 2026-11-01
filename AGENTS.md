@@ -72,6 +72,7 @@ shouldn't.
   from it. Re-fetching the boundary item is harmless because ingest is
   idempotent; a one-second adjustment would create a window where an update is
   lost forever.
+- **`sync_state` counts are finish-time snapshots** that may lag after an interrupted run — exact after every completed run, possibly stale mid-run, so query the tables, not the counts, when a mid-run answer matters (docs/schema.md).
 - **Each item is ingested in one `BEGIN IMMEDIATE` that includes its own
   watermark bump**, so an interrupted run resumes from the last fully committed
   item rather than skipping or re-doing everything. (Exception: `sync

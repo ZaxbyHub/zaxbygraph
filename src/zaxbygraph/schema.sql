@@ -1,4 +1,4 @@
--- zaxbygraph schema v10 (`PRAGMA user_version` = 10; see db.py MIGRATIONS)
+-- zaxbygraph schema v11 (`PRAGMA user_version` = 11; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- All table rows are mechanically derived from fetched GitHub data:
 -- the fetcher replaces item-scoped child tables on re-ingest (v10's
@@ -213,7 +213,12 @@ CREATE TABLE IF NOT EXISTS sync_state (
     include_patches      INTEGER NOT NULL DEFAULT 0,
     full_sync_pending    INTEGER NOT NULL DEFAULT 0,
     rate_limit_remaining INTEGER,
-    rate_limit_reset_at  TEXT
+    rate_limit_reset_at  TEXT,
+    -- v11 (issue #48): the fetch source this store's profile deliberately
+    -- uses, stamped at listing-sync start. NULL (pre-v11 stores, unset)
+    -- means the documented graphql default; the --max-age refresh reads it
+    -- under the sync lock so a deliberately REST store never profile-drifts.
+    fetch_source         TEXT
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
@@ -291,8 +296,10 @@ END;
 
 -- Evidence history (issue #25, migration v8): pre-images of displaced text.
 -- Append-only at ingest — rows are never updated or deleted by the sync
--- path; doctor --consolidate replaces the whole corpus snapshot (the one
--- sanctioned rewrite, with fresh ids). `content` is exactly the displaced
+-- path; doctor --consolidate is the one sanctioned rewrite, scoped per
+-- item (issue #40): covered numbers replace with fresh ids (a covered
+-- number whose candidate rows are payload-identical is left untouched),
+-- others keep their stored history. `content` is exactly the displaced
 -- stored value (NULL legal: the text was absent before). Windows are GitHub
 -- times, never the sync wall clock; per-entity provenance in docs/schema.md.
 CREATE TABLE IF NOT EXISTS revisions (

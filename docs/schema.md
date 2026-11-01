@@ -1,4 +1,4 @@
-# Schema reference (schema version 8, `PRAGMA user_version` = 10)
+# Schema reference (schema version 11, `PRAGMA user_version` = 11)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -346,6 +346,15 @@ from the stored `raw_json` text of items, comments and reviews. v10 (issue
 events and commit messages were never fetched before v10), so migrated stores
 start with both empty and fill as items refresh.
 
+## Migration 11
+
+v11 (issue #48) adds one nullable `sync_state.fetch_source` column — the
+fetch source this store's profile deliberately uses. No backfill is
+possible (the requested source was never recorded before this slot), so a
+migrated store's column is `NULL`, which every reader treats as the
+documented graphql default. Fresh stores get the column at the same
+last position; the migration is a guarded `ALTER TABLE ... ADD COLUMN`.
+
 ## revisions
 
 v8. Evidence history: the pre-image of every displaced text version — item
@@ -369,9 +378,24 @@ Write rules:
 
 - **Append-only at ingest.** Nothing in the sync path updates or deletes a
   revision — not child replacement, not the deletion oracle, not migrations.
-  `doctor --consolidate` is the one sanctioned rewrite: it replaces the whole
-  corpus snapshot and re-assigns fresh ids, ordered so each item's sequence
-  survives.
+  `doctor --consolidate` is the one sanctioned rewrite, scoped per item
+  (issue #40): a covered item (the adopted candidate has revision rows for
+  it) whose candidate rows are payload-identical to the stored rows is left
+  untouched; a covered item with different rows is replaced with fresh ids,
+  ordered so the item's sequence survives; an item the candidate never
+  observed keeps its stored history (a pre-v8 candidate's empty revisions
+  table is a schema artifact, not an observation — deleting unobserved
+  history would destroy evidence that cannot be re-derived). "Covered"
+  means the candidate holds revision ROWS for the number, whether or not
+  it carries the item itself. Two recorded consequences of that scoping:
+  within-item depth loss (a shallower candidate for a covered number still
+  replaces its deeper history, because the candidate's rows are a real
+  observation), and preserved rows can outlive their item rows when the
+  candidate lacked the item — the adoption replaces the slug's `items`
+  rows wholesale, so a preserved number's `items` row may be gone while
+  its revision history survives: `item --history` reports not found until
+  a re-sync restores the item, `status` counts the rows, and
+  `export-corpus --include revisions` emits them (review PRR-012).
 - **No content key.** A row exists only when the stored value and the
   incoming value differ (exact, NULL-aware). An edit reverted A→B→A therefore
   yields two rows and can never wedge a sync. A displacement whose
@@ -446,6 +470,7 @@ One row per repo. What `zaxbygraph status` reads.
 | `comment_count` | INTEGER | |
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
+| `fetch_source` | TEXT | v11. The fetch source this store's profile deliberately uses — `graphql` or `rest` — stamped at listing-sync start whenever a run EXPLICITLY stated a source (`--source`, or the `--max-age` refresh honoring the stored value); a run that did not state one (a plain `sync`, a targeted `--numbers` run without `--source`, the MCP surface) never rewrites the stamp, so a store deliberately kept on `--source rest` stays rest until the operator says otherwise. `NULL` on pre-v11 stores or where never recorded, which every reader treats as the documented graphql default. The `--max-age` refresh re-reads it under the sync lock and re-stamps the concrete value it honored; a mid-run GraphQL→REST degradation is a transient fact of one run and never rewrites the stamp. Consolidation adopts a post-v11 candidate's value with its sync_state row; a pre-v11 candidate leaves the column NULL. |
 | `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
@@ -461,7 +486,7 @@ can disagree with its live `counts[]` for the same reason.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `10`). The
+`PRAGMA user_version` is the authoritative schema state (currently `11`). The
 `meta.schema_version` row is informational only. `init_schema` (which runs
 the migration chain) executes only on a WRITABLE open: a `sync`, an
 MCP-triggered sync, or `doctor --consolidate` (adoption migrates its temp

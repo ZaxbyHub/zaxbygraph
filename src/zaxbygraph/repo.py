@@ -197,6 +197,60 @@ def _parse_remote_url(url: str) -> str | None:
     return None if info is None else info[1]
 
 
+def _proxy_disabled_reason(url: str) -> str | None:
+    """Why a disabled ZAXBYGRAPH_PROXY_FORGE_HOST broke this URL's parse.
+
+    Issue #48 AC4: names the variable only on the exact counterfactual —
+    the URL is a supported scheme whose authority is a loopback proxy and
+    whose path is a `git/<valid-slug>` that WOULD have resolved through
+    the rewrite, and the env var is in a disabled state (set but empty/
+    whitespace, or set but unparseable per the documented grammar). A
+    loopback URL that fails to parse even with the rewrite enabled (no
+    git/ prefix, malformed slug, no scheme) gets no attribution: the
+    variable did not cause that failure. Unset and valid-host states are
+    never "disabled", so they never attribute either. Normalization
+    mirrors _parse_remote_info exactly (final-critic round: a trailing
+    .git is stripped first, so a .git-suffixed proxy URL that would
+    resolve through the rewrite still attributes)."""
+    url = url.strip()
+    if url.endswith(".git"):
+        url = url[:-4]
+    for scheme in ("https://", "http://", "ssh://"):
+        if url.startswith(scheme):
+            break
+    else:
+        return None
+    rest = url[len(scheme):]
+    if rest.startswith("git@"):
+        rest = rest[4:]
+    host_raw, _, path = rest.partition("/")
+    path = path.strip("/")
+    if not _loopback_authority(host_raw.rsplit("@", 1)[-1]):
+        return None
+    if path[:4].lower() != "git/":
+        return None
+    slug = path[4:].strip("/")
+    if not REPO_SLUG_RE.match(slug):
+        return None
+    override = os.environ.get(_PROXY_ENV_VAR)
+    if override is None:
+        return None
+    if not override.strip():
+        return (
+            f" (ZAXBYGRAPH_PROXY_FORGE_HOST is set but empty, which disables"
+            f" the loopback rewrite this remote relies on)"
+        )
+    if not _valid_forge_host(override):
+        # The value itself is never echoed (review PRR-002): an operator who
+        # pasted a credential-bearing string into the variable must not have
+        # it disclosed verbatim in the error envelope, stderr, or CI logs.
+        return (
+            f" (ZAXBYGRAPH_PROXY_FORGE_HOST is set but unparseable, which"
+            f" disables the loopback rewrite this remote relies on)"
+        )
+    return None
+
+
 def _redact_url(url: str) -> str:
     """Mask userinfo credentials before echoing an origin URL anywhere.
 
@@ -233,7 +287,11 @@ def slug_from_git(cwd: Path | None = None) -> str:
         raise RepoError("no git origin remote; pass --repo OWNER/REPO")
     parsed = _parse_remote_url(proc.stdout)
     if not parsed:
-        raise RepoError(f"could not parse origin remote: {_redact_url(proc.stdout.strip())!r}")
+        reason = _proxy_disabled_reason(proc.stdout.strip())
+        raise RepoError(
+            f"could not parse origin remote: {_redact_url(proc.stdout.strip())!r}"
+            f"{reason or ''}"
+        )
     return validate_slug(parsed)
 
 
@@ -254,7 +312,11 @@ def remote_info(cwd: Path | None = None) -> tuple[str, str]:
         raise RepoError("no git origin remote; pass --repo OWNER/REPO")
     info = _parse_remote_info(proc.stdout)
     if info is None:
-        raise RepoError(f"could not parse origin remote: {_redact_url(proc.stdout.strip())!r}")
+        reason = _proxy_disabled_reason(proc.stdout.strip())
+        raise RepoError(
+            f"could not parse origin remote: {_redact_url(proc.stdout.strip())!r}"
+            f"{reason or ''}"
+        )
     host, slug = info
     return host, validate_slug(slug)
 
