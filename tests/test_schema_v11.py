@@ -33,6 +33,26 @@ def _version(db_path):
         c.close()
 
 
+def _make_v10_store(conn) -> None:
+    """Demote an initialized store to the real v10 sync_state shape
+    (ALTER DROP chokes on the commented CREATE text) and rewind the
+    version stamp. Shared by the migration tests (review PRR-018)."""
+    conn.execute("DROP TABLE sync_state")
+    conn.execute(
+        "CREATE TABLE sync_state ("
+        " repo TEXT PRIMARY KEY, issues_since TEXT,"
+        " last_full_sync_at TEXT, last_incr_sync_at TEXT,"
+        " last_error TEXT, item_count INTEGER NOT NULL DEFAULT 0,"
+        " comment_count INTEGER NOT NULL DEFAULT 0,"
+        " edge_count INTEGER NOT NULL DEFAULT 0,"
+        " include_patches INTEGER NOT NULL DEFAULT 0,"
+        " full_sync_pending INTEGER NOT NULL DEFAULT 0,"
+        " rate_limit_remaining INTEGER, rate_limit_reset_at TEXT)"
+    )
+    conn.execute("PRAGMA user_version = 10")
+    conn.commit()
+
+
 class SchemaV11MigrationTests(unittest.TestCase):
     def setUp(self) -> None:
         td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -60,22 +80,8 @@ class SchemaV11MigrationTests(unittest.TestCase):
     def test_v10_store_migrates_to_identical_shape(self):
         c = connect(self.db)
         init_schema(c)
-        # Demote to the real v10 shape (ALTER DROP chokes on the commented
-        # CREATE text): recreate the table without the v11 column.
-        c.execute("DROP TABLE sync_state")
-        c.execute(
-            "CREATE TABLE sync_state ("
-            " repo TEXT PRIMARY KEY, issues_since TEXT,"
-            " last_full_sync_at TEXT, last_incr_sync_at TEXT,"
-            " last_error TEXT, item_count INTEGER NOT NULL DEFAULT 0,"
-            " comment_count INTEGER NOT NULL DEFAULT 0,"
-            " edge_count INTEGER NOT NULL DEFAULT 0,"
-            " include_patches INTEGER NOT NULL DEFAULT 0,"
-            " full_sync_pending INTEGER NOT NULL DEFAULT 0,"
-            " rate_limit_remaining INTEGER, rate_limit_reset_at TEXT)"
-        )
-        c.execute("PRAGMA user_version = 10")
-        c.commit()
+        # Demote to the real v10 shape (shared helper, review PRR-018).
+        _make_v10_store(c)
         c.close()
         self.assertNotIn("fetch_source", _columns(self.db))
 
@@ -101,20 +107,7 @@ class SchemaV11MigrationTests(unittest.TestCase):
     def test_reads_never_migrate_a_v10_store(self):
         c = connect(self.db)
         init_schema(c)
-        c.execute("DROP TABLE sync_state")
-        c.execute(
-            "CREATE TABLE sync_state ("
-            " repo TEXT PRIMARY KEY, issues_since TEXT,"
-            " last_full_sync_at TEXT, last_incr_sync_at TEXT,"
-            " last_error TEXT, item_count INTEGER NOT NULL DEFAULT 0,"
-            " comment_count INTEGER NOT NULL DEFAULT 0,"
-            " edge_count INTEGER NOT NULL DEFAULT 0,"
-            " include_patches INTEGER NOT NULL DEFAULT 0,"
-            " full_sync_pending INTEGER NOT NULL DEFAULT 0,"
-            " rate_limit_remaining INTEGER, rate_limit_reset_at TEXT)"
-        )
-        c.execute("PRAGMA user_version = 10")
-        c.commit()
+        _make_v10_store(c)
         c.close()
         ro = open_existing(self.db)
         try:

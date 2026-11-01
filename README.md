@@ -869,7 +869,7 @@ rewrite at another forge, with four states:
 | set, non-empty, unparseable | Rewrite disabled; the remote parses (or fails to) exactly as without the variable. |
 | set but empty/whitespace | Opt out — same as unparseable. |
 
-When a disabled state makes a `git/`-prefixed loopback remote fail to parse, the error names the variable and its state — `could not parse origin remote: '<url>' (ZAXBYGRAPH_PROXY_FORGE_HOST is set but empty, which disables the loopback rewrite this remote relies on)` — so the cause is not misread as a malformed remote. A loopback URL that fails to parse even with the rewrite enabled names no variable.
+When a disabled state makes a `git/`-prefixed loopback remote fail to parse, the error names the variable and its state — `could not parse origin remote: '<url>' (ZAXBYGRAPH_PROXY_FORGE_HOST is set but empty, which disables the loopback rewrite this remote relies on)` for the empty state, or `(ZAXBYGRAPH_PROXY_FORGE_HOST is set but unparseable, ...)` for the unparseable state (the variable's value is never echoed) — so the cause is not misread as a malformed remote. A loopback URL that fails to parse even with the rewrite enabled names no variable.
 
 A "valid" value is `host[:port]`: ASCII dot-separated labels (`a-z0-9_`,
 hyphens inside labels), optional 1-5 digit port. Only `git/`-prefixed paths

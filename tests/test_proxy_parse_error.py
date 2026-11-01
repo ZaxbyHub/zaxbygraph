@@ -75,6 +75,27 @@ class ProxyDisabledReasonUnitTests(unittest.TestCase):
                 with self.subTest(url=url):
                     self.assertIsNone(_proxy_disabled_reason(url))
 
+    def test_scheme_and_loopback_spellings_attribute(self):
+        """Review PRR-017: the counterfactual must attribute across the
+        full URL grammar the parser accepts - ssh:// scheme and every
+        loopback spelling - so dropping any of them from the helper
+        fails here."""
+        urls = [
+            "ssh://git@127.0.0.1:41233/git/owner/repo",
+            "http://localhost:41233/git/owner/repo",
+            "http://[::1]:41233/git/owner/repo",
+            "https://127.0.0.1/git/owner/repo",
+        ]
+        with mock.patch.dict(
+            os.environ, {"ZAXBYGRAPH_PROXY_FORGE_HOST": "   "}
+        ):
+            for url in urls:
+                with self.subTest(url=url):
+                    self.assertIsNotNone(
+                        _proxy_disabled_reason(url),
+                        f"disabled env: {url} must attribute",
+                    )
+
     def test_git_suffixed_proxy_url_attributes(self):
         """Final-critic round: the parser strips a trailing .git before
         parsing (repo.py _parse_remote_info), so a .git-suffixed

@@ -296,8 +296,9 @@ END;
 
 -- Evidence history (issue #25, migration v8): pre-images of displaced text.
 -- Append-only at ingest — rows are never updated or deleted by the sync
--- path; doctor --consolidate replaces the whole corpus snapshot (the one
--- sanctioned rewrite, with fresh ids). `content` is exactly the displaced
+-- path; doctor --consolidate is the one sanctioned rewrite, scoped per
+-- item (issue #40): covered numbers replace with fresh ids, others keep
+-- their stored history. `content` is exactly the displaced
 -- stored value (NULL legal: the text was absent before). Windows are GitHub
 -- times, never the sync wall clock; per-entity provenance in docs/schema.md.
 CREATE TABLE IF NOT EXISTS revisions (

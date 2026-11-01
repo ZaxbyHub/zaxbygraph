@@ -714,8 +714,15 @@ class AppendOnlyGuardTests(TempDBTest):
                 if ("UPDATE REVISIONS" in up or "DELETE FROM REVISIONS" in up):
                     if path.name == "doctor.py" and "DELETE FROM {table}" in line:
                         continue  # the sanctioned copy-loop delete
-                    if path.name == "doctor.py" and "number = ?" in line:
-                        continue  # the sanctioned per-item delete (issue #40)
+                    if (
+                        path.name == "doctor.py"
+                        and "DELETE FROM REVISIONS" in up
+                        and "number = ?" in line
+                    ):
+                        continue  # the sanctioned per-item delete (issue #40);
+                        # UPDATE REVISIONS lines are never whitelisted
+                        # (review PRR-014: a shape-blind substring match
+                        # would have exempted an in-place rewrite)
                     offenders.append(f"{path.name}:{lineno}: {line.strip()}")
         self.assertEqual(offenders, [])
 
@@ -1063,8 +1070,9 @@ class ReplayFidelityTests(TempDBTest):
 
 class ConsolidationRevisionTests(unittest.TestCase):
     """PRR-001 (plan D5): consolidation adopts revisions with fresh ids in
-    per-item sequence order and removes stale destination rows for the
-    slug, without touching other repos' history."""
+    per-item sequence order; numbers the candidate holds no revision rows
+    for keep their stored history, and other repos' history is untouched
+    (per-item scope since issue #40)."""
 
     def setUp(self) -> None:
         td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

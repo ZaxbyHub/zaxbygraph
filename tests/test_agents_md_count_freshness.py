@@ -32,7 +32,12 @@ class AgentsCountFreshnessTests(unittest.TestCase):
             for ln in text.splitlines()
             if ln.lstrip().startswith(("-", "*"))
         ]
-        hits = [b for b in bullets if "count" in b.lower()]
+        import re as _re
+
+        hits = [
+            b for b in bullets
+            if _re.search(r"\bcounts?\b", b, _re.IGNORECASE)
+        ]
         self.assertTrue(
             hits,
             "AGENTS-COUNT-FRESHNESS-MISSING: AGENTS.md carries no bullet"

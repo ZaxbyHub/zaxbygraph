@@ -241,10 +241,12 @@ def _proxy_disabled_reason(url: str) -> str | None:
             f" the loopback rewrite this remote relies on)"
         )
     if not _valid_forge_host(override):
+        # The value itself is never echoed (review PRR-002): an operator who
+        # pasted a credential-bearing string into the variable must not have
+        # it disclosed verbatim in the error envelope, stderr, or CI logs.
         return (
-            f" (ZAXBYGRAPH_PROXY_FORGE_HOST is set but unparseable"
-            f" ({override.strip()!r}), which disables the loopback rewrite"
-            f" this remote relies on)"
+            f" (ZAXBYGRAPH_PROXY_FORGE_HOST is set but unparseable, which"
+            f" disables the loopback rewrite this remote relies on)"
         )
     return None
 

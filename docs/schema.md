@@ -1,4 +1,4 @@
-# Schema reference (schema version 8, `PRAGMA user_version` = 11)
+# Schema reference (schema version 11, `PRAGMA user_version` = 11)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -385,10 +385,17 @@ Write rules:
   ordered so the item's sequence survives; an item the candidate never
   observed keeps its stored history (a pre-v8 candidate's empty revisions
   table is a schema artifact, not an observation — deleting unobserved
-  history would destroy evidence that cannot be re-derived). Within-item
-  depth loss remains a recorded boundary: a shallower candidate for an item
-  it covers still replaces that item's deeper history, because the
-  candidate's rows are a real observation for that item.
+  history would destroy evidence that cannot be re-derived). "Covered"
+  means the candidate holds revision ROWS for the number, whether or not
+  it carries the item itself. Two recorded consequences of that scoping:
+  within-item depth loss (a shallower candidate for a covered number still
+  replaces its deeper history, because the candidate's rows are a real
+  observation), and preserved rows can outlive their item rows when the
+  candidate lacked the item — the adoption replaces the slug's `items`
+  rows wholesale, so a preserved number's `items` row may be gone while
+  its revision history survives: `item --history` reports not found until
+  a re-sync restores the item, `status` counts the rows, and
+  `export-corpus --include revisions` emits them (review PRR-012).
 - **No content key.** A row exists only when the stored value and the
   incoming value differ (exact, NULL-aware). An edit reverted A→B→A therefore
   yields two rows and can never wedge a sync. A displacement whose

@@ -10,6 +10,7 @@ through a copy).
 Report payload (the CLI wraps it in the issue-#3 envelope; these keys live
 under `data`, with `ok`/`db`/`repo`/`freshness` on the envelope root):
     {"adopted": <path|null>,
+     "revisions_adopted": <int>, "revisions_preserved": <int>,
      "scanned": [{"path", "items", "garbled", "complete", "adopted"}, ...]}
 
 Pinned semantics:
@@ -42,10 +43,11 @@ _MOJIBAKE_LIKE = (
 
 #: tables copied on adoption -> the autoincrement pk column to omit (None =
 #: keep every column; GitHub-assigned ids in items/releases/reviews are kept).
-#: Issue #25: `revisions` adopts with FRESH ids (its id is the synthetic
-#: sequence, omitted here), and the copy loop orders by the omitted pk so
-#: each item's revision sequence survives the copy. Consolidation is the one
-#: sanctioned rewrite of revision history (append-only everywhere else).
+#: Issue #25/#40: `revisions` adopt per item through the dedicated per-item
+#: block in consolidate() (covered numbers replace with FRESH ids in sequence
+#: order; numbers the candidate holds no revision rows for keep their stored
+#: history). Consolidation is the one sanctioned rewrite of revision history
+#: (append-only everywhere else).
 _COPY_TABLES = (
     ("items", None),
     ("labels", None),
@@ -231,38 +233,44 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                     )
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
-                # Issue #40: revisions adopt per item. A covered item whose
-                # candidate rows are payload-identical to the stored rows is
-                # skipped entirely (AC6: a same-candidate re-adoption is a
-                # no-op); a covered item with different rows is replaced;
-                # uncovered items are never touched (AC1/AC2).
-                covered = [
-                    int(r[0])
-                    for r in src.execute(
-                        "SELECT DISTINCT number FROM revisions WHERE lower(repo) = ?",
-                        (repo_l,),
-                    )
-                ]
+                # Issue #40: revisions adopt per item. A covered number
+                # (the candidate has revision rows for it) whose candidate
+                # rows are payload-identical to the stored rows is skipped
+                # entirely (AC6: a same-candidate re-adoption is a no-op); a
+                # covered number with different rows is replaced; numbers
+                # with no candidate rows are never touched (AC1/AC2). One
+                # indexed pass over the candidate's rows, grouped per number
+                # here — the per-item lower(repo) query shape full-scans the
+                # table (review PRR-006). repo = ? is exact: revisions rows
+                # are only written with the folded slug (ingest via
+                # validate_slug, consolidation via lower()).
                 rev_payload_cols = (
                     "entity", "entity_id", "kind", "origin", "content",
                     "valid_from", "valid_to",
                 )
+                covered_rows: dict[int, list] = {}
+                for row in src.execute(
+                    "SELECT number, " + ", ".join(rev_payload_cols)
+                    + " FROM revisions WHERE repo = ? ORDER BY number, id",
+                    (repo_l,),
+                ):
+                    covered_rows.setdefault(int(row[0]), []).append(
+                        tuple(row[1:])
+                    )
+                store_revs_before = dst.execute(
+                    "SELECT COUNT(*) FROM revisions WHERE repo = ?", (repo_l,)
+                ).fetchone()[0]
                 adopted_rows = 0
-                preserved_rows = 0
-                for number in covered:
-                    cand_rows = src.execute(
-                        "SELECT " + ", ".join(rev_payload_cols)
-                        + " FROM revisions WHERE lower(repo) = ? AND number = ?"
-                        " ORDER BY id",
-                        (repo_l, number),
-                    ).fetchall()
+                replaced_rows = 0
+                for number in sorted(covered_rows):
+                    cand_rows = covered_rows[number]
                     stored_rows = dst.execute(
                         "SELECT " + ", ".join(rev_payload_cols)
                         + " FROM revisions WHERE repo = ? AND number = ?"
                         " ORDER BY id",
                         (repo_l, number),
                     ).fetchall()
-                    if [tuple(r) for r in cand_rows] == [tuple(r) for r in stored_rows]:
+                    if cand_rows == [tuple(r) for r in stored_rows]:
                         continue  # same observation: no-op (AC6)
                     dst.execute(
                         "DELETE FROM revisions WHERE repo = ? AND number = ?",
@@ -277,18 +285,12 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                         [tuple(r) + (repo_l, number) for r in cand_rows],
                     )
                     adopted_rows += len(cand_rows)
-                if covered:
-                    placeholders = ",".join("?" for _ in covered)
-                    preserved_rows = dst.execute(
-                        "SELECT COUNT(*) FROM revisions"
-                        f" WHERE repo = ? AND number NOT IN ({placeholders})",
-                        (repo_l, *covered),
-                    ).fetchone()[0]
-                else:
-                    preserved_rows = dst.execute(
-                        "SELECT COUNT(*) FROM revisions WHERE repo = ?",
-                        (repo_l,),
-                    ).fetchone()[0]
+                    replaced_rows += len(stored_rows)
+                # Preserved = stored rows for numbers the candidate holds no
+                # revision rows for, by arithmetic — an unbounded NOT IN
+                # placeholder list hits SQLite's host-parameter ceiling on
+                # very large corpora (review PRR-005).
+                preserved_rows = store_revs_before - replaced_rows
 
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":

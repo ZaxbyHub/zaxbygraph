@@ -1,15 +1,11 @@
 """Consolidation revision-preservation acceptance checks (issue #40).
 
-New file for the 40-48-36-followups trace (tests/test_revisions.py is over
-the new-check file cap at 1121 lines). The DISCRIMINATING checks for
-40-AC1/AC2 (``test_empty_candidate_keeps_stored_history``,
-``test_partial_candidate_replaces_only_observed_items``) and the 40-AC4
-report test (``test_adoption_reports_preserved_revision_counts``) are
-authored by the fix, not at freeze time: at the frozen base this module
-carries only the 40-AC6 check (``test_consolidation_twice_is_row_neutral``,
-amended per plan-critic round 1 from count-only row neutrality to an
-id-stability oracle), so the absence legs observe ``NO TESTS RAN`` (exit 5
-on py -3.14).
+Consolidation-scoped acceptance checks for the 40-48-36-followups trace
+(tests/test_revisions.py was over the new-check file cap, so these live
+in their own module). Six tests: the 40-AC1/AC2 preservation checks, the
+40-AC4 report-count checks (including the zero-coverage case), the
+40-AC6 twice-adoption id-stability oracle, and the seven-column
+payload-comparison pin.
 """
 
 from __future__ import annotations
@@ -422,6 +418,63 @@ class RevisionPreservationTests(unittest.TestCase):
             " narrowed; content-only mutants survive without this pin)",
         )
         store.close()
+
+    def test_each_comparison_column_forces_replacement(self):
+        """Review PRR-016: the payload comparison spans all seven columns -
+        exercised one column at a time, so narrowing the comparison to any
+        PROPER SUBSET that excludes the varied column fails here."""
+        from zaxbygraph.doctor import consolidate
+
+        stored_row = ("item_body", None, None, "edit", "STORE-A",
+                      "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z")
+        # The column each subTest varies, and the candidate's value for it.
+        variants = [
+            ("entity", "comment"),
+            ("entity_id", 7),
+            ("kind", "issue_comment"),
+            ("origin", "deleted"),
+            ("content", "STORE-A-CHANGED"),
+            ("valid_from", "2026-05-05T00:00:00Z"),
+            ("valid_to", "2026-06-06T00:00:00Z"),
+        ]
+        for col, value in variants:
+            store = connect(self.store_db)
+            init_schema(store)
+            store.execute(
+                "INSERT INTO revisions(repo, number, entity, entity_id, kind,"
+                " origin, content, valid_from, valid_to)"
+                " VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                (REPO, *stored_row),
+            )
+            store.commit()
+            cand_row = list(stored_row)
+            cand_row[variants.index((col, value))] = value
+            cand = connect(self.candidate_db)
+            init_schema(cand)
+            cand.execute(
+                "INSERT INTO revisions(repo, number, entity, entity_id, kind,"
+                " origin, content, valid_from, valid_to)"
+                " VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)",
+                (REPO, *cand_row),
+            )
+            cand.commit()
+            cand.close()
+            consolidate(self.store_db, self.candidate_db, REPO)
+            content = store.execute(
+                "SELECT content FROM revisions WHERE repo = ? AND number = 1",
+                (REPO,),
+            ).fetchone()[0]
+            expected = "STORE-A-CHANGED" if col == "content" else "STORE-A"
+            self.assertEqual(
+                content, expected,
+                f"COMPARISON-NARROWED: a comparison excluding {col} treats a"
+                f" {col}-only difference as payload-identical and skips the"
+                f" replacement",
+            )
+            store.close()
+            # Reset both fixtures for the next variant.
+            self.store_db.unlink(missing_ok=True)
+            self.candidate_db.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

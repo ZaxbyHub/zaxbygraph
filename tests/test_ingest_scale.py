@@ -306,11 +306,13 @@ class IngestScaleChecks(unittest.TestCase):
         repo = ? AND title = ? AND number != ?) is captured from the
         connection trace of a REAL ingest (a merged revert-titled PR
         resolves its target through the stored-titles lookup), so only the
-        statement the code actually executes can satisfy this check - a
-        mutant rewriting the shipped lookup to an unindexable
-        LOWER(title) = LOWER(?) predicate turns this check RED where the
-        pre-amendment copied-literal form stayed GREEN (probe of record in
-        the PR #35 review, test-infrastructure lane). The EXPLAIN runs as
+        statement the code actually executes can satisfy this check. EVERY
+        captured runtime title lookup must plan as a title-index seek -
+        the shipped title_lookup (store.py ~:925) and the symmetric
+        title-revert pass (~:990) both emit into the same trace, and a
+        LOWER(title) = LOWER(?) rewrite at EITHER site is matched by the
+        shape filter and fails the plan assertion, where the
+        pre-amendment copied-literal form stayed GREEN. The EXPLAIN runs as
         a stats-independent oracle (C1's pattern): any sqlite_stat1 the
         shipped finish-time PRAGMA optimize created is cleared first and
         the plan is read on a FRESH connection. The check deliberately
@@ -334,12 +336,15 @@ class IngestScaleChecks(unittest.TestCase):
         def _is_title_lookup(stmt: str) -> bool:
             # The trace hands back parameter-expanded text (observed on
             # this build), so match the family by shape, placeholders or
-            # literals alike - exactly the shipped title_lookup statement.
+            # literals alike - the shipped title_lookup statement AND its
+            # unindexable LOWER(title) mutant form. A rewritten statement
+            # must be CAPTURED so the plan assertion can fail on it rather
+            # than being silently filtered out (review PRR-007).
             n = " ".join(stmt.split()).upper()
             return (
                 n.startswith("SELECT NUMBER FROM ITEMS WHERE REPO = ")
-                and " AND TITLE = " in n
                 and " AND NUMBER != " in n
+                and (" AND TITLE = " in n or "LOWER(TITLE)" in n)
             )
 
         lookups = [s for s in captured if _is_title_lookup(s)]
@@ -352,21 +357,25 @@ class IngestScaleChecks(unittest.TestCase):
         ).fetchone() is not None:
             self.conn.execute("DELETE FROM sqlite_stat1")
             self.conn.commit()
+        plans: list[str] = []
         plan_conn = sqlite3.connect(str(self.db_path))
         try:
-            details = [
-                row[3].strip()
-                for row in plan_conn.execute("EXPLAIN QUERY PLAN " + lookups[0])
-            ]
+            for lookup in lookups:
+                plans.extend(
+                    row[3].strip()
+                    for row in plan_conn.execute("EXPLAIN QUERY PLAN " + lookup)
+                )
         finally:
             plan_conn.close()
-        ok = any(
-            re.search(r"USING (COVERING )?INDEX [^ ]+ \([^)]*title=\?", d)
-            for d in details
-        )
-        self.assertTrue(
-            ok,
-            "TITLE-LOOKUP-PLAN: " + " ; ".join(details),
+        unindexed = [
+            d
+            for d in plans
+            if not re.search(r"USING (COVERING )?INDEX [^ ]+ \([^)]*title=\?", d)
+        ]
+        self.assertFalse(
+            unindexed,
+            "TITLE-LOOKUP-PLAN: a captured runtime title lookup is not served"
+            " by a title index: " + " ; ".join(unindexed),
         )
 
     # --- AC3: recount is finish-only ---------------------------------------

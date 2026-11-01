@@ -528,7 +528,9 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
         row = row.fetchone()
         if row is None:
             return False
-        include_patches = bool(row["include_patches"])
+        # The pre-lock query is a store-identity probe only (repo row
+        # exists); the refresh's actual configuration is read under the
+        # lock below, never from this snapshot (review PRR-020).
         age = _freshness(ro, slug).get("age_s")
         if age is not None and age <= budget:
             return False
@@ -583,7 +585,14 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
                     if cfg is None:
                         return False
                     refresh_patches = bool(cfg["include_patches"])
-                    refresh_source = cfg["fetch_source"]
+                    raw_source = cfg["fetch_source"]
+                    # Out-of-domain stored values (a tampered or foreign
+                    # candidate-adopted row) heal to the documented graphql
+                    # default instead of silently persisting through the
+                    # refresh's re-stamp (review PRR-021).
+                    refresh_source = (
+                        raw_source if raw_source in ("graphql", "rest") else None
+                    )
                     _run_refresh_sync(
                         conn,
                         slug,

@@ -345,8 +345,14 @@ class SyncStampingTests(unittest.TestCase):
             def list_issues(self, since=None):
                 raise RuntimeError("STAMP-FAIL-MARKER")
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(RuntimeError) as ctx:
             self._sync(FailingSource(), "rest")
+        self.assertIn(
+            "STAMP-FAIL-MARKER", str(ctx.exception),
+            "the listing failure itself must be the exception under test -"
+            " an unrelated failure mode must not satisfy this check"
+            " (review PRR-013)",
+        )
         self.assertEqual(
             self._stamped(), "rest",
             "STAMP-AT-FINISH-MUTANT: a failed sync must leave the START"
