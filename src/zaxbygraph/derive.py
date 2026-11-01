@@ -2971,7 +2971,7 @@ def _brief_live(
             if isinstance(e, dict)
         ]
         prs.append(entry)
-    return {"prs": prs}, None
+    return {"prs": prs, "omitted_prs": omitted_prs}, None
 
 
 def brief(
@@ -3190,6 +3190,11 @@ def brief(
     if live:
         live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
         packet["live"] = live_block
+        if live_block is not None and live_block.get("omitted_prs"):
+            # The live fan is aggregate-capped (pr49 review PRR-010); the
+            # packet must not look complete when linked PRs were trimmed
+            # (cubic r2, comment 4434043108).
+            packet["truncated"] = True
         if live_error is not None:
             packet["live_error"] = live_error
 

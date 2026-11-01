@@ -1228,8 +1228,8 @@ _TOOLS: list[dict] = [
                 "numbers": {
                     "type": "array",
                     "items": {"type": "integer", "minimum": 1},
-                    "description": "Refresh exactly these items; the watermark is untouched (at most 64)",
-                    "maxItems": 64,
+                    "description": f"Refresh exactly these items; the watermark is untouched (at most {_MAX_NUMBERS})",
+                    "maxItems": _MAX_NUMBERS,
                 },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},
                 **_REPO_DB,
@@ -1255,7 +1255,7 @@ _TOOLS: list[dict] = [
             {
                 "limit": _LIMIT,
                 "cursor": _CURSOR,
-                "top_k": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Keep only the top K ranked rows (at most 50)"},
+                "top_k": {"type": "integer", "minimum": 1, "maximum": _MAX_TOP_K, "description": f"Keep only the top K ranked rows (at most {_MAX_TOP_K})"},
                 "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
                 **_REPO_DB,
             }
@@ -1268,8 +1268,8 @@ _TOOLS: list[dict] = [
             {
                 "size": {"type": "string", "description": "Bundle size range like '2-3'"},
                 "count": {"type": "integer", "minimum": 1, "description": "At most K bundles"},
-                "pool": {"type": "array", "items": {"type": "integer"}, "maxItems": 64, "description": "Restrict the pool to these issue numbers (at most 64)"},
-                "exclude": {"type": "array", "items": {"type": "integer"}, "maxItems": 64, "description": "Remove these numbers from the pool (at most 64)"},
+                "pool": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Restrict the pool to these issue numbers (at most {_MAX_NUMBERS})"},
+                "exclude": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Remove these numbers from the pool (at most {_MAX_NUMBERS})"},
                 "allow_shared_files": {"type": "boolean"},
                 "max_files": {"type": "integer", "minimum": 1},
                 "budget_tokens": {"type": "integer", "minimum": 1},

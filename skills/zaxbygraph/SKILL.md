@@ -70,8 +70,8 @@ registers it.
   and `annotations` (`readOnlyHint` true except `sync`), and every COMPLETE result also
   carries `structuredContent` — the parsed envelope (the modern
   `input_required` answer is the exception: `{resultType, requestState,
-  content}` by protocol design). Each tool result's text parses to the same JSON envelope the
-  CLI prints; errors arrive as `isError: true` with the `error{code, message,
+  content}` by protocol design). Each tool result's text parses to a JSON envelope with the same
+  shape the CLI prints (identity/freshness fields are per-surface); errors arrive as `isError: true` with the `error{code, message,
   hint}` object. The five derived/work-selection tools (`similar_items`,
   `triage`, `bundle`, `brief`, `churn`) answer with the same DATA payloads as
   their CLI commands (envelope identity/freshness fields are per-surface). List tools take `limit`/`cursor`; `search`/`file_history`/`open_items`
