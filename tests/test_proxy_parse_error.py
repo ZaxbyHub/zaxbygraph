@@ -84,6 +84,7 @@ class ProxyDisabledReasonUnitTests(unittest.TestCase):
             "ssh://git@127.0.0.1:41233/git/owner/repo",
             "http://localhost:41233/git/owner/repo",
             "http://[::1]:41233/git/owner/repo",
+            "http://::1:41233/git/owner/repo",
             "https://127.0.0.1/git/owner/repo",
         ]
         with mock.patch.dict(

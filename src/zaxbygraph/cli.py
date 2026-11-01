@@ -517,7 +517,7 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
     try:
         try:
             row = ro.execute(
-                "SELECT repo, include_patches FROM sync_state WHERE lower(repo) = ?",
+                "SELECT repo FROM sync_state WHERE lower(repo) = ?",
                 (slug,),
             )
         except sqlite3.OperationalError as exc:

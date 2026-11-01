@@ -157,6 +157,93 @@ class FetchSourceRefreshTests(_CliStore):
 class RefreshConfigRereadTests(_CliStore):
     """48-AC2: refresh configuration is re-read under the sync lock."""
 
+    def test_cli_sync_stamp_source_forwarding(self):
+        """Final-critic M1 pin: the cmd_sync seam must forward stamp_source
+        exactly as --source was stated - unstated -> None (profile never
+        rewritten), stated -> that value. A mutant forcing the unstated
+        case to re-stamp graphql (the pre-1995da4 defect shape at the CLI
+        layer) fails here, at the seam the sync_repo-level test cannot
+        see."""
+        from fixtures import FakeGitHubSource, issue
+        from zaxbygraph import cli as cli_mod
+        from zaxbygraph.sync import sync_repo
+
+        def _sync_explicit(source, fetch_source):
+            sync_repo(
+                self.conn, source, REPO, include_patches=False,
+                jsonl_path=None, numbers=None, fetch_source=fetch_source,
+            )
+
+        # Store deliberately stamped rest by an explicit run (the temp
+        # store is this class's own seeded _CliStore fixture).
+        src = FakeGitHubSource()
+        src.add_issue(
+            issue(2, title="two", body="b", updated_at="2026-03-02T12:00:30Z")
+        )
+        _sync_explicit(src, "rest")
+        stamped = self.conn.execute(
+            "SELECT fetch_source FROM sync_state WHERE repo = ?", (REPO,)
+        ).fetchone()[0]
+        self.assertEqual(stamped, "rest")
+        seen = {}
+
+        def runner(conn, slug, *, include_patches=False, source_name=None,
+                   stamp_source=None, **kw):
+            seen.setdefault("stamp_source", []).append(stamp_source)
+            # Simulate the completed sync: refresh the staleness stamp so
+            # a second invocation in the same test still triggers.
+            c = sqlite3.connect(self.db)
+            try:
+                c.execute(
+                    "UPDATE sync_state SET last_incr_sync_at = ? WHERE repo = ?",
+                    (
+                        (datetime.now(timezone.utc) - timedelta(seconds=1))
+                        .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        REPO,
+                    ),
+                )
+                c.commit()
+            finally:
+                c.close()
+            return {"ingested": 0}
+
+        # A stale store + sync WITHOUT --source: stamp_source None.
+        self._set_stamp(10_000)
+        with mock.patch.object(cli_mod, "_sync_core", runner):
+            code, _out, err = self.run_cli(
+                ["sync", "--repo", REPO, "--db", self.db, "--format", "json"]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertIs(
+            seen["stamp_source"][-1], None,
+            f"M1-MUTANT-SHAPE: an unstated-source CLI sync forwarded a"
+            f" concrete stamp ({seen['stamp_source'][-1]!r}) - the exact"
+            f" defect shape where an incidental sync rewrites the store's"
+            f" recorded profile",
+        )
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT fetch_source FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchone()[0],
+            "rest",
+        )
+
+        # A stale store + sync WITH --source rest: stamp_source "rest".
+        self._set_stamp(10_000)
+        with mock.patch.object(cli_mod, "_sync_core", runner):
+            code, _out, err = self.run_cli(
+                ["sync", "--repo", REPO, "--db", self.db, "--format", "json",
+                 "--source", "rest"]
+            )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen["stamp_source"][-1], "rest")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT fetch_source FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchone()[0],
+            "rest",
+        )
+
     def test_refresh_config_reread_under_lock(self):
         """A concurrent writer flips BOTH config values while the read waits
         on the sync lock; the refresh must use the NEW values (captured at
