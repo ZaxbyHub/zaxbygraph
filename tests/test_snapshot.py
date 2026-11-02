@@ -39,9 +39,27 @@ from zaxbygraph.snapshot import (
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def _git(*argv, cwd):
-    return subprocess.run(
-        ["git", *argv], cwd=str(cwd), capture_output=True, timeout=120)
+#: deterministic, self-contained git identity for the test-side plumbing
+#: (commit-tree cannot guess one on CI runners, where no user.name exists —
+#: a silent failure there leaves the pushed ref absent)
+_GIT_ENV = {
+    "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@snapshot.invalid",
+    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@snapshot.invalid",
+    "GIT_AUTHOR_DATE": "1970-01-01T00:00:00Z",
+    "GIT_COMMITTER_DATE": "1970-01-01T00:00:00Z",
+}
+
+
+def _git(*argv, cwd, check: bool = False):
+    env = dict(os.environ)
+    env.update(_GIT_ENV)
+    proc = subprocess.run(
+        ["git", *argv], cwd=str(cwd), capture_output=True, timeout=120, env=env)
+    if check and proc.returncode != 0:
+        raise AssertionError(
+            f"git {' '.join(argv)} failed ({proc.returncode}): "
+            + proc.stderr.decode("utf-8", "replace")[:200])
+    return proc
 
 
 def _build_store(td: Path, return_source: bool = False):
@@ -228,8 +246,9 @@ class SnapshotPullTests(unittest.TestCase):
             (work / "snapshot-0000.gz").write_bytes(b"\x1f\x8b\x08\x00junk")
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
-            commit = _git("commit-tree", tree, cwd=work).stdout.decode().strip()
-            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            commit = _git("commit-tree", tree, cwd=work, check=True).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
             exc = self._assert_refused_intact(db, bare)
             self.assertEqual(exc.code, "part_sha_mismatch")
         finally:
@@ -268,8 +287,9 @@ class SnapshotPullTests(unittest.TestCase):
             (work / "snapshot-0000.gz").write_bytes(gz)
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
-            commit = _git("commit-tree", tree, cwd=work).stdout.decode().strip()
-            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            commit = _git("commit-tree", tree, cwd=work, check=True).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
             exc = self._assert_refused_intact(db, bare)
             self.assertEqual(exc.code, "quick_check_failed")
         finally:
@@ -454,7 +474,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
             commit = _git("commit-tree", tree, "-m", "corrupt", cwd=work).stdout.decode().strip()
-            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
             before = db.read_bytes()
             with self.assertRaises(SnapshotError) as ctx:
                 pull(db, str(bare))
@@ -560,7 +581,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
             commit = _git("commit-tree", tree, "-m", "wmless", cwd=work).stdout.decode().strip()
-            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
             before = db.read_bytes()
             with self.assertRaises(SnapshotError) as ctx:
                 pull(db, str(bare))
@@ -593,7 +615,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 _git("add", "-A", cwd=work)
                 tree = _git("write-tree", cwd=work).stdout.decode().strip()
                 commit = _git("commit-tree", tree, "-m", "parts", cwd=work).stdout.decode().strip()
-                _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+                _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
                 before = db.read_bytes()
                 with self.assertRaises(SnapshotError) as ctx:
                     pull(db, str(bare))
@@ -641,7 +664,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
             commit = _git("commit-tree", tree, "-m", "digest", cwd=work).stdout.decode().strip()
-            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
             before = db.read_bytes()
             with self.assertRaises(SnapshotError) as ctx:
                 pull(db, str(bare))
