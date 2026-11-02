@@ -462,7 +462,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
         try:
             db = _build_store(td)
             bare = _bare(td)
-            publish(db, str(bare), publisher="rd")
+            pub = publish(db, str(bare), publisher="rd")
+            wmark = pub["manifest"]["watermark"]
             if sys.platform == "win32":
                 before = db.read_bytes()
                 reader = sqlite3.connect(str(db))
@@ -488,8 +489,7 @@ class SnapshotReviewFixTests(unittest.TestCase):
                         "SELECT issues_since FROM sync_state WHERE repo = ?",
                         (REPO,)).fetchone()
                     conn.close()
-                    self.assertEqual(row["issues_since"],
-                                     "2027-06-01T00:00:00Z")
+                    self.assertEqual(row["issues_since"], wmark)
                 finally:
                     reader.close()
         finally:
