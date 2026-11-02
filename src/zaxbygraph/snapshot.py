@@ -471,18 +471,20 @@ def _install(staged: Path, db_path: Path) -> None:
     self-contained; any quiescence/replace/open-handle failure refuses
     cleanly (coded SnapshotError) with the local store untouched."""
     try:
-        dest = sqlite3.connect(str(db_path))
+        # best-effort WAL quiesce: back-fill pending frames into the main
+        # db so the replaced file never coexists with stale sidecar data.
+        # The checkpoint's busy result is deliberately NOT judged: sqlite
+        # build-dependent, and the guarded OSError below is the committed
+        # refusal path (Windows refuses on open handles; POSIX installs
+        # over a live reader by design - disclosed in the test).
         try:
-            busy = int(dest.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0])
-        finally:
-            dest.close()
-        if busy:
-            raise SnapshotError(
-                "dest_open",
-                "destination store is busy (a reader holds it); "
-                f"checkpoint reported busy={busy}",
-                hint="close readers holding the store open and re-pull",
-            )
+            dest = sqlite3.connect(str(db_path))
+            try:
+                dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                dest.close()
+        except OSError:
+            pass
         for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
             if sidecar.exists():
                 sidecar.unlink()

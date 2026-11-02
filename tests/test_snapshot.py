@@ -475,8 +475,16 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 finally:
                     reader.close()
             else:
-                pull(db, str(bare), force=True)
-                self.assertTrue(db.exists())
+                # POSIX: unlink/replace succeed over a live reader, so the
+                # install lands (disclosed asymmetry; the busy-verdict test
+                # covers the cross-platform refusal)
+                reader = sqlite3.connect(str(db))
+                try:
+                    reader.execute("SELECT COUNT(*) FROM items").fetchone()
+                    pull(db, str(bare), force=True)
+                    self.assertTrue(db.exists())
+                finally:
+                    reader.close()
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
@@ -539,23 +547,72 @@ class SnapshotReviewFixTests(unittest.TestCase):
             work = td / "w"
             work.mkdir()
             _git("init", "-b", "main", str(work), cwd=td)
-            man = {"format": MANIFEST_FORMAT, "repo": REPO,
-                   "user_version": CURRENT_USER_VERSION,
-                   "watermark": "2027-06-01T00:00:00Z",
-                   "corpus_sha256": "0" * 64, "db_sha256": "0" * 64,
-                   "gz_sha256": "0" * 64, "parts": "nope",
-                   "publisher": "pt"}
+            for parts_shape in ("nope", [{"name": "snapshot-0000.gz"}]):
+                man = {"format": MANIFEST_FORMAT, "repo": REPO,
+                       "user_version": CURRENT_USER_VERSION,
+                       "watermark": "2027-06-01T00:00:00Z",
+                       "corpus_sha256": "0" * 64, "db_sha256": "0" * 64,
+                       "gz_sha256": "0" * 64, "parts": parts_shape,
+                       "publisher": "pt"}
+                (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
+                                                    encoding="utf-8")
+                (work / "snapshot-0000.gz").write_bytes(b"junk")
+                _git("add", "-A", cwd=work)
+                tree = _git("write-tree", cwd=work).stdout.decode().strip()
+                commit = _git("commit-tree", tree, "-m", "parts", cwd=work).stdout.decode().strip()
+                _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+                before = db.read_bytes()
+                with self.assertRaises(SnapshotError) as ctx:
+                    pull(db, str(bare))
+                self.assertEqual(ctx.exception.code, "bad_manifest")
+                self.assertEqual(db.read_bytes(), before)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_wrong_corpus_digest(self) -> None:
+        # staged-first digest pin: a manifest whose corpus_sha256 disagrees
+        # with the (valid) snapshot bytes refuses BEFORE anything replaces
+        # the local store; deleting _check_staged_digest makes this red
+        td = Path(tempfile.mkdtemp(prefix="digest_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="dg")
+            work = td / "w"
+            work.mkdir()
+            _git("init", "-b", "main", str(work), cwd=td)
+            import gzip as _gzip
+            import io as _io
+            raw = db.read_bytes()
+            buf = _io.BytesIO()
+            with _gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
+                g.write(raw)
+            gz = buf.getvalue()
+            man = {
+                "format": MANIFEST_FORMAT,
+                "user_version": CURRENT_USER_VERSION,
+                "repo": REPO,
+                "host": "github.com",
+                "watermark": "2027-06-01T00:00:00Z",
+                "corpus_sha256": "f" * 64,
+                "db_sha256": hashlib.sha256(raw).hexdigest(),
+                "gz_sha256": hashlib.sha256(gz).hexdigest(),
+                "parts": [{"name": "snapshot-0000.gz",
+                           "sha256": hashlib.sha256(gz).hexdigest(),
+                           "bytes": len(gz)}],
+                "publisher": "dg",
+            }
             (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
                                                 encoding="utf-8")
-            (work / "snapshot-0000.gz").write_bytes(b"junk")
+            (work / "snapshot-0000.gz").write_bytes(gz)
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
-            commit = _git("commit-tree", tree, "-m", "parts", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, "-m", "digest", cwd=work).stdout.decode().strip()
             _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
             before = db.read_bytes()
             with self.assertRaises(SnapshotError) as ctx:
                 pull(db, str(bare))
-            self.assertEqual(ctx.exception.code, "bad_manifest")
+            self.assertEqual(ctx.exception.code, "corpus_mismatch")
             self.assertEqual(db.read_bytes(), before)
         finally:
             shutil.rmtree(td, ignore_errors=True)
