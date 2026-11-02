@@ -37,7 +37,7 @@ from pathlib import Path
 
 from .db import CURRENT_USER_VERSION, connect, init_schema
 from .sync import sync_repo
-from .export import iter_corpus_content_lines
+from .export import canonical, iter_corpus_content_lines
 
 #: snapshot manifest format stamp
 MANIFEST_FORMAT = "zaxbygraph.snapshot.v1"
@@ -560,91 +560,65 @@ def _post_install_check(db_path: Path, manifest: dict) -> dict:
     return {"corpus_sha256": digest, "installed": True}
 
 
-def _corpus_digest_conn(conn: sqlite3.Connection, repo: str) -> str:
-    """Corpus digest from an open connection (the post-install check)."""
-    hasher = hashlib.sha256()
-    for piece in iter_corpus_content_lines(conn, repo, set()):
-        hasher.update(piece)
-    return hasher.hexdigest()
-
-
-def _fetch_children(src, number: int, payload: dict) -> dict:
-    """Re-fetch one sampled item's children through the source (the same
-    endpoints a fresh sync would read). PR-file children only apply to
-    pull requests; a source fault on an optional child list degrades to
-    empty (the hash comparison then honestly reports drift)."""
-    children = {
-        "issue_comments": src.list_issue_comments(number),
-        "review_comments": [],
-        "reviews": [],
-        "files": [],
+def _payload_projection(payload: dict) -> bytes:
+    """The comparable core of one issue-list payload: exactly the fields
+    the REST listing endpoint (the same family the watermark contract
+    documents as identity-preserving) faithfully carries — title, body,
+    state, timestamps, author, label names, and the pull_request marker.
+    Children and GraphQL-only sections are deliberately excluded: a
+    re-fetch cannot faithfully reproduce them, so they never enter the
+    comparison (they can never false-drift)."""
+    core = {
+        "title": payload.get("title"),
+        "body": payload.get("body"),
+        "state": payload.get("state"),
+        "created_at": payload.get("created_at"),
+        "updated_at": payload.get("updated_at"),
+        "user": (payload.get("user") or {}).get("login"),
+        "labels": sorted(l.get("name") for l in payload.get("labels") or []),
+        "is_pr": bool(payload.get("pull_request")),
     }
-    try:
-        children["review_comments"] = src.list_review_comments(number)
-        children["reviews"] = src.list_reviews(number)
-    except Exception:
-        pass
-    if payload.get("pull_request"):
-        try:
-            children["files"] = src.list_pr_files(number)
-        except Exception:
-            pass
-    return children
+    return canonical(core)
+
+
+def _store_projection(conn: sqlite3.Connection, repo: str, number: int) -> bytes:
+    """The same projection read from the installed store's row + labels."""
+    row = conn.execute(
+        "SELECT title, body, state, created_at, updated_at, author"
+        " FROM items WHERE repo = ? AND number = ?",
+        (repo, number)).fetchone()
+    labels = sorted(r[0] for r in conn.execute(
+        "SELECT name FROM labels WHERE repo = ? AND number = ? ORDER BY name",
+        (repo, number)))
+    core = {
+        "title": row["title"],
+        "body": row["body"],
+        "state": row["state"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "user": row["author"],
+        "labels": labels,
+        "is_pr": bool(conn.execute(
+            "SELECT 1 FROM items WHERE repo = ? AND number = ?"
+            " AND kind = 'pr'", (repo, number)).fetchone()),
+    }
+    return canonical(core)
 
 
 def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dict:
     """Issue #34's --verify-sample N: re-fetch N random items from the
-    live source and compare each item's export content-line hash against
-    the installed store. A mismatch means GitHub moved on after the
-    snapshot was taken (drift, reported - not corruption: the manifest
-    digest already proves store == snapshot). Uses the real ``gh`` REST
-    source unless ``source_factory`` injects one (tests)."""
+    live source and compare the payload-level projection (title, body,
+    state, timestamps, author, labels, pull marker) against the installed
+    store. A mismatch means GitHub moved on after the snapshot was taken
+    (drift, reported - not corruption: the manifest digest already proves
+    store == snapshot). Payload-level only: children and GraphQL-only
+    sections are never sampled (a re-fetch cannot faithfully reproduce
+    them, so they can never false-drift). Uses the real ``gh`` REST
+    source unless ``source_factory`` injects one (tests). Source faults
+    raise the coded ``verify_failed``, never a raw traceback."""
     import random
 
-    from zaxbygraph.export import _item_content, canonical
-
-    class _SinglePayloadSource:
-        """A minimal GitHubSource serving one pre-fetched payload WITH its
-        re-fetched children, so the REAL ingest pipeline hashes the same
-        live bytes a fresh sync would see."""
-
-        def __init__(self, payload, children):
-            self._payload = payload
-            self._children = children
-
-        def list_issues(self, since=None):
-            if since is None:
-                yield [self._payload]
-
-        def fetch_children(self, items):
-            out = {}
-            for raw in items:
-                num = int(raw["number"])
-                out[num] = dict(self._children)
-            return out
-
-        def list_releases(self, since=None):
-            return iter(())
-
-        def fetch_releases(self, tags):
-            return {}
-
-        def check_deleted(self, numbers):
-            return {}
-
-        def get_pull(self, number):
-            raise LookupError(number)
-
-    conn = connect(db_path)
-    conn.row_factory = sqlite3.Row
     try:
-        numbers = [r["number"] for r in conn.execute(
-            "SELECT number FROM items WHERE repo = ?", (repo,))]
-        if not numbers:
-            return {"requested": n, "checked": 0, "matched": 0,
-                    "changed": 0, "skipped": 0}
-        sample = random.sample(numbers, min(n, len(numbers)))
-        local = set(str(x) for x in numbers)
         if source_factory is None:
             from zaxbygraph.github import GhApiSource
 
@@ -658,44 +632,62 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
             src = GhApiSource(owner, name)
         else:
             src = source_factory()
-        payloads = src.get_issues(sample)
-        checked = matched = changed = skipped = 0
-        for number in sample:
-            payload, _status = payloads.get(number, (None, None))
-            row = conn.execute(
-                "SELECT * FROM items WHERE repo = ? AND number = ?",
-                (repo, number)).fetchone()
-            if payload is None or row is None:
-                skipped += 1
-                continue
-            children = _fetch_children(src, number, payload)
-            tmp = Path(tempfile.mkdtemp(prefix="verify-"))
+        conn = connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            numbers = [r["number"] for r in conn.execute(
+                "SELECT number FROM items WHERE repo = ?", (repo,))]
+            if not numbers:
+                return {"requested": n, "checked": 0, "matched": 0,
+                        "changed": 0, "skipped": 0}
+            sample = random.sample(numbers, min(n, len(numbers)))
             try:
-                tconn = connect(tmp / "h.db")
+                payloads = src.get_issues(sample)
+            except SnapshotError:
+                raise
+            except Exception as exc:
+                raise SnapshotError(
+                    "verify_failed",
+                    f"sample re-fetch failed: {exc}",
+                    hint="gh must be authenticated for --verify-sample",
+                ) from exc
+            checked = matched = changed = skipped = 0
+            for number in sample:
+                payload, _status = payloads.get(number, (None, None))
+                if payload is None:
+                    skipped += 1
+                    continue
                 try:
-                    init_schema(tconn)
-                    sync_repo(tconn,
-                              _SinglePayloadSource(payload, children), repo)
-                    tconn.row_factory = sqlite3.Row
-                    trow = tconn.execute(
-                        "SELECT * FROM items WHERE repo = ? AND number = ?",
-                        (repo, number)).fetchone()
-                    tlocal = {str(number)}
-                    live_hash = hashlib.sha256(canonical(_item_content(
-                        tconn, repo, trow, set(), tlocal))).hexdigest()
-                finally:
-                    tconn.close()
-            finally:
-                shutil.rmtree(tmp, ignore_errors=True)
-            local_hash = hashlib.sha256(canonical(_item_content(
-                conn, repo, row, set(), local))).hexdigest()
-            checked += 1
-            if live_hash == local_hash:
-                matched += 1
-            else:
-                changed += 1
-        return {"requested": n, "checked": checked, "matched": matched,
-                "changed": changed, "skipped": skipped}
-    finally:
-        conn.close()
+                    live = _payload_projection(payload)
+                    local = _store_projection(conn, repo, number)
+                except Exception as exc:
+                    raise SnapshotError(
+                        "verify_failed",
+                        f"sample comparison failed for #{number}: {exc}",
+                        hint="report this as a bug",
+                    ) from exc
+                checked += 1
+                if live == local:
+                    matched += 1
+                else:
+                    changed += 1
+            return {"requested": n, "checked": checked, "matched": matched,
+                    "changed": changed, "skipped": skipped}
+        finally:
+            conn.close()
+    except SnapshotError:
+        raise
+    except Exception as exc:
+        raise SnapshotError(
+            "verify_failed",
+            f"sample verification failed: {exc}",
+            hint="gh must be authenticated for --verify-sample",
+        ) from exc
 
+
+def _corpus_digest_conn(conn: sqlite3.Connection, repo: str) -> str:
+    """Corpus digest from an open connection (the post-install check)."""
+    hasher = hashlib.sha256()
+    for piece in iter_corpus_content_lines(conn, repo, set()):
+        hasher.update(piece)
+    return hasher.hexdigest()
