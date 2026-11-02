@@ -61,6 +61,25 @@ def _build_store(td: Path, return_source: bool = False):
     return (db, src) if return_source else db
 
 
+def _build_store_commented(td: Path, return_source: bool = False):
+    """A store whose first item carries a comment - the verify-sample
+    regression shape (children must re-fetch or the item false-drifts)."""
+    db = td / "history.db"
+    conn = connect(db)
+    init_schema(conn)
+    conn.row_factory = sqlite3.Row
+    src = FakeGitHubSource()
+    src.add_issue(issue(201, title="Report 201", body="body 201",
+                        created_at="2027-06-01T00:00:00Z"))
+    src.comment_on(201, "a comment that must re-fetch")
+    for n in range(202, 205):
+        src.add_issue(issue(n, title=f"Report {n}", body=f"body {n}",
+                            created_at="2027-06-01T00:00:00Z"))
+    sync_repo(conn, src, REPO)
+    conn.close()
+    return (db, src) if return_source else db
+
+
 def _bare(td: Path, name="snapshot.git") -> Path:
     b = td / name
     b.mkdir()
@@ -97,9 +116,11 @@ class SnapshotPublishTests(unittest.TestCase):
         self.assertEqual(m["format"], MANIFEST_FORMAT)
         self.assertEqual(m["repo"], REPO)
         self.assertEqual(m["user_version"], CURRENT_USER_VERSION)
-        # host derives from the store path / capability meta (fixture
-        # stores live in temp dirs outside the slug layout -> "unknown")
-        self.assertIn(m["host"], ("github.com", "unknown"))
+        # host derives from the store path / capability meta; the fixture
+        # store lives in a bare temp dir with no capability meta, so the
+        # derivation must answer "unknown" (the old constant would too —
+        # the discriminating leg is test_host_derivation below)
+        self.assertEqual(m["host"], "unknown")
         # deterministic bytes -> identical orphan commit (idempotent publish);
         # a content change moves the ref (replacement)
         p2 = publish(self.db, str(self.bare), publisher="tester")
@@ -684,19 +705,32 @@ class SnapshotReviewFixTests(unittest.TestCase):
         # hashes must match (matched == checked)
         td = Path(tempfile.mkdtemp(prefix="vs_"))
         try:
-            db, seeded = _build_store(td, return_source=True)
+            db, seeded = _build_store_commented(td, return_source=True)
             bare = _bare(td)
             publish(db, str(bare), publisher="vs")
 
             class _StubSource:
-                """Serves the SAME payloads the snapshot store holds
-                (the sampling comparison must match)."""
+                """Serves the SAME payloads AND children the snapshot
+                store holds (the sampling comparison must match even for
+                the comment-bearing item)."""
 
                 def get_issues(self, numbers):
                     out = {}
                     for n in numbers:
                         out[n] = (seeded.issues[n], None)
                     return out
+
+                def list_issue_comments(self, number):
+                    return list(seeded.issue_comments.get(number, []))
+
+                def list_review_comments(self, number):
+                    return list(seeded.review_comments.get(number, []))
+
+                def list_reviews(self, number):
+                    return list(seeded.reviews.get(number, []))
+
+                def list_pr_files(self, number):
+                    return list(seeded.files.get(number, []))
 
             dst = td / "dst"
             dst.mkdir()
@@ -707,6 +741,24 @@ class SnapshotReviewFixTests(unittest.TestCase):
             self.assertEqual(vs["checked"], 2)
             self.assertEqual(vs["matched"], 2)
             self.assertEqual(vs["changed"], 0)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_host_derivation(self) -> None:
+        # the capability-probe meta key supplies the host; without it a
+        # bare temp path derives "unknown" (a "github.com" constant would
+        # fail the second leg only)
+        td = Path(tempfile.mkdtemp(prefix="host_"))
+        try:
+            db = _build_store(td)
+            from zaxbygraph.snapshot import _host_of
+            self.assertEqual(_host_of(db), "unknown")
+            c = sqlite3.connect(str(db))
+            c.execute("INSERT INTO meta(key, value) VALUES "
+                      "('capability_probe:ghe.corp:v3', '{}')")
+            c.commit()
+            c.close()
+            self.assertEqual(_host_of(db), "ghe.corp")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

@@ -568,6 +568,30 @@ def _corpus_digest_conn(conn: sqlite3.Connection, repo: str) -> str:
     return hasher.hexdigest()
 
 
+def _fetch_children(src, number: int, payload: dict) -> dict:
+    """Re-fetch one sampled item's children through the source (the same
+    endpoints a fresh sync would read). PR-file children only apply to
+    pull requests; a source fault on an optional child list degrades to
+    empty (the hash comparison then honestly reports drift)."""
+    children = {
+        "issue_comments": src.list_issue_comments(number),
+        "review_comments": [],
+        "reviews": [],
+        "files": [],
+    }
+    try:
+        children["review_comments"] = src.list_review_comments(number)
+        children["reviews"] = src.list_reviews(number)
+    except Exception:
+        pass
+    if payload.get("pull_request"):
+        try:
+            children["files"] = src.list_pr_files(number)
+        except Exception:
+            pass
+    return children
+
+
 def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dict:
     """Issue #34's --verify-sample N: re-fetch N random items from the
     live source and compare each item's export content-line hash against
@@ -580,11 +604,13 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
     from zaxbygraph.export import _item_content, canonical
 
     class _SinglePayloadSource:
-        """A minimal GitHubSource serving one pre-fetched issue payload,
-        so the REAL ingest pipeline hashes the live bytes."""
+        """A minimal GitHubSource serving one pre-fetched payload WITH its
+        re-fetched children, so the REAL ingest pipeline hashes the same
+        live bytes a fresh sync would see."""
 
-        def __init__(self, payload):
+        def __init__(self, payload, children):
             self._payload = payload
+            self._children = children
 
         def list_issues(self, since=None):
             if since is None:
@@ -594,8 +620,7 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
             out = {}
             for raw in items:
                 num = int(raw["number"])
-                out[num] = {"issue_comments": [], "review_comments": [],
-                            "reviews": [], "files": []}
+                out[num] = dict(self._children)
             return out
 
         def list_releases(self, since=None):
@@ -621,11 +646,15 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
         sample = random.sample(numbers, min(n, len(numbers)))
         local = set(str(x) for x in numbers)
         if source_factory is None:
-            from zaxbygraph.cli import GhRestSource
-            from zaxbygraph.repo import remote_info
+            from zaxbygraph.github import GhApiSource
 
-            _host, slug = remote_info()
-            owner, _, name = slug.rpartition("/")
+            owner, _, name = repo.rpartition("/")
+            if not owner:
+                raise SnapshotError(
+                    "verify_failed",
+                    f"cannot derive owner/name from repo {repo!r}",
+                    hint="sample verification needs an owner/repo slug",
+                )
             src = GhApiSource(owner, name)
         else:
             src = source_factory()
@@ -639,12 +668,14 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
             if payload is None or row is None:
                 skipped += 1
                 continue
+            children = _fetch_children(src, number, payload)
             tmp = Path(tempfile.mkdtemp(prefix="verify-"))
             try:
                 tconn = connect(tmp / "h.db")
                 try:
                     init_schema(tconn)
-                    sync_repo(tconn, _SinglePayloadSource(payload), repo)
+                    sync_repo(tconn,
+                              _SinglePayloadSource(payload, children), repo)
                     tconn.row_factory = sqlite3.Row
                     trow = tconn.execute(
                         "SELECT * FROM items WHERE repo = ? AND number = ?",

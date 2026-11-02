@@ -37,22 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: tests can never drift from the production literal
 CHAIN_SRC_KEY = [k for k in load_triage_config() if k.startswith("_") and "source" in k][0]
 
-#: hermeticity (issue #46 AC2): mirrors the isolated derived-tier leg
-#: runners - CLI legs launched from THIS module run in a temp cwd so the
-#: planted repo-root config never leaks into unrelated suites.
-_LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-chain-legs-")
 
-
-def _cli_json(argv: list[str]) -> dict:
-    """Envelope runner for one CLI leg (temp cwd, leg-local PYTHONPATH)."""
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests"),
-         env.get("PYTHONPATH", "")])
-    proc = subprocess.run(
-        [os.sys.executable, "-m", "zaxbygraph", *argv],
-        capture_output=True, env=env, cwd=_LEG_CWD, timeout=120)
-    return json.loads(proc.stdout.decode("utf-8"))
 class ChainSourceTests(unittest.TestCase):
     """Per-level source labels and per-key precedence (AC1)."""
 
@@ -253,10 +238,3 @@ def _explicit_cfg() -> str:
         f.write_text("[triage]\ntop_k = 50\n", encoding="utf-8")
         _EXPLICIT_CACHE = str(f)
         return _EXPLICIT_CACHE
-
-
-def _similar_checkout() -> Path:
-    """The temp git checkout test_similar's CLI legs run in (reused so the
-    planted config sits exactly where the leg's cwd resolves it)."""
-    import test_similar
-    return test_similar._leg_checkout()
