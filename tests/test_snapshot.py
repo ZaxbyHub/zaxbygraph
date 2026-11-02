@@ -762,6 +762,72 @@ class SnapshotReviewFixTests(unittest.TestCase):
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_verify_sample_detects_drift(self) -> None:
+        # the DETECTION half pinned (critic round 4): a stub serving a
+        # MUTATED payload must report changed == checked — a mutant
+        # collapsing the projections to a constant would pass the
+        # matched-only test and fail this one. EVERY sampled item drifts,
+        # so the assertion holds regardless of which items the sampler
+        # picks.
+        td = Path(tempfile.mkdtemp(prefix="vsd_"))
+        try:
+            db, seeded = _build_store(td, return_source=True)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="vsd")
+
+            class _DriftedSource:
+                """Serves the stored payloads with every title mutated —
+                GitHub moved on after the snapshot was taken."""
+
+                def get_issues(self, numbers):
+                    out = {}
+                    for n in numbers:
+                        payload = dict(seeded.issues[n])
+                        payload["title"] = payload["title"] + " (edited upstream)"
+                        out[n] = (payload, None)
+                    return out
+
+            dst = td / "dst"
+            dst.mkdir()
+            result = pull(dst / "history.db", str(bare), verify_sample=2,
+                          source_factory=_DriftedSource)
+            vs = result["verify_sample"]
+            self.assertEqual(vs["requested"], 2)
+            self.assertEqual(vs["checked"], 2)
+            self.assertEqual(vs["matched"], 0)
+            self.assertEqual(vs["changed"], 2)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_verify_sample_detects_field_drift(self) -> None:
+        # a body mutation alone (every sampled item) reports drift: the
+        # projected field set discriminates beyond the title
+        td = Path(tempfile.mkdtemp(prefix="vsb_"))
+        try:
+            db, seeded = _build_store(td, return_source=True)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="vsb")
+
+            class _BodyDriftSource:
+                def get_issues(self, numbers):
+                    out = {}
+                    for n in numbers:
+                        payload = dict(seeded.issues[n])
+                        payload["body"] = payload["body"] + " - revised"
+                        out[n] = (payload, None)
+                    return out
+
+            dst = td / "dst"
+            dst.mkdir()
+            result = pull(dst / "history.db", str(bare), verify_sample=2,
+                          source_factory=_BodyDriftSource)
+            vs = result["verify_sample"]
+            self.assertEqual(vs["checked"], 2)
+            self.assertEqual(vs["changed"], 2)
+            self.assertEqual(vs["matched"], 0)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_cli_snapshot_envelopes(self) -> None:
         # envelope-guard docstring reason: the CLI publish/pull envelopes
         # are pinned here (schema-notes pattern: exclude + pin elsewhere)

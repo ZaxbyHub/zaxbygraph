@@ -35,8 +35,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import CURRENT_USER_VERSION, connect, init_schema
-from .sync import sync_repo
+from .db import CURRENT_USER_VERSION, connect
 from .export import canonical, iter_corpus_content_lines
 
 #: snapshot manifest format stamp
