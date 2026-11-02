@@ -251,7 +251,7 @@ def _git_publish(tmp: Path, target: str, publisher: str,
     tree = _run_git(["write-tree"], wd).stdout.decode().strip()
     ident = ["-c", "user.name=" + publisher,
              "-c", "user.email=publisher@snapshot.invalid"]
-    commit = _run_git([*ident, "commit-tree", tree], wd).stdout.decode().strip()
+    commit = _run_git([*ident, "commit-tree", tree, "-m", "zaxbygraph snapshot"], wd).stdout.decode().strip()
     push = None
     for ref in (SNAPSHOT_REF, "refs/heads/" + SNAPSHOT_BRANCH):
         push = _run_git(["push", target, commit + ":" + ref, "--force"],
@@ -270,6 +270,7 @@ def pull(db_path: Path, source: str, force: bool = False) -> dict:
     held for the authoritative re-check and the install; one atomic replace
     replaces the store; post-install the corpus digest is re-verified."""
     db_path = Path(db_path).resolve()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
     from .sync import acquire_sync_lock
 
     tmp = Path(tempfile.mkdtemp(prefix="zaxbygraph-pull-"))
@@ -277,6 +278,8 @@ def pull(db_path: Path, source: str, force: bool = False) -> dict:
         manifest, gz_bytes = _fetch_and_verify_parts(tmp, source)
         staged = tmp / "staged.db"
         _verify_staged(staged, gz_bytes, manifest)
+
+        _check_staged_digest(staged, manifest)
 
         lock = acquire_sync_lock(db_path, wait=True)
         try:
@@ -346,7 +349,14 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
     if manifest.get("gz_sha256") and gz_sha != manifest["gz_sha256"]:
         raise SnapshotError("gz_sha_mismatch", "gzip stream sha mismatch",
                             hint="re-publish or re-pull")
-    raw = gzip.decompress(gz_bytes)
+    try:
+        raw = gzip.decompress(gz_bytes)
+    except (OSError, EOFError) as exc:
+        raise SnapshotError(
+            "gz_bad",
+            f"snapshot payload is not a readable gzip stream: {exc}",
+            hint="the snapshot content is corrupt or tampered with",
+        ) from exc
     if hashlib.sha256(raw).hexdigest() != manifest["db_sha256"]:
         raise SnapshotError("db_sha_mismatch", "db sha mismatch",
                             hint="re-publish or re-pull")
@@ -373,6 +383,19 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
             f"snapshot schema v{uv} newer than this build (v{CURRENT_USER_VERSION})",
             hint="upgrade zaxbygraph and re-pull",
         )
+
+
+def _check_staged_digest(staged: Path, manifest: dict) -> None:
+    """Staged-first corpus digest check (plan v4 round-2 finding 5): a
+    manifest/bytes disagreement refuses BEFORE anything is replaced."""
+    staged_digest = _corpus_digest(staged, manifest["repo"])
+    if staged_digest != manifest["corpus_sha256"]:
+        raise SnapshotError(
+            "corpus_mismatch",
+            "staged corpus digest differs from the manifest",
+            hint="re-publish and re-pull; local store untouched",
+        )
+    return None
 
 
 def _local_watermark(db_path: Path) -> str | None:
@@ -414,19 +437,24 @@ def _now_iso() -> str:
 
 
 def _install(staged: Path, db_path: Path) -> None:
-    """Quiesce dest, delete old sidecars BEFORE the replace, then ONE
-    os.replace. The staged file is closed and self-contained (round-2
-    finding 2 protocol); a dest-open failure refuses cleanly with the
-    local store untouched."""
-    for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
-        if sidecar.exists():
-            sidecar.unlink()
+    """Quiesce dest (checkpoint its WAL), delete old sidecars BEFORE the
+    replace, then ONE os.replace. The staged file is closed and
+    self-contained; any quiescence/replace/open-handle failure refuses
+    cleanly (coded SnapshotError) with the local store untouched."""
     try:
+        dest = sqlite3.connect(str(db_path))
+        try:
+            dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            dest.close()
+        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+            if sidecar.exists():
+                sidecar.unlink()
         os.replace(staged, db_path)
     except OSError as exc:
         raise SnapshotError(
             "dest_open",
-            f"destination store could not be replaced atomically: {exc}",
+            f"destination store could not be quiesced and replaced: {exc}",
             hint="close readers holding the store open and re-pull",
         ) from exc
 

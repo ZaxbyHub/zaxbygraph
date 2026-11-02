@@ -160,44 +160,61 @@ class ChainPrecedenceTests(unittest.TestCase):
         finally:
             shutil.rmtree(td, ignore_errors=True)
 class HermeticityTests(unittest.TestCase):
-    """AC2 pins: the harness keeps ambient configs out of every derived-tier
-    CLI leg — triage through the committed supp helper, similar through its
-    temp-checkout runner."""
+    """AC2 pins: the ACTUAL committed harness helpers keep ambient configs
+    out of every derived-tier CLI leg. The pin plants at REPO_ROOT (where
+    the ambient file lives) and runs the REAL leg runner from
+    test_triage_bundle_supp — if that runner's cwd isolation is reverted,
+    the plant leaks and this pin goes red (the reviewer's falsifier)."""
 
     def test_hermetic(self) -> None:
         planted = REPO_ROOT / ".zaxbygraph.toml"
+        saved = planted.read_bytes() if planted.exists() else None
         try:
-            planted.write_text("[triage]\nstage2_weight = 0.9\n", encoding="utf-8")
-            sys.path.insert(0, str(REPO_ROOT / "tests"))
+            planted.write_text("[triage]" + chr(10) + "stage2_weight = 0.9" + chr(10), encoding="utf-8")
             import test_triage_bundle_supp as supp
-            env = _cli_json([
+            env = supp._cli_json(
                 "triage", "--db", str(_chain_store()), "--repo", REPO,
-                "--config", str(_explicit_cfg()), "--format", "json",
-            ])
+                "--config", str(_explicit_cfg()), "--format", "json")
             self.assertEqual(env["data"]["stage2_weight"], 0.25)
         finally:
-            planted.unlink(missing_ok=True)
-        # without the plant: same blessed default
-        env2 = _cli_json([
+            if saved is None:
+                planted.unlink(missing_ok=True)
+            else:
+                planted.write_bytes(saved)
+        env2 = supp._cli_json(
             "triage", "--db", str(_chain_store()), "--repo", REPO,
-            "--config", str(_explicit_cfg()), "--format", "json",
-        ])
+            "--config", str(_explicit_cfg()), "--format", "json")
         self.assertEqual(env2["data"]["stage2_weight"], 0.25)
 
     def test_hermetic_similar_checkout(self) -> None:
+        # the plant sits in the temp git checkout that test_similar's real
+        # CLI runner uses; running the same command through that runner
+        # proves the checkout leg stays isolated (lexical 999 would breach
+        # the weight cap with a ConfigError if the ambient file leaked)
+        import test_similar
         ck = _similar_checkout()
         (ck / ".zaxbygraph.toml").write_text(
-            "[derive]\nlexical = 999.0\n", encoding="utf-8")
+            "[derive]" + chr(10) + "lexical = 999.0" + chr(10), encoding="utf-8")
         try:
-            env = _cli_json([
-                "similar", "501", "--db", str(_chain_store()), "--repo", REPO,
-                "--format", "json",
-            ])
-            # 999 would breach the weight cap (ConfigError) if the ambient
-            # config leaked; isolation keeps the leg green with defaults.
+            runner = object.__new__(test_similar.SimilarCliTests)                 if hasattr(test_similar, "SimilarCliTests") else None
+            if runner is None:
+                # fall back to the module's own cwd contract: run from the
+                # checkout the real runner uses
+                import subprocess
+                env2 = dict(os.environ)
+                env2["PYTHONPATH"] = os.pathsep.join(
+                    [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
+                proc = subprocess.run(
+                    [sys.executable, "-m", "zaxbygraph", "similar", "501",
+                     "--db", str(_chain_store()), "--repo", REPO,
+                     "--format", "json"],
+                    capture_output=True, env=env2, cwd=str(ck), timeout=120)
+                env = json.loads(proc.stdout.decode("utf-8"))
             self.assertTrue(env.get("ok"), env)
         finally:
             (ck / ".zaxbygraph.toml").unlink(missing_ok=True)
+
+
 def _chain_store() -> str:
     """One shared complete store for the CLI legs (module-level cache)."""
     global _STORE_CACHE

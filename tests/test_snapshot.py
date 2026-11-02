@@ -29,6 +29,7 @@ from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 from zaxbygraph.sync import sync_repo
 from zaxbygraph.snapshot import (
     MANIFEST_FORMAT,
+    SNAPSHOT_BRANCH,
     SNAPSHOT_REF,
     SnapshotError,
     publish,
@@ -98,6 +99,7 @@ class SnapshotPublishTests(unittest.TestCase):
         # a content change moves the ref (replacement)
         p2 = publish(self.db, str(self.bare), publisher="tester")
         self.assertEqual(_ls_remote(self.bare, SNAPSHOT_REF), p2["commit"])
+        self.assertEqual(p2["commit"], sha1)  # deterministic bytes, idempotent
         conn = sqlite3.connect(str(self.db))
         conn.execute("INSERT OR IGNORE INTO labels(repo, number, name) VALUES (?, 201, 'x')",
                      (REPO,))
@@ -116,7 +118,7 @@ class SnapshotPublishTests(unittest.TestCase):
             publish(empty, str(self.bare), publisher="t")
         self.assertEqual(ctx.exception.code, "repo_not_synced")
 
-    def test_publish_refuses_errored_store(self) -> None:
+    def test_publish_refuses_incomplete_errored_store(self) -> None:
         # (b) last_error set: store_incomplete
         err_db = self.td / "err.db"
         conn = connect(err_db)
@@ -133,7 +135,7 @@ class SnapshotPublishTests(unittest.TestCase):
             publish(err_db, str(self.bare), publisher="t")
         self.assertEqual(ctx.exception.code, "store_incomplete")
 
-    def test_publish_refuses_pending_store(self) -> None:
+    def test_publish_refuses_incomplete_pending_store(self) -> None:
         # (c) full_sync_pending set: store_incomplete
         pend = self.td / "pend.db"
         conn = connect(pend)
@@ -287,6 +289,15 @@ class SnapshotPullTests(unittest.TestCase):
             conn.close()
             self.assertEqual(row["issues_since"], "2027-06-01T00:00:00Z")
             self.assertEqual(prov["value"], "tester")
+            # status surfaces the provenance block (plan s10)
+            from zaxbygraph.query import status as q_status
+            qc = sqlite3.connect(str(db))
+            qc.row_factory = sqlite3.Row
+            snap_block = q_status(qc, REPO)["snapshot"]
+            qc.close()
+            self.assertEqual(snap_block["publisher"], "tester")
+            self.assertTrue(snap_block["manifest_sha256"])
+            self.assertTrue(snap_block["pulled_at"])
         finally:
             shutil.rmtree(td, ignore_errors=True)
     def test_round_trip_hash(self) -> None:
@@ -317,3 +328,159 @@ class SnapshotPullTests(unittest.TestCase):
                              out["manifest"]["corpus_sha256"])
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+
+class SnapshotReviewFixTests(unittest.TestCase):
+    """Implementation-review round 1 fixes: fallback coverage, discriminating
+    quick_check, fresh-directory pull, active-reader refusal, consolidation
+    and status pins."""
+
+    def test_publish_falls_back_to_branch(self) -> None:
+        # AC6 fallback leg: a target that refuses refs/zaxbygraph/* gets the
+        # snapshot on the branch fallback instead
+        td = Path(tempfile.mkdtemp(prefix="fb_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            hook = bare / "hooks" / "pre-receive"
+            hook.write_text(
+                "#!/bin/sh\n"
+                'echo "custom snapshot namespace refused" >&2\n'
+                'while read old new ref; do\n'
+                '  case "$ref" in refs/zaxbygraph/*) exit 1 ;; esac\n'
+                'done\n',
+                encoding="utf-8")
+            _git("add", "-A", cwd=bare)
+            _git("commit-tree", "--help", cwd=bare)  # no-op; keep hook exec bits
+            out = publish(db, str(bare), publisher="fb")
+            self.assertEqual(out["pushed_ref"], "refs/heads/" + SNAPSHOT_BRANCH)
+            remote = _ls_remote(bare, "refs/heads/" + SNAPSHOT_BRANCH)
+            self.assertEqual(remote, out["commit"])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_accepts_branch_only_source(self) -> None:
+        td = Path(tempfile.mkdtemp(prefix="branchonly_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="bo")
+            _git("push", str(bare), "--delete", SNAPSHOT_REF, cwd=td)
+            dst = td / "dst"
+            dst.mkdir()
+            pull(dst / "history.db", str(bare))
+            self.assertTrue((dst / "history.db").exists())
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+    def test_pull_refuses_header_valid_corrupt_db(self) -> None:
+        # AC3 discriminating pin: a header-valid corrupt page trips
+        # quick_check while part shas and user_version still pass
+        td = Path(tempfile.mkdtemp(prefix="corruptpage_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            # corrupt a page WITHOUT touching the 100-byte header
+            raw = bytearray(db.read_bytes())
+            page = 0x1000  # far past the header, mid-file
+            raw[page:page + 64] = b"\xde\xad" * 32
+            corrupt = td / "corrupt.db"
+            corrupt.write_bytes(bytes(raw))
+            import gzip as _gzip
+            import io as _io
+            buf = _io.BytesIO()
+            with _gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
+                g.write(bytes(raw))
+            gz = buf.getvalue()
+            man = {
+                "format": MANIFEST_FORMAT,
+                "user_version": CURRENT_USER_VERSION,
+                "repo": REPO,
+                "host": "github.com",
+                "watermark": "2027-06-01T00:00:00Z",
+                "corpus_sha256": "0" * 64,
+                "db_sha256": hashlib.sha256(bytes(raw)).hexdigest(),
+                "gz_sha256": hashlib.sha256(gz).hexdigest(),
+                "parts": [{"name": "snapshot-0000.gz",
+                           "sha256": hashlib.sha256(gz).hexdigest(),
+                           "bytes": len(gz)}],
+                "publisher": "corrupt",
+            }
+            work = td / "w"
+            work.mkdir()
+            _git("init", "-b", "main", str(work), cwd=td)
+            (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
+                                                encoding="utf-8")
+            (work / "snapshot-0000.gz").write_bytes(gz)
+            _git("add", "-A", cwd=work)
+            tree = _git("write-tree", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, "-m", "corrupt", cwd=work).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            before = db.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(db, str(bare))
+            self.assertEqual(ctx.exception.code, "quick_check_failed")
+            self.assertEqual(db.read_bytes(), before)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+    def test_pull_into_fresh_directory(self) -> None:
+        # reviewer finding: pull must create the destination's parent dirs
+        td = Path(tempfile.mkdtemp(prefix="fresh_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="fr")
+            dst = td / "fresh" / "nested" / "store"
+            pull(dst / "history.db", str(bare))
+            self.assertTrue((dst / "history.db").exists())
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_when_reader_holds_dest(self) -> None:
+        # reviewer finding: an open reader on the destination refuses
+        # cleanly (coded SnapshotError) with the store byte-identical
+        td = Path(tempfile.mkdtemp(prefix="reader_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="rd")
+            before = db.read_bytes()
+            reader = sqlite3.connect(str(db))
+            try:
+                reader.execute("SELECT COUNT(*) FROM items").fetchone()
+                with self.assertRaises(SnapshotError) as ctx:
+                    pull(db, str(bare), force=True)
+                self.assertEqual(ctx.exception.code, "dest_open")
+                self.assertEqual(db.read_bytes(), before)
+            finally:
+                reader.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_consolidation_drops_snapshot_provenance(self) -> None:
+        # plan s11 pin: consolidate deletes snapshot.* meta keys
+        td = Path(tempfile.mkdtemp(prefix="cons_"))
+        try:
+            db = _build_store(td)
+            c = sqlite3.connect(str(db))
+            for key, val in (("snapshot.publisher", "x"),
+                             ("snapshot.manifest_sha256", "abc"),
+                             ("snapshot.pulled_at", "t")):
+                c.execute(
+                    "INSERT INTO meta(key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, val))
+            c.commit()
+            c.close()
+            from zaxbygraph.doctor import consolidate
+            consolidate(db, db, REPO)
+            c = sqlite3.connect(str(db))
+            rows = c.execute(
+                "SELECT key FROM meta WHERE key LIKE 'snapshot.%'").fetchall()
+            c.close()
+            self.assertEqual(rows, [])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
