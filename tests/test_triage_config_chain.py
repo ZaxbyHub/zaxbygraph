@@ -187,32 +187,37 @@ class HermeticityTests(unittest.TestCase):
         self.assertEqual(env2["data"]["stage2_weight"], 0.25)
 
     def test_hermetic_similar_checkout(self) -> None:
-        # the plant sits in the temp git checkout that test_similar's real
-        # CLI runner uses; running the same command through that runner
-        # proves the checkout leg stays isolated (lexical 999 would breach
-        # the weight cap with a ConfigError if the ambient file leaked)
-        import test_similar
-        ck = _similar_checkout()
-        (ck / ".zaxbygraph.toml").write_text(
-            "[derive]" + chr(10) + "lexical = 999.0" + chr(10), encoding="utf-8")
+        # the OPERATOR's file lives at REPO_ROOT; the similar runner's
+        # isolation is that its legs execute in the temp git checkout, so
+        # a REPO_ROOT plant must stay invisible. The plant carries an
+        # INVALID weight (1e10 breaches the 1e9 cap): any leak raises
+        # ConfigError, so the effective-weight assert below only passes
+        # when the ambient file stayed out of the leg.
+        planted = REPO_ROOT / ".zaxbygraph.toml"
+        saved = planted.read_bytes() if planted.exists() else None
         try:
-            runner = object.__new__(test_similar.SimilarCliTests)                 if hasattr(test_similar, "SimilarCliTests") else None
-            if runner is None:
-                # fall back to the module's own cwd contract: run from the
-                # checkout the real runner uses
-                import subprocess
-                env2 = dict(os.environ)
-                env2["PYTHONPATH"] = os.pathsep.join(
-                    [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
-                proc = subprocess.run(
-                    [sys.executable, "-m", "zaxbygraph", "similar", "501",
-                     "--db", str(_chain_store()), "--repo", REPO,
-                     "--format", "json"],
-                    capture_output=True, env=env2, cwd=str(ck), timeout=120)
-                env = json.loads(proc.stdout.decode("utf-8"))
+            planted.write_text(
+                "[derive]" + chr(10) + "lexical = 1e10" + chr(10),
+                encoding="utf-8")
+            import subprocess
+            import test_similar
+            ck = test_similar._leg_checkout()
+            env2 = dict(os.environ)
+            env2["PYTHONPATH"] = os.pathsep.join(
+                [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
+            proc = subprocess.run(
+                [sys.executable, "-m", "zaxbygraph", "similar", "501",
+                 "--db", str(_chain_store()), "--repo", REPO,
+                 "--format", "json"],
+                capture_output=True, env=env2, cwd=str(ck), timeout=120)
+            env = json.loads(proc.stdout.decode("utf-8"))
             self.assertTrue(env.get("ok"), env)
+            self.assertEqual(env["data"]["weights"]["lexical"], 1.0)
         finally:
-            (ck / ".zaxbygraph.toml").unlink(missing_ok=True)
+            if saved is None:
+                planted.unlink(missing_ok=True)
+            else:
+                planted.write_bytes(saved)
 
 
 def _chain_store() -> str:

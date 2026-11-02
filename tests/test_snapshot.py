@@ -350,8 +350,8 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 '  case "$ref" in refs/zaxbygraph/*) exit 1 ;; esac\n'
                 'done\n',
                 encoding="utf-8")
-            _git("add", "-A", cwd=bare)
-            _git("commit-tree", "--help", cwd=bare)  # no-op; keep hook exec bits
+            import os as _os
+            _os.chmod(hook, 0o755)  # POSIX find_hook requires X_OK
             out = publish(db, str(bare), publisher="fb")
             self.assertEqual(out["pushed_ref"], "refs/heads/" + SNAPSHOT_BRANCH)
             remote = _ls_remote(bare, "refs/heads/" + SNAPSHOT_BRANCH)
@@ -457,6 +457,51 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 self.assertEqual(db.read_bytes(), before)
             finally:
                 reader.close()
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_wrong_corpus_digest(self) -> None:
+        # staged-first digest pin: a manifest whose corpus_sha256 disagrees
+        # with the (valid) snapshot bytes refuses BEFORE anything replaces
+        # the local store; deleting _check_staged_digest makes this red
+        td = Path(tempfile.mkdtemp(prefix="digest_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="dg")
+            # re-publish with a tampered manifest: flip the corpus digest
+            # in the pushed commit (bytes stay self-consistent)
+            work = td / "w"
+            work.mkdir()
+            _git("init", "-b", "main", str(work), cwd=td)
+            real = publish(db, str(self.bare if hasattr(self, "bare") else bare),
+                           publisher="dg")["manifest"]
+            import gzip as _gzip
+            import io as _io
+            raw = db.read_bytes()
+            buf = _io.BytesIO()
+            with _gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
+                g.write(raw)
+            gz = buf.getvalue()
+            man = dict(real)
+            man["corpus_sha256"] = "f" * 64
+            man["db_sha256"] = hashlib.sha256(raw).hexdigest()
+            man["gz_sha256"] = hashlib.sha256(gz).hexdigest()
+            man["parts"] = [{"name": "snapshot-0000.gz",
+                             "sha256": hashlib.sha256(gz).hexdigest(),
+                             "bytes": len(gz)}]
+            (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
+                                                encoding="utf-8")
+            (work / "snapshot-0000.gz").write_bytes(gz)
+            _git("add", "-A", cwd=work)
+            tree = _git("write-tree", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, "-m", "tampered", cwd=work).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            before = db.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(db, str(bare))
+            self.assertEqual(ctx.exception.code, "corpus_mismatch")
+            self.assertEqual(db.read_bytes(), before)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

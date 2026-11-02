@@ -323,7 +323,22 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
         )
     commit = _run_git(["rev-parse", "FETCH_HEAD"], wd).stdout.decode().strip()
     mbytes = _run_git(["cat-file", "blob", commit + ":manifest.json"], wd).stdout
-    manifest = json.loads(mbytes.decode("utf-8"))
+    try:
+        manifest = json.loads(mbytes.decode("utf-8"))
+    except ValueError as exc:
+        raise SnapshotError(
+            "bad_manifest",
+            f"snapshot manifest is not valid JSON: {exc}",
+            hint="re-publish and re-pull",
+        ) from exc
+    missing = [k for k in ("format", "repo", "db_sha256", "gz_sha256",
+                           "corpus_sha256", "parts") if k not in manifest]
+    if missing:
+        raise SnapshotError(
+            "bad_manifest",
+            f"snapshot manifest is missing required keys: {missing}",
+            hint="re-publish and re-pull",
+        )
     if manifest.get("format") != MANIFEST_FORMAT:
         raise SnapshotError(
             "bad_manifest",
@@ -444,9 +459,16 @@ def _install(staged: Path, db_path: Path) -> None:
     try:
         dest = sqlite3.connect(str(db_path))
         try:
-            dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            busy = int(dest.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0])
         finally:
             dest.close()
+        if busy:
+            raise SnapshotError(
+                "dest_open",
+                "destination store is busy (a reader holds it); "
+                f"checkpoint reported busy={busy}",
+                hint="close readers holding the store open and re-pull",
+            )
         for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
             if sidecar.exists():
                 sidecar.unlink()
