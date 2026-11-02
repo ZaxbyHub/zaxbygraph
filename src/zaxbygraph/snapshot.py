@@ -331,12 +331,27 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             f"snapshot manifest is not valid JSON: {exc}",
             hint="re-publish and re-pull",
         ) from exc
-    missing = [k for k in ("format", "repo", "db_sha256", "gz_sha256",
-                           "corpus_sha256", "parts") if k not in manifest]
+    missing = [k for k in ("format", "repo", "user_version", "watermark",
+                           "db_sha256", "gz_sha256", "corpus_sha256",
+                           "parts") if k not in manifest]
     if missing:
         raise SnapshotError(
             "bad_manifest",
             f"snapshot manifest is missing required keys: {missing}",
+            hint="re-publish and re-pull",
+        )
+    parts = manifest.get("parts")
+    shape_bad = (
+        not isinstance(parts, list)
+        or any(not isinstance(p, dict)
+               or not all(k in p for k in ("name", "sha256", "bytes"))
+               for p in parts)
+    )
+    if shape_bad:
+        raise SnapshotError(
+            "bad_manifest",
+            "snapshot manifest parts must be a list of dicts with "
+            "name/sha256/bytes",
             hint="re-publish and re-pull",
         )
     if manifest.get("format") != MANIFEST_FORMAT:
@@ -410,7 +425,6 @@ def _check_staged_digest(staged: Path, manifest: dict) -> None:
             "staged corpus digest differs from the manifest",
             hint="re-publish and re-pull; local store untouched",
         )
-    return None
 
 
 def _local_watermark(db_path: Path) -> str | None:

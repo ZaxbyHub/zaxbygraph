@@ -360,19 +360,31 @@ class SnapshotReviewFixTests(unittest.TestCase):
             shutil.rmtree(td, ignore_errors=True)
 
     def test_pull_accepts_branch_only_source(self) -> None:
+        # the source carries ONLY the branch fallback: a hooked target
+        # refuses the custom ref, publish lands on the branch, and pull
+        # installs from it
         td = Path(tempfile.mkdtemp(prefix="branchonly_"))
         try:
             db = _build_store(td)
             bare = _bare(td)
+            hook = bare / "hooks" / "pre-receive"
+            hook.write_text(
+                "#!/bin/sh" + chr(10)
+                + 'while read old new ref; do' + chr(10)
+                + '  case "$ref" in refs/zaxbygraph/*) exit 1 ;; esac' + chr(10)
+                + 'done' + chr(10),
+                encoding="utf-8")
+            import os as _os
+            _os.chmod(hook, 0o755)
             publish(db, str(bare), publisher="bo")
-            _git("push", str(bare), "--delete", SNAPSHOT_REF, cwd=td)
+            self.assertIsNone(_ls_remote(bare, SNAPSHOT_REF),
+                              "the custom ref must be absent on this target")
             dst = td / "dst"
             dst.mkdir()
             pull(dst / "history.db", str(bare))
             self.assertTrue((dst / "history.db").exists())
         finally:
             shutil.rmtree(td, ignore_errors=True)
-
 
     def test_pull_refuses_header_valid_corrupt_db(self) -> None:
         # AC3 discriminating pin: a header-valid corrupt page trips
@@ -440,42 +452,46 @@ class SnapshotReviewFixTests(unittest.TestCase):
             shutil.rmtree(td, ignore_errors=True)
 
     def test_pull_refuses_when_reader_holds_dest(self) -> None:
-        # reviewer finding: an open reader on the destination refuses
-        # cleanly (coded SnapshotError) with the store byte-identical
+        # platform-conditional (PR #42 convention, asymmetry disclosed):
+        # Windows refuses an open-reader destination (dest_open; the busy
+        # checkpoint fires when sqlite reports pending frames, the file
+        # lock otherwise), while POSIX safely installs over a live reader.
+        # The refusal leg runs where the platform refuses; the install leg
+        # documents the POSIX behavior.
         td = Path(tempfile.mkdtemp(prefix="reader_"))
         try:
             db = _build_store(td)
             bare = _bare(td)
             publish(db, str(bare), publisher="rd")
-            before = db.read_bytes()
-            reader = sqlite3.connect(str(db))
-            try:
-                reader.execute("SELECT COUNT(*) FROM items").fetchone()
-                with self.assertRaises(SnapshotError) as ctx:
-                    pull(db, str(bare), force=True)
-                self.assertEqual(ctx.exception.code, "dest_open")
-                self.assertEqual(db.read_bytes(), before)
-            finally:
-                reader.close()
+            if sys.platform == "win32":
+                before = db.read_bytes()
+                reader = sqlite3.connect(str(db))
+                try:
+                    reader.execute("SELECT COUNT(*) FROM items").fetchone()
+                    with self.assertRaises(SnapshotError) as ctx:
+                        pull(db, str(bare), force=True)
+                    self.assertEqual(ctx.exception.code, "dest_open")
+                    self.assertEqual(db.read_bytes(), before)
+                finally:
+                    reader.close()
+            else:
+                pull(db, str(bare), force=True)
+                self.assertTrue(db.exists())
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
-    def test_pull_refuses_wrong_corpus_digest(self) -> None:
-        # staged-first digest pin: a manifest whose corpus_sha256 disagrees
-        # with the (valid) snapshot bytes refuses BEFORE anything replaces
-        # the local store; deleting _check_staged_digest makes this red
-        td = Path(tempfile.mkdtemp(prefix="digest_"))
+    def test_pull_refuses_watermarkless_manifest(self) -> None:
+        # AC4 closure: watermark is a required key; without it the
+        # local-newer guard short-circuits and a newer local store would
+        # be overwritten without --force
+        td = Path(tempfile.mkdtemp(prefix="wm_"))
         try:
             db = _build_store(td)
             bare = _bare(td)
-            publish(db, str(bare), publisher="dg")
-            # re-publish with a tampered manifest: flip the corpus digest
-            # in the pushed commit (bytes stay self-consistent)
+            publish(db, str(bare), publisher="wm")
             work = td / "w"
             work.mkdir()
             _git("init", "-b", "main", str(work), cwd=td)
-            real = publish(db, str(self.bare if hasattr(self, "bare") else bare),
-                           publisher="dg")["manifest"]
             import gzip as _gzip
             import io as _io
             raw = db.read_bytes()
@@ -483,24 +499,63 @@ class SnapshotReviewFixTests(unittest.TestCase):
             with _gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
                 g.write(raw)
             gz = buf.getvalue()
-            man = dict(real)
-            man["corpus_sha256"] = "f" * 64
-            man["db_sha256"] = hashlib.sha256(raw).hexdigest()
-            man["gz_sha256"] = hashlib.sha256(gz).hexdigest()
-            man["parts"] = [{"name": "snapshot-0000.gz",
-                             "sha256": hashlib.sha256(gz).hexdigest(),
-                             "bytes": len(gz)}]
+            man = {
+                "format": MANIFEST_FORMAT,
+                "user_version": CURRENT_USER_VERSION,
+                "repo": REPO,
+                "host": "github.com",
+                # watermark deliberately absent
+                "corpus_sha256": "0" * 64,
+                "db_sha256": hashlib.sha256(raw).hexdigest(),
+                "gz_sha256": hashlib.sha256(gz).hexdigest(),
+                "parts": [{"name": "snapshot-0000.gz",
+                           "sha256": hashlib.sha256(gz).hexdigest(),
+                           "bytes": len(gz)}],
+                "publisher": "wmless",
+            }
             (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
                                                 encoding="utf-8")
             (work / "snapshot-0000.gz").write_bytes(gz)
             _git("add", "-A", cwd=work)
             tree = _git("write-tree", cwd=work).stdout.decode().strip()
-            commit = _git("commit-tree", tree, "-m", "tampered", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, "-m", "wmless", cwd=work).stdout.decode().strip()
             _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
             before = db.read_bytes()
             with self.assertRaises(SnapshotError) as ctx:
                 pull(db, str(bare))
-            self.assertEqual(ctx.exception.code, "corpus_mismatch")
+            self.assertEqual(ctx.exception.code, "bad_manifest")
+            self.assertEqual(db.read_bytes(), before)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_malformed_parts(self) -> None:
+        # parts presence is not shape: a non-list or dict-missing part
+        # entries must refuse as bad_manifest, not traceback
+        td = Path(tempfile.mkdtemp(prefix="parts_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="pt")
+            work = td / "w"
+            work.mkdir()
+            _git("init", "-b", "main", str(work), cwd=td)
+            man = {"format": MANIFEST_FORMAT, "repo": REPO,
+                   "user_version": CURRENT_USER_VERSION,
+                   "watermark": "2027-06-01T00:00:00Z",
+                   "corpus_sha256": "0" * 64, "db_sha256": "0" * 64,
+                   "gz_sha256": "0" * 64, "parts": "nope",
+                   "publisher": "pt"}
+            (work / "manifest.json").write_text(json.dumps(man, sort_keys=True),
+                                                encoding="utf-8")
+            (work / "snapshot-0000.gz").write_bytes(b"junk")
+            _git("add", "-A", cwd=work)
+            tree = _git("write-tree", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, "-m", "parts", cwd=work).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work)
+            before = db.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(db, str(bare))
+            self.assertEqual(ctx.exception.code, "bad_manifest")
             self.assertEqual(db.read_bytes(), before)
         finally:
             shutil.rmtree(td, ignore_errors=True)

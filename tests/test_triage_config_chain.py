@@ -199,18 +199,16 @@ class HermeticityTests(unittest.TestCase):
             planted.write_text(
                 "[derive]" + chr(10) + "lexical = 1e10" + chr(10),
                 encoding="utf-8")
-            import subprocess
             import test_similar
-            ck = test_similar._leg_checkout()
-            env2 = dict(os.environ)
-            env2["PYTHONPATH"] = os.pathsep.join(
-                [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
-            proc = subprocess.run(
-                [sys.executable, "-m", "zaxbygraph", "similar", "501",
-                 "--db", str(_chain_store()), "--repo", REPO,
-                 "--format", "json"],
-                capture_output=True, env=env2, cwd=str(ck), timeout=120)
-            env = json.loads(proc.stdout.decode("utf-8"))
+            # the REAL runner contract: CliContractTests._run is the leg
+            # runner under test - invoking it means a revert of its cwd
+            # isolation makes THIS pin red (the reviewer's falsifier)
+            runner = object.__new__(test_similar.CliContractTests)
+            rc, out, err = runner._run(
+                "similar", "501", "--db", str(_chain_store()), "--repo",
+                REPO, "--format", "json")
+            self.assertEqual(rc, 0, out + err)
+            env = json.loads(out.decode("utf-8"))
             self.assertTrue(env.get("ok"), env)
             self.assertEqual(env["data"]["weights"]["lexical"], 1.0)
         finally:
