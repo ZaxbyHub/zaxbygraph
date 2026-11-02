@@ -2444,7 +2444,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pull.add_argument("--verify-sample", dest="verify_sample", type=int,
                          default=0, metavar="N",
                          help="Re-fetch N random items from the live source"
-                              " and compare content hashes (issue #34)")
+                              " and compare their stored fields (title/body/"
+                              "state/timestamps/author/labels/pull-marker)"
+                              " for drift (issue #34)")
     sp_pull.set_defaults(func=cmd_snapshot_pull)
 
     sp = sub.add_parser("where", help="Print the resolution chain for this checkout")

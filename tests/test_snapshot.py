@@ -710,27 +710,15 @@ class SnapshotReviewFixTests(unittest.TestCase):
             publish(db, str(bare), publisher="vs")
 
             class _StubSource:
-                """Serves the SAME payloads AND children the snapshot
-                store holds (the sampling comparison must match even for
-                the comment-bearing item)."""
+                """Serves the SAME payloads the snapshot store holds (the
+                payload-level sampling comparison must match — children
+                never enter the projection)."""
 
                 def get_issues(self, numbers):
                     out = {}
                     for n in numbers:
                         out[n] = (seeded.issues[n], None)
                     return out
-
-                def list_issue_comments(self, number):
-                    return list(seeded.issue_comments.get(number, []))
-
-                def list_review_comments(self, number):
-                    return list(seeded.review_comments.get(number, []))
-
-                def list_reviews(self, number):
-                    return list(seeded.reviews.get(number, []))
-
-                def list_pr_files(self, number):
-                    return list(seeded.files.get(number, []))
 
             dst = td / "dst"
             dst.mkdir()
