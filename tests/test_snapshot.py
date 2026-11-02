@@ -476,13 +476,20 @@ class SnapshotReviewFixTests(unittest.TestCase):
                     reader.close()
             else:
                 # POSIX: unlink/replace succeed over a live reader, so the
-                # install lands (disclosed asymmetry; the busy-verdict test
-                # covers the cross-platform refusal)
+                # install lands (disclosed asymmetry; the refusal leg runs
+                # on Windows)
                 reader = sqlite3.connect(str(db))
                 try:
                     reader.execute("SELECT COUNT(*) FROM items").fetchone()
                     pull(db, str(bare), force=True)
-                    self.assertTrue(db.exists())
+                    conn = sqlite3.connect(str(db))
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT issues_since FROM sync_state WHERE repo = ?",
+                        (REPO,)).fetchone()
+                    conn.close()
+                    self.assertEqual(row["issues_since"],
+                                     "2027-06-01T00:00:00Z")
                 finally:
                     reader.close()
         finally:
@@ -614,6 +621,29 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 pull(db, str(bare))
             self.assertEqual(ctx.exception.code, "corpus_mismatch")
             self.assertEqual(db.read_bytes(), before)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_replaces_corrupt_destination(self) -> None:
+        # pull is the recovery path for a corrupt store: a non-sqlite
+        # destination must not traceback; the quiesce falls through and
+        # the validated snapshot replaces the unreadable bytes
+        td = Path(tempfile.mkdtemp(prefix="corruptdest_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="cd")
+            dst = td / "dst"
+            dst.mkdir()
+            dest = dst / "history.db"
+            dest.write_bytes(b"this is not a sqlite database at all" * 100)
+            pull(dest, str(bare))
+            check = sqlite3.connect(str(dest))
+            try:
+                (q,) = check.execute("PRAGMA quick_check").fetchone()
+            finally:
+                check.close()
+            self.assertEqual(q, "ok")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

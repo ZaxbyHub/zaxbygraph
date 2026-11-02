@@ -466,10 +466,13 @@ def _now_iso() -> str:
 
 
 def _install(staged: Path, db_path: Path) -> None:
-    """Quiesce dest (checkpoint its WAL), delete old sidecars BEFORE the
-    replace, then ONE os.replace. The staged file is closed and
-    self-contained; any quiescence/replace/open-handle failure refuses
-    cleanly (coded SnapshotError) with the local store untouched."""
+    """Best-effort WAL quiesce, delete old sidecars BEFORE the replace,
+    then ONE os.replace. The staged file is closed and self-contained.
+    The quiesce is deliberately unguarded-by-verdict (any failure there
+    falls through - pull is the recovery path for a corrupt dest); the
+    COMMITTED refusal is the guarded OSError below (Windows refuses open
+    handles as coded dest_open; POSIX installs over a live reader,
+    disclosed in the test)."""
     try:
         # best-effort WAL quiesce: back-fill pending frames into the main
         # db so the replaced file never coexists with stale sidecar data.
@@ -483,7 +486,10 @@ def _install(staged: Path, db_path: Path) -> None:
                 dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             finally:
                 dest.close()
-        except OSError:
+        except (OSError, sqlite3.Error):
+            # pull is the recovery path for a corrupt destination (README
+            # recipes): a quiesce failure on unreadable bytes falls
+            # through to the guarded install, which replaces them
             pass
         for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
             if sidecar.exists():
