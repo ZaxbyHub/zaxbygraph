@@ -739,14 +739,16 @@ incremental `sync` fetches only the delta.
 ### Travel recipe
 
 Publish before you leave (`zaxbygraph snapshot publish <store-repo>`),
-pull on arrival (`zaxbygraph snapshot pull <store-repo>`), then run a
-normal incremental `sync` — only updates after the snapshot's watermark
+pull on arrival (`zaxbygraph snapshot pull <store-repo>`, add
+`--verify-sample 5` to spot-check five items against live GitHub), then
+run a normal incremental `sync` — only updates after the snapshot's watermark
 come over the network.
 
 ### Team recipe
 
 One machine (or one scheduled Action using GITHUB_TOKEN, never a PAT) is
-the single writer: it publishes. Everyone else only pulls, and a newer
+the single writer: it publishes — `docs/examples/snapshot-publish.yml` is
+a copy-paste scheduled-workflow example. Everyone else only pulls, and a newer
 local store is never overwritten without `--force`.
 
 ### Credential separation

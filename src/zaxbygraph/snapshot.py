@@ -35,7 +35,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import CURRENT_USER_VERSION, connect
+from .db import CURRENT_USER_VERSION, connect, init_schema
+from .sync import sync_repo
 from .export import iter_corpus_content_lines
 
 #: snapshot manifest format stamp
@@ -78,6 +79,9 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
         "GIT_AUTHOR_DATE": _FIXED_DATE,
         "GIT_COMMITTER_DATE": _FIXED_DATE,
     })
+    # the temp-repo plumbing must not inherit an ambient checkout context
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+        env.pop(k, None)
     proc = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, env=env, timeout=300,
     )
@@ -231,7 +235,31 @@ def _publish_staged(staged: Path, tmp: Path, target: str,
     commit_sha, pushed_ref = _git_publish(tmp, target, publisher, parts, manifest, gz_bytes)
     return {"manifest": manifest, "commit": commit_sha, "pushed_ref": pushed_ref}
 def _host_of(db_path: Path) -> str:
-    return "github.com"
+    """The store's origin host: the capability-probe meta key carries it
+    (the segment between the prefix and the next colon); the slug-keyed
+    store path (<root>/<host>/<owner>/<repo>/) is the fallback; a bare
+    --db path outside that layout derives 'unknown'."""
+    try:
+        conn = sqlite3.connect(str(db_path))
+        try:
+            row = conn.execute(
+                "SELECT key FROM meta WHERE key LIKE 'capability_probe:%'"
+            ).fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        row = None
+    if row:
+        parts = row[0].split(":")
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    try:
+        host_dir = Path(db_path).resolve().parent.parent.parent
+        if "." in host_dir.name and host_dir.name not in ("", ".", ".."):
+            return host_dir.name
+    except OSError:
+        pass
+    return "unknown"
 def _git_publish(tmp: Path, target: str, publisher: str,
                  parts: list[dict], manifest: dict, gz_bytes: bytes) -> tuple[str, str]:
     """One orphan commit in a temp git repo, pushed to the AC6 default ref
@@ -263,7 +291,8 @@ def _git_publish(tmp: Path, target: str, publisher: str,
         "target refused the snapshot ref and the fallback branch",
         hint=_tail(push.stderr),
     )
-def pull(db_path: Path, source: str, force: bool = False) -> dict:
+def pull(db_path: Path, source: str, force: bool = False,
+         verify_sample: int = 0, source_factory=None) -> dict:
     """snapshot pull (issue #34 AC3-AC5): verify-then-install. Staged
     verification happens first (part shas, gzip stream, db sha, quick_check,
     schema version); provenance lands in the staged db; the sync lock is
@@ -296,6 +325,9 @@ def pull(db_path: Path, source: str, force: bool = False) -> dict:
             _write_provenance(staged, manifest)
             _install(staged, db_path)
             result = _post_install_check(db_path, manifest)
+            if verify_sample > 0:
+                result["verify_sample"] = _verify_sample(
+                    db_path, manifest["repo"], verify_sample, source_factory)
             result["manifest"] = manifest
             return result
         finally:
@@ -338,6 +370,13 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
         raise SnapshotError(
             "bad_manifest",
             f"snapshot manifest is missing required keys: {missing}",
+            hint="re-publish and re-pull",
+        )
+    if not isinstance(manifest.get("watermark"), str) or not manifest["watermark"]:
+        # a null-valued watermark must not bypass AC4's newer-local guard
+        raise SnapshotError(
+            "bad_manifest",
+            "snapshot manifest watermark must be a non-empty string",
             hint="re-publish and re-pull",
         )
     parts = manifest.get("parts")
@@ -527,3 +566,105 @@ def _corpus_digest_conn(conn: sqlite3.Connection, repo: str) -> str:
     for piece in iter_corpus_content_lines(conn, repo, set()):
         hasher.update(piece)
     return hasher.hexdigest()
+
+
+def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dict:
+    """Issue #34's --verify-sample N: re-fetch N random items from the
+    live source and compare each item's export content-line hash against
+    the installed store. A mismatch means GitHub moved on after the
+    snapshot was taken (drift, reported - not corruption: the manifest
+    digest already proves store == snapshot). Uses the real ``gh`` REST
+    source unless ``source_factory`` injects one (tests)."""
+    import random
+
+    from zaxbygraph.export import _item_content, canonical
+
+    class _SinglePayloadSource:
+        """A minimal GitHubSource serving one pre-fetched issue payload,
+        so the REAL ingest pipeline hashes the live bytes."""
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def list_issues(self, since=None):
+            if since is None:
+                yield [self._payload]
+
+        def fetch_children(self, items):
+            out = {}
+            for raw in items:
+                num = int(raw["number"])
+                out[num] = {"issue_comments": [], "review_comments": [],
+                            "reviews": [], "files": []}
+            return out
+
+        def list_releases(self, since=None):
+            return iter(())
+
+        def fetch_releases(self, tags):
+            return {}
+
+        def check_deleted(self, numbers):
+            return {}
+
+        def get_pull(self, number):
+            raise LookupError(number)
+
+    conn = connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        numbers = [r["number"] for r in conn.execute(
+            "SELECT number FROM items WHERE repo = ?", (repo,))]
+        if not numbers:
+            return {"requested": n, "checked": 0, "matched": 0,
+                    "changed": 0, "skipped": 0}
+        sample = random.sample(numbers, min(n, len(numbers)))
+        local = set(str(x) for x in numbers)
+        if source_factory is None:
+            from zaxbygraph.cli import GhRestSource
+            from zaxbygraph.repo import remote_info
+
+            _host, slug = remote_info()
+            owner, _, name = slug.rpartition("/")
+            src = GhApiSource(owner, name)
+        else:
+            src = source_factory()
+        payloads = src.get_issues(sample)
+        checked = matched = changed = skipped = 0
+        for number in sample:
+            payload, _status = payloads.get(number, (None, None))
+            row = conn.execute(
+                "SELECT * FROM items WHERE repo = ? AND number = ?",
+                (repo, number)).fetchone()
+            if payload is None or row is None:
+                skipped += 1
+                continue
+            tmp = Path(tempfile.mkdtemp(prefix="verify-"))
+            try:
+                tconn = connect(tmp / "h.db")
+                try:
+                    init_schema(tconn)
+                    sync_repo(tconn, _SinglePayloadSource(payload), repo)
+                    tconn.row_factory = sqlite3.Row
+                    trow = tconn.execute(
+                        "SELECT * FROM items WHERE repo = ? AND number = ?",
+                        (repo, number)).fetchone()
+                    tlocal = {str(number)}
+                    live_hash = hashlib.sha256(canonical(_item_content(
+                        tconn, repo, trow, set(), tlocal))).hexdigest()
+                finally:
+                    tconn.close()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            local_hash = hashlib.sha256(canonical(_item_content(
+                conn, repo, row, set(), local))).hexdigest()
+            checked += 1
+            if live_hash == local_hash:
+                matched += 1
+            else:
+                changed += 1
+        return {"requested": n, "checked": checked, "matched": matched,
+                "changed": changed, "skipped": skipped}
+    finally:
+        conn.close()
+

@@ -44,8 +44,10 @@ def _git(*argv, cwd):
         ["git", *argv], cwd=str(cwd), capture_output=True, timeout=120)
 
 
-def _build_store(td: Path) -> Path:
-    """A complete single-repo store built from FakeGitHubSource."""
+def _build_store(td: Path, return_source: bool = False):
+    """A complete single-repo store built from FakeGitHubSource. With
+    return_source=True, returns (db, src) so a verify-sample stub can
+    serve payloads identical to what the store ingested."""
     db = td / "history.db"
     conn = connect(db)
     init_schema(conn)
@@ -56,7 +58,7 @@ def _build_store(td: Path) -> Path:
                             created_at="2027-06-01T00:00:00Z"))
     sync_repo(conn, src, REPO)
     conn.close()
-    return db
+    return (db, src) if return_source else db
 
 
 def _bare(td: Path, name="snapshot.git") -> Path:
@@ -95,6 +97,9 @@ class SnapshotPublishTests(unittest.TestCase):
         self.assertEqual(m["format"], MANIFEST_FORMAT)
         self.assertEqual(m["repo"], REPO)
         self.assertEqual(m["user_version"], CURRENT_USER_VERSION)
+        # host derives from the store path / capability meta (fixture
+        # stores live in temp dirs outside the slug layout -> "unknown")
+        self.assertIn(m["host"], ("github.com", "unknown"))
         # deterministic bytes -> identical orphan commit (idempotent publish);
         # a content change moves the ref (replacement)
         p2 = publish(self.db, str(self.bare), publisher="tester")
@@ -668,6 +673,72 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 "SELECT key FROM meta WHERE key LIKE 'snapshot.%'").fetchall()
             c.close()
             self.assertEqual(rows, [])
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+    def test_pull_verify_sample(self) -> None:
+        # issue #34 Scope In: --verify-sample N re-fetches N random items
+        # from the live source and compares content hashes; the injected
+        # stub source returns the SAME payloads the store holds, so the
+        # hashes must match (matched == checked)
+        td = Path(tempfile.mkdtemp(prefix="vs_"))
+        try:
+            db, seeded = _build_store(td, return_source=True)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="vs")
+
+            class _StubSource:
+                """Serves the SAME payloads the snapshot store holds
+                (the sampling comparison must match)."""
+
+                def get_issues(self, numbers):
+                    out = {}
+                    for n in numbers:
+                        out[n] = (seeded.issues[n], None)
+                    return out
+
+            dst = td / "dst"
+            dst.mkdir()
+            result = pull(dst / "history.db", str(bare),
+                          verify_sample=2, source_factory=_StubSource)
+            vs = result["verify_sample"]
+            self.assertEqual(vs["requested"], 2)
+            self.assertEqual(vs["checked"], 2)
+            self.assertEqual(vs["matched"], 2)
+            self.assertEqual(vs["changed"], 0)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_cli_snapshot_envelopes(self) -> None:
+        # envelope-guard docstring reason: the CLI publish/pull envelopes
+        # are pinned here (schema-notes pattern: exclude + pin elsewhere)
+        td = Path(tempfile.mkdtemp(prefix="env_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
+            import subprocess
+            for argv in (
+                ["snapshot", "publish", str(bare), "--db", str(db),
+                 "--repo", REPO, "--publisher", "env", "--format", "json"],
+                ["snapshot", "pull", str(bare), "--db",
+                 str(td / "dst2" / "h.db"), "--repo", REPO,
+                 "--force", "--format", "json"],
+            ):
+                (td / ("dst2" if argv[1] == "pull" else "dst2")).mkdir(
+                    parents=True, exist_ok=True)
+                proc = subprocess.run(
+                    [sys.executable, "-m", "zaxbygraph", *argv],
+                    capture_output=True, env=env, cwd=str(REPO_ROOT),
+                    timeout=120)
+                self.assertEqual(proc.returncode, 0, proc.stderr[:200])
+                payload = json.loads(proc.stdout.decode("utf-8"))
+                for key in ("ok", "db", "repo", "freshness", "data",
+                            "truncated"):
+                    self.assertIn(key, payload)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

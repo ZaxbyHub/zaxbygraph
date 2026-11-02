@@ -1914,7 +1914,8 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
         return emit_failure(args, 2, str(exc), slug=None)
     store_db = Path(args.db) if args.db else store_db_path(host, repo)
     try:
-        result = snapshot_pull(store_db, args.source, force=args.force)
+        result = snapshot_pull(store_db, args.source, force=args.force,
+                            verify_sample=max(0, int(args.verify_sample)))
     except SnapshotError as exc:
         return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
                             code_key=exc.code, hint=exc.hint)
@@ -2440,6 +2441,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp_pull.add_argument("source", help="Source git repository (path or URL)")
     sp_pull.add_argument("--force", action="store_true",
                          help="Overwrite a newer local store")
+    sp_pull.add_argument("--verify-sample", dest="verify_sample", type=int,
+                         default=0, metavar="N",
+                         help="Re-fetch N random items from the live source"
+                              " and compare content hashes (issue #34)")
     sp_pull.set_defaults(func=cmd_snapshot_pull)
 
     sp = sub.add_parser("where", help="Print the resolution chain for this checkout")
