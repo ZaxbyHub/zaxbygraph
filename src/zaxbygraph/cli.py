@@ -1899,7 +1899,8 @@ def cmd_snapshot_publish(args: argparse.Namespace) -> int:
     # DB > the would-be store path (paths.resolve_db)
     store_db, _chain = resolve_db(repo, explicit=args.db, host=host)
     try:
-        result = snapshot_publish(store_db, args.target, args.publisher)
+        result = snapshot_publish(store_db, args.target, args.publisher,
+                               expected_repo=repo)
     except SnapshotError as exc:
         return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
                             code_key=exc.code, hint=exc.hint)

@@ -224,7 +224,8 @@ def _staged_backup(conn: sqlite3.Connection, staged: Path) -> None:
         c2.close()
 
 
-def publish(db_path: Path, target: str, publisher: str) -> dict:
+def publish(db_path: Path, target: str, publisher: str,
+            expected_repo: str | None = None) -> dict:
     """snapshot publish (issue #34 AC1-AC2): verified orphan-commit
     transport under the sync lock; every manifest field derives from one
     staged backup."""
@@ -261,6 +262,17 @@ def publish(db_path: Path, target: str, publisher: str) -> dict:
                     hint="publish from a store holding exactly one repo",
                 )
             repo = states[0][0]
+            if expected_repo is not None and repo != expected_repo:
+                # the manifest is written from sync_state; an envelope
+                # labelled with a different --repo would report a corpus
+                # this store does not hold (cubic second-round finding)
+                raise SnapshotError(
+                    "repo_mismatch",
+                    f"store holds {repo!r} but the requested repo is"
+                    f" {expected_repo!r}",
+                    hint="publish from the matching repo's store, or pass"
+                         " --repo for the store's repo",
+                )
             tmp = Path(tempfile.mkdtemp(prefix="zaxbygraph-publish-"))
             staged = tmp / "staged.db"
             _staged_backup(conn, staged)
@@ -406,12 +418,22 @@ def pull(db_path: Path, source: str, force: bool = False,
                     f" ({manifest['watermark']}); pass --force to overwrite",
                     hint="pull keeps a newer local store (issue #34 AC4)",
                 )
+            # Sample verification runs on the STAGED store, BEFORE the
+            # replace (cubic second-round finding): a gh/source fault must
+            # refuse while the destination is still intact, because the
+            # refusal envelope is a promise that nothing was replaced. A
+            # drift REPORT is not a fault - the manifest digest already
+            # proves store == snapshot, so the install proceeds and the
+            # counts ride along in the result.
+            sample = None
+            if verify_sample > 0:
+                sample = _verify_sample(
+                    staged, manifest["repo"], verify_sample, source_factory)
             _write_provenance(staged, manifest)
             _install(staged, db_path)
             result = _post_install_check(db_path, manifest)
-            if verify_sample > 0:
-                result["verify_sample"] = _verify_sample(
-                    db_path, manifest["repo"], verify_sample, source_factory)
+            if sample is not None:
+                result["verify_sample"] = sample
             result["manifest"] = manifest
             return result
         finally:
@@ -813,7 +835,8 @@ def _post_install_check(db_path: Path, manifest: dict) -> dict:
         raise SnapshotError(
             "corpus_mismatch",
             "post-install corpus digest differs from the manifest",
-            hint="the install did not land; re-pull",
+            hint="the store was already replaced; re-pull or restore a"
+                 " known-good store",
         )
     return {"corpus_sha256": digest, "installed": True}
 
@@ -866,8 +889,9 @@ def _store_projection(conn: sqlite3.Connection, repo: str, number: int) -> bytes
 def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dict:
     """Issue #34's --verify-sample N: re-fetch N random items from the
     live source and compare the payload-level projection (title, body,
-    state, timestamps, author, labels, pull marker) against the installed
-    store. A mismatch means GitHub moved on after the snapshot was taken
+    state, timestamps, author, labels, pull marker) against the store at
+    db_path - the STAGED copy, so a source fault refuses before the
+    destination is replaced. A mismatch means GitHub moved on after the snapshot was taken
     (drift, reported - not corruption: the manifest digest already proves
     store == snapshot). Payload-level only: children and GraphQL-only
     sections are never sampled (a re-fetch cannot faithfully reproduce

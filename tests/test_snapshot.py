@@ -960,6 +960,81 @@ class SnapshotReviewFixTests(unittest.TestCase):
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
+    def test_publish_refuses_repo_mismatch(self) -> None:
+        # cubic round 2: the manifest repo comes from sync_state, so a
+        # publish into another repo's store must refuse rather than emit
+        # an envelope labelled with a corpus this store does not hold
+        td = Path(tempfile.mkdtemp(prefix="pubmis_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            before = _ls_remote(bare, SNAPSHOT_REF)
+            with self.assertRaises(SnapshotError) as ctx:
+                publish(db, str(bare), publisher="x",
+                        expected_repo="acme/other")
+            self.assertEqual(ctx.exception.code, "repo_mismatch")
+            # nothing was pushed: the refusal happens before any transport
+            self.assertEqual(_ls_remote(bare, SNAPSHOT_REF), before)
+            # the matching repo still publishes
+            out = publish(db, str(bare), publisher="x", expected_repo=REPO)
+            self.assertEqual(out["manifest"]["repo"], REPO)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_cli_publish_refusal_carries_repo_mismatch(self) -> None:
+        # the CLI leg: a mismatched --repo/--db pair must reach the envelope
+        # as repo_mismatch, not a traceback and not a wrong-slug success
+        td = Path(tempfile.mkdtemp(prefix="clipub_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
+            proc = subprocess.run(
+                [sys.executable, "-m", "zaxbygraph", "snapshot", "publish",
+                 str(bare), "--db", str(db), "--repo", "acme/other",
+                 "--publisher", "cli", "--format", "json"],
+                capture_output=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+            self.assertEqual(proc.returncode, 2, proc.stderr[:300])
+            payload = json.loads(proc.stdout.decode("utf-8"))
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"]["code"], "repo_mismatch")
+            self.assertIsNone(_ls_remote(bare, SNAPSHOT_REF))
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_verify_sample_source_fault_refuses_before_install(self) -> None:
+        # cubic round 2 (CUB-14): verification runs on the STAGED store, so
+        # a source fault refuses while the destination is still intact. The
+        # refusal envelope is a promise that nothing was replaced - the old
+        # order installed first and then reported a failure.
+        td = Path(tempfile.mkdtemp(prefix="vsfault_"))
+        try:
+            db, seeded = _build_store_commented(td, return_source=True)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="vsf")
+
+            class _BrokenSource:
+                def get_issues(self, numbers):
+                    raise RuntimeError("gh is not authenticated")
+
+            dst = td / "dst"
+            dst.mkdir()
+            target = dst / "history.db"
+            before = db.read_bytes()
+            shutil.copyfile(db, target)
+            target_before = target.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(target, str(bare), verify_sample=2,
+                     source_factory=_BrokenSource)
+            self.assertEqual(ctx.exception.code, "verify_failed")
+            # the destination is byte-identical: no install happened
+            self.assertEqual(target.read_bytes(), target_before)
+            self.assertEqual(db.read_bytes(), before)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
     def test_pull_refuses_multi_repo_destination(self) -> None:
         # PRR-C: a whole-file replace must not silently drop the other
         # repos in the destination store

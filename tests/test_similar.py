@@ -77,13 +77,16 @@ def _leg_checkout() -> Path:
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
         }
+        # check=True on every leg (cubic second-round finding): a missing
+        # or misconfigured git must fail HERE, where the cause is visible,
+        # not three tests later as an unrelated checkout error
         _sp.run(["git", "init", "-b", "main", str(_LEG_CK)],
-                capture_output=True, env=env)
+                capture_output=True, env=env, check=True)
         (_LEG_CK / "readme.txt").write_text("x", encoding="utf-8")
         _sp.run(["git", "add", "-A"], cwd=str(_LEG_CK),
-                capture_output=True, env=env)
+                capture_output=True, env=env, check=True)
         _sp.run(["git", "commit", "-m", "init"], cwd=str(_LEG_CK),
-                capture_output=True, env=env)
+                capture_output=True, env=env, check=True)
         return _LEG_CK
 from fixtures_eval import build_eval_store, record_real_corpus
 

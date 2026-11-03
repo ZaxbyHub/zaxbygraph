@@ -42,6 +42,13 @@ def _cli_json(argv: list[str]) -> dict:
     proc = subprocess.run([sys.executable, "-m", "zaxbygraph", *argv],
                           capture_output=True, env=env, cwd=_LEG_CWD,
                           timeout=120)
+    # assert success BEFORE decoding (cubic second-round finding): a failing
+    # CLI leg must report its exit code and stderr, not raise JSONDecodeError
+    # on an empty stdout and hide the real cause
+    assert proc.returncode == 0, (
+        f"zaxbygraph {' '.join(argv)} exited {proc.returncode}\n"
+        f"stdout: {proc.stdout.decode('utf-8', 'replace')[:2000]}\n"
+        f"stderr: {proc.stderr.decode('utf-8', 'replace')[:2000]}")
     return json.loads(proc.stdout.decode("utf-8"))
 class BudgetCapPins(unittest.TestCase):
     """Three discriminating budget legs on a bundle-forming fixture."""
