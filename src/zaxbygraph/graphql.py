@@ -316,19 +316,51 @@ def _int_or_none(value) -> int | None:
     return None
 
 
+#: The shape `_link_node` returns for a node it cannot parse (issue #53):
+#: a non-dict node or one whose number does not coerce. It flows into the
+#: `links` children section, where it is BOTH unparseable at the store layer
+#: (`_link_dst` rejects it — defense in depth) and marks the connection for
+#: `links_incomplete` here, so a malformed node degrades to union-only
+#: instead of presenting a silently cleared/empty connection as complete.
+_MALFORMED_LINK_NODE = {"__malformed__": True}
+
+
 def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     """(nodes, incomplete) for one GraphQL connection payload. A null or
-    malformed connection returns ([], False) — callers distinguish a
+    malformed connection value returns ([], False) — callers distinguish a
     genuinely empty page from a section the node did not carry by checking
-    key presence before calling this."""
+    key presence before calling this. A malformed CONTAINER inside a carried
+    connection (a non-list `nodes`, a non-dict `pageInfo`) or dropped
+    non-dict nodes returns ([], True): the section degrades to union-only
+    rather than presenting a silently empty page as complete (issue #53)."""
     if not isinstance(nodes, dict):
         return [], False
-    out = [n for n in (nodes.get("nodes") or []) if isinstance(n, dict)]
+    raw_nodes = nodes.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return [], True
+    out = [n for n in raw_nodes if isinstance(n, dict)]
+    page_info = nodes.get("pageInfo")
+    if page_info is None:
+        page_info = {}
+    elif not isinstance(page_info, dict):
+        return [], True
+    incomplete = bool(page_info.get("hasNextPage")) or len(out) != len(raw_nodes)
     total = nodes.get("totalCount")
-    incomplete = bool((nodes.get("pageInfo") or {}).get("hasNextPage"))
     if isinstance(total, int) and total > len(out):
         incomplete = True
     return out, incomplete
+
+
+def _carried_connection(raw: object) -> tuple[list[dict], bool]:
+    """A CARRIED connection (the caller checked key presence): a non-dict
+    value (null, a scalar) is malformed — union-only, never complete-empty
+    (issue #53). A dict value goes through `_connection`'s container
+    validation. This is the one truth-table entry shared by the link
+    connections and the timeline container, so a malformed carried section
+    can never present a silently empty page as complete at either site."""
+    if not isinstance(raw, dict):
+        return [], True
+    return _connection(raw)
 
 
 def _commit_message(commit: dict) -> str | None:
@@ -1061,11 +1093,24 @@ class GraphQLSource(GhApiSource):
         )
         if any(field in node for field in link_fields):
             def _link_node(raw_node: object) -> dict | None:
-                if not isinstance(raw_node, dict):
+                """One link node, the cleared marker (None) or the malformed
+                sentinel (issue #53). JSON null is a CLEARED value — no
+                parent / not a duplicate — and still retracts; a non-dict
+                node or one whose number does not coerce is MALFORMED and
+                must degrade the connection to union-only. The old mapping
+                turned both shapes into None, which presented a silently
+                cleared connection as complete and retracted the stored
+                edge."""
+                if raw_node is None:
                     return None
+                if not isinstance(raw_node, dict):
+                    return _MALFORMED_LINK_NODE
+                number = _int_or_none(raw_node.get("number"))
+                if number is None:
+                    return _MALFORMED_LINK_NODE
                 repo_ref = raw_node.get("repository")
                 return {
-                    "number": _int_or_none(raw_node.get("number")),
+                    "number": number,
                     "repo": repo_ref.get("nameWithOwner")
                     if isinstance(repo_ref, dict)
                     else None,
@@ -1073,33 +1118,55 @@ class GraphQLSource(GhApiSource):
 
             links: dict = {}
             overflowed: list[str] = []
+
             if "blockedBy" in node:
-                blocked_nodes, blocked_more = _connection(node.get("blockedBy"))
+                blocked_nodes, blocked_more = _carried_connection(node.get("blockedBy"))
                 links["blocked_by"] = [_link_node(n) for n in blocked_nodes]
-                if blocked_more:
+                if blocked_more or any(
+                    n is _MALFORMED_LINK_NODE for n in links["blocked_by"]
+                ):
                     overflowed.append("blocked_by")
             if "parent" in node:
-                links["parent"] = _link_node(node.get("parent"))
+                parent_node = _link_node(node.get("parent"))
+                links["parent"] = parent_node
+                if parent_node is _MALFORMED_LINK_NODE:
+                    overflowed.append("parent")
             if "duplicateOf" in node:
-                links["duplicate_of"] = _link_node(node.get("duplicateOf"))
+                duplicate_node = _link_node(node.get("duplicateOf"))
+                links["duplicate_of"] = duplicate_node
+                if duplicate_node is _MALFORMED_LINK_NODE:
+                    overflowed.append("duplicate_of")
             if "closedByPullRequestsReferences" in node:
-                open_nodes, open_more = _connection(
+                open_nodes, open_more = _carried_connection(
                     node.get("closedByPullRequestsReferences")
                 )
                 links["open_prs"] = [_link_node(n) for n in open_nodes]
-                if open_more:
+                if open_more or any(
+                    n is _MALFORMED_LINK_NODE for n in links["open_prs"]
+                ):
                     overflowed.append("open_prs")
             children["links"] = links
             if overflowed:
                 children["links_incomplete"] = overflowed
 
         if node.get("timelineItems") is not None:
-            events, timeline_more = _connection(node.get("timelineItems"))
+            events, timeline_more = _carried_connection(node.get("timelineItems"))
             children["timeline"] = [_timeline_event(e) for e in events]
             # Retained for fetch_children's continuation; _resolve_children
             # never forwards it, and _complete_timeline pops it when it runs.
-            page_info = (node.get("timelineItems") or {}).get("pageInfo") or {}
-            children["timeline_cursor"] = page_info.get("endCursor")
+            # The pageInfo is read through the VALIDATED connection shape: a
+            # non-dict pageInfo degrades to no-cursor, never a crash (the raw
+            # dereference this replaces raised AttributeError on a malformed
+            # payload — issue #53).
+            timeline_conn = node.get("timelineItems")
+            page_info = (
+                timeline_conn.get("pageInfo")
+                if isinstance(timeline_conn, dict)
+                else None
+            )
+            children["timeline_cursor"] = (
+                page_info.get("endCursor") if isinstance(page_info, dict) else None
+            )
             if timeline_more:
                 children["timeline_incomplete"] = True
         return children

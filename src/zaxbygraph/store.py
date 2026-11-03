@@ -24,6 +24,7 @@ from zaxbygraph.extract import (
     extract_listing_signals,
     extract_pull_owned,
     item_kind,
+    malformed_link_connections,
     merge_absent,
     merge_evidence,
     normalize_incomplete_connections,
@@ -447,7 +448,11 @@ def rebuild_links(
     connection (named in links_incomplete) unions without retraction; an
     ABSENT section (links is None, or the key missing from the dict) touches
     nothing — a degraded re-ingest can never retract a GitHub-reported link
-    fact."""
+    fact. A MALFORMED connection (issue #53: a node that fails to parse, a
+    carried plural null, a list on a singular connection) unions like an
+    overflowed one: the payload did not faithfully report the connection, so
+    the stored edges survive. An explicitly cleared singular value
+    (`parent: null`) is not malformed and still retracts."""
     if links is None or not isinstance(links, dict):
         return
     incomplete = normalize_incomplete_connections(links_incomplete)
@@ -458,11 +463,12 @@ def rebuild_links(
     # unrecognized marker silently retracted edges from a truncated page).
     if incomplete - set(_LINK_RELATIONS):
         incomplete = set(_LINK_RELATIONS) & set(links)
+    union_only = incomplete | malformed_link_connections(repo, number, links)
     emitted = edges_from_links(repo, number, links)
     for connection, relation in _LINK_RELATIONS.items():
         if connection not in links:
             continue
-        if connection not in incomplete:
+        if connection not in union_only:
             conn.execute(
                 "DELETE FROM edges WHERE repo = ? AND src_type = 'item'"
                 " AND src_id = ? AND rel = ? AND source = 'link'",

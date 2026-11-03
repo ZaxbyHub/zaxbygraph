@@ -203,7 +203,7 @@ The graph itself. One row per relationship.
 | `dst_id` | TEXT | A commit endpoint carries the sha, so the graph joins to `git log`. |
 | `confidence` | TEXT | Always `'EXTRACTED'`, enforced by a CHECK constraint. |
 | `evidence` | TEXT | Provenance payload, never part of an edge's identity — e.g. `pulls.files`, `body closing keyword`, `body #N`. Deliberately **not** part of the unique key; `source` **is** — with the `closes` exception below. |
-| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'link'` (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. `link` edges are exempt from the delete-on-re-ingest rule like `timeline`/`closing_ref`, and are replaced per connection only when that connection was fetched complete. |
+| `source` | TEXT | Provenance stream: `'keyword'` (text patterns), `'timeline'` (closed/cross-referenced events), `'closing_ref'` (PR closingIssuesReferences), `'link'` (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections), `'payload'` (structured fields). Part of the unique key: the same pair reported by two streams is two facts — with the `closes` exception below. `link` edges are exempt from the delete-on-re-ingest rule like `timeline`/`closing_ref`, and are replaced per connection only when that connection was fetched complete. A connection the payload could not faithfully report — an unparseable node (null/non-int number, non-dict, self-reference), a carried plural null, a list on a singular connection — is treated like an overflowed one: union-only, no retraction, so a GitHub-reported link fact is never silently dropped. An explicitly cleared singular value (`parent: null`) is not malformed and still retracts. |
 
 Unique key: `(repo, src_type, src_id, rel, dst_type, dst_id, source)`.
 
@@ -533,7 +533,17 @@ number-scoped rows under their own casing). For a legacy row whose
 complete-but-unprovable corpus reports `complete: false` until the next clean
 run drains the listing and stamps the timestamp — truthful because each item
 commits with its own watermark bump, so a clean run from the watermark has
-covered everything at or below it.
+covered everything at or below it. The `sync_state` merge is driven by the
+live column list (not a hardcoded snapshot), so a folded store keeps every
+column its schema carries — including the v4 rate-limit columns and the v11
+`fetch_source`. `doctor --consolidate` applies the same fold to its migrated
+temp copy for EVERY candidate version (a v11 candidate never migrates, so
+without the explicit fold its dual-cased rows would still collide the
+adoption copy): crash-damaged candidates are copied with their un-checkpointed
+`-wal` frames included (the original is never opened by SQLite), the
+collision cleanup and the `closes` survivor/evidence rules run before the
+row copy, and a case-split candidate is adopted with one row per folded key
+instead of aborting on a raw UNIQUE error.
 
 `complete` for a migrated legacy row means "no unresolved full sync since the
 last recorded one": v1 recorded nothing when a run crashed outside its caught
@@ -650,8 +660,13 @@ resource's notes containing `truncated`; `dropped_fields` counts
 capability-probe `omitted <field>` notes; `null_v7_rows` counts items rows
 where `reactions_total` or `author_association` is `NULL` — the two listing
 keys GitHub always carries with a non-null value, so their `NULL`
-unambiguously marks a payload that predated v7. Columns whose `NULL` is
-legitimate current state are deliberately excluded (unmilestoned/untyped
+unambiguously marks a payload that predated v7 or one the v6→v7 backfill
+could not use (unparseable or non-object `raw_json` degrades that row's
+payload-derived columns to NULL; a wrong-typed FIELD — a non-scalar value or
+an integer outside SQLite's signed 64-bit range — degrades that field's
+column alone; the chain advances either way, and strings and floats bind
+as-is under SQLite's column affinity, per the migration's payload guard). Columns whose
+`NULL` is legitimate current state are deliberately excluded (unmilestoned/untyped
 issues' `milestone`/`item_type`, PR rows' missing dependency summaries,
 unmerged PRs' pull trio) so ordinary rows are not flagged. `null_v7_rows` is
 `null` on pre-v7 stores. `store_bytes` is the database size in bytes

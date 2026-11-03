@@ -28,7 +28,13 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema, open_existing
+from zaxbygraph.db import (
+    CURRENT_USER_VERSION,
+    connect,
+    fold_repo_casings,
+    init_schema,
+    open_existing,
+)
 from zaxbygraph.paths import legacy_db_paths
 from zaxbygraph.store import recount
 
@@ -40,6 +46,12 @@ _MOJIBAKE_LIKE = (
     "IFNULL(labels_text, '') LIKE '%Ã%'",
     "IFNULL(labels_text, '') LIKE '%â€%'",
 )
+
+
+class _UnreadableCandidate(Exception):
+    """The candidate could not be copied/recovered faithfully (issue #52):
+    an active writer kept moving it, or it is not a database. Reported by
+    the CLI's failure envelope like any other storage fault."""
 
 #: tables copied on adoption -> the autoincrement pk column to omit (None =
 #: keep every column; GitHub-assigned ids in items/releases/reviews are kept).
@@ -87,14 +99,79 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _faithful_copy(path: Path, copy: Path) -> bool:
+    """Copy a candidate DB — main file plus any un-checkpointed `-wal` (or
+    hot `-journal`) frames — into `copy` WITHOUT opening the original
+    (issue #52).
+
+    A WAL-mode candidate whose writer was killed before a clean close keeps
+    committed frames in its `-wal`; copying the main file alone (the old
+    `shutil.copy2`) drops them, so the candidate is reported empty — or,
+    worse, adopted as a truncated image that REPLACES the store's richer
+    corpus (replace-the-slug). The recovery log is copied FIRST, then the
+    main file: a checkpoint racing the copy then leaves a stale-but-
+    consistent pair, never a torn one. The copy is opened read-write and
+    checkpointed so recovery happens on the copy alone — the original's
+    files are only ever READ (a read-only SQLite open of the original was
+    rejected in planning: on this platform it still writes the `-shm`
+    beside the original, violating the module's immutability contract).
+
+    The `-shm` is deliberately NOT copied: it is a rebuildable index of the
+    `-wal`, and a stale one beside a copied pair is ignored by recovery.
+
+    Returns False when the source changed during the copy (an active
+    writer — bounded retries, then refuse), when the copy cannot be
+    recovered, or when the source is not a database; the caller keeps
+    today's unreadable path.
+    """
+    sidecars = [
+        Path(str(path) + suffix)
+        for suffix in ("-wal", "-journal")
+        if Path(str(path) + suffix).exists()
+    ]
+    sources = sidecars + [path]
+    for _ in range(3):
+        try:
+            before = {
+                p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in sources
+                if p.exists()
+            }
+            for src in sources:
+                shutil.copy2(src, Path(str(copy) + src.name[len(path.name):]))
+            after = {
+                p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in sources
+                if p.exists()
+            }
+        except OSError:
+            # A source the OS refuses (a locked or permission-denied file) or
+            # a sidecar a finishing writer removed between exists() and the
+            # copy: not a database fault, an unusable candidate. Retry, then
+            # refuse — one unreadable candidate must never abort the scan
+            # (PRR-003).
+            continue
+        if before != after:
+            continue  # an active writer moved the source: retry, then refuse
+        try:
+            conn = sqlite3.connect(str(copy))
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            finally:
+                conn.close()
+            return True
+        except sqlite3.DatabaseError:
+            continue
+    return False
+
+
 def inspect(path: Path, repo: str) -> dict | None:
     """Per-DB stats for one slug, read from a temp copy. None = unreadable."""
     repo_l = repo.lower()
     with tempfile.TemporaryDirectory() as td:
         copy = Path(td) / path.name
-        try:
-            shutil.copy2(path, copy)
-        except OSError:
+        if not _faithful_copy(path, copy):
             return None
         try:
             conn = open_existing(copy)
@@ -112,8 +189,16 @@ def inspect(path: Path, repo: str) -> dict | None:
                 complete_expr = "last_full_sync_at IS NOT NULL"
                 if pend:
                     complete_expr += " AND full_sync_pending = 0"
+                # Deterministic winner rule (issue #52): a case-split
+                # candidate's sync_state rows are read through the same
+                # freshest-first ordering the fold's merge uses, so
+                # completeness/watermark never depend on scan order.
+                # COALESCE matches _fold_sync_state's (issues_since or "")
+                # ranking, where NULL and empty string tie.
                 state = conn.execute(
-                    "SELECT issues_since FROM sync_state WHERE lower(repo) = ?", (repo_l,)
+                    "SELECT issues_since FROM sync_state WHERE lower(repo) = ?"
+                    " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
+                    (repo_l,),
                 ).fetchone()
                 items = conn.execute(
                     "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
@@ -126,7 +211,9 @@ def inspect(path: Path, repo: str) -> dict | None:
                 complete = False
                 if state is not None:
                     row = conn.execute(
-                        f"SELECT ({complete_expr}) AS c FROM sync_state WHERE lower(repo) = ?",
+                        f"SELECT ({complete_expr}) AS c FROM sync_state"
+                        " WHERE lower(repo) = ?"
+                        " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
                         (repo_l,),
                     ).fetchone()
                     complete = bool(row["c"])
@@ -144,31 +231,42 @@ def inspect(path: Path, repo: str) -> dict | None:
 
 
 class _MigratedCopy:
-    """Temp copy of a legacy DB, migrated to the current schema if needed.
+    """Temp copy of a legacy DB, migrated to the current schema if needed
+    and then case-folded for EVERY candidate version (issue #52).
 
-    connect+init_schema runs the MIGRATIONS framework on the copy (case
+    `connect`+`init_schema` runs the MIGRATIONS framework on the copy (case
     folds, adds full_sync_pending); the original is never opened for write.
-    The temp directory is removed on close (PRR-006: every --consolidate
-    used to leak a full DB copy into the system temp dir).
+    A candidate already at the current version never migrates, so without
+    the explicit fold its dual-cased rows would still collide the adoption
+    copy — `fold_repo_casings` runs on every copy (idempotent: a pre-v2
+    candidate already folded inside migrate_v1_to_v2 is folded again as a
+    no-op). The temp directory is removed on close (PRR-006: every
+    --consolidate used to leak a full DB copy into the system temp dir).
     """
 
     def __init__(self, path: Path) -> None:
         self._td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
         try:
             self.path = Path(self._td) / path.name
-            shutil.copy2(path, self.path)
-            conn = sqlite3.connect(str(self.path))
+            if not _faithful_copy(path, self.path):
+                raise _UnreadableCandidate(path)
+            version = None
             try:
-                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            except sqlite3.DatabaseError:
-                self.migrated = False
-                conn.close()
-                return
-            conn.close()
+                probe = sqlite3.connect(str(self.path))
+                try:
+                    version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+                finally:
+                    probe.close()
+            except sqlite3.DatabaseError as exc:
+                raise _UnreadableCandidate(path) from exc
             self.migrated = version < CURRENT_USER_VERSION
-            if self.migrated:
-                conn = connect(self.path)
-                init_schema(conn)
+            conn = connect(self.path)
+            try:
+                if self.migrated:
+                    init_schema(conn)
+                fold_repo_casings(conn)
+                conn.commit()
+            finally:
                 conn.close()
         except BaseException:
             self.close()
@@ -342,8 +440,13 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                     )
                     dst.executemany(insert_sql, [tuple(r) for r in rows])
 
+                # The copy is case-folded before this point, so the folded
+                # slug has exactly one sync_state row; the ordering keeps
+                # the read deterministic even if that ever changes.
                 state = src.execute(
-                    "SELECT * FROM sync_state WHERE lower(repo) = ?", (repo_l,)
+                    "SELECT * FROM sync_state WHERE lower(repo) = ?"
+                    " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
+                    (repo_l,),
                 ).fetchone()
                 if state is not None:
                     dst.execute(

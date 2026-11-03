@@ -203,6 +203,18 @@ def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def _index_exists(conn: sqlite3.Connection, index: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?", (index,)
+    ).fetchone() is not None
+
+
 def _fold_dedupe_table(
     conn: sqlite3.Connection,
     table: str,
@@ -234,6 +246,25 @@ def _fold_dedupe_table(
     conn.execute("DROP TABLE _fold")
 
 
+#: Every repo-keyed item-scoped table whose rows die with their item when a
+#: distinct-id `(repo, number)` collision is resolved (issue #52): the five
+#: v1-era tables plus the item-scoped tables added by v7/v9/v10. Coverage
+#: is tested against schema.sql by a census pin in tests/test_migrations.py.
+_LOSER_CHILD_TABLES = (
+    "labels",
+    "comments",
+    "reviews",
+    "pr_files",
+    "assignees",
+    "issue_field_values",
+    "revisions",
+    "item_path_refs",
+    "item_signatures",
+    "item_events",
+    "pr_commits",
+)
+
+
 def _drop_collision_losers(conn: sqlite3.Connection) -> None:
     """Resolve distinct-id `(repo, number)` collisions before folding.
 
@@ -246,6 +277,12 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
     item's number. Children stranded under the *winner's* casing by the
     pre-migration corruption are indistinguishable from the winner's own and
     survive; `sync --force` rebuilds children truthfully.
+
+    The per-loser delete covers EVERY repo-keyed item-scoped table
+    (_LOSER_CHILD_TABLES), not only the five that existed when this helper
+    was written (issue #52): docs/schema.md contracts the cleanup across
+    "every repo-keyed table". Table existence is guarded so the migration
+    stays portable if the schema is ever re-ordered.
     """
     collisions = conn.execute(
         "SELECT lower(repo) AS lr, number, COUNT(DISTINCT id) AS c "
@@ -263,10 +300,12 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
         ).fetchall()
         nid = str(number)
         for (casing,) in loser_casings:
-            conn.execute("DELETE FROM labels WHERE repo = ? AND number = ?", (casing, number))
-            conn.execute("DELETE FROM comments WHERE repo = ? AND number = ?", (casing, number))
-            conn.execute("DELETE FROM reviews WHERE repo = ? AND number = ?", (casing, number))
-            conn.execute("DELETE FROM pr_files WHERE repo = ? AND number = ?", (casing, number))
+            for table in _LOSER_CHILD_TABLES:
+                if _table_exists(conn, table):
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE repo = ? AND number = ?",
+                        (casing, number),
+                    )
             conn.execute(
                 "DELETE FROM edges WHERE repo = ? AND ("
                 "(src_type = 'item' AND src_id = ?) OR (dst_type = 'item' AND dst_id = ?))",
@@ -277,20 +316,21 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
 def _fold_sync_state(conn: sqlite3.Connection) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
-    The explicit INSERT column list below is a snapshot of the PRE-v4 shape
-    and is order-dependent: MIGRATIONS runs v1->v2 before v3->v4, so the
-    rate-limit columns do not exist yet when this fold runs. Adding a v5
-    column requires revisiting this list (or copying via PRAGMA table_info).
-
-    Winner = greatest `issues_since` (NULL ranks lowest, ties by rowid).
-    Timestamps and `include_patches` take MAX so no real sync fact is lost;
-    counts are recomputed afterwards. `full_sync_pending` is never carried
-    from a loser: it is derived from the merged timestamp.
+    The insert is driven by `PRAGMA table_info`, NOT a hardcoded column
+    list: a snapshot list silently drops every column added after it was
+    written (the pre-v4 list would lose the v4 rate-limit columns and the
+    v11 `fetch_source` — issue #52). Winner = greatest `issues_since`
+    (NULL ranks lowest, ties by rowid). Timestamps and `include_patches`
+    take MAX so no real sync fact is lost; the newer columns carry the
+    winner's values; counts are recomputed afterwards.
+    `full_sync_pending` is never carried from a loser: it is derived from
+    the merged timestamp.
     """
     rows = conn.execute("SELECT rowid AS rid, * FROM sync_state ORDER BY rowid").fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
         groups.setdefault(row["repo"].lower(), []).append(row)
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
     for lower_repo, group in groups.items():
         if len(group) == 1 and group[0]["repo"] == lower_repo:
             continue
@@ -304,64 +344,228 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         patches = max(r["include_patches"] for r in group)
         for row in group:
             conn.execute("DELETE FROM sync_state WHERE rowid = ?", (row["rid"],))
+        values: dict[str, object] = {}
+        for column in columns:
+            if column == "repo":
+                values[column] = lower_repo
+            elif column == "last_full_sync_at":
+                values[column] = full
+            elif column == "last_incr_sync_at":
+                values[column] = incr
+            elif column == "include_patches":
+                values[column] = patches
+            elif column in ("item_count", "comment_count", "edge_count"):
+                values[column] = 0
+            elif column == "full_sync_pending":
+                values[column] = 1 if full is None else 0
+            else:
+                keys = winner.keys()
+                values[column] = winner[column] if column in keys else None
         conn.execute(
-            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at, last_incr_sync_at,"
-            " last_error, item_count, comment_count, edge_count, include_patches,"
-            " full_sync_pending) VALUES (?,?,?,?,?,0,0,0,?,?)",
-            (
-                lower_repo,
-                winner["issues_since"],
-                full,
-                incr,
-                winner["last_error"],
-                patches,
-                1 if full is None else 0,
-            ),
+            f"INSERT INTO sync_state ({', '.join(values)}) "
+            f"VALUES ({', '.join('?' for _ in values)})",
+            tuple(values.values()),
         )
+
+
+#: Every repo-keyed table the case-fold dedupes on its folded key, with the
+#: conflict target for that table's declared uniqueness and the ordering
+#: that picks the survivor (freshest-first for items, natural key order for
+#: the composite-keyed children, rowid for the synthetic-pk ones). The
+#: v1-era entries are the clauses migrate_v1_to_v2 has always used; the
+#: post-v2 item-scoped tables join here with issue #52. `edges` is folded
+#: separately (shape-aware clause plus the closes-pair handling).
+_FOLD_TABLES = (
+    ("items",
+     "ON CONFLICT(id) DO NOTHING ON CONFLICT(repo, number) DO NOTHING",
+     "updated_at DESC, id DESC"),
+    ("labels",
+     "ON CONFLICT(repo, number, name) DO NOTHING",
+     "repo DESC, number DESC, name DESC"),
+    ("comments",
+     "ON CONFLICT(repo, kind, github_id) DO NOTHING",
+     "updated_at DESC, pk DESC"),
+    ("pr_files",
+     "ON CONFLICT(repo, number, path) DO NOTHING",
+     "repo DESC, number DESC, path DESC"),
+    ("releases",
+     "ON CONFLICT(repo, tag_name) DO NOTHING",
+     "id DESC"),
+    ("assignees",
+     "ON CONFLICT(repo, number, login) DO NOTHING",
+     "repo DESC, number DESC, login DESC"),
+    ("issue_field_values",
+     "ON CONFLICT(repo, number, field_name) DO NOTHING",
+     "repo DESC, number DESC, field_name DESC"),
+    ("revisions",
+     "ON CONFLICT(id) DO NOTHING",
+     "rowid"),
+    ("item_path_refs",
+     "ON CONFLICT(repo, number, origin, path) DO NOTHING",
+     "rowid"),
+    ("item_signatures",
+     "ON CONFLICT(repo, number, exception, error_line) DO NOTHING",
+     "rowid"),
+    ("item_events",
+     "ON CONFLICT(repo, number, type, created_at) DO NOTHING",
+     "rowid"),
+    ("pr_commits",
+     "ON CONFLICT(repo, number, sha) DO NOTHING",
+     "rowid"),
+)
+
+
+def _union_closes_same_source(conn: sqlite3.Connection) -> None:
+    """Union evidence across FOLDED DUPLICATE groups of `rel='closes'`.
+
+    Two dual-casing rows reporting the same closure through the same stream
+    are ONE fact, so their evidence unions — with
+    `reserve=(CLOSES_REF_MARKER,)`, exactly as production ingest unions a
+    same-source closes refresh (store.py insert_edge). Without the reserve
+    the marker is dropped once the merged evidence hits the 512-byte cap
+    (issue #52, plan critic Round 4). Runs BEFORE the generic dedupe-fold so
+    the fold can never discard a row whose evidence has not been merged.
+    """
+    groups = conn.execute(
+        "SELECT lower(repo) AS lr, src_type, src_id, dst_type, dst_id, source,"
+        " COUNT(*) AS n FROM edges WHERE rel = 'closes'"
+        " GROUP BY lr, src_type, src_id, dst_type, dst_id, source HAVING n > 1"
+    ).fetchall()
+    for group in groups:
+        rows = conn.execute(
+            "SELECT id, evidence FROM edges WHERE lower(repo) = ? AND src_type = ?"
+            " AND src_id = ? AND rel = 'closes' AND dst_type = ? AND dst_id = ?"
+            " AND source = ? ORDER BY id DESC",
+            (group["lr"], group["src_type"], group["src_id"],
+             group["dst_type"], group["dst_id"], group["source"]),
+        ).fetchall()
+        merged = merge_evidence(
+            *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
+        )
+        conn.execute(
+            "UPDATE edges SET evidence = ? WHERE id = ?", (merged, rows[0]["id"])
+        )
+        for other in rows[1:]:
+            conn.execute("DELETE FROM edges WHERE id = ?", (other["id"],))
+
+
+def _collapse_closes_pairs(conn: sqlite3.Connection) -> None:
+    """At most one `closes` edge per (repo, dst, src) pair (issue #19).
+
+    The two GitHub-reported closes streams — closingIssuesReferences
+    (source='closing_ref') and the timeline closed event (source='timeline')
+    — corroborate ONE closure fact, so stored pairs carrying both rows
+    collapse: the closing_ref row survives when present (the structured
+    declaration over the event stream), evidence merged first-seen via
+    extract.merge_evidence, the other rows deleted. Extracted from
+    migrate_v5_to_v6 so the doctor's case-fold (issue #52) reuses these
+    survivor/evidence rules instead of reimplementing them; the partial
+    UNIQUE index that makes the invariant physical is the caller's concern.
+    """
+    dupes = conn.execute(
+        """
+        SELECT repo, src_type, src_id, dst_type, dst_id
+        FROM edges WHERE rel = 'closes'
+        GROUP BY repo, src_type, src_id, dst_type, dst_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    for pair in dupes:
+        rows = conn.execute(
+            """
+            SELECT id, source, evidence FROM edges
+            WHERE repo = ? AND src_type = ? AND src_id = ? AND rel = 'closes'
+            AND dst_type = ? AND dst_id = ?
+            ORDER BY (source = 'closing_ref') DESC, id
+            """,
+            (
+                pair["repo"],
+                pair["src_type"],
+                pair["src_id"],
+                pair["dst_type"],
+                pair["dst_id"],
+            ),
+        ).fetchall()
+        survivor = rows[0]
+        merged = merge_evidence(
+            *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
+        )
+        conn.execute(
+            "UPDATE edges SET evidence = ?, source = ? WHERE id = ?",
+            (merged, survivor["source"], survivor["id"]),
+        )
+        for other in rows[1:]:
+            conn.execute("DELETE FROM edges WHERE id = ?", (other["id"],))
+
+
+def fold_repo_casings(conn: sqlite3.Connection) -> None:
+    """Collapse case-split repo identities to the folded slug.
+
+    One mechanism, two callers: `migrate_v1_to_v2` (every store open below
+    v2) and `doctor`'s consolidation (every candidate, any version —
+    `_MigratedCopy` has already migrated the copy to the current shape, so
+    the source-bearing steps are open there). Idempotent: a second call on
+    already-folded data writes nothing.
+
+    Order matters: distinct-id collisions are resolved FIRST (so a loser's
+    children can never attach to the winner's number), then the
+    same-source closes evidence unions (so the generic dedupe can never
+    discard a row whose evidence has not been merged), then every
+    repo-keyed table dedupes on its folded key.
+
+    The closes-specific steps (same-source union, cross-source collapse)
+    are gated on the `edges.source` column: the genuine v1 `edges` table
+    has no `source` column (it arrives with migrate_v4_to_v5, which also
+    renames legacy keyword-derived `closes` rows to `closes_keyword`), so
+    applying GitHub-backed closes semantics there would be wrong on two
+    counts (issue #52, plan critic Round 5). In that window the fold keeps
+    the shape-aware six-column edge clause and no index dance.
+
+    `full_sync_pending` is derived on MERGED rows only (inside
+    _fold_sync_state): the doctor path must not clobber a live
+    crashed-mid-sync flag on a single-cased current store, so the
+    migration's blanket derivation lives in migrate_v1_to_v2, not here.
+    """
+    _drop_collision_losers(conn)
+    source_bearing = _column_exists(conn, "edges", "source")
+    idx_existed = _index_exists(conn, "ux_edges_closes_pair")
+    if idx_existed:
+        conn.execute("DROP INDEX ux_edges_closes_pair")
+    if source_bearing:
+        _union_closes_same_source(conn)
+    for table, clause, order in _FOLD_TABLES:
+        if _table_exists(conn, table):
+            _fold_dedupe_table(conn, table, clause, order)
+    _fold_dedupe_table(conn, "edges", _edges_conflict_clause(conn), "id DESC")
+    if source_bearing:
+        _collapse_closes_pairs(conn)
+    if idx_existed:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_edges_closes_pair "
+            "ON edges(repo, src_type, src_id, rel, dst_type, dst_id)"
+            " WHERE rel = 'closes'"
+        )
+    conn.execute("UPDATE reviews SET repo = lower(repo)")
+    conn.execute("UPDATE fetch_log SET repo = lower(repo)")
+    _fold_sync_state(conn)
+    from zaxbygraph.store import recount  # local import: store owns the counts
+
+    for (repo,) in conn.execute("SELECT DISTINCT repo FROM sync_state").fetchall():
+        recount(conn, repo)
 
 
 def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
     """v1 -> v2: `sync_state.full_sync_pending` + lowercase repo identity.
 
     Runs inside one transaction owned by init_schema. Idempotent: every step
-    is guarded or a no-op on already-folded data.
+    is guarded or a no-op on already-folded data. The fold itself lives in
+    `fold_repo_casings` (shared with doctor's consolidation, issue #52).
     """
     if not _column_exists(conn, "sync_state", "full_sync_pending"):
         conn.execute(
             "ALTER TABLE sync_state ADD COLUMN full_sync_pending INTEGER NOT NULL DEFAULT 0"
         )
-    _drop_collision_losers(conn)
-    _fold_dedupe_table(
-        conn, "items",
-        "ON CONFLICT(id) DO NOTHING ON CONFLICT(repo, number) DO NOTHING",
-        "updated_at DESC, id DESC",
-    )
-    _fold_dedupe_table(
-        conn, "labels",
-        "ON CONFLICT(repo, number, name) DO NOTHING",
-        "repo DESC, number DESC, name DESC",
-    )
-    _fold_dedupe_table(
-        conn, "comments",
-        "ON CONFLICT(repo, kind, github_id) DO NOTHING",
-        "updated_at DESC, pk DESC",
-    )
-    _fold_dedupe_table(
-        conn, "pr_files",
-        "ON CONFLICT(repo, number, path) DO NOTHING",
-        "repo DESC, number DESC, path DESC",
-    )
-    _fold_dedupe_table(
-        conn, "releases",
-        "ON CONFLICT(repo, tag_name) DO NOTHING",
-        "id DESC",
-    )
-    _fold_dedupe_table(
-        conn, "edges", _edges_conflict_clause(conn), "id DESC"
-    )
-    conn.execute("UPDATE reviews SET repo = lower(repo)")
-    conn.execute("UPDATE fetch_log SET repo = lower(repo)")
-    _fold_sync_state(conn)
+    fold_repo_casings(conn)
     # Single rule, applied once at the end: completeness is derived from the
     # merged timestamps, never carried per-loser. Legacy rows that never
     # finished a full sync stay pending (complete: false) until a clean run
@@ -370,10 +574,6 @@ def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
         "UPDATE sync_state SET full_sync_pending = "
         "CASE WHEN last_full_sync_at IS NULL THEN 1 ELSE 0 END"
     )
-    from zaxbygraph.store import recount  # local import: store owns the counts
-
-    for (repo,) in conn.execute("SELECT DISTINCT repo FROM sync_state").fetchall():
-        recount(conn, repo)
 
 
 #: FTS objects as schema.sql creates them at the current shape (porter
@@ -608,46 +808,15 @@ def migrate_v5_to_v6(conn: sqlite3.Connection) -> None:
     they enter init_schema at user_version 0 and this chain runs in full.
     Idempotent: a store with no duplicate pairs just gains (or already
     has) the index.
+
+    The collapse itself lives in `_collapse_closes_pairs` (shared with the
+    doctor case-fold, issue #52) so the survivor/evidence rules exist once.
     """
-    dupes = conn.execute(
-        """
-        SELECT repo, src_type, src_id, dst_type, dst_id
-        FROM edges WHERE rel = 'closes'
-        GROUP BY repo, src_type, src_id, dst_type, dst_id
-        HAVING COUNT(*) > 1
-        """
-    ).fetchall()
-    for pair in dupes:
-        rows = conn.execute(
-            """
-            SELECT id, source, evidence FROM edges
-            WHERE repo = ? AND src_type = ? AND src_id = ? AND rel = 'closes'
-            AND dst_type = ? AND dst_id = ?
-            ORDER BY (source = 'closing_ref') DESC, id
-            """,
-            (
-                pair["repo"],
-                pair["src_type"],
-                pair["src_id"],
-                pair["dst_type"],
-                pair["dst_id"],
-            ),
-        ).fetchall()
-        survivor = rows[0]
-        merged = merge_evidence(
-            *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
-        )
-        conn.execute(
-            "UPDATE edges SET evidence = ?, source = ? WHERE id = ?",
-            (merged, survivor["source"], survivor["id"]),
-        )
-        for other in rows[1:]:
-            conn.execute("DELETE FROM edges WHERE id = ?", (other["id"],))
+    _collapse_closes_pairs(conn)
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_edges_closes_pair "
         "ON edges(repo, src_type, src_id, rel, dst_type, dst_id) WHERE rel = 'closes'"
     )
-
 
 #: v7 FTS objects (issue #24): items_fts gains the paths_text column,
 #: reviews_fts is new. Kept as individual statements — NEVER `executescript`
@@ -735,6 +904,39 @@ _V7_ITEM_COLUMNS = (
     ("paths_text", "TEXT NOT NULL DEFAULT ''"),
 )
 
+#: The payload-derived item columns the v6->v7 backfill binds, in the
+#: UPDATE's parameter order — one list drives the SQL and the binding so
+#: they cannot drift apart.
+_V7_ITEM_COLUMN_ORDER = (
+    "reactions_total", "milestone", "item_type", "sub_issues_total",
+    "sub_issues_completed", "dependencies_blocked_by", "dependencies_blocking",
+    "dependencies_total_blocked_by", "dependencies_total_blocking",
+    "author_association", "merged_by", "merge_commit", "merged_at",
+)
+
+#: SQLite's signed 64-bit integer domain; JSON carries arbitrary precision.
+_SQLITE_INT_MIN = -(2 ** 63)
+_SQLITE_INT_MAX = 2 ** 63 - 1
+
+
+def _v7_scalar(value: object) -> object:
+    """A payload-derived value must bind as a SQLite scalar.
+
+    Stored `raw_json` is untrusted input: a wrong-typed field (a list where
+    a string belongs) or an integer beyond the signed 64-bit range reaches
+    the binder as a Python object SQLite cannot store, which would abort
+    the migration chain and pin the store's `user_version` forever (issue
+    #53). The honest degradation is NULL: the row keeps its non-payload
+    columns and the chain advances. This is a PAYLOAD-validation boundary —
+    a database execution fault is not swallowed here (AGENTS.md: a storage
+    fault is reported, not swallowed).
+    """
+    if value is None or isinstance(value, (str, float)):
+        return value
+    if isinstance(value, int):  # bool is an int subclass and binds as 0/1
+        return value if _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX else None
+    return None
+
 
 def _existing_row_v7(conn: sqlite3.Connection, repo: str, number: int, item_id: int):
     """The stored row's ABSENT-mergeable columns as a dict, resolving both
@@ -799,11 +1001,20 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
 
     # Backfill items from the stored (merged) payload. Keys absent from an
     # old payload stay NULL (AC2); the pull-owned trio uses the same
-    # ABSENT-merge rule as ingest so a stored value never regresses.
+    # ABSENT-merge rule as ingest so a stored value never regresses. A
+    # payload the store cannot parse or whose fields are wrong-typed
+    # (issue #53) degrades THAT ROW's derived columns to NULL — the chain
+    # advances and the row keeps its non-payload columns; a storage fault
+    # is not swallowed (AGENTS.md).
     for row in conn.execute(
         "SELECT repo, number, id, raw_json FROM items"
     ).fetchall():
-        raw = json.loads(row["raw_json"])
+        try:
+            raw = json.loads(row["raw_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
         values = merge_absent(extract_listing_signals(raw), {})
         pull_values = merge_absent(
             extract_pull_owned(raw),
@@ -818,42 +1029,34 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
             " author_association = ?, merged_by = ?, merge_commit = ?,"
             " merged_at = ? WHERE id = ?",
             (
-                values["reactions_total"],
-                values["milestone"],
-                values["item_type"],
-                values["sub_issues_total"],
-                values["sub_issues_completed"],
-                values["dependencies_blocked_by"],
-                values["dependencies_blocking"],
-                values["dependencies_total_blocked_by"],
-                values["dependencies_total_blocking"],
-                values["author_association"],
-                values["merged_by"],
-                values["merge_commit"],
-                values["merged_at"],
+                *(_v7_scalar(values[column]) for column in _V7_ITEM_COLUMN_ORDER),
                 row["id"],
             ),
         )
-        for assignee in raw.get("assignees") or []:
-            login = assignee.get("login") if isinstance(assignee, dict) else assignee
-            if login:
-                conn.execute(
-                    "INSERT OR IGNORE INTO assignees(repo, number, login)"
-                    " VALUES (?, ?, ?)",
-                    (row["repo"], row["number"], str(login)),
-                )
-        for field in raw.get("issue_field_values") or []:
-            if isinstance(field, dict) and field.get("name") is not None:
-                conn.execute(
-                    "INSERT OR REPLACE INTO issue_field_values"
-                    "(repo, number, field_name, value) VALUES (?, ?, ?, ?)",
-                    (
-                        row["repo"],
-                        row["number"],
-                        str(field["name"]),
-                        None if field.get("value") is None else str(field["value"]),
-                    ),
-                )
+        assignees = raw.get("assignees")
+        if isinstance(assignees, list):
+            for assignee in assignees:
+                login = assignee.get("login") if isinstance(assignee, dict) else assignee
+                if login:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO assignees(repo, number, login)"
+                        " VALUES (?, ?, ?)",
+                        (row["repo"], row["number"], str(login)),
+                    )
+        fields = raw.get("issue_field_values")
+        if isinstance(fields, list):
+            for field in fields:
+                if isinstance(field, dict) and field.get("name") is not None:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO issue_field_values"
+                        "(repo, number, field_name, value) VALUES (?, ?, ?, ?)",
+                        (
+                            row["repo"],
+                            row["number"],
+                            str(field["name"]),
+                            None if field.get("value") is None else str(field["value"]),
+                        ),
+                    )
 
     # Derived columns and comment provenance (table-derived, not payload).
     for comment_count_row in conn.execute(
@@ -866,12 +1069,17 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     for comment_row in conn.execute(
         "SELECT pk, raw_json FROM comments WHERE author_association IS NULL"
     ).fetchall():
-        raw = json.loads(comment_row["raw_json"])
+        try:
+            raw = json.loads(comment_row["raw_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict):
+            continue
         value = raw.get("author_association")
         if value is not None:
             conn.execute(
                 "UPDATE comments SET author_association = ? WHERE pk = ?",
-                (value, comment_row["pk"]),
+                (_v7_scalar(value), comment_row["pk"]),
             )
     for item_row in conn.execute(
         "SELECT repo, number, kind FROM items WHERE kind = 'pr'"

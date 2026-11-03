@@ -96,8 +96,11 @@ shouldn't.
   ('timeline','closing_ref','link')`, which are GitHub-reported link facts a
   degraded re-ingest cannot re-derive and survive every re-ingest. The v10
   `link` stream is additionally replaced **per connection** when that
-  connection was fetched complete (overflow is union-only), so a complete
-  re-fetch retracts removed links while a degraded one never does
+  connection was fetched complete AND faithfully reported — a node that
+  fails to parse, a carried plural null, or a list on a singular connection
+  is malformed, not a removal, so it is union-only like an overflow
+  (issue #53) — while a complete, well-formed re-fetch retracts removed
+  links and a degraded one never does
   (docs/schema.md). Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.
