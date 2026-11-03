@@ -1894,12 +1894,19 @@ def cmd_snapshot_publish(args: argparse.Namespace) -> int:
             host, repo = remote_info()
     except RepoError as exc:
         return emit_failure(args, 2, str(exc), slug=None)
-    store_db = Path(args.db) if args.db else store_db_path(host, repo)
+    # the snapshot commands resolve the store exactly like sync and every
+    # read command: --db > ZAXBYGRAPH_DB > existing store > legacy in-repo
+    # DB > the would-be store path (paths.resolve_db)
+    store_db, _chain = resolve_db(repo, explicit=args.db, host=host)
     try:
         result = snapshot_publish(store_db, args.target, args.publisher)
     except SnapshotError as exc:
         return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
                             code_key=exc.code, hint=exc.hint)
+    except (OSError, sqlite3.Error) as exc:
+        # a storage fault is a result object, never a traceback
+        return emit_failure(args, 1, str(exc), slug=repo, db_path=store_db,
+                            code_key="runtime")
     emit_result(args, result, slug=repo, db_path=store_db, identity=False)
     return 0
 
@@ -1912,13 +1919,18 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
             host, repo = remote_info()
     except RepoError as exc:
         return emit_failure(args, 2, str(exc), slug=None)
-    store_db = Path(args.db) if args.db else store_db_path(host, repo)
+    store_db, _chain = resolve_db(repo, explicit=args.db, host=host)
     try:
         result = snapshot_pull(store_db, args.source, force=args.force,
-                            verify_sample=max(0, int(args.verify_sample)))
+                               verify_sample=max(0, int(args.verify_sample)),
+                               expected_repo=repo, expected_host=host)
     except SnapshotError as exc:
         return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
                             code_key=exc.code, hint=exc.hint)
+    except (OSError, sqlite3.Error) as exc:
+        # a storage fault is a result object, never a traceback
+        return emit_failure(args, 1, str(exc), slug=repo, db_path=store_db,
+                            code_key="runtime")
     emit_result(args, result, slug=repo, db_path=store_db, identity=False)
     return 0
 

@@ -239,6 +239,35 @@ class SnapshotPullTests(unittest.TestCase):
             _git("init", "-b", "main", str(work), cwd=td)
             real = publish(self.db, str(self.bare), publisher="x")["manifest"]
             bogus = dict(real)
+            # a descriptor that MATCHES the junk bytes but carries a wrong
+            # sha: the descriptor check passes and the sha check fires
+            junk = b"\x1f\x8b\x08\x00junk"
+            bogus["parts"] = [{"name": "snapshot-0000.gz",
+                               "sha256": "0" * 64,
+                               "bytes": len(junk)}]
+            (work / "manifest.json").write_text(
+                json.dumps(bogus, sort_keys=True), encoding="utf-8")
+            (work / "snapshot-0000.gz").write_bytes(junk)
+            _git("add", "-A", cwd=work)
+            tree = _git("write-tree", cwd=work).stdout.decode().strip()
+            commit = _git("commit-tree", tree, cwd=work, check=True).stdout.decode().strip()
+            _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
+                 check=True)
+            exc = self._assert_refused_intact(db, bare)
+            self.assertEqual(exc.code, "part_sha_mismatch")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_part_size_mismatch(self) -> None:
+        # PRR-G: the descriptor must match the bytes actually received
+        td = Path(tempfile.mkdtemp(prefix="tamsize_"))
+        try:
+            db, bare, _ = self._pair(td, "2027-06-01T00:00:00Z")
+            work = td / "work"
+            work.mkdir()
+            _git("init", "-b", "main", str(work), cwd=td)
+            real = publish(self.db, str(self.bare), publisher="x")["manifest"]
+            bogus = dict(real)
             bogus["parts"] = [{"name": "snapshot-0000.gz",
                                "sha256": "0" * 64, "bytes": 1}]
             (work / "manifest.json").write_text(
@@ -250,9 +279,31 @@ class SnapshotPullTests(unittest.TestCase):
             _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force", cwd=work,
                  check=True)
             exc = self._assert_refused_intact(db, bare)
-            self.assertEqual(exc.code, "part_sha_mismatch")
+            self.assertEqual(exc.code, "part_size_mismatch")
         finally:
             shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_non_object_manifest(self) -> None:
+        # PRR-A/PRR-711: a manifest decoding to null or a scalar must refuse
+        # as bad_manifest, never raise TypeError out of pull
+        for payload in (b"null", b"42"):
+            td = Path(tempfile.mkdtemp(prefix="tamnull_"))
+            try:
+                db, bare, _ = self._pair(td, "2027-06-01T00:00:00Z")
+                work = td / "work"
+                work.mkdir()
+                _git("init", "-b", "main", str(work), cwd=td)
+                (work / "manifest.json").write_bytes(payload)
+                _git("add", "-A", cwd=work)
+                tree = _git("write-tree", cwd=work).stdout.decode().strip()
+                commit = _git("commit-tree", tree, cwd=work,
+                              check=True).stdout.decode().strip()
+                _git("push", str(bare), commit + ":" + SNAPSHOT_REF, "--force",
+                     cwd=work, check=True)
+                exc = self._assert_refused_intact(db, bare)
+                self.assertEqual(exc.code, "bad_manifest", payload)
+            finally:
+                shutil.rmtree(td, ignore_errors=True)
 
     def test_pull_refuses_tampered_or_newer_corrupt_db(self) -> None:
         td = Path(tempfile.mkdtemp(prefix="corrupt_"))
@@ -524,21 +575,29 @@ class SnapshotReviewFixTests(unittest.TestCase):
                     reader.close()
             else:
                 # POSIX: unlink/replace succeed over a live reader, so the
-                # install lands (disclosed asymmetry; the refusal leg runs
-                # on Windows)
+                # install lands. The assertion is DISCRIMINATING (PRR-I6):
+                # the store is first mutated to a DIFFERENT watermark, so
+                # the pre-pull value cannot satisfy it — only a real
+                # install can restore the snapshot's watermark.
+                conn = sqlite3.connect(str(db))
+                conn.execute(
+                    "UPDATE sync_state SET issues_since = ? WHERE repo = ?",
+                    ("2000-01-01T00:00:00Z", REPO))
+                conn.commit()
+                conn.close()
                 reader = sqlite3.connect(str(db))
                 try:
                     reader.execute("SELECT COUNT(*) FROM items").fetchone()
                     pull(db, str(bare), force=True)
-                    conn = sqlite3.connect(str(db))
-                    conn.row_factory = sqlite3.Row
-                    row = conn.execute(
-                        "SELECT issues_since FROM sync_state WHERE repo = ?",
-                        (REPO,)).fetchone()
-                    conn.close()
-                    self.assertEqual(row["issues_since"], wmark)
                 finally:
                     reader.close()
+                conn = sqlite3.connect(str(db))
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT issues_since FROM sync_state WHERE repo = ?",
+                    (REPO,)).fetchone()
+                conn.close()
+                self.assertEqual(row["issues_since"], wmark)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
@@ -851,6 +910,9 @@ class SnapshotReviewFixTests(unittest.TestCase):
             env["PYTHONPATH"] = os.pathsep.join(
                 [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
             import subprocess
+            # success legs: the full machine-mode contract — exit 0, an
+            # EMPTY stderr (the guardrail this command is exempted from),
+            # and one parseable envelope carrying all six keys
             for argv in (
                 ["snapshot", "publish", str(bare), "--db", str(db),
                  "--repo", REPO, "--publisher", "env", "--format", "json"],
@@ -865,10 +927,90 @@ class SnapshotReviewFixTests(unittest.TestCase):
                     capture_output=True, env=env, cwd=str(REPO_ROOT),
                     timeout=120)
                 self.assertEqual(proc.returncode, 0, proc.stderr[:200])
+                self.assertEqual(proc.stderr, b"",
+                                 "machine mode must keep stderr empty")
                 payload = json.loads(proc.stdout.decode("utf-8"))
                 for key in ("ok", "db", "repo", "freshness", "data",
                             "truncated"):
                     self.assertIn(key, payload)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_cli_refusal_codes_reach_the_envelope(self) -> None:
+        # PRR-I2: code_key=exc.code is shipped; a refusal through the CLI
+        # must carry the SNAPSHOT's code, not the generic bad_request
+        td = Path(tempfile.mkdtemp(prefix="cliref_"))
+        try:
+            empty = td / "history.db"
+            conn = connect(empty)
+            init_schema(conn)
+            conn.close()
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.pathsep.join(
+                [str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])
+            proc = subprocess.run(
+                [sys.executable, "-m", "zaxbygraph", "snapshot", "publish",
+                 str(td / "bare"), "--db", str(empty), "--repo", REPO,
+                 "--format", "json"],
+                capture_output=True, env=env, cwd=str(REPO_ROOT), timeout=120)
+            self.assertEqual(proc.returncode, 2, proc.stderr[:200])
+            payload = json.loads(proc.stdout.decode("utf-8"))
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error"]["code"], "repo_not_synced")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_multi_repo_destination(self) -> None:
+        # PRR-C: a whole-file replace must not silently drop the other
+        # repos in the destination store
+        td = Path(tempfile.mkdtemp(prefix="destmulti_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="t")
+            # a genuine two-repo destination: sync BOTH repos into one db
+            merged = td / "merged.db"
+            mconn = connect(merged)
+            init_schema(mconn)
+            mconn.row_factory = sqlite3.Row
+            src = FakeGitHubSource()
+            for n in range(601, 604):
+                src.add_issue(issue(n, title=f"R{n}", body="b",
+                                    created_at="2027-06-01T00:00:00Z"))
+            sync_repo(mconn, src, REPO)
+            src2 = FakeGitHubSource()
+            src2.add_issue(issue(901, title="Other repo", body="x",
+                                 created_at="2027-06-01T00:00:00Z"))
+            sync_repo(mconn, src2, "acme/other")
+            mconn.close()
+            before = merged.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(merged, str(bare), force=False)
+            self.assertEqual(ctx.exception.code, "multi_repo_destination")
+            self.assertEqual(merged.read_bytes(), before)
+            # --force overrides, and the caller owns the consequence
+            pull(merged, str(bare), force=True)
+            self.assertTrue(merged.exists())
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_repo_mismatch(self) -> None:
+        # PRR-C: a snapshot for repo A must never install into repo B's
+        # store, even when the caller resolves B by cwd/--repo
+        td = Path(tempfile.mkdtemp(prefix="repomis_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="t")
+            dst = td / "dst"
+            dst.mkdir()
+            dest = dst / "history.db"
+            before = dest.read_bytes() if dest.exists() else b""
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(dest, str(bare), force=False, expected_repo="acme/other")
+            self.assertEqual(ctx.exception.code, "repo_mismatch")
+            self.assertEqual(dest.read_bytes() if dest.exists() else b"",
+                             before)
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

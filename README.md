@@ -742,7 +742,11 @@ Publish before you leave (`zaxbygraph snapshot publish <store-repo>`),
 pull on arrival (`zaxbygraph snapshot pull <store-repo>`, add
 `--verify-sample 5` to spot-check five items against live GitHub), then
 run a normal incremental `sync` — only updates after the snapshot's watermark
-come over the network.
+come over the network. `--verify-sample` compares each sampled item's stored
+fields (title, body, state, timestamps, author, labels, pull marker) against
+the live payload; it does not re-fetch comments, reviews, files or events, and
+it is not the `content_hash` a full re-sync would compute — a clean sample
+means GitHub has not moved on those fields since the snapshot.
 
 ### Team recipe
 

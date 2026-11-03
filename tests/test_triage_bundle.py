@@ -32,7 +32,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import atexit
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -65,6 +67,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: dedicated temp cwd instead of REPO_ROOT - an operator's repo-root
 #: `.zaxbygraph.toml` must never reweight a check.
 _LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-legs-")
+#: PRR-I7: the leg cwd is created once per process and removed at exit, so
+#: repeated suite runs do not accumulate temp directories
+atexit.register(shutil.rmtree, _LEG_CWD, ignore_errors=True)
 
 #: Deterministic "latest synced_at" anchor for every store whose stage-2
 #: hotspot the hand computation depends on (04-root-cause.md section 2:

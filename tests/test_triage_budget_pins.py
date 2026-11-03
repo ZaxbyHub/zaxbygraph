@@ -9,6 +9,7 @@ Stdlib only; unittest; hermetic.
 from __future__ import annotations
 
 import json
+import atexit
 import os
 import shutil
 import sqlite3
@@ -29,6 +30,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: hermeticity (issue #46 AC2): bundle legs run in a dedicated temp cwd so
 #: ambient operator configs cannot reweight the pins
 _LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-budget-legs-")
+
+atexit.register(shutil.rmtree, _LEG_CWD, ignore_errors=True)
 
 
 def _cli_json(argv: list[str]) -> dict:

@@ -23,6 +23,7 @@ Design notes:
 """
 from __future__ import annotations
 
+import errno
 import gzip
 import hashlib
 import json
@@ -36,13 +37,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .db import CURRENT_USER_VERSION, connect
-from .export import canonical, iter_corpus_content_lines
+from .export import MIN_EXPORT_VERSION, canonical, iter_corpus_content_lines
 
 #: snapshot manifest format stamp
 MANIFEST_FORMAT = "zaxbygraph.snapshot.v1"
 
 #: max gzip part size (bytes): 100 MB per the issue's splitting rule
 PART_MAX_BYTES = 100 * 1024 * 1024
+
+#: per-invocation git credential configuration: gh's helper is the only
+#: sanctioned bridge from GH_TOKEN (or an interactive gh login) to git, and
+#: it is passed with -c so no config file is ever written
+_CREDENTIAL_CONFIG = (
+    ("credential.helper", ""),
+    ("credential.helper", "!gh auth git-credential"),
+    ("credential.useHttpPath", "true"),
+)
+
+#: hard ceiling on the EXPANDED snapshot bytes a pull will allocate: a
+#: small published part can expand ~1030x, so the pull path caps the
+#: expansion before decompressing into memory (publish-side PART_MAX_BYTES
+#: bounds the compressed side only)
+PULL_MAX_DB_BYTES = 8 * 1024 * 1024 * 1024
 
 #: the published ref (issue #34 AC6 default location)
 SNAPSHOT_REF = "refs/zaxbygraph/snapshot"
@@ -79,11 +95,52 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
         "GIT_COMMITTER_DATE": _FIXED_DATE,
     })
     # the temp-repo plumbing must not inherit an ambient checkout context
-    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
+    # or an ambient identity (which would override the -c identity below
+    # and make the orphan commit non-deterministic)
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+              "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_DATE",
+              "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+              "GIT_COMMITTER_DATE"):
         env.pop(k, None)
-    proc = subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, env=env, timeout=300,
-    )
+    env.update({
+        "GIT_AUTHOR_DATE": _FIXED_DATE,
+        "GIT_COMMITTER_DATE": _FIXED_DATE,
+    })
+    # gh is this repo's only credential (AGENTS.md), and the git subprocess
+    # runs with the ambient git config neutralized for determinism — so the
+    # credential helper is configured PER INVOCATION (never written to any
+    # config file). That keeps the documented HTTPS push/fetch working with
+    # GH_TOKEN or an interactive gh login, while a host without gh still
+    # gets the clean GIT_TERMINAL_PROMPT=0 failure rather than a hang.
+    argv = ["git"]
+    for key, value in _CREDENTIAL_CONFIG:
+        argv += ["-c", f"{key}={value}"]
+    argv += args
+    try:
+        proc = subprocess.run(
+            argv, cwd=str(cwd), capture_output=True, env=env,
+            timeout=300,
+        )
+    except FileNotFoundError as exc:
+        raise SnapshotError(
+            "git_missing",
+            f"git executable not found: {exc}",
+            hint="snapshot transport drives git as a subprocess; "
+                 "git must be on PATH",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SnapshotError(
+            "git_timeout",
+            f"git {args[0]} timed out after 300s",
+            hint="the snapshot transfer is too slow for the transport"
+                 " timeout; retry or publish from a faster link",
+        ) from exc
+    except OSError as exc:
+        raise SnapshotError(
+            "git_failed",
+            f"git {args[0]} could not run: {exc}",
+            hint="check the git installation and the target path",
+        ) from exc
     if check and proc.returncode != 0:
         raise SnapshotError(
             "git_failed",
@@ -175,7 +232,18 @@ def publish(db_path: Path, target: str, publisher: str) -> dict:
     publisher = (publisher or "").strip() or "unknown"
     from .sync import acquire_sync_lock
 
+    # A store that does not exist (or is not a file) must refuse BEFORE
+    # anything creates it: connect() would otherwise leave a schema-less
+    # file at the canonical path that resolve_db prefers over the real
+    # store, turning later reads into store_unreadable.
+    if not db_path.is_file():
+        raise SnapshotError(
+            "no_corpus",
+            f"no store at {db_path}; run sync first",
+            hint="snapshot publish moves a synced corpus",
+        )
     lock = acquire_sync_lock(db_path, wait=True)
+    tmp: Path | None = None
     try:
         conn = connect(db_path)
         try:
@@ -196,13 +264,23 @@ def publish(db_path: Path, target: str, publisher: str) -> dict:
             tmp = Path(tempfile.mkdtemp(prefix="zaxbygraph-publish-"))
             staged = tmp / "staged.db"
             _staged_backup(conn, staged)
+            uv = int(conn.execute("PRAGMA user_version").fetchone()[0])
         finally:
             conn.close()
-        try:
-            return _publish_staged(staged, tmp, target, publisher, repo, db_path)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        if uv < MIN_EXPORT_VERSION:
+            # the corpus digest needs the v10 tables; refuse with the
+            # same coded floor export-corpus already applies
+            raise SnapshotError(
+                "store_too_old",
+                f"store schema v{uv} is below the export floor"
+                f" (v{MIN_EXPORT_VERSION}); re-run sync once against this"
+                " database to migrate",
+                hint="snapshot transport needs a v10+ store",
+            )
+        return _publish_staged(staged, tmp, target, publisher, repo, db_path)
     finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
         lock.release_owned()
 def _publish_staged(staged: Path, tmp: Path, target: str,
                     publisher: str, repo: str, db_path: Path) -> dict:
@@ -291,19 +369,26 @@ def _git_publish(tmp: Path, target: str, publisher: str,
         hint=_tail(push.stderr),
     )
 def pull(db_path: Path, source: str, force: bool = False,
-         verify_sample: int = 0, source_factory=None) -> dict:
+         verify_sample: int = 0, source_factory=None,
+         expected_repo: str | None = None,
+         expected_host: str | None = None) -> dict:
     """snapshot pull (issue #34 AC3-AC5): verify-then-install. Staged
     verification happens first (part shas, gzip stream, db sha, quick_check,
-    schema version); provenance lands in the staged db; the sync lock is
-    held for the authoritative re-check and the install; one atomic replace
-    replaces the store; post-install the corpus digest is re-verified."""
+    schema version); the destination identity is bound to the manifest
+    BEFORE the lock is taken; provenance lands in the staged db; the sync
+    lock is held for the authoritative re-check and the install; one atomic
+    replace replaces the store; post-install the corpus digest is re-verified."""
     db_path = Path(db_path).resolve()
+    # the lock file needs its directory; the store FILE itself is never
+    # created here (a schema-less file at the canonical path would shadow
+    # the real store in resolve_db)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     from .sync import acquire_sync_lock
 
     tmp = Path(tempfile.mkdtemp(prefix="zaxbygraph-pull-"))
     try:
         manifest, gz_bytes = _fetch_and_verify_parts(tmp, source)
+        _bind_destination(manifest, expected_repo, expected_host)
         staged = tmp / "staged.db"
         _verify_staged(staged, gz_bytes, manifest)
 
@@ -311,9 +396,9 @@ def pull(db_path: Path, source: str, force: bool = False,
 
         lock = acquire_sync_lock(db_path, wait=True)
         try:
-            local_newer = _local_watermark(db_path)
+            local_newer = _local_watermark(db_path, manifest["repo"])
+            _check_destination_shape(db_path, manifest, force)
             if (local_newer is not None
-                    and manifest.get("watermark")
                     and local_newer > manifest["watermark"] and not force):
                 raise SnapshotError(
                     "local_newer",
@@ -340,20 +425,43 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
     wd = tmp / "work"
     wd.mkdir()
     _run_git(["init", "-b", "main"], wd)
-    fetched = None
+    # fetch EVERY candidate ref and install the NEWEST manifest: a stale
+    # custom ref left behind by a namespace refusal must not keep serving
+    # the first snapshot forever (swarm-pr-review PRR-H)
+    candidates = {}
     for ref in (SNAPSHOT_REF, "refs/heads/" + SNAPSHOT_BRANCH):
         f = _run_git(["fetch", source, ref], wd, check=False)
-        if f.returncode == 0:
-            fetched = ref
-            break
-    if fetched is None:
+        if f.returncode != 0:
+            continue
+        commit = _run_git(["rev-parse", "FETCH_HEAD"], wd).stdout.decode().strip()
+        mbytes = _run_git(["cat-file", "blob", commit + ":manifest.json"],
+                          wd, check=False)
+        if mbytes.returncode != 0:
+            continue
+        try:
+            cand = json.loads(mbytes.stdout.decode("utf-8"))
+        except ValueError:
+            # unparseable: keep the candidate so the downstream decoder
+            # produces the coded bad_manifest refusal
+            cand = None
+        if isinstance(cand, dict) and isinstance(cand.get("watermark"), str)                 and cand["watermark"]:
+            wm = cand["watermark"]
+        else:
+            # malformed/absent watermark sorts lowest but is still served,
+            # so the manifest validation below refuses it with its code
+            wm = ""
+        candidates[ref] = (wm, commit, mbytes.stdout)
+    if not candidates:
         raise SnapshotError(
             "snapshot_absent",
             f"source has neither {SNAPSHOT_REF} nor the fallback branch",
             hint="publish first, or point pull at the right repo",
         )
-    commit = _run_git(["rev-parse", "FETCH_HEAD"], wd).stdout.decode().strip()
-    mbytes = _run_git(["cat-file", "blob", commit + ":manifest.json"], wd).stdout
+    # newest watermark wins; ties break toward the custom ref so a stable
+    # source keeps a deterministic answer
+    fetched = max(candidates,
+                  key=lambda r: (candidates[r][0], r == SNAPSHOT_REF))
+    watermark, commit, mbytes = candidates[fetched]
     try:
         manifest = json.loads(mbytes.decode("utf-8"))
     except ValueError as exc:
@@ -362,6 +470,15 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             f"snapshot manifest is not valid JSON: {exc}",
             hint="re-publish and re-pull",
         ) from exc
+    if not isinstance(manifest, dict):
+        # a remote manifest that decodes to null/scalar/list must refuse as
+        # bad_manifest, not raise TypeError on the membership test below
+        raise SnapshotError(
+            "bad_manifest",
+            f"snapshot manifest must be a JSON object, got"
+            f" {type(manifest).__name__}",
+            hint="re-publish and re-pull",
+        )
     missing = [k for k in ("format", "repo", "user_version", "watermark",
                            "db_sha256", "gz_sha256", "corpus_sha256",
                            "parts") if k not in manifest]
@@ -392,6 +509,25 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             "name/sha256/bytes",
             hint="re-publish and re-pull",
         )
+    for part in parts:
+        # part names reach a git object path and local paths: require a
+        # plain non-empty string without separators or NUL
+        name = part["name"]
+        if (not isinstance(name, str) or not name
+                or "\x00" in name or "/" in name or "\\" in name
+                or name in (".", "..")):
+            raise SnapshotError(
+                "bad_manifest",
+                f"snapshot part name {name!r} is not a plain file name",
+                hint="re-publish and re-pull",
+            )
+        if not isinstance(part["bytes"], int) or isinstance(part["bytes"], bool) \
+                or part["bytes"] < 0:
+            raise SnapshotError(
+                "bad_manifest",
+                f"snapshot part {name!r} bytes must be a non-negative int",
+                hint="re-publish and re-pull",
+            )
     if manifest.get("format") != MANIFEST_FORMAT:
         raise SnapshotError(
             "bad_manifest",
@@ -399,8 +535,16 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             hint="not a zaxbygraph snapshot",
         )
     gz_parts = []
-    for part in manifest.get("parts", []):
+    for part in parts:
         blob = _run_git(["cat-file", "blob", commit + ":" + part["name"]], wd).stdout
+        if len(blob) != part["bytes"]:
+            # the descriptor must match the bytes actually received
+            raise SnapshotError(
+                "part_size_mismatch",
+                f"part {part['name']} is {len(blob)} bytes, manifest says"
+                f" {part['bytes']}",
+                hint="the snapshot content changed or was tampered with",
+            )
         got = hashlib.sha256(blob).hexdigest()
         if got != part["sha256"]:
             raise SnapshotError(
@@ -418,7 +562,18 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
         raise SnapshotError("gz_sha_mismatch", "gzip stream sha mismatch",
                             hint="re-publish or re-pull")
     try:
+        # bounded decompression: a small published part can expand ~1030x,
+        # so the pull path caps the expanded size before allocating it
         raw = gzip.decompress(gz_bytes)
+        if len(raw) > PULL_MAX_DB_BYTES:
+            raise SnapshotError(
+                "snapshot_too_large",
+                f"snapshot expands to {len(raw)} bytes, over the"
+                f" {PULL_MAX_DB_BYTES}-byte pull ceiling",
+                hint="the snapshot is too large for this build to install",
+            )
+    except SnapshotError:
+        raise
     except (OSError, EOFError) as exc:
         raise SnapshotError(
             "gz_bad",
@@ -451,6 +606,16 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
             f"snapshot schema v{uv} newer than this build (v{CURRENT_USER_VERSION})",
             hint="upgrade zaxbygraph and re-pull",
         )
+    if uv < MIN_EXPORT_VERSION:
+        # the corpus digest below needs the v10 tables; refuse with the
+        # same coded floor export-corpus already applies
+        raise SnapshotError(
+            "store_too_old",
+            f"snapshot schema v{uv} is below the export floor"
+            f" (v{MIN_EXPORT_VERSION}); re-run sync once against this"
+            " database to migrate",
+            hint="snapshot transport needs a v10+ store",
+        )
 
 
 def _check_staged_digest(staged: Path, manifest: dict) -> None:
@@ -465,12 +630,81 @@ def _check_staged_digest(staged: Path, manifest: dict) -> None:
         )
 
 
-def _local_watermark(db_path: Path) -> str | None:
+def _bind_destination(manifest: dict, expected_repo: str | None,
+                      expected_host: str | None) -> None:
+    """Bind the snapshot to the destination BEFORE anything is replaced
+    (swarm-pr-review PRR-C): a snapshot for another repo must never install
+    into this store, and a manifest whose host namespace differs from the
+    destination's is refused too. The manifest repo/host are written by
+    publish; this is the read side that was missing."""
+    snap_repo = manifest.get("repo")
+    if not isinstance(snap_repo, str) or not snap_repo:
+        raise SnapshotError(
+            "bad_manifest",
+            "snapshot manifest repo must be a non-empty string",
+            hint="re-publish and re-pull",
+        )
+    if expected_repo is not None and snap_repo != expected_repo:
+        raise SnapshotError(
+            "repo_mismatch",
+            f"snapshot holds {snap_repo!r} but the destination is"
+            f" {expected_repo!r}",
+            hint="pull the snapshot into the matching repo's store, or"
+                 " pass --repo for the snapshot's repo",
+        )
+    if expected_host is not None:
+        snap_host = manifest.get("host")
+        if snap_host not in (None, "unknown") and snap_host != expected_host:
+            raise SnapshotError(
+                "host_mismatch",
+                f"snapshot was taken on host {snap_host!r} but the"
+                f" destination is {expected_host!r}",
+                hint="snapshots do not move between origin hosts",
+            )
+
+
+def _check_destination_shape(db_path: Path, manifest: dict,
+                             force: bool) -> None:
+    """A whole-file replace destroys every other repo in the destination,
+    so a multi-repo destination is refused unless --force is passed. The
+    publish side already refuses a multi-repo SOURCE (multi_repo_store);
+    this is the symmetric destination guard (PRR-C)."""
+    if not db_path.is_file():
+        return
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return
+    try:
+        repos = [r[0] for r in conn.execute("SELECT repo FROM sync_state")]
+    except sqlite3.Error:
+        return
+    finally:
+        conn.close()
+    others = [r for r in repos if r != manifest["repo"]]
+    if others and not force:
+        raise SnapshotError(
+            "multi_repo_destination",
+            f"destination store also holds {', '.join(sorted(others))};"
+            " replacing it would drop those corpora",
+            hint="pull into a single-repo store, or pass --force to"
+                 " overwrite the whole store",
+        )
+
+
+def _local_watermark(db_path: Path, repo: str) -> str | None:
+    """The destination's watermark FOR THE SNAPSHOT'S REPO. An absent or
+    unreadable store reads as None (no local corpus) and must never be
+    created just to ask — connect() would leave a schema-less file that
+    resolve_db prefers over the real store (PRR-F3)."""
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             row = conn.execute(
-                "SELECT issues_since FROM sync_state LIMIT 1").fetchone()
+                "SELECT issues_since FROM sync_state WHERE repo = ?",
+                (repo,)).fetchone()
         finally:
             conn.close()
     except sqlite3.Error:
@@ -504,20 +738,18 @@ def _now_iso() -> str:
 
 
 def _install(staged: Path, db_path: Path) -> None:
-    """Best-effort WAL quiesce, delete old sidecars BEFORE the replace,
-    then ONE os.replace. The staged file is closed and self-contained.
-    The quiesce is deliberately unguarded-by-verdict (any failure there
-    falls through - pull is the recovery path for a corrupt dest); the
-    COMMITTED refusal is the guarded OSError below (Windows refuses open
-    handles as coded dest_open; POSIX installs over a live reader,
-    disclosed in the test)."""
+    """Quiesce the destination, ONE os.replace, then drop the OLD sidecars.
+    Order matters (swarm-pr-review PRR-F1): the sidecars are only deleted
+    AFTER a successful replace, so a failed replace can never discard
+    committed WAL frames — the pre-replace file and its sidecars survive
+    untouched. The quiesce is best-effort and unguarded-by-verdict (any
+    failure falls through — pull is the recovery path for a corrupt
+    destination); the COMMITTED refusals are the guarded replace below,
+    classified by cause: a busy reader, a cross-volume move, or a storage
+    fault each get their own code and hint."""
     try:
         # best-effort WAL quiesce: back-fill pending frames into the main
         # db so the replaced file never coexists with stale sidecar data.
-        # The checkpoint's busy result is deliberately NOT judged: sqlite
-        # build-dependent, and the guarded OSError below is the committed
-        # refusal path (Windows refuses on open handles; POSIX installs
-        # over a live reader by design - disclosed in the test).
         try:
             dest = sqlite3.connect(str(db_path))
             try:
@@ -529,15 +761,42 @@ def _install(staged: Path, db_path: Path) -> None:
             # recipes): a quiesce failure on unreadable bytes falls
             # through to the guarded install, which replaces them
             pass
+        try:
+            os.replace(staged, db_path)
+        except OSError as exc:
+            # a same-file open reader and a cross-volume move are different
+            # faults with different remedies; name them apart
+            winerr = getattr(exc, "winerror", None)
+            if winerr == 17 or exc.errno == errno.EXDEV:
+                raise SnapshotError(
+                    "dest_cross_volume",
+                    "destination store is on a different volume than the"
+                    " staging area; set TMPDIR onto the store's volume",
+                    hint="os.replace cannot move a file across volumes",
+                ) from exc
+            if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
+                                                  errno.EPERM, errno.ETXTBSY):
+                raise SnapshotError(
+                    "dest_open",
+                    "destination store is held open by another process",
+                    hint="close readers holding the store open and re-pull",
+                ) from exc
+            raise SnapshotError(
+                "dest_open",
+                f"destination store could not be replaced: {exc}",
+                hint="check the destination path and its permissions",
+            ) from exc
+        # only now are the OLD sidecars stale: the new main file is in place
         for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
             if sidecar.exists():
                 sidecar.unlink()
-        os.replace(staged, db_path)
+    except SnapshotError:
+        raise
     except OSError as exc:
         raise SnapshotError(
             "dest_open",
-            f"destination store could not be quiesced and replaced: {exc}",
-            hint="close readers holding the store open and re-pull",
+            f"destination store could not be replaced: {exc}",
+            hint="check the destination path and its permissions",
         ) from exc
 
 

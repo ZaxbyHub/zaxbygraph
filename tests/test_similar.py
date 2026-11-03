@@ -46,8 +46,10 @@ live on the synthetic store only.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -68,6 +70,9 @@ def _leg_checkout() -> Path:
         import subprocess as _sp
 
         _LEG_CK = Path(tempfile.mkdtemp(prefix="zaxbygraph-legs-ck-"))
+        # PRR-I7: created once per process and removed at exit, so repeated
+        # suite runs do not accumulate temp directories
+        atexit.register(shutil.rmtree, _LEG_CK, ignore_errors=True)
         env = {
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",

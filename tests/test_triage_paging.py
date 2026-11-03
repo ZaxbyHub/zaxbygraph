@@ -24,7 +24,9 @@ Stdlib only; unittest (no pytest).
 from __future__ import annotations
 
 import json
+import atexit
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -43,6 +45,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: hermeticity (issue #46 AC2): see test_triage_bundle.py - legs run in a
 #: dedicated temp cwd so ambient config files cannot reweight checks.
 _LEG_CWD = tempfile.mkdtemp(prefix="zaxbygraph-legs-")
+#: PRR-I7: the leg cwd is created once per process and removed at exit, so
+#: repeated suite runs do not accumulate temp directories
+atexit.register(shutil.rmtree, _LEG_CWD, ignore_errors=True)
 
 
 def _run_cli(*argv: str) -> tuple[int, bytes, bytes]:
