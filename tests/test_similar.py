@@ -46,14 +46,57 @@ live on the synthetic store only.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
 from fixtures import REPO, TempDBTest, scrubbed_env
+
+
+#: hermeticity (issue #46 AC2): similar CLI legs are checkout-dependent
+#: (the command probes git ls-files from the cwd), so they run in a
+#: dedicated temp GIT CHECKOUT - ambient config files in the operator's
+#: checkout must not reweight checks, and ls-files still resolves there.
+def _leg_checkout() -> Path:
+    global _LEG_CK
+    try:
+        return _LEG_CK
+    except NameError:
+        import subprocess as _sp
+
+        _LEG_CK = Path(tempfile.mkdtemp(prefix="zaxbygraph-legs-ck-"))
+        # PRR-I7: created once per process and removed at exit, so repeated
+        # suite runs do not accumulate temp directories
+        atexit.register(shutil.rmtree, _LEG_CK, ignore_errors=True)
+        env = {
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        }
+
+        def _git(*argv, cwd=_LEG_CK):
+            # check=True would fail HERE rather than three tests later
+            # (cubic second-round finding), but CalledProcessError's
+            # message never carries stderr, so the missing-or-
+            # misconfigured-git cause would still be lost (cubic run 4).
+            # Same shape as tests/test_snapshot.py's _git helper.
+            proc = _sp.run(["git", *argv], cwd=str(cwd), capture_output=True,
+                           env=env, timeout=120)
+            if proc.returncode != 0:
+                raise AssertionError(
+                    f"git {' '.join(argv)} failed ({proc.returncode}): "
+                    + proc.stderr.decode("utf-8", "replace")[:2000])
+            return proc
+
+        _git("init", "-b", "main", str(_LEG_CK))
+        (_LEG_CK / "readme.txt").write_text("x", encoding="utf-8")
+        _git("add", "-A")
+        _git("commit", "-m", "init")
+        return _LEG_CK
 from fixtures_eval import build_eval_store, record_real_corpus
 
 from zaxbygraph.db import connect, init_schema, open_existing
@@ -768,7 +811,7 @@ class CliContractTests(DerivedTierTest):
             [executable, "-m", "zaxbygraph", *argv],
             capture_output=True,
             env=env,
-            cwd=str(Path(__file__).resolve().parents[1]),
+            cwd=str(_leg_checkout()),
             timeout=120,
         )
         return proc.returncode, proc.stdout, proc.stderr

@@ -603,7 +603,7 @@ Audit trail of HTTP fetches.
 | Column | Type | Notes |
 | --- | --- | --- |
 | `key` | TEXT | Primary key. Includes `schema_version` and the capability-cache namespace `capability_probe:<host>:<gh-version>` (value: JSON `{"Issue": [...field names], "PullRequest": [...]}`, rewritten by every successful probe). |
-| `value` | TEXT | |
+| `value` | TEXT | Also carries `snapshot.publisher`, `snapshot.manifest_sha256`, `snapshot.pulled_at` — provenance written by `snapshot pull` (issue #34); dropped by `doctor consolidate` (the merged corpus is not the pulled snapshot). |
 
 ## Full-text search
 

@@ -53,7 +53,9 @@ def _guardrail_commands() -> list[list[str]]:
     artifact itself (issue #28), not an envelope — its structured error
     envelopes (`bad_include`, `repo_required`, `out_is_database`,
     `store_too_old`, `store_too_new`, `incomplete_store`) are pinned by
-    tests/test_export_corpus.py."""
+    tests/test_export_corpus.py. `snapshot` is excluded too: publish/pull
+    are write-transport workflow commands whose envelopes are pinned by
+    tests/test_snapshot.py (CLI envelope legs)."""
     return [
         ["status"],
         ["search", "needle"],
@@ -388,7 +390,7 @@ class EnvelopeContractTests(unittest.TestCase):
             missing = [k for k in required if k not in payload]
             if missing:
                 problems.append(f"{name} missing {','.join(missing)}")
-        uncovered = registered - seen - {"sync", "mcp", "export-corpus"}
+        uncovered = registered - seen - {"sync", "mcp", "export-corpus", "snapshot"}
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"
         )

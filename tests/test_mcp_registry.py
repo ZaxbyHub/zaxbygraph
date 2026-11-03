@@ -54,6 +54,9 @@ CLI_TO_SURFACE = {
     "bundle": "bundle",
     "brief": "brief",
     "sync": "sync",
+    # Snapshot transport (issue #34): a human-workflow surface (moves a
+    # store between machines), not an agent read - the MCP gap is recorded.
+    "snapshot": "documented-gap: snapshot transport (issue #34); MCP surfacing is a future lane",
 }
 
 #: {tool -> CLI command}. Every typed tool must stay reachable from the

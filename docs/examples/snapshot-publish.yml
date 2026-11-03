@@ -1,0 +1,50 @@
+# Example scheduled snapshot publisher (issue #34, docs-only example).
+# One machine is the single writer: this workflow publishes the store
+# snapshot on a schedule. Everyone else only pulls. gh stays the only
+# credential - no PAT. The snapshot transport configures gh's git
+# credential helper per invocation, so GH_TOKEN is all the push needs.
+name: snapshot-publish
+on:
+  schedule:
+    - cron: "0 3 * * *" # daily 03:00 UTC
+  workflow_dispatch:
+
+# Serialize runs: a scheduled run and a manual dispatch must never race
+# each other's force-push onto the same snapshot ref.
+concurrency:
+  group: snapshot-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install zaxbygraph (pinned, no token in the build env)
+        # PEP 517 builds execute upstream code, so the install must not
+        # run in the same step env as the write-capable token. Pin the ref
+        # so the publisher is reproducible.
+        run: |
+          pip install --no-deps \
+            "git+https://github.com/ZaxbyHub/zaxbygraph.git@<commit-sha>"
+
+      - name: Restore the previous snapshot so the sync is incremental
+        # Each scheduled run starts on a fresh runner with no store: pull
+        # the prior snapshot first (a cold sync otherwise re-fetches the
+        # whole corpus daily). The first run has nothing to pull - the
+        # fallback is a full sync.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          zaxbygraph snapshot pull "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --repo OWNER/REPO || echo "no prior snapshot yet; cold sync"
+
+      - name: Sync and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          zaxbygraph sync --repo OWNER/REPO
+          zaxbygraph snapshot publish "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --repo OWNER/REPO --publisher scheduled-action

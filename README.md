@@ -291,6 +291,12 @@ carries the effective `[derive]` affinity weights under an `affinity` key
 bundle affinity resolve `[derive]` through the same store/cwd/`--config`
 chain as `similar`.
 
+Ambient configs are part of the trust boundary: `<store>/config.toml` and a
+cwd `.zaxbygraph.toml` are auto-loaded and treated as trusted operator input — a planted or hostile config reweights results, and its strings
+echo unwrapped into agent-facing payloads. Only point the chain at
+checkouts and stores you control, and treat a cwd `.zaxbygraph.toml`
+the way you treat shell profiles.
+
 `brief` addresses open issues only: a stored-but-closed issue (or a PR)
 answers `not_found` with "item #N is not an open issue" rather than a
 packet.
@@ -720,6 +726,41 @@ opencode (`~/.config/opencode/opencode.json`):
 ```json
 {"mcp": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}
 ```
+
+## Remote use: snapshot transport
+
+One verified store snapshot moves between machines and teammates as a
+single orphan commit. `snapshot publish` pushes the manifest + gzip parts
+to a target git repository (a dedicated store repo works best); `snapshot
+pull` verifies every sha, checks the schema and the corpus digest, and
+installs atomically under the sync lock. After the pull, a normal
+incremental `sync` fetches only the delta.
+
+### Travel recipe
+
+Publish before you leave (`zaxbygraph snapshot publish <store-repo>`),
+pull on arrival (`zaxbygraph snapshot pull <store-repo>`, add
+`--verify-sample 5` to spot-check five items against live GitHub), then
+run a normal incremental `sync` — only updates after the snapshot's watermark
+come over the network. `--verify-sample` compares each sampled item's stored
+fields (title, body, state, timestamps, author, labels, pull marker) against
+the live payload; it does not re-fetch comments, reviews, files or events, and
+it is not the `content_hash` a full re-sync would compute — a clean sample
+means GitHub has not moved on those fields since the snapshot.
+
+### Team recipe
+
+One machine (or one scheduled Action using GITHUB_TOKEN, never a PAT) is
+the single writer: it publishes — `docs/examples/snapshot-publish.yml` is
+a copy-paste scheduled-workflow example. Everyone else only pulls, and a newer
+local store is never overwritten without `--force`.
+
+### Credential separation
+
+zaxbygraph-snapshot-refs and zmem-sync-repos never share a repository or
+push credential: keep the snapshot ref namespace (the `refs/zaxbygraph/*`
+default location with the `zaxbygraph-snapshot` branch fallback) in its
+own repository, apart from zmem's sync repos.
 
 ## Output and error contract
 
