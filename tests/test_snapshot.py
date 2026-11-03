@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fixtures import REPO, FakeGitHubSource, issue
 
@@ -1063,9 +1064,109 @@ class SnapshotReviewFixTests(unittest.TestCase):
                 pull(merged, str(bare), force=False)
             self.assertEqual(ctx.exception.code, "multi_repo_destination")
             self.assertEqual(merged.read_bytes(), before)
-            # --force overrides, and the caller owns the consequence
+            # --force overrides, and the caller owns the consequence: the
+            # whole store is REPLACED, so the assertion must prove the
+            # replace landed rather than that the file still exists (it
+            # already did) - cubic run 3
             pull(merged, str(bare), force=True)
-            self.assertTrue(merged.exists())
+            self.assertNotEqual(merged.read_bytes(), before)
+            check = sqlite3.connect(str(merged))
+            try:
+                repos = {row[0] for row in check.execute(
+                    "SELECT repo FROM sync_state")}
+            finally:
+                check.close()
+            self.assertEqual(repos, {REPO})
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pull_refuses_multi_repo_destination_with_uri_hostile_path(self) -> None:
+        # cubic run 3: the read-only URI was built from a raw path, so a
+        # destination containing '%' or '#' made sqlite3.connect raise and
+        # the except branch silently returned - skipping the multi-repo
+        # guard entirely and letting a whole-file replace drop the other
+        # repo's corpus. The guard must fire whatever the path looks like.
+        td = Path(tempfile.mkdtemp(prefix="urihostile_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="uh")
+            merged_dir = td / "pct%20dir#frag"
+            merged_dir.mkdir()
+            merged = merged_dir / "merged.db"
+            mconn = connect(merged)
+            init_schema(mconn)
+            mconn.row_factory = sqlite3.Row
+            src = FakeGitHubSource()
+            src.add_issue(issue(601, title="R601", body="b",
+                                created_at="2027-06-01T00:00:00Z"))
+            sync_repo(mconn, src, REPO)
+            src2 = FakeGitHubSource()
+            src2.add_issue(issue(902, title="Other", body="x",
+                                created_at="2027-06-01T00:00:00Z"))
+            sync_repo(mconn, src2, "acme/other")
+            mconn.close()
+            before = merged.read_bytes()
+            with self.assertRaises(SnapshotError) as ctx:
+                pull(merged, str(bare), force=False)
+            self.assertEqual(ctx.exception.code, "multi_repo_destination")
+            self.assertEqual(merged.read_bytes(), before)
+            # the newer-local guard reads through the same helper: a newer
+            # local watermark must still be honoured on this path
+            newer = merged_dir / "newer.db"
+            shutil.copyfile(merged, newer)
+            nc = sqlite3.connect(str(newer))
+            nc.execute("UPDATE sync_state SET issues_since = ? WHERE repo = ?",
+                       ("2030-01-01T00:00:00Z", REPO))
+            nc.commit()
+            nc.close()
+            with self.assertRaises(SnapshotError) as ctx2:
+                pull(newer, str(bare), force=False)
+            self.assertEqual(ctx2.exception.code, "multi_repo_destination")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_verify_staged_bounds_decompression_without_decompress(self) -> None:
+        # cubic run 3: the pull ceiling was checked AFTER gzip.decompress
+        # had already allocated the whole expansion, so it capped nothing.
+        # Pin the bounded path structurally - it must never call the
+        # unbounded gzip.decompress - and still refuse an oversized stream.
+        import gzip as _gzip
+
+        import zaxbygraph.snapshot as snap
+        td = Path(tempfile.mkdtemp(prefix="bound_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            out = publish(db, str(bare), publisher="bound")
+            manifest = out["manifest"]
+            wd = td / "wd"
+            wd.mkdir()
+            _git("init", "-b", "main", str(wd), cwd=td)
+            _git("fetch", str(bare), SNAPSHOT_REF, cwd=wd, check=True)
+            commit = _git("rev-parse", "FETCH_HEAD", cwd=wd,
+                          check=True).stdout.decode().strip()
+            gz = b"".join(
+                _git("cat-file", "blob", commit + ":" + part["name"], cwd=wd,
+                     check=True).stdout
+                for part in manifest["parts"])
+            calls = []
+            real = _gzip.decompress
+
+            def spy(data, *a, **k):
+                calls.append(len(data) if isinstance(data, (bytes, bytearray))
+                             else -1)
+                return real(data, *a, **k)
+
+            with mock.patch.object(_gzip, "decompress", spy), \
+                    mock.patch.object(snap, "PULL_MAX_DB_BYTES", 16):
+                with self.assertRaises(SnapshotError) as ctx:
+                    snap._verify_staged(td / "staged.db", gz, manifest)
+            self.assertEqual(ctx.exception.code, "snapshot_too_large")
+            self.assertEqual(
+                calls, [],
+                "the bounded path must not call gzip.decompress: the ceiling"
+                " has to bound the allocation, not inspect it afterwards")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

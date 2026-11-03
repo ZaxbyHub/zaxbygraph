@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import errno
 import gzip
+import io
 import hashlib
 import json
 import os
@@ -585,8 +586,12 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
                             hint="re-publish or re-pull")
     try:
         # bounded decompression: a small published part can expand ~1030x,
-        # so the pull path caps the expanded size before allocating it
-        raw = gzip.decompress(gz_bytes)
+        # so the pull path caps the expanded size BEFORE allocating it -
+        # the ceiling must bound the allocation, not inspect it after the
+        # fact (cubic run 3). GzipFile.read(n) returns at most n bytes, so
+        # the largest buffer this path can build is ceiling + 1.
+        with gzip.GzipFile(fileobj=io.BytesIO(gz_bytes)) as gunzip:
+            raw = gunzip.read(PULL_MAX_DB_BYTES + 1)
         if len(raw) > PULL_MAX_DB_BYTES:
             raise SnapshotError(
                 "snapshot_too_large",
@@ -685,6 +690,17 @@ def _bind_destination(manifest: dict, expected_repo: str | None,
             )
 
 
+def _open_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open a store read-only WITHOUT ever writing to it. The URI must be
+    built with as_uri(), which percent-encodes the path: a raw f-string
+    leaves a literal '?', '#' or '%' in the path to terminate or corrupt
+    the URI, sqlite3.connect then raises, and the caller's except branch
+    would silently skip the guard it is protecting (cubic run 3 - a
+    fail-open on the multi-repo and newer-local checks). as_uri() also
+    guarantees an absolute path, which the URI form requires."""
+    return sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True)
+
+
 def _check_destination_shape(db_path: Path, manifest: dict,
                              force: bool) -> None:
     """A whole-file replace destroys every other repo in the destination,
@@ -694,7 +710,7 @@ def _check_destination_shape(db_path: Path, manifest: dict,
     if not db_path.is_file():
         return
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = _open_readonly(db_path)
     except sqlite3.Error:
         return
     try:
@@ -722,7 +738,7 @@ def _local_watermark(db_path: Path, repo: str) -> str | None:
     if not db_path.is_file():
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = _open_readonly(db_path)
         try:
             row = conn.execute(
                 "SELECT issues_since FROM sync_state WHERE repo = ?",
