@@ -704,7 +704,10 @@ class AppendOnlyGuardTests(TempDBTest):
         """Guardrail: the ingest path never rewrites history. Only doctor's
         consolidation may touch revisions, and only in its two sanctioned
         shapes: the copy-loop slug delete (per-table, revisions exempt
-        since issue #40) and the per-item covered-item delete."""
+        since issue #40) and the per-item covered-item delete. The third
+        sanctioned shape is the case-fold's payload-identity dedupe
+        (db.py `_dedupe_revisions`, issue #53 review PRR-002): it removes
+        whole duplicate rows by identity and never rewrites one in place."""
         src = Path(__file__).parent.parent / "src" / "zaxbygraph"
         offenders = []
         for path in src.glob("*.py"):
@@ -723,6 +726,13 @@ class AppendOnlyGuardTests(TempDBTest):
                         # UPDATE REVISIONS lines are never whitelisted
                         # (review PRR-014: a shape-blind substring match
                         # would have exempted an in-place rewrite)
+                    if (
+                        path.name == "db.py"
+                        and "DELETE FROM revisions WHERE id NOT IN (" in line
+                    ):
+                        continue  # the sanctioned fold dedupe (PRR-002): the
+                        # literal shape, so a differently-shaped rewrite of a
+                        # stored revision is still an offender
                     offenders.append(f"{path.name}:{lineno}: {line.strip()}")
         self.assertEqual(offenders, [])
 

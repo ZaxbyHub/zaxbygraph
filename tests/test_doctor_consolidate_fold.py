@@ -37,7 +37,7 @@ from zaxbygraph.db import (  # noqa: E402
     init_schema,
     migrate_v1_to_v2,
 )
-from zaxbygraph.extract import CLOSES_REF_MARKER  # noqa: E402
+from zaxbygraph.extract import CLOSES_REF_MARKER, EVIDENCE_CAP  # noqa: E402
 
 REPO = "probe/clinic"
 MIXED = "Probe/Clinic"
@@ -293,6 +293,37 @@ class ClosesPairFoldTests(_ConsolidateCase):
         self.assertIn("mixed casing", evidence)
         self.assertIn("folded casing", evidence)
 
+    def test_same_source_over_cap_retains_the_marker(self) -> None:
+        """The same-source union reserves the closing_ref marker.
+
+        Two dual-casing `closing_ref` rows for one pair, each carrying the
+        marker plus oversized filler, merge over the 512-byte evidence cap.
+        Without `reserve=(CLOSES_REF_MARKER,)` the merge_evidence truncation
+        drops the marker and the surviving row stops saying WHY the closure
+        fact is trusted (issue #52, plan critic Round 4; probe leg 8).
+        """
+        filler = "x" * 300
+        candidate = self._closes_candidate([
+            (MIXED, "closing_ref", f"{CLOSES_REF_MARKER} {MIXED} {filler}"),
+            (REPO, "closing_ref", f"{CLOSES_REF_MARKER} {REPO} {filler}"),
+        ])
+        store = self._store()
+        rc, envelope, stderr = self._run_doctor(store, self._scan_dir(candidate))
+        self.assertEqual(rc, 0, stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            rows = conn.execute(
+                "SELECT evidence FROM edges WHERE rel = 'closes'"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1, rows)
+        evidence = rows[0][0]
+        self.assertIn(CLOSES_REF_MARKER, evidence)
+        self.assertLessEqual(len(evidence), EVIDENCE_CAP)
+        self.assertIn(MIXED, evidence)
+        self.assertIn(REPO, evidence)
+
     def _scan_dir(self, candidate: Path) -> Path:
         return candidate.parent
 
@@ -304,6 +335,74 @@ class FoldSemanticsTests(_ConsolidateCase):
         conn = connect(candidate)
         init_schema(conn)
         return candidate, conn
+
+    def test_duplicate_revision_payloads_collapse_to_one_row(self) -> None:
+        """`revisions` declares no unique key beyond `id`, so the generic
+        fold's `ON CONFLICT(id)` for it is inert: a case-split candidate's
+        byte-identical duplicate pre-images (same folded key, same payload,
+        distinct ids) would BOTH survive and be adopted twice (issue #53,
+        review PRR-002). The observation's identity is its payload tuple;
+        the lowest id survives. A DISTINCT observation never collapses."""
+        candidate, conn = self._v11_candidate()
+        _seed_item(conn, 101, MIXED, 1, "one", "2026-01-01T00:00:00Z")
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, NULL, 0, 0)",
+            (REPO, self.stamp, self.stamp, self.stamp),
+        )
+        payload = (
+            1, "item_title", None, "title", "edit",
+            "the old title", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z",
+        )
+        # two byte-identical observations under the two casings, distinct ids
+        conn.execute(
+            "INSERT INTO revisions(id, repo, number, entity, entity_id, kind,"
+            " origin, content, valid_from, valid_to)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (9100, MIXED, *payload),
+        )
+        conn.execute(
+            "INSERT INTO revisions(id, repo, number, entity, entity_id, kind,"
+            " origin, content, valid_from, valid_to)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (9101, REPO, *payload),
+        )
+        # a genuinely different observation (a later edit window) survives too
+        conn.execute(
+            "INSERT INTO revisions(id, repo, number, entity, entity_id, kind,"
+            " origin, content, valid_from, valid_to)"
+            " VALUES (9102, ?, 1, 'item_title', NULL, 'title', 'edit',"
+            " 'an even older title', '2025-12-01T00:00:00Z',"
+            " '2026-01-01T00:00:00Z')",
+            (MIXED,),
+        )
+        conn.commit()
+        conn.close()
+        store = self._store()
+        rc, envelope, stderr = self._run_doctor(store, candidate.parent)
+        self.assertEqual(rc, 0, stderr)
+        conn = sqlite3.connect(str(store))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT id, repo, content FROM revisions ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            [(r["repo"], r["content"]) for r in rows],
+            [
+                (REPO, "the old title"),
+                (REPO, "an even older title"),
+            ],
+            "the duplicate observation must collapse and the distinct"
+            " observation must survive, both under the folded casing",
+        )
+        # ids are not pinned: consolidation adopts revisions with FRESH ids
+        # per item (issue #40, _COPY_TABLES ("revisions", "id")), so the
+        # survivor's identity is its payload tuple, not its rowid.
+        self.assertEqual(len({r["id"] for r in rows}), 2)
 
     def test_sync_state_columns_survive_the_fold(self) -> None:
         """A folded v11 candidate keeps its newer sync_state columns: the

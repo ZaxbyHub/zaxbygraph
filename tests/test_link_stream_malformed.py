@@ -19,12 +19,21 @@ the GraphQL normalizer converts malformed input into `([], False)` /
 """
 from __future__ import annotations
 
+import sys
 import unittest
 from copy import deepcopy
+from pathlib import Path
 
-from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pull, ts
-from zaxbygraph.graphql import GraphQLSource
-from zaxbygraph.sync import sync_repo
+# Self-pin the repo src like this PR's other new modules: a non-editable
+# `pip install` drops a real package directory into site-packages that
+# SHADOWS the editable .pth, and discovery would then silently test the
+# stale installed build.
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+
+from fixtures import REPO, FakeGitHubSource, TempDBTest, issue, pull, ts  # noqa: E402
+from zaxbygraph.graphql import GraphQLSource  # noqa: E402
+from zaxbygraph.sync import sync_repo  # noqa: E402
 
 
 class _BulkLinkSource(FakeGitHubSource):
@@ -184,6 +193,94 @@ class StoreLayerMalformedTests(TempDBTest):
         src.links[10] = _links(parent=None)
         self._sync(src)
         self.assertEqual(_edges(self.conn, 10), [])
+
+
+class GraphQLSeamMalformedTests(TempDBTest):
+    """The PUBLIC seam: `GraphQLSource.fetch_children` -> `sync_repo`.
+
+    Every GraphQL-layer test above calls `_children_from_node` directly, so
+    a regression in the chunk/alias plumbing (`_fetch_children_chunk`
+    dropping the node, `fetch_children` swallowing the flag) would pass
+    them all while the production sync still retracted the link. These legs
+    drive the real entry point with a stubbed transport (issue #53, review
+    PRR-011)."""
+
+    def _seam_source(self, node_links: dict) -> FakeGitHubSource:
+        """A fake REST listing whose children come from a real
+        GraphQLSource.fetch_children answering with `node_links`."""
+
+        class _StubbedTransport(GraphQLSource):
+            def __init__(self) -> None:
+                super().__init__("probe", "clinic")
+                # The real `_graphql` initializes these; the stub replaces it.
+                self.last_dropped_sections: dict[int, list] = {}
+
+            def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+                node = {"number": 10, "id": "I_10", "title": "blocked work"}
+                node.update(node_links)
+                # `_graphql` returns the UNWRAPPED `data` payload.
+                return {"repository": {"i10": node}}
+
+        class _SeamSource(FakeGitHubSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self._gql = _StubbedTransport()
+
+            def fetch_children(self, items) -> dict[int, dict]:
+                return self._gql.fetch_children(items)
+
+        return _SeamSource()
+
+    def _seed(self) -> FakeGitHubSource:
+        src = _BulkLinkSource()
+        src.add_issue(issue(10, title="blocked work"))
+        src.add_issue(issue(11, title="blocker one"))
+        src.add_issue(issue(12, title="blocker two"))
+        src.links[10] = _links(
+            blocked_by=[{"number": 11, "repo": REPO}, {"number": 12, "repo": REPO}]
+        )
+        return src
+
+    def test_malformed_node_survives_the_public_seam(self) -> None:
+        src = self._seed()
+        sync_repo(self.conn, src, REPO)
+        self.assertEqual(len(_edges(self.conn, 10)), 2, _edges(self.conn, 10))
+        src.issues[10]["updated_at"] = ts(200_010)
+        seam = self._seam_source(
+            {
+                "blockedBy": {
+                    "nodes": [
+                        {"number": True, "repository": None},
+                        {"number": 12, "repository": {"nameWithOwner": REPO}},
+                    ]
+                }
+            }
+        )
+        seam.issues[10] = src.issues[10]
+        sync_repo(self.conn, seam, REPO)
+        self.assertEqual(
+            sorted(_edges(self.conn, 10)),
+            [("blocked_by", "11", "link"), ("blocked_by", "12", "link")],
+            "a boolean number through the public seam must not retract the edge",
+        )
+
+    def test_wellformed_node_still_retracts_through_the_seam(self) -> None:
+        """PRESERVING floor: the seam path is not blanket union-only — a
+        well-formed connection that drops a blocker still retracts it."""
+        src = self._seed()
+        sync_repo(self.conn, src, REPO)
+        self.assertEqual(len(_edges(self.conn, 10)), 2)
+        src.issues[10]["updated_at"] = ts(200_010)
+        seam = self._seam_source(
+            {"blockedBy": {"nodes": [{"number": 11, "repository": {"nameWithOwner": REPO}}]}}
+        )
+        seam.issues[10] = src.issues[10]
+        sync_repo(self.conn, seam, REPO)
+        self.assertEqual(
+            _edges(self.conn, 10),
+            [("blocked_by", "11", "link")],
+            "a well-formed connection through the seam must still retract",
+        )
 
 
 def _source() -> GraphQLSource:

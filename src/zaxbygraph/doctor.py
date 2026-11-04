@@ -50,8 +50,9 @@ _MOJIBAKE_LIKE = (
 
 class _UnreadableCandidate(Exception):
     """The candidate could not be copied/recovered faithfully (issue #52):
-    an active writer kept moving it, or it is not a database. Reported by
-    the CLI's failure envelope like any other storage fault."""
+    an active writer kept moving it, it is not a database, or its schema
+    defeated the fold. Reported by the CLI's failure envelope like any other
+    storage fault, naming the path and the reason."""
 
 #: tables copied on adoption -> the autoincrement pk column to omit (None =
 #: keep every column; GitHub-assigned ids in items/releases/reviews are kept).
@@ -123,14 +124,27 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
     writer — bounded retries, then refuse), when the copy cannot be
     recovered, or when the source is not a database; the caller keeps
     today's unreadable path.
+
+    The sidecar set is re-enumerated on EVERY attempt (issue #53, review
+    PRR-001): a `-wal` a writer creates after the first enumeration is
+    otherwise never copied nor stability-checked (a stale main-only copy
+    accepted as faithful), and a sidecar that vanishes after it makes every
+    retry re-fail on the same stale path (a healthy candidate refused).
     """
-    sidecars = [
-        Path(str(path) + suffix)
-        for suffix in ("-wal", "-journal")
-        if Path(str(path) + suffix).exists()
-    ]
-    sources = sidecars + [path]
     for _ in range(3):
+        # Regular files only (issue #53, review PRR-022): a symlinked or
+        # non-regular sidecar (FIFO/device) is not a recovery log this copy
+        # can faithfully take — skipping it would silently truncate the
+        # candidate, so such a candidate is reported unusable instead.
+        sidecars = []
+        for suffix in ("-wal", "-journal"):
+            sidecar = Path(str(path) + suffix)
+            if not sidecar.exists():
+                continue
+            if sidecar.is_symlink() or not sidecar.is_file():
+                return False
+            sidecars.append(sidecar)
+        sources = sidecars + [path]
         try:
             before = {
                 p.name: (p.stat().st_size, p.stat().st_mtime_ns)
@@ -146,10 +160,10 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
             }
         except OSError:
             # A source the OS refuses (a locked or permission-denied file) or
-            # a sidecar a finishing writer removed between exists() and the
-            # copy: not a database fault, an unusable candidate. Retry, then
-            # refuse — one unreadable candidate must never abort the scan
-            # (PRR-003).
+            # a sidecar a finishing writer removed between the enumeration and
+            # the copy: not a database fault, an unusable candidate. Retry,
+            # then refuse — one unreadable candidate must never abort the
+            # scan (PRR-003).
             continue
         if before != after:
             continue  # an active writer moved the source: retry, then refuse
@@ -249,7 +263,7 @@ class _MigratedCopy:
         try:
             self.path = Path(self._td) / path.name
             if not _faithful_copy(path, self.path):
-                raise _UnreadableCandidate(path)
+                raise _UnreadableCandidate(path, "the candidate could not be copied faithfully")
             version = None
             try:
                 probe = sqlite3.connect(str(self.path))
@@ -258,7 +272,9 @@ class _MigratedCopy:
                 finally:
                     probe.close()
             except sqlite3.DatabaseError as exc:
-                raise _UnreadableCandidate(path) from exc
+                raise _UnreadableCandidate(
+                    path, "the candidate is not a readable database"
+                ) from exc
             self.migrated = version < CURRENT_USER_VERSION
             conn = connect(self.path)
             try:
@@ -266,6 +282,16 @@ class _MigratedCopy:
                     init_schema(conn)
                 fold_repo_casings(conn)
                 conn.commit()
+            except sqlite3.DatabaseError as exc:
+                # A candidate whose schema diverges from the tool's can still
+                # defeat the fold (e.g. a missing unique index behind an ON
+                # CONFLICT target). The fold runs on the temp copy only, so
+                # the candidate is reported unusable — one divergent
+                # candidate must never abort the whole scan (issue #53,
+                # review PRR-005; base adopted such candidates).
+                raise _UnreadableCandidate(
+                    path, f"the candidate's schema defeated the fold: {exc}"
+                ) from exc
             finally:
                 conn.close()
         except BaseException:
@@ -532,11 +558,20 @@ def doctor(
                 best = (key, entry)
     if consolidate_flag and best is not None:
         winner = best[1]
-        rev_adopted, rev_preserved = consolidate(
-            store_db, Path(winner["path"]), repo_l
-        )
-        winner["adopted"] = True
-        adopted = winner["path"]
+        try:
+            rev_adopted, rev_preserved = consolidate(
+                store_db, Path(winner["path"]), repo_l
+            )
+        except _UnreadableCandidate:
+            # The winner passed inspection but cannot be adopted (its schema
+            # defeated the fold). Report the scan without adopting — one
+            # unusable candidate must never abort the whole command (PRR-003;
+            # issue #53, review PRR-005). The store is untouched: the fold
+            # runs on the temp copy before any store write.
+            rev_adopted, rev_preserved = 0, 0
+        else:
+            winner["adopted"] = True
+            adopted = winner["path"]
     else:
         rev_adopted = 0
         rev_preserved = 0

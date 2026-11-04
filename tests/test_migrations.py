@@ -815,6 +815,48 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(row["full_sync_pending"], 1)
         self.assertEqual(status(conn, "solo/repo")["repos"][0]["complete"], False)
 
+    def test_v1_store_holding_reviews_migrates(self) -> None:
+        """A v1 store that ever synced a PR must not brick at v1->v2.
+
+        `_schema_sql()` installs `reviews_fts` and its triggers on every
+        open, so a pre-v7 store gets an EMPTY external-content index over
+        `reviews` rows that already exist. The fold's
+        `UPDATE reviews SET repo = lower(repo)` then fires FTS5's `'delete'`
+        command for a rowid that is not in the index, which raises
+        SQLITE_CORRUPT and pins `user_version` at 1 forever — every later
+        `sync`, `doctor` and read on that store fails. RED at the PR head
+        (executed probe: one reviews row, single casing, no distinct-id
+        collision -> `sqlite3.DatabaseError: database disk image is
+        malformed`)."""
+        v1 = sqlite3.connect(str(self.db_path))
+        v1.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at, raw_json)"
+            " VALUES (7001, 'solo/repo', 7, 'pr', 'a pr', 'open', '2026-01-01T00:00:00Z', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (8001, 'solo/repo', 7, 'COMMENTED', 'a review', '{}')"
+        )
+        v1.commit()
+        v1.close()
+
+        conn = self._open_current()
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
+        row = conn.execute(
+            "SELECT repo, body FROM reviews WHERE id = 8001"
+        ).fetchone()
+        self.assertEqual(row["repo"], "solo/repo")
+        self.assertEqual(row["body"], "a review")
+        # the primed index is truthful: the review is searchable
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM reviews_fts WHERE reviews_fts MATCH 'review'"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_distinct_id_collision_drops_losers_children(self) -> None:
         v1 = sqlite3.connect(str(self.db_path))
         # delete-and-recreate shape: same (repo, number), distinct ids, lower fresher
@@ -828,6 +870,35 @@ class MigrationTests(unittest.TestCase):
         )
         v1.execute("INSERT INTO labels(repo, number, name, color) VALUES ('ZaxbyHub/TrainingApp', 7, 'bug', 'ff0000')")
         v1.execute("INSERT INTO labels(repo, number, name, color) VALUES ('zaxbyhub/trainingapp', 7, 'bug', '00ff00')")
+        # loser's item-scoped child rows in comments/reviews/pr_files — the
+        # three the reviewer named, which the original helper covered but
+        # nothing pinned (issue #52, review PRR-014). The post-v2 tables are
+        # covered by LosersCoverEveryTableTests below (a v1 store cannot hold
+        # rows in tables that did not exist yet).
+        v1.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, body, raw_json)"
+            " VALUES (5001, 'ZaxbyHub/TrainingApp', 7, 'issue_comment', 'loser', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, body, raw_json)"
+            " VALUES (5002, 'zaxbyhub/trainingapp', 7, 'issue_comment', 'winner', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (6001, 'ZaxbyHub/TrainingApp', 7, 'COMMENTED', 'loser', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (6002, 'zaxbyhub/trainingapp', 7, 'COMMENTED', 'winner', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO pr_files(repo, number, path, status)"
+            " VALUES ('ZaxbyHub/TrainingApp', 7, 'loser.py', 'modified')"
+        )
+        v1.execute(
+            "INSERT INTO pr_files(repo, number, path, status)"
+            " VALUES ('zaxbyhub/trainingapp', 7, 'winner.py', 'modified')"
+        )
         # loser's outbound authored edge and an inbound mention edge at the loser casing
         v1.execute(
             "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id, confidence, evidence)"
@@ -855,6 +926,34 @@ class MigrationTests(unittest.TestCase):
         # loser's children and number-scoped edges (outbound AND inbound) deleted
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM labels WHERE number = 7").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT color FROM labels WHERE number = 7").fetchone()[0], "00ff00")
+        # the item-scoped child tables keep the WINNER's rows only, under the
+        # folded casing (issue #52: the cleanup covers every repo-keyed table)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM comments WHERE number = 7").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn.execute("SELECT body FROM comments WHERE number = 7").fetchone()[0],
+            "winner",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM reviews WHERE number = 7").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn.execute("SELECT path FROM pr_files WHERE number = 7").fetchone()[0],
+            "winner.py",
+        )
+        # no row anywhere still carries the loser's casing
+        leftovers = []
+        for table in (
+            "items", "labels", "comments", "reviews", "pr_files", "sync_state",
+            "fetch_log",
+        ):
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE repo = 'ZaxbyHub/TrainingApp'"
+            ).fetchone()[0]
+            if n:
+                leftovers.append(f"{table}:{n}")
+        self.assertEqual(leftovers, [], "loser casing survived in " + ", ".join(leftovers))
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM edges WHERE repo LIKE 'zaxbyhub/%' AND (src_id = '7' OR dst_id = '7')").fetchone()[0],
             1,

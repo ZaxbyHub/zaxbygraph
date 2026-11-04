@@ -303,9 +303,14 @@ def _q(value: str) -> str:
 
 def _int_or_none(value) -> int | None:
     """Coerce a scalar from an external JSON payload to int without ever
-    raising out of payload mapping (string digits concatenate otherwise)."""
-    if isinstance(value, bool) or value is None:
-        return None if value is None else int(value)
+    raising out of payload mapping (string digits concatenate otherwise).
+    A JSON boolean is not a number (issue #53): coercing `true` to 1 would
+    fabricate a link to real item #1, so a bool yields None and the caller's
+    malformed-node path degrades the connection to union-only."""
+    if isinstance(value, bool):
+        return None
+    if value is None:
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -838,7 +843,14 @@ class GraphQLSource(GhApiSource):
         if not isinstance(connection, dict):
             return [], {}
         events, _ = _connection(connection)
-        return [_timeline_event(e) for e in events], connection.get("pageInfo") or {}
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict):
+            # Malformed continuation metadata is unanswerable, not "no more
+            # pages": returning it raw made _complete_timeline read
+            # hasNextPage=False and clear the truncation flag (issue #53,
+            # review PRR-004). An unanswerable page keeps the flag set.
+            return [], {}
+        return [_timeline_event(e) for e in events], page_info
 
     def _complete_timeline(self, number: int, kind: str, child: dict) -> None:
         """Finish a flagged timeline and own the `timeline_incomplete` flag.
@@ -964,13 +976,13 @@ class GraphQLSource(GhApiSource):
         # must stay ABSENT so the sync's per-item REST fallback runs for it;
         # writing [] would present a silently empty page as complete.
         if node.get("comments") is not None:
-            comments, comments_more = _connection(node.get("comments"))
+            comments, comments_more = _carried_connection(node.get("comments"))
             children["issue_comments"] = [_comment_payload(c) for c in comments]
             if comments_more:
                 children["issue_comments_incomplete"] = True
 
         if node.get("reviews") is not None:
-            reviews, reviews_more = _connection(node.get("reviews"))
+            reviews, reviews_more = _carried_connection(node.get("reviews"))
             review_nodes = [r for r in reviews]
             children["reviews"] = [
                 {
@@ -986,7 +998,7 @@ class GraphQLSource(GhApiSource):
             if reviews_more:
                 children["reviews_incomplete"] = True
 
-            review_payloads = [_connection(r.get("comments")) for r in review_nodes]
+            review_payloads = [_carried_connection(r.get("comments")) for r in review_nodes]
             review_comments = [c for payload, _ in review_payloads for c in payload]
             children["review_comments"] = [
                 _comment_payload(
@@ -1001,7 +1013,7 @@ class GraphQLSource(GhApiSource):
                 children["review_comments_incomplete"] = True
 
         if node.get("files") is not None:
-            files, files_more = _connection(node.get("files"))
+            files, files_more = _carried_connection(node.get("files"))
             children["files"] = [
                 {
                     "filename": f.get("path"),
@@ -1034,7 +1046,9 @@ class GraphQLSource(GhApiSource):
             merged_by_login = (
                 merged_by.get("login") if isinstance(merged_by, dict) else None
             )
-            closing_refs, closing_more = _connection(node.get("closingIssuesReferences"))
+            closing_refs, closing_more = _carried_connection(
+                node.get("closingIssuesReferences")
+            )
             pull_payload = {
                 "additions": node.get("additions"),
                 "deletions": node.get("deletions"),
@@ -1074,7 +1088,7 @@ class GraphQLSource(GhApiSource):
         # capability mask can drop baseRefName/mergedAt while commits answer.
         commits_conn = node.get("commits")
         if isinstance(commits_conn, dict) and "nodes" in commits_conn:
-            commit_nodes, commits_more = _connection(commits_conn)
+            commit_nodes, commits_more = _carried_connection(commits_conn)
             children["pr_commits"] = [
                 {
                     "sha": ((c.get("commit") or {}).get("oid")),
@@ -1150,25 +1164,27 @@ class GraphQLSource(GhApiSource):
                 children["links_incomplete"] = overflowed
 
         if node.get("timelineItems") is not None:
-            events, timeline_more = _carried_connection(node.get("timelineItems"))
-            children["timeline"] = [_timeline_event(e) for e in events]
-            # Retained for fetch_children's continuation; _resolve_children
-            # never forwards it, and _complete_timeline pops it when it runs.
-            # The pageInfo is read through the VALIDATED connection shape: a
-            # non-dict pageInfo degrades to no-cursor, never a crash (the raw
-            # dereference this replaces raised AttributeError on a malformed
-            # payload — issue #53).
             timeline_conn = node.get("timelineItems")
-            page_info = (
-                timeline_conn.get("pageInfo")
-                if isinstance(timeline_conn, dict)
-                else None
-            )
-            children["timeline_cursor"] = (
-                page_info.get("endCursor") if isinstance(page_info, dict) else None
+            events, timeline_more = _carried_connection(timeline_conn)
+            children["timeline"] = [_timeline_event(e) for e in events]
+            # A malformed carried container (non-dict connection, non-list
+            # nodes, non-dict pageInfo) leaves the section unfetchable: the
+            # events preceding any cursor are unknowable, so NO cursor is
+            # emitted and _complete_timeline cannot drain the section and
+            # clear the flag — a well-formed continuation would otherwise
+            # present a partial timeline as complete and delete the stored
+            # item_events (issue #53, review PRR-004).
+            malformed_container = (
+                not isinstance(timeline_conn, dict)
+                or not isinstance(timeline_conn.get("nodes"), list)
+                or not isinstance(timeline_conn.get("pageInfo"), dict)
             )
             if timeline_more:
                 children["timeline_incomplete"] = True
+                if not malformed_container:
+                    children["timeline_cursor"] = timeline_conn.get("pageInfo").get(
+                        "endCursor"
+                    )
         return children
 
     # -- deletion oracle ----------------------------------------------------

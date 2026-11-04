@@ -215,6 +215,17 @@ def _index_exists(conn: sqlite3.Connection, index: str) -> bool:
     ).fetchone() is not None
 
 
+def _quote_ident(name: str) -> str:
+    """Quote a schema-derived identifier for SQL interpolation.
+
+    The fold's statements are assembled from the CANDIDATE's own
+    `PRAGMA table_info` output (issue #52), so a column name is untrusted
+    text until quoted: an unquoted divergent name (e.g. `"order"`) parses
+    as SQL and aborts the whole doctor command (issue #53, review PRR-005).
+    """
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _fold_dedupe_table(
     conn: sqlite3.Connection,
     table: str,
@@ -228,11 +239,14 @@ def _fold_dedupe_table(
     the external-content FTS triggers keep the index consistent through the
     delete/reinsert — and re-inserts with ON CONFLICT ... DO NOTHING so the
     first (winning) row survives each folded key. `WHERE true` disambiguates
-    the upsert parse after INSERT ... SELECT.
+    the upsert parse after INSERT ... SELECT. Column names come from the
+    candidate's schema and are quoted (issue #53, review PRR-005).
     """
     cols = [row[1] for row in conn.execute(f"PRAGMA table_info({table})")]
-    collist = ", ".join(cols)
-    lowered = ", ".join("lower(repo)" if c == "repo" else c for c in cols)
+    collist = ", ".join(_quote_ident(c) for c in cols)
+    lowered = ", ".join(
+        "lower(repo)" if c == "repo" else _quote_ident(c) for c in cols
+    )
     conn.execute("DROP TABLE IF EXISTS _fold")
     conn.execute(f"CREATE TEMP TABLE _fold AS SELECT {collist} FROM main.{table} WHERE 0")
     conn.execute(f"INSERT INTO _fold SELECT {collist} FROM main.{table} ORDER BY {order_by}")
@@ -342,6 +356,14 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
             (r["last_incr_sync_at"] for r in group if r["last_incr_sync_at"]), default=None
         )
         patches = max(r["include_patches"] for r in group)
+        # A recorded fault is never merged away: the merged row keeps the
+        # winner's last_error when it has one, else any casing's, so an
+        # adopted corpus cannot report fault-free over a failed run
+        # (AGENTS.md: a failing sync records last_error; issue #53, review
+        # PRR-007).
+        last_error = next(
+            (r["last_error"] for r in (winner, *group) if r["last_error"]), None
+        )
         for row in group:
             conn.execute("DELETE FROM sync_state WHERE rowid = ?", (row["rid"],))
         values: dict[str, object] = {}
@@ -354,6 +376,8 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
                 values[column] = incr
             elif column == "include_patches":
                 values[column] = patches
+            elif column == "last_error":
+                values[column] = last_error
             elif column in ("item_count", "comment_count", "edge_count"):
                 values[column] = 0
             elif column == "full_sync_pending":
@@ -362,7 +386,7 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
                 keys = winner.keys()
                 values[column] = winner[column] if column in keys else None
         conn.execute(
-            f"INSERT INTO sync_state ({', '.join(values)}) "
+            f"INSERT INTO sync_state ({', '.join(_quote_ident(c) for c in values)}) "
             f"VALUES ({', '.join('?' for _ in values)})",
             tuple(values.values()),
         )
@@ -415,6 +439,24 @@ _FOLD_TABLES = (
 )
 
 
+def _dedupe_revisions(conn: sqlite3.Connection) -> None:
+    """Collapse byte-identical revision observations after the case-fold.
+
+    `revisions` declares no unique key beyond its `id` (schema.sql:305-316),
+    so the generic fold's `ON CONFLICT(id)` clause for it is inert: a
+    case-split candidate's duplicate pre-images (same folded key, same
+    payload, distinct ids) would both survive and be adopted twice
+    (issue #53, review PRR-002). The observation's identity is its payload
+    tuple; the lowest id survives each group. Distinct observations (a
+    different edit window, entity, or content) never collapse.
+    """
+    conn.execute(
+        "DELETE FROM revisions WHERE id NOT IN ("
+        " SELECT MIN(id) FROM revisions GROUP BY repo, number, entity, entity_id,"
+        " kind, origin, content, valid_from, valid_to)"
+    )
+
+
 def _union_closes_same_source(conn: sqlite3.Connection) -> None:
     """Union evidence across FOLDED DUPLICATE groups of `rel='closes'`.
 
@@ -428,16 +470,19 @@ def _union_closes_same_source(conn: sqlite3.Connection) -> None:
     """
     groups = conn.execute(
         "SELECT lower(repo) AS lr, src_type, src_id, dst_type, dst_id, source,"
-        " COUNT(*) AS n FROM edges WHERE rel = 'closes'"
+        " COUNT(*) AS n, GROUP_CONCAT(id) AS ids FROM edges WHERE rel = 'closes'"
         " GROUP BY lr, src_type, src_id, dst_type, dst_id, source HAVING n > 1"
     ).fetchall()
     for group in groups:
+        # The ids come from the aggregate: re-selecting the members with a
+        # lower(repo) predicate cannot use an index (a full scan per group),
+        # which made the fold O(groups x edges) on large dual-cased
+        # candidates (issue #53, review PRR-017).
+        ids = [int(x) for x in str(group["ids"]).split(",")]
         rows = conn.execute(
-            "SELECT id, evidence FROM edges WHERE lower(repo) = ? AND src_type = ?"
-            " AND src_id = ? AND rel = 'closes' AND dst_type = ? AND dst_id = ?"
-            " AND source = ? ORDER BY id DESC",
-            (group["lr"], group["src_type"], group["src_id"],
-             group["dst_type"], group["dst_id"], group["source"]),
+            "SELECT id, evidence FROM edges WHERE id IN (%s) ORDER BY id DESC"
+            % ",".join("?" * len(ids)),
+            ids,
         ).fetchall()
         merged = merge_evidence(
             *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
@@ -498,6 +543,37 @@ def _collapse_closes_pairs(conn: sqlite3.Connection) -> None:
             conn.execute("DELETE FROM edges WHERE id = ?", (other["id"],))
 
 
+def _prime_fts_for_fold(conn: sqlite3.Connection) -> None:
+    """Repopulate an external-content index that a store predates.
+
+    `_schema_sql()` creates `reviews_fts` (an external-content FTS5 index)
+    and its three triggers with `IF NOT EXISTS` on EVERY open — including on
+    a store from before schema v7, where neither object ever existed. Such a
+    store's index is EMPTY while its `reviews` rows already exist, and FTS5's
+    `'delete'` command — fired by the fold's
+    `UPDATE reviews SET repo = lower(repo)` and by `_drop_collision_losers`'s
+    per-loser delete — requires the rowid to BE in the index: it raises
+    SQLITE_CORRUPT and the whole v1->v2 migration bricks, pinning
+    `user_version` at 1 forever (executed probe: one reviews row, single
+    casing, no distinct-id collision ->
+    `sqlite3.DatabaseError: database disk image is malformed`).
+
+    `COUNT(*)` over an external-content index is answered from the CONTENT
+    table, so it cannot detect the anachronism; the schema slot can.
+    Rebuilding first makes the index truthful, so the fold's writes keep it
+    consistent through the triggers — the steady state `migrate_v6_to_v7`
+    establishes, and which it re-establishes anyway (it drops and rebuilds
+    these indexes), so nothing here outlives its slot. The `items` and
+    `comments` indexes need no priming: both existed at v1 alongside their
+    triggers, so they are already populated on every store that holds rows.
+    """
+    if not _table_exists(conn, "reviews_fts"):
+        return
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= _V7_USER_VERSION:
+        return  # post-v7: the index is populated and the triggers are correct
+    conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
+
+
 def fold_repo_casings(conn: sqlite3.Connection) -> None:
     """Collapse case-split repo identities to the folded slug.
 
@@ -525,7 +601,12 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
     _fold_sync_state): the doctor path must not clobber a live
     crashed-mid-sync flag on a single-cased current store, so the
     migration's blanket derivation lives in migrate_v1_to_v2, not here.
+
+    The fold REWRITES rows wholesale (delete + re-insert) and updates
+    `reviews.repo` in place, so every external-content FTS index it touches
+    must be populated first — `_prime_fts_for_fold` runs before any of it.
     """
+    _prime_fts_for_fold(conn)
     _drop_collision_losers(conn)
     source_bearing = _column_exists(conn, "edges", "source")
     idx_existed = _index_exists(conn, "ux_edges_closes_pair")
@@ -536,6 +617,8 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
     for table, clause, order in _FOLD_TABLES:
         if _table_exists(conn, table):
             _fold_dedupe_table(conn, table, clause, order)
+    if _table_exists(conn, "revisions"):
+        _dedupe_revisions(conn)
     _fold_dedupe_table(conn, "edges", _edges_conflict_clause(conn), "id DESC")
     if source_bearing:
         _collapse_closes_pairs(conn)
@@ -1011,7 +1094,11 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     ).fetchall():
         try:
             raw = json.loads(row["raw_json"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
+            # RecursionError: json.loads on a deeply nested stored payload
+            # raises it (a RuntimeError, not a ValueError) — one such row
+            # would otherwise re-brick the chain at v6 (issue #53, review
+            # CUB-8).
             continue
         if not isinstance(raw, dict):
             continue
@@ -1071,7 +1158,7 @@ def migrate_v6_to_v7(conn: sqlite3.Connection) -> None:
     ).fetchall():
         try:
             raw = json.loads(comment_row["raw_json"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             continue
         if not isinstance(raw, dict):
             continue
@@ -1225,7 +1312,7 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
         repo, number = row["repo"], row["number"]
         try:
             raw = json.loads(row["raw_json"])
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             continue
         if not isinstance(raw, dict):
             continue

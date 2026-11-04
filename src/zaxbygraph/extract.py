@@ -610,12 +610,15 @@ def _link_dst(repo: str, node: object, number: int) -> str | None:
     """One {number, repo} link node -> the stored endpoint id: bare number
     when same-repo, repo-qualified 'owner/repo#N' when foreign (the
     cross_referenced precedent); self-references and malformed nodes yield
-    None."""
+    None. A JSON boolean is NOT a number here: `isinstance(True, int)` is
+    True in Python, but a bool `number` is a malformed node (issue #53) —
+    accepting it would stringify to dst_id "True" and retract a stored
+    GitHub-reported link edge."""
     if not isinstance(node, dict):
         return None
     dst_number = node.get("number")
     dst_repo = node.get("repo")
-    if not isinstance(dst_number, int):
+    if isinstance(dst_number, bool) or not isinstance(dst_number, int):
         return None
     if dst_number == number and (not isinstance(dst_repo, str) or dst_repo.lower() == repo.lower()):
         return None

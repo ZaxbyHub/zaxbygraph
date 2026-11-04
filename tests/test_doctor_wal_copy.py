@@ -235,6 +235,74 @@ class SourceImmutabilityTests(_DoctorWalCase):
         self.assertEqual(entry["items"], 4, entry)
 
 
+class FaithfulCopyMechanicsTests(_DoctorWalCase):
+    """The two mechanics `_faithful_copy` relies on, driven in-process so an
+    injected fault actually reaches the copy loop (a subprocess mock never
+    does): the recovery log is copied BEFORE the main file, and a source
+    that moves during the copy is REFUSED rather than accepted as faithful
+    (issue #52, review PRR-016)."""
+
+    def _killed(self, name: str = "history.db", rows: int = 10) -> Path:
+        scan_dir = self.scratch / "scan"
+        scan_dir.mkdir()
+        return self._killed_writer_candidate(scan_dir, 1, rows)
+
+    def test_recovery_log_is_copied_before_the_main_file(self) -> None:
+        import unittest.mock as mock
+
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        copy = self.scratch / "copy.db"
+        real_copy2 = shutil.copy2
+        order: list[str] = []
+
+        def recording_copy2(src, dst, *a, **kw):
+            order.append(Path(str(src)).name)
+            return real_copy2(src, dst, *a, **kw)
+
+        with mock.patch.object(doctor_mod.shutil, "copy2", recording_copy2):
+            self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
+        self.assertEqual(
+            order,
+            ["history.db-wal", "history.db"],
+            "the recovery log must be copied first so a racing checkpoint"
+            " leaves a stale-but-consistent pair, never a torn one",
+        )
+
+    def test_source_moving_during_the_copy_is_refused(self) -> None:
+        """An active writer that changes the source between the before and
+        after stat makes the pair unfaithful: the candidate must be refused
+        (False), not accepted as a torn image (issue #52)."""
+        import unittest.mock as mock
+
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        copy = self.scratch / "copy.db"
+        real_copy2 = shutil.copy2
+
+        def growing_copy2(src, dst, *a, **kw):
+            result = real_copy2(src, dst, *a, **kw)
+            if Path(str(src)).name == "history.db":
+                # an active writer appending to the main file after the copy
+                with open(candidate, "ab") as handle:
+                    handle.write(b"\x00" * 16)
+            return result
+
+        with mock.patch.object(doctor_mod.shutil, "copy2", growing_copy2):
+            self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
+
+    def test_stable_source_is_accepted(self) -> None:
+        """PRESERVING floor: the stability check must not refuse a quiescent
+        candidate (a killed writer's sidecars are already final)."""
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        copy = self.scratch / "copy.db"
+        self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
+
+
 class UnreadableCandidateTests(_DoctorWalCase):
     def test_non_database_file_reported_unusable_not_crash(self) -> None:
         scan_dir = self.scratch / "scan"
