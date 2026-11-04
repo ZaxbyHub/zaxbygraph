@@ -110,28 +110,26 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
-#: A recovery log larger than this is not a recovery log (a runaway writer,
-#: or a non-log file dropped beside the candidate): copying it would spend
-#: unbounded disk and time on a store that is almost certainly not a
-#: faithful WAL (issue #53, review PRR-022). An ABSOLUTE ceiling, not a
-#: multiple of the main file: a WAL-mode store whose main file has never
-#: been checkpointed holds ALL its committed data in the log, so the log
-#: legitimately dwarfs a schema-only main file — a multiple refused real
-#   crash-damaged candidates (frozen check C1 caught it).
-_MAX_SIDECAR_BYTES = 1 << 30
-
-
 def _sidecars(path: Path) -> list[Path] | None:
     """The candidate's recovery logs, or None when one is not a log.
 
     Regular files only (issue #53, review PRR-022): a symlinked or
     non-regular sidecar (FIFO/device) is not a recovery log this copy can
     faithfully take — skipping it would silently truncate the candidate,
-    so such a candidate is reported unusable instead. `is_symlink()` is
-    checked BEFORE `exists()` because `exists()` follows symlinks and a
-    dangling one would otherwise be skipped silently (cubic PR #54 round
-    1). A sidecar above `_MAX_SIDECAR_BYTES` is the other shape that is not
-    a recovery log.
+    and copying a FIFO would block forever, so such a candidate is reported
+    unusable instead. `is_symlink()` is checked BEFORE `exists()` because
+    `exists()` follows symlinks and a dangling one would otherwise be
+    skipped silently (cubic PR #54 round 1).
+
+    There is deliberately NO size bound. A size ceiling was tried first and
+    removed: it refuses a legitimate crash-damaged candidate whose
+    un-checkpointed `-wal` exceeds the ceiling — the exact base defect this
+    module exists to fix (frozen check C1 caught the multiple-of-main-file
+    form doing it; cubic PR #54 round 2 caught the absolute form doing it
+    above 1 GiB). A runaway writer is already refused by the stat-stability
+    check in `_faithful_copy`, which sees a growing source and refuses after
+    bounded retries; a LARGE BUT STABLE log is a real crash-damaged
+    candidate, not a runaway one.
     """
     sidecars = []
     for suffix in ("-wal", "-journal"):
@@ -146,8 +144,6 @@ def _sidecars(path: Path) -> list[Path] | None:
         if not sidecar.exists():
             continue
         if not sidecar.is_file():
-            return None
-        if sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
             return None
         sidecars.append(sidecar)
     return sidecars

@@ -401,26 +401,71 @@ class SidecarEnumerationTests(_DoctorWalCase):
             " attempt re-enumerates and finds only the main file",
         )
 
-    def test_oversized_sidecar_is_refused(self) -> None:
-        """PRR-022's bound: a recovery log above the absolute ceiling is not
-        a recovery log, so the candidate is reported unusable rather than
-        copied. The ceiling is patched rather than written out: a 1 GiB
-        fixture would make the suite slow for no extra evidence, and the
-        check is the comparison, not the file."""
+    def test_non_regular_sidecar_is_refused(self) -> None:
+        """A sidecar that is not a regular file is not a recovery log this
+        copy can faithfully take (issue #53, review PRR-022): skipping it
+        would silently truncate the candidate and copying a FIFO would
+        block forever. A DIRECTORY named `history.db-wal` is the portable
+        shape -- `exists()` answers True for it, so the guard's ordering is
+        exercised on every platform without needing a symlink privilege.
+
+        Pinned STRUCTURALLY, not by outcome: `shutil.copy2` must never be
+        called. Disabling the guard would still refuse the candidate (the
+        copy of a directory raises IsADirectoryError, an OSError, and the
+        retry refuses), so an outcome-only assertion cannot tell a refusal
+        from a refusal-after-attempting-to-copy-a-directory."""
         import unittest.mock as mock
 
         import zaxbygraph.doctor as doctor_mod
 
         candidate = self._killed()
-        copy = self.scratch / "copy.db"
-        with mock.patch.object(doctor_mod, "_MAX_SIDECAR_BYTES", 8):
-            self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
-        # and the unpatched ceiling accepts the same candidate: the bound
-        # must not refuse a legitimate crash-damaged store. A MULTIPLE of
-        # the main file did exactly that -- a WAL-mode store whose main file
-        # was never checkpointed holds all its data in the log, so the log
-        # legitimately dwarfs a schema-only main file (frozen check C1).
-        self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
+        wal = Path(str(candidate) + "-wal")
+        real = wal.read_bytes()
+        wal.unlink()
+        wal.mkdir()
+        try:
+            self.assertTrue(wal.exists(), "the fixture must be present")
+            self.assertFalse(wal.is_file(), "the fixture must not be a file")
+            copy = self.scratch / "copy.db"
+            with mock.patch.object(doctor_mod.shutil, "copy2") as spy:
+                self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
+            self.assertEqual(
+                spy.call_count,
+                0,
+                "the guard must refuse before any copy is attempted",
+            )
+        finally:
+            wal.rmdir()
+            wal.write_bytes(real)
+
+    def test_large_but_stable_sidecar_is_accepted(self) -> None:
+        """There is deliberately NO size bound. A ceiling refuses a
+        legitimate crash-damaged candidate whose un-checkpointed `-wal`
+        exceeds it -- the exact base defect this module fixes (a multiple of
+        the main file failed frozen check C1; an absolute 1 GiB ceiling
+        failed cubic's round-2 finding the same way). A RUNAWAY writer is
+        already refused by the stat-stability check, which sees a growing
+        source; a large but stable log is a real candidate."""
+        import unittest.mock as mock
+
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        wal = Path(str(candidate) + "-wal")
+        real = wal.read_bytes()
+        with open(wal, "wb") as handle:
+            handle.write(real + bytes(2 * 1024 * 1024))
+        try:
+            copy = self.scratch / "copy.db"
+            self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
+            conn = sqlite3.connect(str(copy))
+            try:
+                live = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(live, 10, "the large log's frames were dropped")
+        finally:
+            wal.write_bytes(real)
 
 
 class DivergentCandidateTests(_DoctorWalCase):

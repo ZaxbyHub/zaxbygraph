@@ -403,11 +403,26 @@ def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
         return False
     if len([n for n in raw_nodes if isinstance(n, dict)]) != len(raw_nodes):
         return False
+    total = raw.get("totalCount")
+    comparable = isinstance(total, int) and not isinstance(total, bool)
     if (
         initial
         and not page_info.get("hasNextPage")
-        and isinstance(raw.get("totalCount"), int)
-        and raw["totalCount"] > len(raw_nodes)
+        and "totalCount" in raw
+        and total is not None
+        and not comparable
+    ):
+        # A totalCount the store cannot compare (a string, a float, a bool)
+        # on a page that claims to be last is not an answer we can check, so
+        # the page is not faithful. GitHub emits an int or omits the key;
+        # this arm is the malformed-payload contract, not an observed shape.
+        # A bool is not an int here, matching `_int_or_none` (PRR-003).
+        return False
+    if (
+        initial
+        and not page_info.get("hasNextPage")
+        and comparable
+        and total > len(raw_nodes)
     ):
         return False
     return True

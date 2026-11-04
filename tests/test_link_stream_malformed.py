@@ -627,6 +627,25 @@ class TimelineDrainSafetyTests(unittest.TestCase):
             "the retained events must survive an unanswerable replacement page",
         )
 
+    def test_wrong_typed_totalcount_is_not_an_answer(self) -> None:
+        """A `totalCount` the store cannot compare (a string, a float) on a
+        page that claims to be last is not an answer we can check, so the
+        page is not faithful -- reading it as absent would let
+        `write_item_events` replace the stored rows. GitHub emits an int or
+        omits the key; this arm is the malformed-payload contract."""
+        for bad in ("9", 9.5, True, [9]):
+            with self.subTest(totalCount=bad):
+                children = self._initial(
+                    nodes=[{"__typename": "ReopenedEvent"}],
+                    pageInfo={"hasNextPage": False, "endCursor": "X"},
+                    totalCount=bad,
+                )
+                self.assertTrue(
+                    children.get("timeline_incomplete"),
+                    f"totalCount {bad!r} was not flagged: {children}",
+                )
+                self.assertNotIn("timeline_cursor", children)
+
     def test_unfaithful_continuation_page_keeps_the_flag(self) -> None:
         """The continuation page has the same hole: `_timeline_page` must
         report an unfaithful page as unanswerable so the drain cannot
