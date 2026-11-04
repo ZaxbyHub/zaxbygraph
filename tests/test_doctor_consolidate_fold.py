@@ -404,6 +404,83 @@ class FoldSemanticsTests(_ConsolidateCase):
         # survivor's identity is its payload tuple, not its rowid.
         self.assertEqual(len({r["id"] for r in rows}), 2)
 
+    def test_folded_sync_state_keeps_a_recorded_fault(self) -> None:
+        """PRR-007: an adopted corpus must never report fault-free over a
+        failed run.
+
+        The freshest casing (the winner) carries `last_error = NULL` while
+        the loser casing recorded `boom: disk I/O error`. A winner-only
+        merge drops the fault and `status` then reports a clean sync for a
+        corpus whose last run actually failed (AGENTS.md: a failing sync
+        records `last_error`), so the merged row keeps the winner's error
+        when it has one and any casing's otherwise."""
+        candidate, conn = self._v11_candidate()
+        _seed_item(conn, 101, REPO, 1, "one", "2026-01-01T00:00:00Z")
+        _seed_item(conn, 102, MIXED, 1, "one again", "2026-01-02T00:00:00Z")
+        # the freshest row (the fold's winner) is the clean one
+        # the winner is the greatest issues_since (ties by rowid), so the
+        # clean REPO row wins outright and the fault lives only on the loser
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, NULL, 0, 0)",
+            (REPO, "2026-03-01T00:00:00Z", self.stamp, self.stamp),
+        )
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, 'boom: disk I/O error', 0, 0)",
+            (MIXED, self.stamp, self.stamp, self.stamp),
+        )
+        conn.commit()
+        conn.close()
+        store = self._store()
+        rc, envelope, stderr = self._run_doctor(store, candidate.parent)
+        self.assertEqual(rc, 0, stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            rows = conn.execute(
+                "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0][0], "boom: disk I/O error")
+
+    def test_folded_sync_state_keeps_the_winner_s_own_fault(self) -> None:
+        """The other precedence: when the WINNER carries the fault, it is
+        the one reported — the coalesce is winner-first, not loser-first."""
+        candidate, conn = self._v11_candidate()
+        _seed_item(conn, 101, MIXED, 1, "one", "2026-01-01T00:00:00Z")
+        _seed_item(conn, 102, REPO, 1, "one again", "2026-01-02T00:00:00Z")
+        # the winner is the greatest issues_since (ties by rowid), so the
+        # REPO row wins outright here rather than on an insertion-order tie
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, 'winner failed', 0, 0)",
+            (REPO, "2026-03-01T00:00:00Z", self.stamp, self.stamp),
+        )
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, 'loser failed', 0, 0)",
+            (MIXED, self.stamp, self.stamp, self.stamp),
+        )
+        conn.commit()
+        conn.close()
+        store = self._store()
+        rc, envelope, stderr = self._run_doctor(store, candidate.parent)
+        self.assertEqual(rc, 0, stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            rows = conn.execute(
+                "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([r[0] for r in rows], ["winner failed"])
+
     def test_sync_state_columns_survive_the_fold(self) -> None:
         """A folded v11 candidate keeps its newer sync_state columns: the
         generalized merge must carry fetch_source (v11) and the rate-limit

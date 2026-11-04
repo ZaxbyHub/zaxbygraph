@@ -457,6 +457,13 @@ def _dedupe_revisions(conn: sqlite3.Connection) -> None:
     )
 
 
+#: Host parameters bound per statement. SQLite's ceiling
+#: (SQLITE_MAX_VARIABLE_NUMBER) is 32,766 on the 3.35 floor and 327,666 on
+#: newer builds; 500 is far below either, so an IN list built from an
+#: aggregate id set can never exceed it.
+_SQL_PARAM_CHUNK = 500
+
+
 def _union_closes_same_source(conn: sqlite3.Connection) -> None:
     """Union evidence across FOLDED DUPLICATE groups of `rel='closes'`.
 
@@ -477,13 +484,22 @@ def _union_closes_same_source(conn: sqlite3.Connection) -> None:
         # The ids come from the aggregate: re-selecting the members with a
         # lower(repo) predicate cannot use an index (a full scan per group),
         # which made the fold O(groups x edges) on large dual-cased
-        # candidates (issue #53, review PRR-017).
+        # candidates (issue #53, review PRR-017). The IN list is bound in
+        # chunks so a pathologically large duplicate group cannot exceed
+        # SQLite's host-parameter ceiling (SQLITE_MAX_VARIABLE_NUMBER) and
+        # abort the fold as an unusable candidate.
         ids = [int(x) for x in str(group["ids"]).split(",")]
-        rows = conn.execute(
-            "SELECT id, evidence FROM edges WHERE id IN (%s) ORDER BY id DESC"
-            % ",".join("?" * len(ids)),
-            ids,
-        ).fetchall()
+        rows = []
+        for start in range(0, len(ids), _SQL_PARAM_CHUNK):
+            chunk = ids[start:start + _SQL_PARAM_CHUNK]
+            rows.extend(
+                conn.execute(
+                    "SELECT id, evidence FROM edges WHERE id IN (%s)"
+                    % ",".join("?" * len(chunk)),
+                    chunk,
+                ).fetchall()
+            )
+        rows.sort(key=lambda r: r["id"], reverse=True)
         merged = merge_evidence(
             *[r["evidence"] for r in rows], reserve=(CLOSES_REF_MARKER,)
         )

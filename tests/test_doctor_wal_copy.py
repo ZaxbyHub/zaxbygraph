@@ -303,6 +303,280 @@ class FaithfulCopyMechanicsTests(_DoctorWalCase):
         self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
 
 
+class SidecarEnumerationTests(_DoctorWalCase):
+    """PRR-001's two legs, driven in-process so the injected fault reaches
+    the copy loop (a subprocess mock never does): a sidecar a writer
+    CREATES after the enumeration is copied and stability-checked, and a
+    sidecar that VANISHES does not refuse a healthy candidate."""
+
+    def _killed(self, rows: int = 10) -> Path:
+        scan_dir = self.scratch / "scan"
+        scan_dir.mkdir()
+        return self._killed_writer_candidate(scan_dir, 1, rows)
+
+    def test_late_sidecar_is_copied_and_checked(self) -> None:
+        """A `-wal` a writer creates AFTER the enumeration is not lost.
+
+        The real recovery log is moved out of place so the first attempt
+        sees only the main file, then moved back while that file is being
+        copied. The stale enumeration would accept a main-only image (the
+        candidate's committed frames silently dropped); the re-enumeration
+        inside the retry loop copies it, and the accepted image recovers
+        the writer's whole corpus (issue #53, review PRR-001)."""
+        import unittest.mock as mock
+
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        wal = Path(str(candidate) + "-wal")
+        stashed = self.scratch / "stashed-wal"
+        wal.replace(stashed)
+        self.assertFalse(wal.exists(), "the fixture must start with no sidecar")
+        copy = self.scratch / "copy.db"
+        real_copy2 = shutil.copy2
+        seen: list[str] = []
+
+        def late_sidecar_copy2(src, dst, *a, **kw):
+            name = Path(str(src)).name
+            seen.append(name)
+            result = real_copy2(src, dst, *a, **kw)
+            if name == "history.db" and stashed.exists():
+                # a writer committing new frames while the main file is
+                # already being copied: the sidecar appears late
+                stashed.replace(wal)
+            return result
+
+        with mock.patch.object(doctor_mod.shutil, "copy2", late_sidecar_copy2):
+            accepted = doctor_mod._faithful_copy(candidate, copy)
+        self.assertTrue(accepted, "the late sidecar made the candidate unusable")
+        self.assertIn(
+            "history.db-wal", seen, "the late sidecar was never re-enumerated"
+        )
+        self.assertGreater(
+            seen.index("history.db-wal"),
+            seen.index("history.db"),
+            "the sidecar must be copied on a LATER attempt than the main"
+            " file's first copy — a same-attempt copy means it was already"
+            " in the stale enumeration",
+        )
+        # the accepted image carries the writer's committed frames: a
+        # main-only copy would recover an empty database
+        conn = sqlite3.connect(str(copy))
+        try:
+            live = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(live, 10, "the late sidecar's frames were dropped")
+
+    def test_vanished_sidecar_does_not_refuse_a_healthy_candidate(self) -> None:
+        """A sidecar a finishing writer removes between the enumeration and
+        the copy raises FileNotFoundError on every stale path: without the
+        re-enumeration every retry re-fails on the same stale path and a
+        healthy candidate is refused."""
+        import unittest.mock as mock
+
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        copy = self.scratch / "copy.db"
+        wal = Path(str(candidate) + "-wal")
+        self.assertTrue(wal.exists(), "the fixture must start with a sidecar")
+        real_copy2 = shutil.copy2
+        state = {"removed": False}
+
+        def vanishing_copy2(src, dst, *a, **kw):
+            name = Path(str(src)).name
+            if name == "history.db-wal" and not state["removed"]:
+                state["removed"] = True
+                wal.unlink()  # the writer finished and removed the log
+                raise FileNotFoundError(2, "No such file", str(src))
+            return real_copy2(src, dst, *a, **kw)
+
+        with mock.patch.object(doctor_mod.shutil, "copy2", vanishing_copy2):
+            accepted = doctor_mod._faithful_copy(candidate, copy)
+        self.assertTrue(state["removed"], "the vanish race was never exercised")
+        self.assertTrue(
+            accepted,
+            "a vanished sidecar must not refuse the candidate: the next"
+            " attempt re-enumerates and finds only the main file",
+        )
+
+    def test_oversized_sidecar_is_refused(self) -> None:
+        """PRR-022's bound: a recovery log that dwarfs the database it
+        recovers is not a recovery log, so the candidate is reported
+        unusable rather than copied."""
+        import zaxbygraph.doctor as doctor_mod
+
+        candidate = self._killed()
+        wal = Path(str(candidate) + "-wal")
+        with open(wal, "ab") as handle:
+            handle.write(b"\x00" * (65 * max(candidate.stat().st_size, 1)))
+        copy = self.scratch / "copy.db"
+        self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
+
+
+class DivergentCandidateTests(_DoctorWalCase):
+    """PRR-005's pin: a candidate whose schema defeats the fold (or the copy
+    loop the fold runs after) is reported unusable and SKIPPED, never
+    aborting the whole scan — and the reason is recorded (PRR-019), so the
+    report says why nothing was adopted instead of a bare `adopted: null`.
+    Driven in-process through `doctor()` so the injected divergence reaches
+    the real adoption path."""
+
+    def _candidate(self, name: str, diverge) -> Path:
+        scan_dir = self.scratch / "scan" / name
+        scan_dir.mkdir(parents=True, exist_ok=True)
+        candidate = scan_dir / "history.db"
+        conn = connect(candidate)
+        init_schema(conn)
+        # A current-shape store, so `inspect` reads it and it can win the
+        # scan; the divergence is applied afterwards.
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at,"
+            " raw_json) VALUES (1, 'Probe/Clinic', 1, 'issue', 'one', 'open',"
+            " '2026-01-01T00:00:00Z', '{}')"
+        )
+        conn.execute(
+            "INSERT INTO labels(repo, number, name, color)"
+            " VALUES ('Probe/Clinic', 1, 'bug', 'ff0000')"
+        )
+        # The freshest complete candidate in the scan, so the failure lands
+        # on the adoption path rather than on a candidate doctor never
+        # tries to adopt.
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES ('Probe/Clinic', ?, ?, ?, NULL, 0, 0)",
+            ("2026-03-01T00:00:00Z", self.stamp, self.stamp),
+        )
+        diverge(conn)
+        conn.commit()
+        conn.close()
+        return candidate
+
+    def _extra_reserved_column(self, conn) -> None:
+        """An extra column whose name is a reserved word: the fold's
+        interpolated column list parses it as SQL unless quoted, and the
+        copy then finds a column the store does not have."""
+        conn.execute('ALTER TABLE labels ADD COLUMN "order" INTEGER')
+        conn.execute(
+            "UPDATE labels SET \"order\" = 1 WHERE repo = 'Probe/Clinic'"
+        )
+
+    def _no_unique_index(self, conn) -> None:
+        """`labels` without its PRIMARY KEY: the fold's
+        `ON CONFLICT(repo, number, name)` has no matching constraint."""
+        conn.executescript(
+            "CREATE TABLE labels_foldless (repo TEXT, number INTEGER,"
+            " name TEXT, color TEXT);"
+            "INSERT INTO labels_foldless SELECT repo, number, name, color"
+            " FROM labels;"
+            "DROP TABLE labels;"
+            "ALTER TABLE labels_foldless RENAME TO labels;"
+        )
+
+    def _run(self, divergent: Path) -> dict:
+        import zaxbygraph.doctor as doctor_mod
+
+        good_dir = self.scratch / "good"
+        good_dir.mkdir()
+        self.assertEqual(
+            _spawn_writer(good_dir / "history.db", 1, 4, "clean", self.stamp), 0
+        )
+        store = self.scratch / "store" / "history.db"
+        store.parent.mkdir(parents=True)
+        return doctor_mod.doctor(
+            None, REPO, store, extra_scans=[self.scratch / "scan", good_dir],
+            consolidate_flag=True,
+        ), store, good_dir, divergent
+
+    def _assert_skipped(self, report: dict, store: Path, good_dir: Path,
+                        divergent: Path, why: str) -> None:
+        self.assertTrue(report["ok"], report)
+        self.assertIsNone(
+            report["adopted"], f"the unusable winner must not be adopted: {report}"
+        )
+        rows = {
+            os.path.normcase(str(row.get("path", ""))): row
+            for row in report["scanned"]
+        }
+        self.assertIn(
+            os.path.normcase(str(divergent)), rows,
+            "the divergent candidate vanished from the scan",
+        )
+        entry = rows[os.path.normcase(str(divergent))]
+        self.assertTrue(
+            entry.get("unreadable"),
+            f"the divergent candidate must be marked unreadable: {entry}",
+        )
+        self.assertIn(why, entry.get("unreadable_reason", ""), entry)
+        # the healthy sibling is still reported, and the store was never
+        # written by the failed candidate
+        self.assertIn(os.path.normcase(str(good_dir / "history.db")), rows, report)
+        # The adoption is one transaction, so nothing was written: the
+        # store is either absent or an empty schema (a rolled-back stub,
+        # the documented boundary), never holding the candidate's rows.
+        if store.exists():
+            conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+            try:
+                items = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(items, 0, "a failed consolidation wrote rows")
+
+    def test_extra_column_defeats_the_copy_and_is_skipped(self) -> None:
+        divergent = self._candidate("extra", self._extra_reserved_column)
+        report, store, good_dir, path = self._run(divergent)
+        self._assert_skipped(
+            report, store, good_dir, path, "schema defeated the copy"
+        )
+
+    def test_reserved_word_column_folds_and_adopts(self) -> None:
+        """PRR-005's quoting pin, discriminating: the store and the candidate
+        BOTH carry a column named `order`, so the fold's interpolated column
+        list must be quoted for the adoption to work at all. An unquoted
+        reference is a syntax error, which the isolation would report as an
+        unusable candidate -- the adoption here is what proves the quoting,
+        not the skip."""
+        import zaxbygraph.doctor as doctor_mod
+
+        divergent = self._candidate("reserved", self._extra_reserved_column)
+        store = self.scratch / "store" / "history.db"
+        store.parent.mkdir(parents=True)
+        conn = connect(store)
+        init_schema(conn)
+        conn.execute('ALTER TABLE labels ADD COLUMN "order" INTEGER')
+        conn.commit()
+        conn.close()
+        report = doctor_mod.doctor(
+            None, REPO, store, extra_scans=[self.scratch / "scan"],
+            consolidate_flag=True,
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(
+            os.path.normcase(str(report["adopted"])),
+            os.path.normcase(str(divergent)),
+            f"the reserved-word column must fold and adopt: {report}",
+        )
+        conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+        try:
+            rows = conn.execute('SELECT name, "order" FROM labels').fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(
+            [tuple(r) for r in rows],
+            [("bug", 1)],
+            "the reserved-word column's rows must be adopted",
+        )
+
+    def test_missing_unique_index_defeats_the_fold_and_is_skipped(self) -> None:
+        divergent = self._candidate("foldless", self._no_unique_index)
+        report, store, good_dir, path = self._run(divergent)
+        self._assert_skipped(
+            report, store, good_dir, path, "schema defeated the fold"
+        )
+
+
 class UnreadableCandidateTests(_DoctorWalCase):
     def test_non_database_file_reported_unusable_not_crash(self) -> None:
         scan_dir = self.scratch / "scan"
