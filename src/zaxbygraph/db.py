@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from importlib.resources import files
 from pathlib import Path
@@ -100,6 +101,46 @@ def assert_fts5_available(conn: sqlite3.Connection) -> None:
 #: invalidation.
 _ALLOWED_INTERNAL_PRAGMAS = {"data_version"}
 
+#: The three characters that are significant to SQLite's URI parser inside a
+#: path component: '#' starts a fragment, '?' starts the query, and '%XX' is a
+#: percent-escape. Percent-encoding them keeps a filename that contains them
+#: intact as data (issue #55).
+_URI_PATH_ESCAPE = str.maketrans({"#": "%23", "?": "%3F", "%": "%25"})
+
+
+def _readonly_uri(db_path: Path) -> str:
+    """Build the SQLite URI for a read-only open of `db_path`.
+
+    `sqlite3.connect(..., uri=True)` parses its filename as a URI, not as a
+    path, so a filename carrying a URI metacharacter is read as syntax: a
+    '#' truncates the path at the fragment and swallows `mode=ro` into it
+    (the connection then opens the truncated path in default
+    read-write-create mode), and a '%XX' decodes to a different existing
+    file. Both are silent wrong-file reads (issue #55 AC1/AC2).
+
+    `Path.as_uri()` percent-encodes every character significant to the URI
+    grammar, which is why `snapshot._open_readonly` uses it. Two shapes it
+    cannot express are handled explicitly:
+
+    * a **relative** path — `as_uri()` raises ValueError, so the path is made
+      absolute with `os.path.abspath()`. That is the one form that covers all
+      three Windows shapes (ordinary relative, root-relative, and
+      drive-relative on a different drive from the process cwd, which
+      `Path.cwd() / p` leaves relative and `Path.absolute()` also leaves
+      relative) without resolving symlinks the way `Path.resolve()` does.
+    * a **UNC** path — SQLite's URI parser rejects an authority component
+      ("invalid uri authority: <host>"), and `as_uri()` always emits one, so
+      the backslash spelling is the only form SQLite accepts. The three
+      metacharacters are percent-encoded by hand there.
+
+    Every caller of this helper has already established that the file exists;
+    nothing here creates anything.
+    """
+    p = Path(os.path.abspath(db_path))
+    if p.drive.startswith("\\\\"):
+        return "file:" + str(p).translate(_URI_PATH_ESCAPE) + "?mode=ro"
+    return p.as_uri() + "?mode=ro"
+
 
 def _deny_write_authorizer(
     action: int,
@@ -149,7 +190,7 @@ def connect_readonly_query(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
     assert_sqlite_supported()
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(_readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
@@ -184,7 +225,7 @@ def open_existing(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"database not found: {db_path}")
     assert_sqlite_supported()
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(_readonly_uri(db_path), uri=True)
     conn.row_factory = sqlite3.Row
     try:
         assert_fts5_available(conn)
