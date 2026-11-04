@@ -123,11 +123,14 @@ def _readonly_uri(db_path: Path) -> str:
     cannot express are handled explicitly:
 
     * a **relative** path — `as_uri()` raises ValueError, so the path is made
-      absolute with `os.path.abspath()`. That is the one form that covers all
-      three Windows shapes (ordinary relative, root-relative, and
-      drive-relative on a different drive from the process cwd, which
-      `Path.cwd() / p` leaves relative and `Path.absolute()` also leaves
-      relative) without resolving symlinks the way `Path.resolve()` does.
+      absolute. Only the Windows drive-relative shape needs `os.path.abspath`
+      (a `C:foo` spelling stays relative under both `Path.cwd() / p` and
+      `Path.absolute()`, and `abspath` is the one form that resolves it).
+      Every other relative spelling is joined to the cwd verbatim, because
+      `abspath` collapses `..` lexically while opening the original spelling
+      resolves a symlink first and then applies `..` — on POSIX those can
+      select different files, so normalizing them here would silently change
+      which database a read opens.
     * a **UNC** path — SQLite's URI parser rejects an authority component
       ("invalid uri authority: <host>"), and `as_uri()` always emits one, so
       the backslash spelling is the only form SQLite accepts. The three
@@ -136,7 +139,9 @@ def _readonly_uri(db_path: Path) -> str:
     Every caller of this helper has already established that the file exists;
     nothing here creates anything.
     """
-    p = Path(os.path.abspath(db_path))
+    p = Path(db_path)
+    if not p.is_absolute():
+        p = Path(os.path.abspath(p)) if p.drive else Path.cwd() / p
     if p.drive.startswith("\\\\"):
         return "file:" + str(p).translate(_URI_PATH_ESCAPE) + "?mode=ro"
     return p.as_uri() + "?mode=ro"

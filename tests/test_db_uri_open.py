@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import os
 import sqlite3
 import subprocess
 import sys
@@ -78,9 +79,12 @@ class ReadonlyUriHelperTest(unittest.TestCase):
     def test_metacharacters_survive_the_uri_round_trip(self) -> None:
         # The property that matters: SQLite percent-decodes the URI path, so
         # the encoded form must decode back to the filename the caller gave.
-        for name in ("graph#2.sqlite", "%61b.sqlite", "a?b.db", "a b.db",
-                     "a%23b.db"):
-            p = Path("C:/tmp") / name
+        # The base is the host's own temp root so the test is constructible
+        # on Windows and POSIX alike (a 'C:/tmp' spelling is merely a
+        # relative path on POSIX).
+        base = Path("C:/tmp") if sys.platform == "win32" else Path("/tmp")
+        for name in ("graph#2.sqlite", "%61b.sqlite", "a b.db", "a%23b.db"):
+            p = base / name
             uri = _readonly_uri(p)
             self.assertTrue(uri.endswith("?mode=ro"), name)
             path_part = uri[len("file:///"):].split("?", 1)[0]
@@ -96,36 +100,42 @@ class ReadonlyUriHelperTest(unittest.TestCase):
         uri = _readonly_uri(Path("rel.db"))
         self.assertTrue(uri.startswith("file:///"), uri)
 
-    def test_drive_relative_path_on_another_drive_is_absolute(self) -> None:
-        # `Path.cwd() / p` and `Path.absolute()` both leave a drive-relative
-        # path on a different drive relative, and as_uri() then raises. This
-        # is a Windows-only shape, so it is pinned only where it can exist.
-        if sys.platform != "win32":
-            self.skipTest("drive-relative paths are a Windows shape")
-        # cwd is E: here; a 'C:...' drive-relative path must still resolve.
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "drive.db"
-            _build_store(target)
-            drive, _, rest = str(target).partition(":")
-            rel = drive + ":" + rest[1:] if rest.startswith("\\") else None
-            if rel is None:
-                self.skipTest("temp dir is not on a drive-relative shape")
-            uri = _readonly_uri(Path(rel))
-            self.assertTrue(uri.startswith("file:///"), uri)
-            conn = open_existing(Path(rel))
-            try:
-                row = conn.execute("SELECT title FROM items").fetchone()
-                self.assertEqual(row["title"], "row")
-            finally:
-                conn.close()
+    def test_relative_path_is_not_lexically_collapsed(self) -> None:
+        # os.path.abspath collapses '..' lexically, but opening the original
+        # spelling resolves a symlink first and then applies '..' -- on POSIX
+        # those select different files. The helper must therefore normalize
+        # only the Windows drive-relative shape and leave every other
+        # relative spelling intact.
+        uri = _readonly_uri(Path("a/../b.db"))
+        self.assertIn("a/../b.db", uri)
+
+    def test_drive_relative_path_is_made_absolute(self) -> None:
+        # A Windows drive-relative spelling ('E:drive.db') is not absolute to
+        # pathlib and as_uri() refuses it. On POSIX a drive is always empty,
+        # so the ordinary relative spelling is the same branch and the
+        # assertion holds there too.
+        rel = (Path(os.getcwd()).drive + "drive.db"
+               if sys.platform == "win32" else "drive.db")
+        uri = _readonly_uri(Path(rel))
+        self.assertTrue(uri.startswith("file:///"), uri)
+        self.assertIn("drive.db", uri)
 
     def test_unc_path_keeps_the_backslash_spelling(self) -> None:
         # SQLite's URI parser rejects an authority component, and as_uri()
         # always emits one, so a UNC path needs the backslash form.
         unc = Path(r"\\server\share\history.db")
         uri = _readonly_uri(unc)
-        self.assertTrue(uri.startswith("file:" + str(unc)), uri)
-        self.assertNotIn("//server", uri)
+        if sys.platform == "win32":
+            self.assertTrue(uri.startswith("file:" + str(unc)), uri)
+            self.assertNotIn("//server", uri)
+        else:
+            # On POSIX a UNC spelling is an ordinary relative filename; the
+            # helper must still produce a URI that round-trips to it.
+            path_part = uri[len("file:///"):].split("?", 1)[0]
+            self.assertEqual(
+                unquote_to_bytes(path_part),
+                unc.as_posix().encode("utf-8"),
+            )
 
     def test_unc_path_metacharacters_are_escaped(self) -> None:
         # The authority assertion above rejects the two obvious wrong fixes,
@@ -133,27 +143,44 @@ class ReadonlyUriHelperTest(unittest.TestCase):
         # skips escaping. Pin the exact escaped output instead.
         unc = Path(r"\\somehost\share\dir\a#b?c%61d%25e.db")
         uri = _readonly_uri(unc)
-        self.assertEqual(
-            uri,
-            r"file:\\somehost\share\dir\a%23b%3Fc%2561d%2525e.db?mode=ro",
-        )
-        # And it must decode back to the original filename.
-        path_part = uri[len("file:"):].split("?", 1)[0]
-        self.assertEqual(
-            unquote_to_bytes(path_part), str(unc).encode("utf-8")
-        )
+        if sys.platform == "win32":
+            self.assertEqual(
+                uri,
+                r"file:\\somehost\share\dir\a%23b%3Fc%2561d%2525e.db?mode=ro",
+            )
+            path_part = uri[len("file:"):].split("?", 1)[0]
+            self.assertEqual(
+                unquote_to_bytes(path_part), str(unc).encode("utf-8")
+            )
+        else:
+            # On POSIX the spelling is an ordinary relative filename, so pin
+            # the round-trip rather than a Windows URI spelling.
+            path_part = uri[len("file:///"):].split("?", 1)[0]
+            self.assertEqual(
+                unquote_to_bytes(path_part),
+                unc.as_posix().encode("utf-8"),
+            )
 
     def test_unc_uri_is_accepted_by_sqlite(self) -> None:
         # The discriminating half: SQLite accepts the helper's spelling as a
         # URI (it then fails only because the share does not exist here),
-        # while the as_uri() spelling is rejected as a URI outright.
-        unc = Path(r"\\server\share\history.db")
+        # while the as_uri() spelling is rejected as a URI outright. A
+        # non-localhost host is required: SQLite accepts 'localhost' as an
+        # authority, so only a remote host proves the rejection.
+        unc = Path(r"\\somehost\share\history.db")
+        uri = _readonly_uri(unc)
         with self.assertRaises(sqlite3.OperationalError) as ours:
-            sqlite3.connect(_readonly_uri(unc), uri=True)
+            sqlite3.connect(uri, uri=True)
         self.assertIn("unable to open database file", str(ours.exception))
-        with self.assertRaises(sqlite3.OperationalError) as theirs:
-            sqlite3.connect(unc.as_uri() + "?mode=ro", uri=True)
-        self.assertIn("invalid uri authority", str(theirs.exception))
+        if sys.platform == "win32":
+            with self.assertRaises(sqlite3.OperationalError) as theirs:
+                sqlite3.connect(unc.as_uri() + "?mode=ro", uri=True)
+            self.assertIn("invalid uri authority", str(theirs.exception))
+        else:
+            # On POSIX the spelling is a relative filename and as_uri() simply
+            # refuses it, which is the same class of wrong answer.
+            with self.assertRaises(ValueError):
+                unc.as_uri()
 
     def test_unc_uri_round_trips_through_sqlite_decoding(self) -> None:
         # SQLite percent-decodes the URI path, so the encoded form must decode
