@@ -447,6 +447,40 @@ class FoldSemanticsTests(_ConsolidateCase):
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual(rows[0][0], "boom: disk I/O error")
 
+    def test_folded_sync_state_preserves_nullness_of_last_error(self) -> None:
+        """A non-NULL but EMPTY `last_error` is still a recorded state
+        (cubic PR #54 round 1): the coalesce tests `is not None`, not
+        truthiness, so a corpus that stopped early cannot report complete
+        through an empty-string fault being merged away."""
+        candidate, conn = self._v11_candidate()
+        _seed_item(conn, 101, REPO, 1, "one", "2026-01-01T00:00:00Z")
+        _seed_item(conn, 102, MIXED, 1, "one again", "2026-01-02T00:00:00Z")
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, '', 0, 0)",
+            (REPO, "2026-03-01T00:00:00Z", self.stamp, self.stamp),
+        )
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " last_incr_sync_at, last_error, include_patches, full_sync_pending)"
+            " VALUES (?, ?, ?, ?, NULL, 0, 0)",
+            (MIXED, self.stamp, self.stamp, self.stamp),
+        )
+        conn.commit()
+        conn.close()
+        store = self._store()
+        rc, envelope, stderr = self._run_doctor(store, candidate.parent)
+        self.assertEqual(rc, 0, stderr)
+        conn = sqlite3.connect(str(store))
+        try:
+            rows = conn.execute(
+                "SELECT last_error FROM sync_state WHERE repo = ?", (REPO,)
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual([r[0] for r in rows], [""])
+
     def test_folded_sync_state_keeps_the_winner_s_own_fault(self) -> None:
         """The other precedence: when the WINNER carries the fault, it is
         the one reported — the coalesce is winner-first, not loser-first."""

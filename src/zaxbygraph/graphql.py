@@ -1112,9 +1112,19 @@ class GraphQLSource(GhApiSource):
             merged_by_login = (
                 merged_by.get("login") if isinstance(merged_by, dict) else None
             )
-            closing_refs, closing_more = _carried_connection(
-                node.get("closingIssuesReferences")
-            )
+            # Key PRESENCE first (cubic PR #54 round 1): a capability mask
+            # leaves the field out of the node entirely, and
+            # `_carried_connection(None)` reports a malformed carried
+            # section — so every affected PR logged a false "closing
+            # references truncated". An absent field is unanswered, not
+            # truncated; a field present with null IS malformed (the
+            # carried-connection truth table).
+            if "closingIssuesReferences" in node:
+                closing_refs, closing_more = _carried_connection(
+                    node.get("closingIssuesReferences")
+                )
+            else:
+                closing_refs, closing_more = [], False
             pull_payload = {
                 "additions": node.get("additions"),
                 "deletions": node.get("deletions"),

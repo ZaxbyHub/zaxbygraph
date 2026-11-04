@@ -744,6 +744,50 @@ class CarriedSectionTests(unittest.TestCase):
             "files", {"files": "garbage"}, "files", "files_incomplete"
         )
 
+    def test_absent_closing_refs_field_is_not_truncated(self) -> None:
+        """A capability mask leaves the field out of the node; an unanswered
+        section is not a truncated one (cubic PR #54 round 1). Calling
+        `_carried_connection(None)` reported every affected PR as
+        "closing references truncated"."""
+        children = _source()._children_from_node(
+            {
+                "number": 1,
+                "id": "I_1",
+                "baseRefName": "main",
+                "mergedAt": "2026-01-02T00:00:00Z",
+            }
+        )
+        self.assertNotIn(
+            "closing_refs_incomplete",
+            children,
+            "an absent closingIssuesReferences field must not be flagged"
+            f" truncated: {children}",
+        )
+        self.assertEqual(
+            children["pull"]["closing_issues_references"],
+            [],
+            "an absent field still emits the REST-shaped key as empty",
+        )
+
+    def test_present_null_closing_refs_is_still_malformed(self) -> None:
+        """PRESERVING floor: a field PRESENT with null is a malformed
+        carried section, so it stays flagged — the presence check must not
+        swallow the truth table."""
+        children = _source()._children_from_node(
+            {
+                "number": 1,
+                "id": "I_1",
+                "baseRefName": "main",
+                "mergedAt": "2026-01-02T00:00:00Z",
+                "closingIssuesReferences": None,
+            }
+        )
+        self.assertTrue(
+            children.get("closing_refs_incomplete"),
+            "a present-null closingIssuesReferences must stay flagged:"
+            f" {children}",
+        )
+
     def test_malformed_closing_refs_container(self) -> None:
         """The closingIssuesReferences connection lives inside the pull
         gate (its own baseRefName/mergedAt fields), so the fixture carries

@@ -360,9 +360,14 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         # winner's last_error when it has one, else any casing's, so an
         # adopted corpus cannot report fault-free over a failed run
         # (AGENTS.md: a failing sync records last_error; issue #53, review
-        # PRR-007).
+        # PRR-007). The test is `is not None`, not truthiness (cubic PR #54
+        # round 1): a non-NULL but EMPTY last_error is still a recorded
+        # state, and dropping it would let a corpus that stopped early
+        # report complete.
         last_error = next(
-            (r["last_error"] for r in (winner, *group) if r["last_error"]), None
+            (r["last_error"] for r in (winner, *group)
+             if r["last_error"] is not None),
+            None,
         )
         for row in group:
             conn.execute("DELETE FROM sync_state WHERE rowid = ?", (row["rid"],))

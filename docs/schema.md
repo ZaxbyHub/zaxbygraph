@@ -662,12 +662,14 @@ where `reactions_total` or `author_association` is `NULL` — the two listing
 keys GitHub always carries with a non-null value, so their `NULL`
 unambiguously marks a payload that predated v7 or one the v6→v7 backfill
 could not use (unparseable or non-object `raw_json` skips that row's
-backfill, so its v7 columns stay at their ALTER defaults while the
-pre-existing `merge_commit`/`merged_at` keep their stored values; a
-wrong-typed FIELD — a non-scalar value or an integer outside SQLite's
-signed 64-bit range — degrades that field's column alone; the chain
-advances either way, and strings and floats bind as-is under SQLite's
-column affinity, per the migration's payload guard). Columns whose
+backfill, so its PAYLOAD-derived v7 columns stay at their ALTER defaults
+while the pre-existing `merge_commit`/`merged_at` keep their stored values;
+the table-derived `comment_count`/`paths_text` are recomputed for every
+row regardless, so a malformed row can still hold a non-default value
+there; a wrong-typed FIELD — a non-scalar value or an integer outside
+SQLite's signed 64-bit range — degrades that field's column alone; the
+chain advances either way, and strings and floats bind as-is under
+SQLite's column affinity, per the migration's payload guard). Columns whose
 `NULL` is legitimate current state are deliberately excluded (unmilestoned/untyped
 issues' `milestone`/`item_type`, PR rows' missing dependency summaries,
 unmerged PRs' pull trio) so ordinary rows are not flagged. `null_v7_rows` is

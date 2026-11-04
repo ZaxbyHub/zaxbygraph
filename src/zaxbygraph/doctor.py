@@ -110,12 +110,15 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
-#: A recovery log many times larger than the database it recovers is not a
-#: recovery log (a runaway writer, or a non-log file dropped beside the
-#: candidate). Refusing it costs one candidate; copying it costs unbounded
-#: disk and time on a store that is almost certainly not a faithful WAL
-#: (issue #53, review PRR-022).
-_MAX_SIDECAR_FACTOR = 64
+#: A recovery log larger than this is not a recovery log (a runaway writer,
+#: or a non-log file dropped beside the candidate): copying it would spend
+#: unbounded disk and time on a store that is almost certainly not a
+#: faithful WAL (issue #53, review PRR-022). An ABSOLUTE ceiling, not a
+#: multiple of the main file: a WAL-mode store whose main file has never
+#: been checkpointed holds ALL its committed data in the log, so the log
+#: legitimately dwarfs a schema-only main file — a multiple refused real
+#   crash-damaged candidates (frozen check C1 caught it).
+_MAX_SIDECAR_BYTES = 1 << 30
 
 
 def _sidecars(path: Path) -> list[Path] | None:
@@ -124,22 +127,27 @@ def _sidecars(path: Path) -> list[Path] | None:
     Regular files only (issue #53, review PRR-022): a symlinked or
     non-regular sidecar (FIFO/device) is not a recovery log this copy can
     faithfully take — skipping it would silently truncate the candidate,
-    so such a candidate is reported unusable instead. A sidecar that
-    DWARFS the database it recovers is the other shape that is not a
-    recovery log (a runaway writer, or a non-log file dropped beside the
-    candidate): copying it would spend unbounded disk and time on a
-    candidate that is almost certainly not a faithful WAL.
+    so such a candidate is reported unusable instead. `is_symlink()` is
+    checked BEFORE `exists()` because `exists()` follows symlinks and a
+    dangling one would otherwise be skipped silently (cubic PR #54 round
+    1). A sidecar above `_MAX_SIDECAR_BYTES` is the other shape that is not
+    a recovery log.
     """
     sidecars = []
     for suffix in ("-wal", "-journal"):
         sidecar = Path(str(path) + suffix)
+        # `is_symlink()` BEFORE `exists()` (cubic PR #54 round 1): `exists()`
+        # follows symlinks, so a DANGLING one is silently skipped and the
+        # guard below never sees it. `is_symlink()` answers for a dangling
+        # link too, so every symlinked sidecar is refused rather than
+        # quietly dropped.
+        if sidecar.is_symlink():
+            return None
         if not sidecar.exists():
             continue
-        if sidecar.is_symlink() or not sidecar.is_file():
+        if not sidecar.is_file():
             return None
-        if sidecar.stat().st_size > _MAX_SIDECAR_FACTOR * max(
-            path.stat().st_size, 1
-        ):
+        if sidecar.stat().st_size > _MAX_SIDECAR_BYTES:
             return None
         sidecars.append(sidecar)
     return sidecars

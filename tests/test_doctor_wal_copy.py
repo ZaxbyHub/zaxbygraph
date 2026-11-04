@@ -402,17 +402,25 @@ class SidecarEnumerationTests(_DoctorWalCase):
         )
 
     def test_oversized_sidecar_is_refused(self) -> None:
-        """PRR-022's bound: a recovery log that dwarfs the database it
-        recovers is not a recovery log, so the candidate is reported
-        unusable rather than copied."""
+        """PRR-022's bound: a recovery log above the absolute ceiling is not
+        a recovery log, so the candidate is reported unusable rather than
+        copied. The ceiling is patched rather than written out: a 1 GiB
+        fixture would make the suite slow for no extra evidence, and the
+        check is the comparison, not the file."""
+        import unittest.mock as mock
+
         import zaxbygraph.doctor as doctor_mod
 
         candidate = self._killed()
-        wal = Path(str(candidate) + "-wal")
-        with open(wal, "ab") as handle:
-            handle.write(b"\x00" * (65 * max(candidate.stat().st_size, 1)))
         copy = self.scratch / "copy.db"
-        self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
+        with mock.patch.object(doctor_mod, "_MAX_SIDECAR_BYTES", 8):
+            self.assertFalse(doctor_mod._faithful_copy(candidate, copy))
+        # and the unpatched ceiling accepts the same candidate: the bound
+        # must not refuse a legitimate crash-damaged store. A MULTIPLE of
+        # the main file did exactly that -- a WAL-mode store whose main file
+        # was never checkpointed holds all its data in the log, so the log
+        # legitimately dwarfs a schema-only main file (frozen check C1).
+        self.assertTrue(doctor_mod._faithful_copy(candidate, copy))
 
 
 class DivergentCandidateTests(_DoctorWalCase):
