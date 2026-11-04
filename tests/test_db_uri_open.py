@@ -27,6 +27,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -35,7 +36,7 @@ import unittest
 import ast
 import zlib
 from pathlib import Path
-from urllib.parse import unquote_to_bytes
+from urllib.parse import unquote_to_bytes, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -74,6 +75,23 @@ def _build_store(path: Path, title: str = "row") -> Path:
     return path
 
 
+def _uri_path(uri: str) -> bytes:
+    """The decoded path component of a `file:` URI, read the way SQLite does.
+
+    `urlsplit` is used rather than slicing off a literal "file:///" prefix,
+    because a POSIX absolute path is `file:///tmp/x` (three slashes, the
+    first belonging to the path) while a Windows one is `file:///C:/tmp/x`
+    (the drive letter follows the authority). Slicing the prefix strips the
+    POSIX path's leading slash and silently compares the wrong string.
+    """
+    path = urlsplit(uri).path
+    if sys.platform == "win32" and re.match(r"^/[A-Za-z]:", path):
+        # as_uri() emits 'file:///C:/...', so the path arrives as '/C:/...'
+        # and SQLite strips that leading slash for the drive form.
+        path = path[1:]
+    return unquote_to_bytes(path)
+
+
 class ReadonlyUriHelperTest(unittest.TestCase):
     """The shared helper itself: percent-encode what SQLite would parse."""
 
@@ -88,13 +106,7 @@ class ReadonlyUriHelperTest(unittest.TestCase):
             p = base / name
             uri = _readonly_uri(p)
             self.assertTrue(uri.endswith("?mode=ro"), name)
-            path_part = uri[len("file:///"):].split("?", 1)[0]
-            # as_uri() renders the path with forward slashes.
-            self.assertEqual(
-                unquote_to_bytes(path_part),
-                p.as_posix().encode("utf-8"),
-                name,
-            )
+            self.assertEqual(_uri_path(uri), p.as_posix().encode("utf-8"), name)
 
     def test_relative_path_is_made_absolute(self) -> None:
         # as_uri() raises on a relative path; the helper must not.
@@ -130,12 +142,10 @@ class ReadonlyUriHelperTest(unittest.TestCase):
             self.assertTrue(uri.startswith("file:" + str(unc)), uri)
             self.assertNotIn("//server", uri)
         else:
-            # On POSIX a UNC spelling is an ordinary relative filename; the
-            # helper must still produce a URI that round-trips to it.
-            path_part = uri[len("file:///"):].split("?", 1)[0]
+            # On POSIX a UNC spelling is an ordinary relative filename, so the
+            # helper joins it to the cwd; the URI must round-trip to that.
             self.assertEqual(
-                unquote_to_bytes(path_part),
-                unc.as_posix().encode("utf-8"),
+                _uri_path(uri), (Path.cwd() / unc).as_posix().encode("utf-8")
             )
 
     def test_unc_path_metacharacters_are_escaped(self) -> None:
@@ -149,17 +159,12 @@ class ReadonlyUriHelperTest(unittest.TestCase):
                 uri,
                 r"file:\\somehost\share\dir\a%23b%3Fc%2561d%2525e.db?mode=ro",
             )
-            path_part = uri[len("file:"):].split("?", 1)[0]
-            self.assertEqual(
-                unquote_to_bytes(path_part), str(unc).encode("utf-8")
-            )
+            self.assertEqual(_uri_path(uri), str(unc).encode("utf-8"))
         else:
             # On POSIX the spelling is an ordinary relative filename, so pin
             # the round-trip rather than a Windows URI spelling.
-            path_part = uri[len("file:///"):].split("?", 1)[0]
             self.assertEqual(
-                unquote_to_bytes(path_part),
-                unc.as_posix().encode("utf-8"),
+                _uri_path(uri), (Path.cwd() / unc).as_posix().encode("utf-8")
             )
 
     def test_unc_uri_is_accepted_by_sqlite(self) -> None:
@@ -194,12 +199,17 @@ class ReadonlyUriHelperTest(unittest.TestCase):
             r"\\server\share\my%23store.db",
         ):
             uri = _readonly_uri(Path(name))
-            path_part = uri[len("file:"):].split("?", 1)[0].split("#", 1)[0]
-            self.assertEqual(
-                unquote_to_bytes(path_part),
-                str(Path(name)).encode("utf-8"),
-                name,
-            )
+            if sys.platform == "win32":
+                self.assertEqual(
+                    _uri_path(uri), str(Path(name)).encode("utf-8"), name
+                )
+            else:
+                # On POSIX the spelling is an ordinary relative filename.
+                self.assertEqual(
+                    _uri_path(uri),
+                    (Path.cwd() / name).as_posix().encode("utf-8"),
+                    name,
+                )
 
 
 class HashInDbPathTest(unittest.TestCase):
@@ -259,6 +269,23 @@ class HashInDbPathTest(unittest.TestCase):
             "sql", "SELECT title FROM items",
             "--db", str(self.db), "--repo", REPO, "--format", "compact",
         ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("graph", self._names())
+
+    def test_cli_reads_a_relative_db_path(self) -> None:
+        # AC7's end-to-end leg: the CLI must accept a relative --db, which is
+        # the shape the plan critic named as the regression surface for the
+        # as_uri() ValueError. A helper-only unit test would not catch a
+        # CLI-to-helper seam break.
+        previous = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            rc = main([
+                "sql", "SELECT title FROM items",
+                "--db", "graph#2.sqlite", "--repo", REPO, "--format", "compact",
+            ])
+        finally:
+            os.chdir(previous)
         self.assertEqual(rc, 0)
         self.assertNotIn("graph", self._names())
 
