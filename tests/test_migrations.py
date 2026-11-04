@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -8,6 +9,8 @@ from pathlib import Path
 from zaxbygraph.db import (
     CURRENT_USER_VERSION,
     SCHEMA_VERSION,
+    _FOLD_TABLES,
+    _LOSER_CHILD_TABLES,
     _schema_sql,
     connect,
     init_schema,
@@ -812,6 +815,48 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(row["full_sync_pending"], 1)
         self.assertEqual(status(conn, "solo/repo")["repos"][0]["complete"], False)
 
+    def test_v1_store_holding_reviews_migrates(self) -> None:
+        """A v1 store that ever synced a PR must not brick at v1->v2.
+
+        `_schema_sql()` installs `reviews_fts` and its triggers on every
+        open, so a pre-v7 store gets an EMPTY external-content index over
+        `reviews` rows that already exist. The fold's
+        `UPDATE reviews SET repo = lower(repo)` then fires FTS5's `'delete'`
+        command for a rowid that is not in the index, which raises
+        SQLITE_CORRUPT and pins `user_version` at 1 forever — every later
+        `sync`, `doctor` and read on that store fails. RED at the PR head
+        (executed probe: one reviews row, single casing, no distinct-id
+        collision -> `sqlite3.DatabaseError: database disk image is
+        malformed`)."""
+        v1 = sqlite3.connect(str(self.db_path))
+        v1.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at, raw_json)"
+            " VALUES (7001, 'solo/repo', 7, 'pr', 'a pr', 'open', '2026-01-01T00:00:00Z', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (8001, 'solo/repo', 7, 'COMMENTED', 'a review', '{}')"
+        )
+        v1.commit()
+        v1.close()
+
+        conn = self._open_current()
+        self.assertEqual(
+            conn.execute("PRAGMA user_version").fetchone()[0], CURRENT_USER_VERSION
+        )
+        row = conn.execute(
+            "SELECT repo, body FROM reviews WHERE id = 8001"
+        ).fetchone()
+        self.assertEqual(row["repo"], "solo/repo")
+        self.assertEqual(row["body"], "a review")
+        # the primed index is truthful: the review is searchable
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM reviews_fts WHERE reviews_fts MATCH 'review'"
+            ).fetchone()[0],
+            1,
+        )
+
     def test_distinct_id_collision_drops_losers_children(self) -> None:
         v1 = sqlite3.connect(str(self.db_path))
         # delete-and-recreate shape: same (repo, number), distinct ids, lower fresher
@@ -825,6 +870,35 @@ class MigrationTests(unittest.TestCase):
         )
         v1.execute("INSERT INTO labels(repo, number, name, color) VALUES ('ZaxbyHub/TrainingApp', 7, 'bug', 'ff0000')")
         v1.execute("INSERT INTO labels(repo, number, name, color) VALUES ('zaxbyhub/trainingapp', 7, 'bug', '00ff00')")
+        # loser's item-scoped child rows in comments/reviews/pr_files — the
+        # three the reviewer named, which the original helper covered but
+        # nothing pinned (issue #52, review PRR-014). The post-v2 tables are
+        # covered by LosersCoverEveryTableTests below (a v1 store cannot hold
+        # rows in tables that did not exist yet).
+        v1.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, body, raw_json)"
+            " VALUES (5001, 'ZaxbyHub/TrainingApp', 7, 'issue_comment', 'loser', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO comments(github_id, repo, number, kind, body, raw_json)"
+            " VALUES (5002, 'zaxbyhub/trainingapp', 7, 'issue_comment', 'winner', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (6001, 'ZaxbyHub/TrainingApp', 7, 'COMMENTED', 'loser', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO reviews(id, repo, number, state, body, raw_json)"
+            " VALUES (6002, 'zaxbyhub/trainingapp', 7, 'COMMENTED', 'winner', '{}')"
+        )
+        v1.execute(
+            "INSERT INTO pr_files(repo, number, path, status)"
+            " VALUES ('ZaxbyHub/TrainingApp', 7, 'loser.py', 'modified')"
+        )
+        v1.execute(
+            "INSERT INTO pr_files(repo, number, path, status)"
+            " VALUES ('zaxbyhub/trainingapp', 7, 'winner.py', 'modified')"
+        )
         # loser's outbound authored edge and an inbound mention edge at the loser casing
         v1.execute(
             "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id, confidence, evidence)"
@@ -852,6 +926,34 @@ class MigrationTests(unittest.TestCase):
         # loser's children and number-scoped edges (outbound AND inbound) deleted
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM labels WHERE number = 7").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT color FROM labels WHERE number = 7").fetchone()[0], "00ff00")
+        # the item-scoped child tables keep the WINNER's rows only, under the
+        # folded casing (issue #52: the cleanup covers every repo-keyed table)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM comments WHERE number = 7").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn.execute("SELECT body FROM comments WHERE number = 7").fetchone()[0],
+            "winner",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM reviews WHERE number = 7").fetchone()[0], 1
+        )
+        self.assertEqual(
+            conn.execute("SELECT path FROM pr_files WHERE number = 7").fetchone()[0],
+            "winner.py",
+        )
+        # no row anywhere still carries the loser's casing
+        leftovers = []
+        for table in (
+            "items", "labels", "comments", "reviews", "pr_files", "sync_state",
+            "fetch_log",
+        ):
+            n = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE repo = 'ZaxbyHub/TrainingApp'"
+            ).fetchone()[0]
+            if n:
+                leftovers.append(f"{table}:{n}")
+        self.assertEqual(leftovers, [], "loser casing survived in " + ", ".join(leftovers))
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM edges WHERE repo LIKE 'zaxbyhub/%' AND (src_id = '7' OR dst_id = '7')").fetchone()[0],
             1,
@@ -1412,6 +1514,171 @@ class MigrateV7ToV8Tests(unittest.TestCase):
             )
         finally:
             conn.close()
+
+
+class CollisionLoserCoverageTests(unittest.TestCase):
+    """Issue #52 AC4: the v1->v2 distinct-id collision cleanup must delete
+    the loser's number-scoped rows in EVERY repo-keyed item-scoped table,
+    including the post-v2 ones (assignees, issue_field_values, revisions,
+    item_path_refs, item_signatures, item_events, pr_commits) — against
+    docs/schema.md's "every repo-keyed table" contract. Base behavior:
+    db.py:264-274 lists only labels/comments/reviews/pr_files/edges."""
+
+    def setUp(self) -> None:
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        self.db_path = Path(td.name) / "history.db"
+        loser, winner = "ZaxbyHub/TrainingApp", "zaxbyhub/trainingapp"
+        conn = connect(self.db_path)
+        init_schema(conn)
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at, raw_json)"
+            " VALUES (4001, ?, 7, 'issue', 'old seven', 'closed', '2026-01-01T00:00:00Z', '{}')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, updated_at, raw_json)"
+            " VALUES (4002, ?, 7, 'issue', 'new seven', 'open', '2026-01-02T00:00:00Z', '{}')",
+            (winner,),
+        )
+        conn.execute(
+            "INSERT INTO labels(repo, number, name, color) VALUES (?, 7, 'bug', 'ff0000')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO labels(repo, number, name, color) VALUES (?, 7, 'bug', '00ff00')",
+            (winner,),
+        )
+        conn.execute(
+            "INSERT INTO assignees(repo, number, login) VALUES (?, 7, 'old-bot')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO issue_field_values(repo, number, field_name, value)"
+            " VALUES (?, 7, 'iteration', '17')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO revisions(id, repo, number, entity, origin, content,"
+            " valid_from, valid_to) VALUES (8001, ?, 7, 'item_title', 'edit',"
+            " 'old seven', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO item_path_refs(repo, number, origin, path, backticked)"
+            " VALUES (?, 7, 'body', 'src/dup.py', 0)",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO item_signatures(repo, number, exception, error_line, frame_function)"
+            " VALUES (?, 7, 'ValueError', 'line 42', NULL)",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO item_events(repo, number, type, created_at)"
+            " VALUES (?, 7, 'reopened', '2026-01-03T00:00:00Z')",
+            (loser,),
+        )
+        conn.execute(
+            "INSERT INTO pr_commits(repo, number, sha, message)"
+            " VALUES (?, 7, 'abc123', 'old message')",
+            (loser,),
+        )
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+        conn.close()
+
+    def test_collision_losers_cover_all_repo_keyed_tables(self) -> None:
+        loser = "ZaxbyHub/TrainingApp"
+        conn = connect(self.db_path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        for table in (
+            "labels", "assignees", "issue_field_values", "revisions",
+            "item_path_refs", "item_signatures", "item_events", "pr_commits",
+        ):
+            leaked = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE repo = ?", (loser,)
+            ).fetchone()[0]
+            self.assertEqual(leaked, 0, f"{table} kept loser-casing rows")
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM items WHERE repo = ?", (loser,)).fetchone()[0], 0
+        )
+        # the winner's rows survive under the folded casing
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM assignees").fetchone()[0], 0
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM labels WHERE repo = 'zaxbyhub/trainingapp'"
+            ).fetchone()[0],
+            1,
+        )
+
+
+class FoldCoverageCensusTests(unittest.TestCase):
+    """The guardrail for the issue #52 coverage class.
+
+    The case-fold's loser-delete list and dedupe-fold list are hand-written
+    tuples; a future migration that adds a repo-keyed, number-scoped table
+    and forgets them would silently leak loser rows (or skip the fold).
+    This census derives the expected set from schema.sql so the drift fails
+    here. `items` is the fold's subject and `edges` is handled explicitly,
+    so both are covered without being in the loser list.
+    """
+
+    def test_loser_list_covers_every_number_scoped_repo_keyed_table(self) -> None:
+        schema = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "zaxbygraph"
+            / "schema.sql"
+        ).read_text(encoding="utf-8")
+        tables = re.findall(
+            r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\)", schema, re.S
+        )
+        number_scoped = {
+            name
+            for name, body in tables
+            if re.search(r"^\s*repo\s+TEXT", body, re.M)
+            and re.search(r"^\s*number\s+INTEGER", body, re.M)
+        }
+        covered = set(_LOSER_CHILD_TABLES) | {"items", "edges"}
+        self.assertEqual(
+            number_scoped - covered,
+            set(),
+            "a repo-keyed number-scoped table is missing from _LOSER_CHILD_TABLES",
+        )
+
+    def test_fold_table_list_covers_every_number_scoped_table(self) -> None:
+        """Reverse coverage: every repo-keyed, number-scoped table is either
+        dedupe-folded or handled by an explicit exemption with a reason
+        (`reviews` is lowered by UPDATE because reviews.id is the PK; `edges`
+        is folded separately with its shape-aware clause and the closes-pair
+        handling; `items` is the fold's subject)."""
+        schema = (
+            Path(__file__).resolve().parents[1]
+            / "src"
+            / "zaxbygraph"
+            / "schema.sql"
+        ).read_text(encoding="utf-8")
+        tables = re.findall(
+            r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\n\)", schema, re.S
+        )
+        number_scoped = {
+            name
+            for name, body in tables
+            if re.search(r"^\s*repo\s+TEXT", body, re.M)
+            and re.search(r"^\s*number\s+INTEGER", body, re.M)
+        }
+        folded = {table for table, _clause, _order in _FOLD_TABLES}
+        exempt = {
+            "reviews": "lowered by UPDATE; reviews.id is the PK",
+            "edges": "folded separately (shape-aware clause + closes handling)",
+            "items": "the fold's subject",
+        }
+        uncovered = number_scoped - folded - set(exempt)
+        self.assertEqual(uncovered, set(), f"uncovered tables: {uncovered}")
 
 
 if __name__ == "__main__":

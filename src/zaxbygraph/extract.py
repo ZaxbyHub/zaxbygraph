@@ -598,17 +598,27 @@ LINK_CONNECTIONS = {
     "open_prs": "linked_pr",
 }
 
+#: The link connections whose GraphQL type is a single node-or-null rather
+#: than a connection. A LIST value for one of these is a shape violation
+#: (malformed), while an explicit null is a cleared value. Single source of
+#: truth shared by the store detector below and the GraphQL emitter
+#: (graphql.py), so the two layers cannot disagree about the shape rules.
+SINGULAR_LINK_CONNECTIONS = frozenset({"parent", "duplicate_of"})
+
 
 def _link_dst(repo: str, node: object, number: int) -> str | None:
     """One {number, repo} link node -> the stored endpoint id: bare number
     when same-repo, repo-qualified 'owner/repo#N' when foreign (the
     cross_referenced precedent); self-references and malformed nodes yield
-    None."""
+    None. A JSON boolean is NOT a number here: `isinstance(True, int)` is
+    True in Python, but a bool `number` is a malformed node (issue #53) —
+    accepting it would stringify to dst_id "True" and retract a stored
+    GitHub-reported link edge."""
     if not isinstance(node, dict):
         return None
     dst_number = node.get("number")
     dst_repo = node.get("repo")
-    if not isinstance(dst_number, int):
+    if isinstance(dst_number, bool) or not isinstance(dst_number, int):
         return None
     if dst_number == number and (not isinstance(dst_repo, str) or dst_repo.lower() == repo.lower()):
         return None
@@ -639,6 +649,51 @@ def edges_from_links(repo: str, number: int, links: object) -> list[tuple]:
             if dst is not None:
                 edges.append(("item", nid, relation, "item", dst, f"links.{connection}", "link"))
     return edges
+
+
+def malformed_link_connections(repo: str, number: int, links: object) -> set[str]:
+    """The connections a payload CARRIED that must not retract stored edges
+    (issue #53).
+
+    A connection is malformed when its value is a non-dict, non-None scalar;
+    a list on a SINGULAR connection (a shape violation); None on a PLURAL
+    connection (a carried null is not a clear); or when it contains any node
+    `_link_dst` cannot parse (non-dict, non-int number, self-reference). An
+    explicit null on a singular connection is a CLEARED value — GitHub
+    reported the link is gone — and is NOT malformed.
+
+    The caller treats a malformed connection like an overflowed one:
+    union-only, no retraction. Without this, `rebuild_links` deleted a
+    carried-complete connection's stored edges and re-emitted only the
+    parseable nodes, silently retracting a GitHub-reported link fact.
+    """
+    if not isinstance(links, dict):
+        return set()
+    malformed: set[str] = set()
+    for connection in LINK_CONNECTIONS:
+        if connection not in links:
+            continue
+        value = links[connection]
+        singular = connection in SINGULAR_LINK_CONNECTIONS
+        if value is None:
+            if not singular:
+                malformed.add(connection)  # a carried plural null is not a clear
+            continue
+        if isinstance(value, list):
+            if singular:
+                malformed.add(connection)  # a singular + list is a shape violation
+                continue
+            nodes = value
+        elif isinstance(value, dict):
+            nodes = [value]
+        else:
+            malformed.add(connection)  # a scalar/garbage value
+            continue
+        for node in nodes:
+            if _link_dst(repo, node, number) is None:
+                malformed.add(connection)
+                break
+    return malformed
 
 
 def normalize_incomplete_connections(links_incomplete: object) -> set[str]:

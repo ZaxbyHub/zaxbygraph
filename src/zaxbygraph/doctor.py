@@ -28,7 +28,14 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema, open_existing
+from zaxbygraph.db import (
+    CURRENT_USER_VERSION,
+    _quote_ident,
+    connect,
+    fold_repo_casings,
+    init_schema,
+    open_existing,
+)
 from zaxbygraph.paths import legacy_db_paths
 from zaxbygraph.store import recount
 
@@ -40,6 +47,22 @@ _MOJIBAKE_LIKE = (
     "IFNULL(labels_text, '') LIKE '%Ã%'",
     "IFNULL(labels_text, '') LIKE '%â€%'",
 )
+
+
+class _UnreadableCandidate(Exception):
+    """The candidate could not be copied/recovered faithfully (issue #52):
+    an active writer kept moving it, it is not a database, or its schema
+    defeated the fold.
+
+    The reason is carried, not just the path: `doctor` records
+    `unreadable_reason` on the winner's scan entry so the report says WHY
+    nothing was adopted instead of a bare `adopted: null` (issue #53,
+    review PRR-019)."""
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"{path}: {reason}")
+        self.path = path
+        self.reason = reason
 
 #: tables copied on adoption -> the autoincrement pk column to omit (None =
 #: keep every column; GitHub-assigned ids in items/releases/reviews are kept).
@@ -87,14 +110,137 @@ def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     return any(row[1] == column for row in conn.execute(f"PRAGMA table_info({table})"))
 
 
+def _sidecars(path: Path) -> list[Path] | None:
+    """The candidate's recovery logs, or None when one is not a log.
+
+    Regular files only (issue #53, review PRR-022): a symlinked or
+    non-regular sidecar (FIFO/device) is not a recovery log this copy can
+    faithfully take — skipping it would silently truncate the candidate,
+    and copying a FIFO would block forever, so such a candidate is reported
+    unusable instead. `is_symlink()` is checked BEFORE `exists()` because
+    `exists()` follows symlinks and a dangling one would otherwise be
+    skipped silently (cubic PR #54 round 1).
+
+    There is deliberately NO size bound. A size ceiling was tried first and
+    removed: it refuses a legitimate crash-damaged candidate whose
+    un-checkpointed `-wal` exceeds the ceiling — the exact base defect this
+    module exists to fix (frozen check C1 caught the multiple-of-main-file
+    form doing it; cubic PR #54 round 2 caught the absolute form doing it
+    above 1 GiB). A runaway writer is already refused by the stat-stability
+    check in `_faithful_copy`, which sees a growing source and refuses after
+    bounded retries; a LARGE BUT STABLE log is a real crash-damaged
+    candidate, not a runaway one.
+    """
+    sidecars = []
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(str(path) + suffix)
+        # `is_symlink()` BEFORE `exists()` (cubic PR #54 round 1): `exists()`
+        # follows symlinks, so a DANGLING one is silently skipped and the
+        # guard below never sees it. `is_symlink()` answers for a dangling
+        # link too, so every symlinked sidecar is refused rather than
+        # quietly dropped.
+        if sidecar.is_symlink():
+            return None
+        if not sidecar.exists():
+            continue
+        if not sidecar.is_file():
+            return None
+        sidecars.append(sidecar)
+    return sidecars
+
+
+def _faithful_copy(path: Path, copy: Path) -> bool:
+    """Copy a candidate DB — main file plus any un-checkpointed `-wal` (or
+    hot `-journal`) frames — into `copy` WITHOUT opening the original
+    (issue #52).
+
+    A WAL-mode candidate whose writer was killed before a clean close keeps
+    committed frames in its `-wal`; copying the main file alone (the old
+    `shutil.copy2`) drops them, so the candidate is reported empty — or,
+    worse, adopted as a truncated image that REPLACES the store's richer
+    corpus (replace-the-slug). The recovery log is copied FIRST, then the
+    main file: a checkpoint racing the copy then leaves a stale-but-
+    consistent pair, never a torn one. The copy is opened read-write and
+    checkpointed so recovery happens on the copy alone — the original's
+    files are only ever READ (a read-only SQLite open of the original was
+    rejected in planning: on this platform it still writes the `-shm`
+    beside the original, violating the module's immutability contract).
+
+    The `-shm` is deliberately NOT copied: it is a rebuildable index of the
+    `-wal`, and a stale one beside a copied pair is ignored by recovery.
+
+    Returns False when the source changed during the copy (an active
+    writer — bounded retries, then refuse), when the copy cannot be
+    recovered, or when the source is not a database; the caller keeps
+    today's unreadable path.
+
+    The sidecar set is re-enumerated TWICE per attempt (issue #53, review
+    PRR-001) — once before the copy and once after, for the stability
+    comparison. Re-enumerating only at the top of the attempt is not
+    enough: a `-wal` a writer creates DURING the copy would be absent from
+    the stale `sources` list, so the after-stat would not see it and a
+    main-only image would be accepted as faithful. Re-enumerating for the
+    comparison makes the late sidecar mismatch the attempt, and the next
+    attempt's fresh top-of-loop enumeration then copies it. The same
+    re-enumeration is what lets a sidecar that vanishes mid-copy be
+    dropped from the retry instead of re-failing on the same stale path.
+    """
+    for _ in range(3):
+        try:
+            sidecars = _sidecars(path)
+        except OSError:
+            # The sidecar set itself could not be stat'd (the main file was
+            # removed while a `-wal` lingers). Not a database fault: retry,
+            # then refuse — one unreadable candidate must never abort the
+            # scan (PRR-003).
+            continue
+        if sidecars is None:
+            return False
+        sources = sidecars + [path]
+        try:
+            before = {
+                p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in sources
+                if p.exists()
+            }
+            for src in sources:
+                shutil.copy2(src, Path(str(copy) + src.name[len(path.name):]))
+            after_sidecars = _sidecars(path)
+            if after_sidecars is None:
+                continue  # a sidecar appeared that is not a log: retry
+            after = {
+                p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in after_sidecars + [path]
+                if p.exists()
+            }
+        except OSError:
+            # A source the OS refuses (a locked or permission-denied file) or
+            # a sidecar a finishing writer removed between the enumeration and
+            # the copy: not a database fault, an unusable candidate. Retry,
+            # then refuse — one unreadable candidate must never abort the
+            # scan (PRR-003).
+            continue
+        if before != after:
+            continue  # an active writer moved the source: retry, then refuse
+        try:
+            conn = sqlite3.connect(str(copy))
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            finally:
+                conn.close()
+            return True
+        except sqlite3.DatabaseError:
+            continue
+    return False
+
+
 def inspect(path: Path, repo: str) -> dict | None:
     """Per-DB stats for one slug, read from a temp copy. None = unreadable."""
     repo_l = repo.lower()
     with tempfile.TemporaryDirectory() as td:
         copy = Path(td) / path.name
-        try:
-            shutil.copy2(path, copy)
-        except OSError:
+        if not _faithful_copy(path, copy):
             return None
         try:
             conn = open_existing(copy)
@@ -112,8 +258,16 @@ def inspect(path: Path, repo: str) -> dict | None:
                 complete_expr = "last_full_sync_at IS NOT NULL"
                 if pend:
                     complete_expr += " AND full_sync_pending = 0"
+                # Deterministic winner rule (issue #52): a case-split
+                # candidate's sync_state rows are read through the same
+                # freshest-first ordering the fold's merge uses, so
+                # completeness/watermark never depend on scan order.
+                # COALESCE matches _fold_sync_state's (issues_since or "")
+                # ranking, where NULL and empty string tie.
                 state = conn.execute(
-                    "SELECT issues_since FROM sync_state WHERE lower(repo) = ?", (repo_l,)
+                    "SELECT issues_since FROM sync_state WHERE lower(repo) = ?"
+                    " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
+                    (repo_l,),
                 ).fetchone()
                 items = conn.execute(
                     "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
@@ -126,7 +280,9 @@ def inspect(path: Path, repo: str) -> dict | None:
                 complete = False
                 if state is not None:
                     row = conn.execute(
-                        f"SELECT ({complete_expr}) AS c FROM sync_state WHERE lower(repo) = ?",
+                        f"SELECT ({complete_expr}) AS c FROM sync_state"
+                        " WHERE lower(repo) = ?"
+                        " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
                         (repo_l,),
                     ).fetchone()
                     complete = bool(row["c"])
@@ -144,31 +300,54 @@ def inspect(path: Path, repo: str) -> dict | None:
 
 
 class _MigratedCopy:
-    """Temp copy of a legacy DB, migrated to the current schema if needed.
+    """Temp copy of a legacy DB, migrated to the current schema if needed
+    and then case-folded for EVERY candidate version (issue #52).
 
-    connect+init_schema runs the MIGRATIONS framework on the copy (case
+    `connect`+`init_schema` runs the MIGRATIONS framework on the copy (case
     folds, adds full_sync_pending); the original is never opened for write.
-    The temp directory is removed on close (PRR-006: every --consolidate
-    used to leak a full DB copy into the system temp dir).
+    A candidate already at the current version never migrates, so without
+    the explicit fold its dual-cased rows would still collide the adoption
+    copy — `fold_repo_casings` runs on every copy (idempotent: a pre-v2
+    candidate already folded inside migrate_v1_to_v2 is folded again as a
+    no-op). The temp directory is removed on close (PRR-006: every
+    --consolidate used to leak a full DB copy into the system temp dir).
     """
 
     def __init__(self, path: Path) -> None:
         self._td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
         try:
             self.path = Path(self._td) / path.name
-            shutil.copy2(path, self.path)
-            conn = sqlite3.connect(str(self.path))
+            if not _faithful_copy(path, self.path):
+                raise _UnreadableCandidate(path, "the candidate could not be copied faithfully")
+            version = None
             try:
-                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            except sqlite3.DatabaseError:
-                self.migrated = False
-                conn.close()
-                return
-            conn.close()
+                probe = sqlite3.connect(str(self.path))
+                try:
+                    version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+                finally:
+                    probe.close()
+            except sqlite3.DatabaseError as exc:
+                raise _UnreadableCandidate(
+                    path, "the candidate is not a readable database"
+                ) from exc
             self.migrated = version < CURRENT_USER_VERSION
-            if self.migrated:
-                conn = connect(self.path)
-                init_schema(conn)
+            conn = connect(self.path)
+            try:
+                if self.migrated:
+                    init_schema(conn)
+                fold_repo_casings(conn)
+                conn.commit()
+            except sqlite3.DatabaseError as exc:
+                # A candidate whose schema diverges from the tool's can still
+                # defeat the fold (e.g. a missing unique index behind an ON
+                # CONFLICT target). The fold runs on the temp copy only, so
+                # the candidate is reported unusable — one divergent
+                # candidate must never abort the whole scan (issue #53,
+                # review PRR-005; base adopted such candidates).
+                raise _UnreadableCandidate(
+                    path, f"the candidate's schema defeated the fold: {exc}"
+                ) from exc
+            finally:
                 conn.close()
         except BaseException:
             self.close()
@@ -186,6 +365,54 @@ def _migrated_copy(path: Path):
         yield copy.path
     finally:
         copy.close()
+
+
+def _copy_table(
+    src: sqlite3.Connection,
+    dst: sqlite3.Connection,
+    table: str,
+    autoinc_pk: str | None,
+    repo_l: str,
+) -> None:
+    """Copy one repo-keyed table from the candidate into the store.
+
+    Column names come from the CANDIDATE's own `PRAGMA table_info` output,
+    so they are untrusted text until quoted: a divergent name that is a
+    reserved word (`order`, `index`) would otherwise parse as SQL and abort
+    the whole command (issue #53, review PRR-005 — the same defect the
+    fold's quoting closes, in the copy loop the fold runs after). A
+    divergence the quoting cannot absorb (an extra column the store lacks)
+    raises sqlite3.DatabaseError, which the caller converts to an unusable
+    candidate rather than a crash.
+    """
+    cols = [row[1] for row in src.execute(f"PRAGMA table_info({table})")]
+    if autoinc_pk is not None:
+        cols = [c for c in cols if c != autoinc_pk]
+    if not cols:
+        return
+    quoted = [_quote_ident(c) for c in cols]
+    if "repo" in cols:
+        select_cols = ", ".join(
+            "lower(repo)" if c == "repo" else q for c, q in zip(cols, quoted)
+        )
+    else:
+        select_cols = ", ".join(quoted)
+    placeholders = ", ".join("?" for _ in cols)
+    # Ordered by the omitted pk (issue #25): destination ids are fresh, so
+    # insertion order is the only place the source sequence survives —
+    # deterministic for the omit-pk tables.
+    order_by = f" ORDER BY {_quote_ident(autoinc_pk)}" if autoinc_pk else ""
+    rows = src.execute(
+        f"SELECT {select_cols} FROM {_quote_ident(table)}"
+        + (" WHERE lower(repo) = ?" if "repo" in cols else "")
+        + order_by,
+        (repo_l,) if "repo" in cols else (),
+    ).fetchall()
+    insert_sql = (
+        f"INSERT INTO {_quote_ident(table)} ({', '.join(quoted)}) "
+        f"VALUES ({placeholders})"
+    )
+    dst.executemany(insert_sql, [tuple(r) for r in rows])
 
 
 def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
@@ -236,7 +463,8 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                     if table == "revisions":
                         continue  # per-item scoping below (issue #40)
                     dst.execute(
-                        f"DELETE FROM {table} WHERE repo = ?", (repo_l,)
+                        f"DELETE FROM {_quote_ident(table)} WHERE repo = ?",
+                        (repo_l,)
                     )
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
@@ -311,39 +539,29 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # adopted per item above (issue #40)
-                    cols = [
-                        row[1] for row in src.execute(f"PRAGMA table_info({table})")
-                    ]
-                    if autoinc_pk is not None:
-                        cols = [c for c in cols if c != autoinc_pk]
-                    if not cols:
-                        continue
-                    if "repo" in cols:
-                        select_cols = ", ".join(
-                            "lower(repo)" if c == "repo" else c for c in cols
-                        )
-                    else:
-                        select_cols = ", ".join(cols)
-                    placeholders = ", ".join("?" for _ in cols)
-                    # Ordered by the omitted pk (issue #25): destination ids
-                    # are fresh, so insertion order is the only place the
-                    # source sequence survives — deterministic for the
-                    # omit-pk tables.
-                    order_by = f" ORDER BY {autoinc_pk}" if autoinc_pk else ""
-                    rows = src.execute(
-                        f"SELECT {select_cols} FROM {table}"
-                        + (" WHERE lower(repo) = ?" if "repo" in cols else "")
-                        + order_by,
-                        (repo_l,) if "repo" in cols else (),
-                    ).fetchall()
-                    insert_sql = (
-                        f"INSERT INTO {table} ({', '.join(cols)}) "
-                        f"VALUES ({placeholders})"
-                    )
-                    dst.executemany(insert_sql, [tuple(r) for r in rows])
+                    try:
+                        _copy_table(src, dst, table, autoinc_pk, repo_l)
+                    except sqlite3.DatabaseError as exc:
+                        # A candidate whose schema diverges from the tool's
+                        # can defeat the copy as well as the fold (an extra
+                        # column, a missing one, a missing unique index
+                        # behind an ON CONFLICT). The whole adoption is one
+                        # transaction, so nothing has been written; report
+                        # the candidate unusable rather than aborting the
+                        # command (issue #53, review PRR-005 — base adopted
+                        # such candidates for some tables).
+                        raise _UnreadableCandidate(
+                            path,
+                            f"the candidate's schema defeated the copy: {exc}",
+                        ) from exc
 
+                # The copy is case-folded before this point, so the folded
+                # slug has exactly one sync_state row; the ordering keeps
+                # the read deterministic even if that ever changes.
                 state = src.execute(
-                    "SELECT * FROM sync_state WHERE lower(repo) = ?", (repo_l,)
+                    "SELECT * FROM sync_state WHERE lower(repo) = ?"
+                    " ORDER BY COALESCE(issues_since, '') DESC, rowid DESC LIMIT 1",
+                    (repo_l,),
                 ).fetchone()
                 if state is not None:
                     dst.execute(
@@ -429,11 +647,26 @@ def doctor(
                 best = (key, entry)
     if consolidate_flag and best is not None:
         winner = best[1]
-        rev_adopted, rev_preserved = consolidate(
-            store_db, Path(winner["path"]), repo_l
-        )
-        winner["adopted"] = True
-        adopted = winner["path"]
+        try:
+            rev_adopted, rev_preserved = consolidate(
+                store_db, Path(winner["path"]), repo_l
+            )
+        except _UnreadableCandidate as unreadable:
+            # The winner passed inspection but cannot be adopted (its schema
+            # defeated the fold). Report the scan without adopting — one
+            # unusable candidate must never abort the whole command (PRR-003;
+            # issue #53, review PRR-005). The store is untouched: the fold
+            # runs on the temp copy before any store write. The REASON is
+            # recorded on the winner's scan entry so the report says WHY
+            # nothing was adopted instead of a bare `adopted: null`
+            # (issue #53, review PRR-019).
+            winner["adopted"] = False
+            winner["unreadable"] = True
+            winner["unreadable_reason"] = str(unreadable)
+            rev_adopted, rev_preserved = 0, 0
+        else:
+            winner["adopted"] = True
+            adopted = winner["path"]
     else:
         rev_adopted = 0
         rev_preserved = 0

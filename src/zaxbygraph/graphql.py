@@ -303,9 +303,14 @@ def _q(value: str) -> str:
 
 def _int_or_none(value) -> int | None:
     """Coerce a scalar from an external JSON payload to int without ever
-    raising out of payload mapping (string digits concatenate otherwise)."""
-    if isinstance(value, bool) or value is None:
-        return None if value is None else int(value)
+    raising out of payload mapping (string digits concatenate otherwise).
+    A JSON boolean is not a number (issue #53): coercing `true` to 1 would
+    fabricate a link to real item #1, so a bool yields None and the caller's
+    malformed-node path degrades the connection to union-only."""
+    if isinstance(value, bool):
+        return None
+    if value is None:
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -316,19 +321,111 @@ def _int_or_none(value) -> int | None:
     return None
 
 
+#: The shape `_link_node` returns for a node it cannot parse (issue #53):
+#: a non-dict node or one whose number does not coerce. It flows into the
+#: `links` children section, where it is BOTH unparseable at the store layer
+#: (`_link_dst` rejects it — defense in depth) and marks the connection for
+#: `links_incomplete` here, so a malformed node degrades to union-only
+#: instead of presenting a silently cleared/empty connection as complete.
+_MALFORMED_LINK_NODE = {"__malformed__": True}
+
+
 def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     """(nodes, incomplete) for one GraphQL connection payload. A null or
-    malformed connection returns ([], False) — callers distinguish a
+    malformed connection value returns ([], False) — callers distinguish a
     genuinely empty page from a section the node did not carry by checking
-    key presence before calling this."""
+    key presence before calling this. A malformed CONTAINER inside a carried
+    connection (a non-list `nodes`, a non-dict `pageInfo`) or dropped
+    non-dict nodes returns ([], True): the section degrades to union-only
+    rather than presenting a silently empty page as complete (issue #53)."""
     if not isinstance(nodes, dict):
         return [], False
-    out = [n for n in (nodes.get("nodes") or []) if isinstance(n, dict)]
+    raw_nodes = nodes.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return [], True
+    out = [n for n in raw_nodes if isinstance(n, dict)]
+    page_info = nodes.get("pageInfo")
+    if page_info is None:
+        page_info = {}
+    elif not isinstance(page_info, dict):
+        return [], True
+    incomplete = bool(page_info.get("hasNextPage")) or len(out) != len(raw_nodes)
     total = nodes.get("totalCount")
-    incomplete = bool((nodes.get("pageInfo") or {}).get("hasNextPage"))
     if isinstance(total, int) and total > len(out):
         incomplete = True
     return out, incomplete
+
+
+def _carried_connection(raw: object) -> tuple[list[dict], bool]:
+    """A CARRIED connection (the caller checked key presence): a non-dict
+    value (null, a scalar) is malformed — union-only, never complete-empty
+    (issue #53). A dict value goes through `_connection`'s container
+    validation. This is the one truth-table entry shared by the link
+    connections and the timeline container, so a malformed carried section
+    can never present a silently empty page as complete at either site."""
+    if not isinstance(raw, dict):
+        return [], True
+    return _connection(raw)
+
+
+def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
+    """True when a carried timeline page rendered EVERY node it reported.
+
+    A non-dict container, a non-list `nodes`, a non-dict `pageInfo`, or a
+    dropped non-dict node all mean the retained events are NOT a faithful
+    prefix of the page: the events preceding any cursor are partly
+    unknowable. Both timeline sites depend on this predicate, because both
+    can destroy stored history:
+
+    - the INITIAL page gets no `timeline_cursor`, so `_complete_timeline`
+      cannot drain past a prefix it only partly saw;
+    - a CONTINUATION page that fails it is treated as unanswerable, so a
+      well-formed later page cannot present the accumulated partial set as
+      complete.
+
+    `totalCount` is consulted ONLY for the initial page, and only when that
+    page also says there is no next page: a page that reports no further
+    pages while counting more items than it returned has dropped nodes. On
+    a continuation page `totalCount` is the collection's size and legitimately
+    exceeds the page's node count, so comparing them there would call every
+    legitimate final page unfaithful and truncate a large timeline (the
+    regression the re-gate caught). While `hasNextPage` is true the count is
+    likewise the collection's, so exceeding the node count is ordinary
+    pagination (issue #53, review PRR-004).
+    """
+    if not isinstance(raw, dict):
+        return False
+    raw_nodes = raw.get("nodes")
+    if not isinstance(raw_nodes, list):
+        return False
+    page_info = raw.get("pageInfo")
+    if not isinstance(page_info, dict):
+        return False
+    if len([n for n in raw_nodes if isinstance(n, dict)]) != len(raw_nodes):
+        return False
+    total = raw.get("totalCount")
+    comparable = isinstance(total, int) and not isinstance(total, bool)
+    if (
+        initial
+        and not page_info.get("hasNextPage")
+        and "totalCount" in raw
+        and total is not None
+        and not comparable
+    ):
+        # A totalCount the store cannot compare (a string, a float, a bool)
+        # on a page that claims to be last is not an answer we can check, so
+        # the page is not faithful. GitHub emits an int or omits the key;
+        # this arm is the malformed-payload contract, not an observed shape.
+        # A bool is not an int here, matching `_int_or_none` (PRR-003).
+        return False
+    if (
+        initial
+        and not page_info.get("hasNextPage")
+        and comparable
+        and total > len(raw_nodes)
+    ):
+        return False
+    return True
 
 
 def _commit_message(commit: dict) -> str | None:
@@ -805,8 +902,26 @@ class GraphQLSource(GhApiSource):
         connection = node.get("timelineItems")
         if not isinstance(connection, dict):
             return [], {}
+        if not _page_rendered_faithfully(connection, initial=False):
+            # The page did not render every node it reported (a dropped
+            # non-dict node, or a malformed container). The retained events
+            # are not a faithful prefix, so the drain must not treat them as
+            # an answer: report the page as unanswerable and keep the
+            # truncation flag set — the PRR-004 contract applied to the
+            # continuation (issue #53). `totalCount` is NOT consulted here:
+            # on a continuation page it is the collection's size, so a
+            # legitimate final page would be called unfaithful and a large
+            # timeline truncated.
+            return [], {}
         events, _ = _connection(connection)
-        return [_timeline_event(e) for e in events], connection.get("pageInfo") or {}
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict):
+            # Malformed continuation metadata is unanswerable, not "no more
+            # pages": returning it raw made _complete_timeline read
+            # hasNextPage=False and clear the truncation flag (issue #53,
+            # review PRR-004). An unanswerable page keeps the flag set.
+            return [], {}
+        return [_timeline_event(e) for e in events], page_info
 
     def _complete_timeline(self, number: int, kind: str, child: dict) -> None:
         """Finish a flagged timeline and own the `timeline_incomplete` flag.
@@ -867,6 +982,16 @@ class GraphQLSource(GhApiSource):
             child.pop("timeline_incomplete", None)
         else:
             newest, info = self._timeline_page(number, kind, f"last: {_TIMELINE_PAGE_MAX}")
+            if not newest and not info:
+                # The replacement page is unanswerable (a missing alias, or a
+                # page that did not render faithfully) — NOT an empty
+                # collection. Keep the retained set and the flag rather than
+                # erasing the events we do have: `([], {})` from
+                # `_timeline_page` is ambiguous, and only the retained set is
+                # known to be real (issue #53, review PRR-004).
+                child["timeline"] = events
+                child.pop("timeline_cursor", None)
+                return
             if info.get("hasPreviousPage") and info.get("startCursor"):
                 older, _ = self._timeline_page(
                     number,
@@ -932,13 +1057,13 @@ class GraphQLSource(GhApiSource):
         # must stay ABSENT so the sync's per-item REST fallback runs for it;
         # writing [] would present a silently empty page as complete.
         if node.get("comments") is not None:
-            comments, comments_more = _connection(node.get("comments"))
+            comments, comments_more = _carried_connection(node.get("comments"))
             children["issue_comments"] = [_comment_payload(c) for c in comments]
             if comments_more:
                 children["issue_comments_incomplete"] = True
 
         if node.get("reviews") is not None:
-            reviews, reviews_more = _connection(node.get("reviews"))
+            reviews, reviews_more = _carried_connection(node.get("reviews"))
             review_nodes = [r for r in reviews]
             children["reviews"] = [
                 {
@@ -954,7 +1079,7 @@ class GraphQLSource(GhApiSource):
             if reviews_more:
                 children["reviews_incomplete"] = True
 
-            review_payloads = [_connection(r.get("comments")) for r in review_nodes]
+            review_payloads = [_carried_connection(r.get("comments")) for r in review_nodes]
             review_comments = [c for payload, _ in review_payloads for c in payload]
             children["review_comments"] = [
                 _comment_payload(
@@ -969,7 +1094,7 @@ class GraphQLSource(GhApiSource):
                 children["review_comments_incomplete"] = True
 
         if node.get("files") is not None:
-            files, files_more = _connection(node.get("files"))
+            files, files_more = _carried_connection(node.get("files"))
             children["files"] = [
                 {
                     "filename": f.get("path"),
@@ -1002,7 +1127,19 @@ class GraphQLSource(GhApiSource):
             merged_by_login = (
                 merged_by.get("login") if isinstance(merged_by, dict) else None
             )
-            closing_refs, closing_more = _connection(node.get("closingIssuesReferences"))
+            # Key PRESENCE first (cubic PR #54 round 1): a capability mask
+            # leaves the field out of the node entirely, and
+            # `_carried_connection(None)` reports a malformed carried
+            # section — so every affected PR logged a false "closing
+            # references truncated". An absent field is unanswered, not
+            # truncated; a field present with null IS malformed (the
+            # carried-connection truth table).
+            if "closingIssuesReferences" in node:
+                closing_refs, closing_more = _carried_connection(
+                    node.get("closingIssuesReferences")
+                )
+            else:
+                closing_refs, closing_more = [], False
             pull_payload = {
                 "additions": node.get("additions"),
                 "deletions": node.get("deletions"),
@@ -1042,7 +1179,7 @@ class GraphQLSource(GhApiSource):
         # capability mask can drop baseRefName/mergedAt while commits answer.
         commits_conn = node.get("commits")
         if isinstance(commits_conn, dict) and "nodes" in commits_conn:
-            commit_nodes, commits_more = _connection(commits_conn)
+            commit_nodes, commits_more = _carried_connection(commits_conn)
             children["pr_commits"] = [
                 {
                     "sha": ((c.get("commit") or {}).get("oid")),
@@ -1061,11 +1198,24 @@ class GraphQLSource(GhApiSource):
         )
         if any(field in node for field in link_fields):
             def _link_node(raw_node: object) -> dict | None:
-                if not isinstance(raw_node, dict):
+                """One link node, the cleared marker (None) or the malformed
+                sentinel (issue #53). JSON null is a CLEARED value — no
+                parent / not a duplicate — and still retracts; a non-dict
+                node or one whose number does not coerce is MALFORMED and
+                must degrade the connection to union-only. The old mapping
+                turned both shapes into None, which presented a silently
+                cleared connection as complete and retracted the stored
+                edge."""
+                if raw_node is None:
                     return None
+                if not isinstance(raw_node, dict):
+                    return _MALFORMED_LINK_NODE
+                number = _int_or_none(raw_node.get("number"))
+                if number is None:
+                    return _MALFORMED_LINK_NODE
                 repo_ref = raw_node.get("repository")
                 return {
-                    "number": _int_or_none(raw_node.get("number")),
+                    "number": number,
                     "repo": repo_ref.get("nameWithOwner")
                     if isinstance(repo_ref, dict)
                     else None,
@@ -1073,35 +1223,60 @@ class GraphQLSource(GhApiSource):
 
             links: dict = {}
             overflowed: list[str] = []
+
             if "blockedBy" in node:
-                blocked_nodes, blocked_more = _connection(node.get("blockedBy"))
+                blocked_nodes, blocked_more = _carried_connection(node.get("blockedBy"))
                 links["blocked_by"] = [_link_node(n) for n in blocked_nodes]
-                if blocked_more:
+                if blocked_more or any(
+                    n is _MALFORMED_LINK_NODE for n in links["blocked_by"]
+                ):
                     overflowed.append("blocked_by")
             if "parent" in node:
-                links["parent"] = _link_node(node.get("parent"))
+                parent_node = _link_node(node.get("parent"))
+                links["parent"] = parent_node
+                if parent_node is _MALFORMED_LINK_NODE:
+                    overflowed.append("parent")
             if "duplicateOf" in node:
-                links["duplicate_of"] = _link_node(node.get("duplicateOf"))
+                duplicate_node = _link_node(node.get("duplicateOf"))
+                links["duplicate_of"] = duplicate_node
+                if duplicate_node is _MALFORMED_LINK_NODE:
+                    overflowed.append("duplicate_of")
             if "closedByPullRequestsReferences" in node:
-                open_nodes, open_more = _connection(
+                open_nodes, open_more = _carried_connection(
                     node.get("closedByPullRequestsReferences")
                 )
                 links["open_prs"] = [_link_node(n) for n in open_nodes]
-                if open_more:
+                if open_more or any(
+                    n is _MALFORMED_LINK_NODE for n in links["open_prs"]
+                ):
                     overflowed.append("open_prs")
             children["links"] = links
             if overflowed:
                 children["links_incomplete"] = overflowed
 
         if node.get("timelineItems") is not None:
-            events, timeline_more = _connection(node.get("timelineItems"))
+            timeline_conn = node.get("timelineItems")
+            events, timeline_more = _carried_connection(timeline_conn)
             children["timeline"] = [_timeline_event(e) for e in events]
-            # Retained for fetch_children's continuation; _resolve_children
-            # never forwards it, and _complete_timeline pops it when it runs.
-            page_info = (node.get("timelineItems") or {}).get("pageInfo") or {}
-            children["timeline_cursor"] = page_info.get("endCursor")
-            if timeline_more:
+            # The completeness decision and the cursor decision use the SAME
+            # predicate: a page that did not render faithfully (a non-dict
+            # container, a non-list `nodes`, a non-dict OR NULL `pageInfo`, a
+            # dropped node, or an initial page that counts more than it
+            # returned while claiming to be last) leaves the section
+            # unfetchable. Relying on `_carried_connection` alone missed the
+            # null-pageInfo shape — `_connection` reads a null pageInfo as
+            # `{}` (complete), so the flag was never set and
+            # `write_item_events` replaced the stored rows with the page's
+            # subset (issue #53, review PRR-004). No cursor is emitted for an
+            # unfaithful page, so `_complete_timeline` cannot drain past a
+            # prefix it only partly saw.
+            faithful = _page_rendered_faithfully(timeline_conn, initial=True)
+            if timeline_more or not faithful:
                 children["timeline_incomplete"] = True
+                if faithful:
+                    children["timeline_cursor"] = timeline_conn.get("pageInfo").get(
+                        "endCursor"
+                    )
         return children
 
     # -- deletion oracle ----------------------------------------------------
