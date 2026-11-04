@@ -465,6 +465,168 @@ class TimelineDrainSafetyTests(unittest.TestCase):
         self.assertTrue(children.get("timeline_incomplete"))
         self.assertEqual(children.get("timeline_cursor"), "X")
 
+    def test_null_pageinfo_flags_the_section(self) -> None:
+        """A carried `pageInfo: null` is NOT a complete page.
+
+        `_connection` reads a null pageInfo as `{}` (no next page), so the
+        carried connection alone reports complete — the flag would never be
+        set and `write_item_events` would replace the stored rows with the
+        page's subset. The completeness decision must use the same predicate
+        as the cursor decision (re-gate finding NEW-1)."""
+        children = self._initial(
+            nodes=[{"__typename": "ReopenedEvent"}],
+            pageInfo=None,
+        )
+        self.assertTrue(
+            children.get("timeline_incomplete"),
+            f"a null pageInfo was not flagged: {children}",
+        )
+        self.assertNotIn("timeline_cursor", children)
+        # an OMITTED pageInfo is the same shape
+        omitted = _source()._children_from_node(
+            {
+                "number": 1,
+                "id": "I_1",
+                "timelineItems": {"nodes": [{"__typename": "ReopenedEvent"}]},
+            }
+        )
+        self.assertTrue(
+            omitted.get("timeline_incomplete"),
+            f"an omitted pageInfo was not flagged: {omitted}",
+        )
+        self.assertNotIn("timeline_cursor", omitted)
+
+    def test_paginating_final_page_still_drains(self) -> None:
+        """PRESERVING floor for the totalCount rule: a continuation page
+        whose `totalCount` is the COLLECTION's size (legitimately above the
+        page's node count) with `hasNextPage: false` is a normal final page,
+        not a truncated one — the drain must finish it."""
+
+        class _PageSource(GraphQLSource):
+            """Initial page (hasNextPage true, 60 events), then a final
+            continuation page of 20 carrying the collection-wide count."""
+
+            def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+                self.last_dropped_sections = {}
+                if "after:" in query:
+                    nodes = [
+                        {"__typename": "ReopenedEvent", "createdAt": "t2"}
+                        for _ in range(20)
+                    ]
+                    node = {
+                        "timelineItems": {
+                            "nodes": nodes,
+                            "totalCount": 80,
+                            "pageInfo": {"hasNextPage": False, "endCursor": "Y"},
+                        }
+                    }
+                else:
+                    nodes = [
+                        {"__typename": "ReopenedEvent", "createdAt": "t1"}
+                        for _ in range(60)
+                    ]
+                    node = {
+                        "number": 1,
+                        "id": "I_1",
+                        "timelineItems": {
+                            "nodes": nodes,
+                            "totalCount": 80,
+                            "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                        },
+                    }
+                alias = ("p" if "pullRequest(" in query else "i") + "1"
+                return {"repository": {alias: node}}
+
+        src = _PageSource("probe", "clinic")
+        child = src._children_from_node(
+            {
+                "number": 1,
+                "id": "I_1",
+                "timelineItems": {
+                    "nodes": [
+                        {"__typename": "ReopenedEvent", "createdAt": "t1"}
+                        for _ in range(60)
+                    ],
+                    "totalCount": 80,
+                    "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                },
+            }
+        )
+        self.assertEqual(child.get("timeline_cursor"), "X")
+        src._complete_timeline(1, "issue", child)
+        self.assertNotIn(
+            "timeline_incomplete",
+            child,
+            "a paginating final page must drain:"
+            f" {len(child.get('timeline') or [])} events",
+        )
+        self.assertEqual(len(child["timeline"]), 80)
+
+    def test_unanswerable_replacement_page_keeps_the_retained_events(self) -> None:
+        """The replacement page (`last:`) is answered by the same
+        `_timeline_page`: when it is unanswerable the retained events must
+        survive with the flag set, not be erased by an empty list (re-gate
+        finding N2).
+
+        The replacement branch is reached when the drain cannot complete —
+        here the INITIAL page is unfaithful, so it emits no cursor, the
+        continuation loop never runs, and `_complete_timeline` falls through
+        to the replacement page."""
+
+        class _ReplacementUnanswerable(GraphQLSource):
+            def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+                self.last_dropped_sections = {}
+                if "last:" in query:
+                    # an unfaithful replacement page: a dropped non-dict node
+                    node = {
+                        "timelineItems": {
+                            "nodes": [{"__typename": "ReopenedEvent"}, 7],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                else:
+                    node = {
+                        "number": 1,
+                        "id": "I_1",
+                        "timelineItems": {
+                            "nodes": [
+                                {"__typename": "ReopenedEvent", "createdAt": "t1"},
+                                "garbage",
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                        },
+                    }
+                alias = ("p" if "pullRequest(" in query else "i") + "1"
+                return {"repository": {alias: node}}
+
+        src = _ReplacementUnanswerable("probe", "clinic")
+        child = src._children_from_node(
+            {
+                "number": 1,
+                "id": "I_1",
+                "timelineItems": {
+                    "nodes": [
+                        {"__typename": "ReopenedEvent", "createdAt": "t1"},
+                        "garbage",
+                    ],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                },
+            }
+        )
+        self.assertNotIn(
+            "timeline_cursor", child, "an unfaithful page must emit no cursor"
+        )
+        src._complete_timeline(1, "issue", child)
+        self.assertTrue(
+            child.get("timeline_incomplete"),
+            "an unanswerable replacement page must keep the flag set",
+        )
+        self.assertEqual(
+            [e["created_at"] for e in child.get("timeline") or []],
+            ["t1"],
+            "the retained events must survive an unanswerable replacement page",
+        )
+
     def test_unfaithful_continuation_page_keeps_the_flag(self) -> None:
         """The continuation page has the same hole: `_timeline_page` must
         report an unfaithful page as unanswerable so the drain cannot
@@ -643,6 +805,69 @@ class CarriedSectionE2ETests(TempDBTest):
             ).fetchone()[0],
             "kept comment",
             "a malformed comments container must not retract the stored rows",
+        )
+
+
+    def test_null_pageinfo_does_not_erase_stored_events(self) -> None:
+        """E2E for the same shape through the public seam: the flag reaches
+        `sync_repo`, so `write_item_events` keeps the stored rows."""
+        src = _BulkLinkSource()
+        src.add_issue(issue(10, title="eventful work"))
+        sync_repo(self.conn, src, REPO)
+        for day in ("2026-01-03", "2026-01-04"):
+            self.conn.execute(
+                "INSERT INTO item_events(repo, number, type, created_at)"
+                " VALUES (?, 10, 'reopened', ?)",
+                (REPO, f"{day}T00:00:00Z"),
+            )
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM item_events WHERE number = 10"
+            ).fetchone()[0],
+            2,
+        )
+        src.issues[10]["updated_at"] = ts(500_010)
+
+        class _StubbedTransport(GraphQLSource):
+            def __init__(self) -> None:
+                super().__init__("probe", "clinic")
+                self.last_dropped_sections: dict[int, list] = {}
+
+            def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+                node = {
+                    "number": 10,
+                    "id": "I_10",
+                    "timelineItems": {
+                        "nodes": [
+                            {
+                                "__typename": "ReopenedEvent",
+                                "createdAt": "2026-01-02T00:00:00Z",
+                            }
+                        ],
+                        "pageInfo": None,
+                    },
+                }
+                return {"repository": {"i10": node}}
+
+        class _SeamSource(FakeGitHubSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self._gql = _StubbedTransport()
+
+            def fetch_children(self, items) -> dict[int, dict]:
+                return self._gql.fetch_children(items)
+
+        seam = _SeamSource()
+        seam.issues[10] = src.issues[10]
+        sync_repo(self.conn, seam, REPO)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM item_events WHERE number = 10"
+            ).fetchone()[0],
+            2,
+            "a null pageInfo must not present the page as complete and"
+            " erase the stored events",
         )
 
 

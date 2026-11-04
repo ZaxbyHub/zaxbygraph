@@ -182,7 +182,14 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
     dropped from the retry instead of re-failing on the same stale path.
     """
     for _ in range(3):
-        sidecars = _sidecars(path)
+        try:
+            sidecars = _sidecars(path)
+        except OSError:
+            # The sidecar set itself could not be stat'd (the main file was
+            # removed while a `-wal` lingers). Not a database fault: retry,
+            # then refuse — one unreadable candidate must never abort the
+            # scan (PRR-003).
+            continue
         if sidecars is None:
             return False
         sources = sidecars + [path]

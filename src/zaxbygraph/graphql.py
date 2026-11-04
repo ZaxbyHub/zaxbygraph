@@ -368,18 +368,14 @@ def _carried_connection(raw: object) -> tuple[list[dict], bool]:
     return _connection(raw)
 
 
-def _page_rendered_faithfully(raw: object) -> bool:
-    """True when a carried connection rendered EVERY node it reported.
+def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
+    """True when a carried timeline page rendered EVERY node it reported.
 
     A non-dict container, a non-list `nodes`, a non-dict `pageInfo`, or a
     dropped non-dict node all mean the retained events are NOT a faithful
     prefix of the page: the events preceding any cursor are partly
-    unknowable. A `totalCount` above the rendered count means the same ONLY
-    when the page also says there is no next page — while `hasNextPage` is
-    true, `totalCount` is the collection's size, not the page's, so
-    exceeding the node count is ordinary pagination, not a dropped node.
-    Both timeline sites depend on this predicate, because both can destroy
-    stored history:
+    unknowable. Both timeline sites depend on this predicate, because both
+    can destroy stored history:
 
     - the INITIAL page gets no `timeline_cursor`, so `_complete_timeline`
       cannot drain past a prefix it only partly saw;
@@ -387,10 +383,15 @@ def _page_rendered_faithfully(raw: object) -> bool:
       well-formed later page cannot present the accumulated partial set as
       complete.
 
-    Without the content checks (dropped nodes, a last-page `totalCount`
-    overflow) the cursor was still emitted for those shapes and the drain
-    cleared the flag, replacing the stored `item_events` with a partial
-    timeline (issue #53, review PRR-004).
+    `totalCount` is consulted ONLY for the initial page, and only when that
+    page also says there is no next page: a page that reports no further
+    pages while counting more items than it returned has dropped nodes. On
+    a continuation page `totalCount` is the collection's size and legitimately
+    exceeds the page's node count, so comparing them there would call every
+    legitimate final page unfaithful and truncate a large timeline (the
+    regression the re-gate caught). While `hasNextPage` is true the count is
+    likewise the collection's, so exceeding the node count is ordinary
+    pagination (issue #53, review PRR-004).
     """
     if not isinstance(raw, dict):
         return False
@@ -402,11 +403,11 @@ def _page_rendered_faithfully(raw: object) -> bool:
         return False
     if len([n for n in raw_nodes if isinstance(n, dict)]) != len(raw_nodes):
         return False
-    total = raw.get("totalCount")
     if (
-        not page_info.get("hasNextPage")
-        and isinstance(total, int)
-        and total > len(raw_nodes)
+        initial
+        and not page_info.get("hasNextPage")
+        and isinstance(raw.get("totalCount"), int)
+        and raw["totalCount"] > len(raw_nodes)
     ):
         return False
     return True
@@ -886,14 +887,16 @@ class GraphQLSource(GhApiSource):
         connection = node.get("timelineItems")
         if not isinstance(connection, dict):
             return [], {}
-        if not _page_rendered_faithfully(connection):
-            # The page did not render every node it reported (dropped
-            # non-dict node, totalCount overflow, or a malformed
-            # container). The retained events are not a faithful prefix,
-            # so the drain must not treat them as an answer: report the
-            # page as unanswerable and keep the truncation flag set —
-            # exactly the PRR-004 contract for a malformed initial page,
-            # applied to the continuation (issue #53, review PRR-004).
+        if not _page_rendered_faithfully(connection, initial=False):
+            # The page did not render every node it reported (a dropped
+            # non-dict node, or a malformed container). The retained events
+            # are not a faithful prefix, so the drain must not treat them as
+            # an answer: report the page as unanswerable and keep the
+            # truncation flag set — the PRR-004 contract applied to the
+            # continuation (issue #53). `totalCount` is NOT consulted here:
+            # on a continuation page it is the collection's size, so a
+            # legitimate final page would be called unfaithful and a large
+            # timeline truncated.
             return [], {}
         events, _ = _connection(connection)
         page_info = connection.get("pageInfo")
@@ -964,6 +967,16 @@ class GraphQLSource(GhApiSource):
             child.pop("timeline_incomplete", None)
         else:
             newest, info = self._timeline_page(number, kind, f"last: {_TIMELINE_PAGE_MAX}")
+            if not newest and not info:
+                # The replacement page is unanswerable (a missing alias, or a
+                # page that did not render faithfully) — NOT an empty
+                # collection. Keep the retained set and the flag rather than
+                # erasing the events we do have: `([], {})` from
+                # `_timeline_page` is ambiguous, and only the retained set is
+                # known to be real (issue #53, review PRR-004).
+                child["timeline"] = events
+                child.pop("timeline_cursor", None)
+                return
             if info.get("hasPreviousPage") and info.get("startCursor"):
                 older, _ = self._timeline_page(
                     number,
@@ -1220,17 +1233,22 @@ class GraphQLSource(GhApiSource):
             timeline_conn = node.get("timelineItems")
             events, timeline_more = _carried_connection(timeline_conn)
             children["timeline"] = [_timeline_event(e) for e in events]
-            # A page that did not render faithfully leaves the section
-            # unfetchable: the events preceding any cursor are partly
-            # unknowable, so NO cursor is emitted and _complete_timeline
-            # cannot drain the section and clear the flag — a well-formed
-            # continuation would otherwise present a partial timeline as
-            # complete and delete the stored item_events (issue #53,
-            # review PRR-004). The same predicate governs the continuation
-            # pages inside _timeline_page.
-            if timeline_more:
+            # The completeness decision and the cursor decision use the SAME
+            # predicate: a page that did not render faithfully (a non-dict
+            # container, a non-list `nodes`, a non-dict OR NULL `pageInfo`, a
+            # dropped node, or an initial page that counts more than it
+            # returned while claiming to be last) leaves the section
+            # unfetchable. Relying on `_carried_connection` alone missed the
+            # null-pageInfo shape — `_connection` reads a null pageInfo as
+            # `{}` (complete), so the flag was never set and
+            # `write_item_events` replaced the stored rows with the page's
+            # subset (issue #53, review PRR-004). No cursor is emitted for an
+            # unfaithful page, so `_complete_timeline` cannot drain past a
+            # prefix it only partly saw.
+            faithful = _page_rendered_faithfully(timeline_conn, initial=True)
+            if timeline_more or not faithful:
                 children["timeline_incomplete"] = True
-                if _page_rendered_faithfully(timeline_conn):
+                if faithful:
                     children["timeline_cursor"] = timeline_conn.get("pageInfo").get(
                         "endCursor"
                     )
