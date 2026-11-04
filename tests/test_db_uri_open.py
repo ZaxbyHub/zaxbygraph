@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import ast
 import zlib
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
@@ -412,6 +413,75 @@ class PublishNullWatermarkTest(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(pushed.stdout.strip(), "")
+
+
+class SiblingGuardrailTest(unittest.TestCase):
+    """Phase 4.2 guardrail for the class: a guard applied at one site but not
+    at its siblings.
+
+    All four defects in issue #55 were instances of that class - `as_uri()`
+    fixed at `snapshot.py`, `_MAX_PAGE` at `mcp_server.py`, the gzip tuple,
+    the watermark guard - and in each case the fix landed at the reported
+    site rather than at the family. These two tests pin the family directly
+    in source, so a future sibling added with the old spelling fails here
+    rather than shipping.
+
+    Both scans are AST-based: a text scan also matches the docstrings and
+    comments that describe the very calls being pinned.
+    """
+
+    def _sources(self):
+        return sorted((ROOT / "src" / "zaxbygraph").rglob("*.py"))
+
+    def _calls(self, path):
+        import ast
+
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                yield node
+
+    def _enclosing_function(self, path, lineno):
+        import ast
+
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.lineno <= lineno <= (node.end_lineno or node.lineno):
+                    return node
+        return None
+
+    def test_no_read_open_builds_its_uri_by_hand(self) -> None:
+        offenders = []
+        for path in self._sources():
+            for node in self._calls(path):
+                if ast.unparse(node.func) != "sqlite3.connect":
+                    continue
+                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+                if kw.get("uri") != "True":
+                    continue
+                if any("_readonly_uri" in ast.unparse(a) for a in node.args):
+                    continue
+                offenders.append("%s:%d" % (path.name, node.lineno))
+        self.assertEqual(offenders, [])
+
+    def test_every_over_fetch_site_uses_the_ceiling(self) -> None:
+        # A `fetchmany(limit + 1)` site whose enclosing function normalizes
+        # with _clamp_limit instead of _clamp_fetch_limit re-opens AC3/AC4.
+        import ast
+
+        offenders = []
+        for path in self._sources():
+            for node in self._calls(path):
+                if ast.unparse(node.func).split(".")[-1] != "fetchmany":
+                    continue
+                if not any("limit" in ast.unparse(a) for a in node.args):
+                    continue
+                fn = self._enclosing_function(path, node.lineno)
+                body = ast.unparse(fn) if fn is not None else ""
+                if "_clamp_fetch_limit" not in body:
+                    offenders.append("%s:%d" % (path.name, node.lineno))
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":
