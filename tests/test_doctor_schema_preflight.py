@@ -157,6 +157,57 @@ def _divergent_v1_null_flag(db: Path) -> None:
     conn.close()
 
 
+def _divergent_v1_blob_timestamp(db: Path) -> None:
+    """A genuine v1 store whose case-split group carries a BLOB
+    `last_full_sync_at` on one casing — a divergent storage class in a TEXT
+    column, reachable only through init_schema's migration fold."""
+    conn = sqlite3.connect(str(db))
+    conn.executescript(V1_SCHEMA_SQL)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+        " include_patches) VALUES ('ACME/FORGEGATE', '2026-01-02T00:00:00Z',"
+        " x'00', 0)")
+    conn.execute(
+        "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+        " include_patches) VALUES ('acme/forgegate', '2026-01-01T00:00:00Z',"
+        " '2026-01-01T00:00:00Z', 0)")
+    conn.execute(
+        "INSERT INTO items(id, repo, number, kind, title, state, updated_at,"
+        " raw_json) VALUES (1, 'acme/forgegate', 1, 'issue', 'one', 'open',"
+        " '2026-01-01T00:00:00Z', '{}')")
+    conn.commit()
+    conn.close()
+
+
+def _assert_legacy_fold_fails_closed(db: Path, label: str) -> None:
+    """Drive init_schema over a divergent legacy store: the migration-time
+    fold must refuse (sqlite3.DatabaseError) and the store must not
+    advance — never raise an uncaught TypeError through the migration."""
+    conn = connect(db)
+    try:
+        init_schema(conn)
+    except sqlite3.DatabaseError:
+        pass  # the fail-closed refusal (the fixed behavior)
+    except TypeError as exc:
+        self_fail = f"TypeError escaped the migration-time fold ({label}): {exc!r}"
+        raise AssertionError(self_fail) from exc
+    else:
+        raise AssertionError(
+            f"init_schema advanced a divergent legacy store ({label})")
+    finally:
+        conn.close()
+    probe = sqlite3.connect(str(db))
+    try:
+        version = probe.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        probe.close()
+    if version != 1:
+        raise AssertionError(
+            f"the refused store still advanced its schema version ({label}):"
+            f" {version}")
+
+
 class _SchemaPreflightCase(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = Path(tempfile.mkdtemp(prefix="zgt56-preflight-"))
@@ -369,35 +420,24 @@ class AffinityDivergenceTests(_SchemaPreflightCase):
 
 class DivergentLegacyFoldTests(_SchemaPreflightCase):
     def test_divergent_legacy_null_flag_fold_fails_closed(self) -> None:
-        """AC12: when a legacy store's migration-time fold meets a present
-        NULL in a NOT NULL flag column, the system fails closed and refuses
-        the store instead of raising an uncaught error through the
-        migration. RED at base, GREEN after the fix: at base the fold runs
-        inside migrate_v1_to_v2 — before any consolidation preflight can
-        run — and max() over the NULL raises TypeError (plan critic round 3,
-        finding 1); after the fix the fold raises sqlite3.DatabaseError and
-        the store does not advance. Genuine v1 cannot reach this path (its
-        DDL declares the column NOT NULL), which is exactly why the
-        divergent-legacy shape needs its own check."""
-        db = _prep(self.scratch / "c12" / "history.db")
-        _divergent_v1_null_flag(db)
-        conn = connect(db)
-        try:
-            init_schema(conn)
-        except sqlite3.DatabaseError:
-            pass  # the fail-closed refusal (the fixed behavior)
-        except TypeError as exc:
-            self.fail(f"TypeError escaped the migration-time fold: {exc!r}")
-        else:
-            self.fail("init_schema advanced a divergent legacy store")
-        finally:
-            conn.close()
-        # the refusal must not have advanced the store's schema version
-        probe = sqlite3.connect(str(db))
-        try:
-            version = probe.execute("PRAGMA user_version").fetchone()[0]
-        finally:
-            probe.close()
-        self.assertEqual(version, 1,
-                         "the refused store still advanced its schema"
-                         " version")
+        """AC12: when a legacy store's migration-time fold meets a
+        fabricated value — a present NULL in a NOT NULL flag column, or a
+        divergent storage class (BLOB) in a TEXT column — the system fails
+        closed and refuses the store instead of raising an uncaught error
+        through the migration. RED at base, GREEN after the fix: at base
+        the fold runs inside migrate_v1_to_v2 — before any consolidation
+        preflight can run — and max() over the NULL raises TypeError (plan
+        critic round 3, finding 1), while the BLOB timestamp raises
+        TypeError from the same aggregation's type-unsafe comparison
+        (implementation-review round 2, finding 1); after the fix the fold
+        raises sqlite3.DatabaseError and the store does not advance.
+        Genuine v1 cannot reach either path (its DDL declares the flag NOT
+        NULL and the timestamps TEXT), which is exactly why the
+        divergent-legacy shapes need their own check."""
+        null_db = _prep(self.scratch / "c12-null" / "history.db")
+        _divergent_v1_null_flag(null_db)
+        _assert_legacy_fold_fails_closed(null_db, "null flag")
+
+        blob_db = _prep(self.scratch / "c12-blob" / "history.db")
+        _divergent_v1_blob_timestamp(blob_db)
+        _assert_legacy_fold_fails_closed(blob_db, "blob timestamp")
