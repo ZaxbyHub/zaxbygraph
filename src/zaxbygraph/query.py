@@ -29,6 +29,16 @@ _MIN_LIMIT = 1
 #: values, and search/churn/open_items route through `_clamp_limit`.
 _MAX_FETCH_LIMIT = 2**31 - 2
 
+#: Ceiling for ANY caller-supplied row limit, including the ones bound as a
+#: SQL parameter. CPython's sqlite3 binds a Python int as a signed 64-bit
+#: integer, so a limit above 2**63-1 raises OverflowError at the bind and
+#: escapes as a traceback (issue #55, found by the PR #57 swarm review:
+#: `search`/`open`/`churn --limit 99999999999999999999999` crashed at base
+#: and at head). Every value at or below this bound is one SQLite already
+#: accepts, so refusing above it removes a crash without changing any
+#: working request.
+_MAX_SQL_LIMIT = 2**63 - 1
+
 
 #: Small fixed English stopword set for the search fallback (issue #4). Kept
 #: in code with no dependency; tokens are always quoted, so user input never
@@ -82,8 +92,18 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 def _clamp_limit(limit: int) -> int:
     """Clamp a caller-supplied row limit to a sane positive minimum before
     it reaches SQL. SQLite interprets a negative LIMIT as "unlimited", so
-    e.g. `search(limit=-1)` would otherwise return every row."""
+    e.g. `search(limit=-1)` would otherwise return every row.
+
+    A limit above `_MAX_SQL_LIMIT` is refused rather than clamped: CPython's
+    sqlite3 binds a Python int as a signed 64-bit integer, so a larger value
+    raises OverflowError at the bind and escapes as a traceback. Every value
+    at or below the ceiling is one SQLite already accepts.
+    """
     limit = int(limit)
+    if limit > _MAX_SQL_LIMIT:
+        raise ValueError(
+            f"row limit {limit} exceeds the maximum of {_MAX_SQL_LIMIT}"
+        )
     return limit if limit > 0 else _MIN_LIMIT
 
 
@@ -95,7 +115,7 @@ def _clamp_fetch_limit(limit: int) -> int:
     surfaces an error envelope instead of an OverflowError traceback
     (issue #55 AC3/AC4). Only the two `fetchmany(limit + 1)` sites use this;
     every other limit is bound as a SQL parameter, where 64-bit values are
-    legal and a ceiling here would be a behavior change.
+    legal and the tighter ceiling here would be a behavior change.
     """
     limit = _clamp_limit(limit)
     if limit > _MAX_FETCH_LIMIT:

@@ -770,6 +770,20 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
         data = query_fn(conn, *extra, repo=repo)
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
+    except ValueError as exc:
+        # A caller-supplied value the query layer refuses - an out-of-range
+        # row limit from query._clamp_limit / _clamp_fetch_limit - is a
+        # malformed request, not a store fault. Mapped exactly as
+        # _run_read_promote_truncated maps it, so every read command answers
+        # one way (issue #55).
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_request",
+        )
     except sqlite3.Error as exc:
         # A store that cannot be read mid-query (a pre-v7 store hitting a
         # v7-only table, a corrupt page, a read-only directory blocking the
@@ -1594,6 +1608,11 @@ def cmd_mcp(args: argparse.Namespace) -> int:
 
 _NO_SUCH_RE = re.compile(r"^(no such column|no such table)", re.IGNORECASE)
 _TABLE_RE = re.compile(r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
+# The row-limit refusal raised by query._clamp_fetch_limit / _clamp_limit. A
+# caller-supplied limit outside the driver's range is a malformed request, so
+# it must be classified like every other guard refusal (bad_request / exit 2)
+# rather than as a retryable runtime fault (issue #55).
+_LIMIT_RE = re.compile(r"^row limit .+ exceeds the maximum of", re.IGNORECASE)
 
 
 def _hint_table(sql_text: str) -> str | None:
@@ -1692,6 +1711,14 @@ def cmd_sql(args: argparse.Namespace) -> int:
             if match is not None:
                 code_key = match.group(1).lower().replace(" ", "_")
                 hint = _column_hint(ro_conn, args.statement)
+            elif _LIMIT_RE.match(message):
+                # A caller-supplied row limit outside the driver's range is a
+                # malformed request, not an internal fault: `file-history`
+                # reports the identical refusal as bad_request / exit 2, and
+                # README reserves exit 1 for a runtime failure that may succeed
+                # on retry. Reporting `runtime` here told an agent to retry a
+                # request that can never succeed unchanged (issue #55).
+                code_key, hint = "bad_request", None
             else:
                 code_key, hint = "runtime", None
             emit_result(
@@ -1703,7 +1730,9 @@ def cmd_sql(args: argparse.Namespace) -> int:
                 error=_error_for(code_key, message, hint),
                 identity=False,
             )
-            return 1
+            # Exit 2 for the guard refusal so both read commands agree on the
+            # documented caller-error contract; every other ValueError keeps 1.
+            return 2 if code_key == "bad_request" else 1
         fresh = _freshness(ro_conn, repo)
         line = _identity_line(ro_conn, repo, db_path)
     finally:

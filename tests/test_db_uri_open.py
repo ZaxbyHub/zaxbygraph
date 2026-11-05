@@ -127,11 +127,33 @@ class ReadonlyUriHelperTest(unittest.TestCase):
         # pathlib and as_uri() refuses it. On POSIX a drive is always empty,
         # so the ordinary relative spelling is the same branch and the
         # assertion holds there too.
-        rel = (Path(os.getcwd()).drive + "drive.db"
-               if sys.platform == "win32" else "drive.db")
-        uri = _readonly_uri(Path(rel))
-        self.assertTrue(uri.startswith("file:///"), uri)
-        self.assertIn("drive.db", uri)
+        #
+        # The spelling is built on a drive OTHER than the process cwd's, so
+        # the abspath branch is actually observable: on a same-drive spelling
+        # `Path.cwd() / p` and `os.path.abspath(p)` agree, which is why the
+        # earlier version of this test could not fail.
+        if sys.platform == "win32":
+            cwd_drive = Path(os.getcwd()).drive
+            other = next(
+                (d for d in "CDEFGHIJKLMNOPQRSTUVWXYZ"
+                 if (d + ":") != cwd_drive),
+                None,
+            )
+            if other is None:
+                self.skipTest("no second drive letter available")
+            rel = other + ":drive.db"
+            uri = _readonly_uri(Path(rel))
+            # abspath resolves a drive-relative spelling against that drive's
+            # own current directory, so the URI must name the other drive.
+            self.assertTrue(uri.startswith("file:///"), uri)
+            self.assertTrue(
+                uri.startswith("file:///%s:/" % other), uri
+            )
+            self.assertIn("drive.db", uri)
+        else:
+            uri = _readonly_uri(Path("drive.db"))
+            self.assertTrue(uri.startswith("file:///"), uri)
+            self.assertIn("drive.db", uri)
 
     def test_unc_path_keeps_the_backslash_spelling(self) -> None:
         # SQLite's URI parser rejects an authority component, and as_uri()
@@ -307,11 +329,22 @@ class PercentEscapeInDbPathTest(unittest.TestCase):
         self.assertEqual(row["title"], "NAMED")
 
     def test_cli_reads_the_named_database(self) -> None:
-        rc = main([
-            "sql", "SELECT title FROM items",
-            "--db", str(self.named), "--repo", REPO, "--format", "compact",
-        ])
+        # AC2's CLI leg must assert WHICH database was read, not merely that
+        # the command succeeded: reverting connect_readonly_query to the
+        # f-string leaves rc==0 while the envelope answers from the decoy.
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main([
+                "sql", "SELECT title FROM items",
+                "--db", str(self.named), "--repo", REPO, "--format", "compact",
+            ])
+        out = buf.getvalue()
         self.assertEqual(rc, 0)
+        self.assertIn("NAMED", out)
+        self.assertNotIn("DECOY", out)
 
 
 class FetchLimitBoundaryTest(unittest.TestCase):
@@ -331,15 +364,29 @@ class FetchLimitBoundaryTest(unittest.TestCase):
     def _run(self, argv: list[str]) -> int:
         return main(argv)
 
+    def _run_capture(self, argv: list[str]) -> tuple[int, str]:
+        """Run the CLI capturing stdout, so a refusal can be identified by its
+        envelope rather than by an exit code shared with unrelated failures."""
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(argv)
+        return rc, buf.getvalue()
+
     def test_sql_limit_at_the_c_int_boundary_is_refused(self) -> None:
-        rc = self._run([
+        # The envelope must name the limit, not just exit non-zero: exit 1 is
+        # also what an unrelated store failure returns, so an exit-code-only
+        # assertion would pass for the wrong reason.
+        rc, out = self._run_capture([
             "sql", "SELECT number FROM items",
             "--db", str(self.db), "--repo", REPO,
             "--limit", "2147483647", "--format", "compact",
         ])
-        # cmd_sql maps the ValueError to exit 1; any other non-zero
-        # would be a different failure wearing the same shape.
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, 2)
+        self.assertIn("bad_request", out)
+        self.assertIn("row limit 2147483647 exceeds", out)
 
     def test_sql_limit_just_below_the_boundary_still_works(self) -> None:
         # The off-by-one guard: a fix that refuses one value too many breaks
@@ -353,13 +400,14 @@ class FetchLimitBoundaryTest(unittest.TestCase):
         self.assertEqual(rc, 0)
 
     def test_file_history_limit_at_the_c_int_boundary_is_refused(self) -> None:
-        rc = self._run([
+        rc, out = self._run_capture([
             "file-history", "src/zaxbygraph/db.py",
             "--db", str(self.db), "--repo", REPO,
             "--limit", "2147483647", "--format", "compact",
         ])
-        # _run_read_promote_truncated maps it to bad_request exit 2.
         self.assertEqual(rc, 2)
+        self.assertIn("bad_request", out)
+        self.assertIn("row limit 2147483647 exceeds", out)
 
     def test_file_history_limit_just_below_the_boundary_still_works(self) -> None:
         rc = self._run([
@@ -368,6 +416,35 @@ class FetchLimitBoundaryTest(unittest.TestCase):
             "--limit", "2147483646", "--format", "compact",
         ])
         self.assertEqual(rc, 0)
+
+    def test_sql_limit_above_the_sql_bind_range_is_refused(self) -> None:
+        # The 64-bit sibling of the C-int ceiling: a limit above 2**63-1
+        # overflows the SQL bind, which escaped as a traceback at base and at
+        # head (found by the PR #57 swarm review). Both read commands must
+        # refuse it as a caller error.
+        for argv in (
+            ["sql", "SELECT number FROM items"],
+            ["file-history", "src/zaxbygraph/db.py"],
+        ):
+            rc, out = self._run_capture(
+                argv + ["--db", str(self.db), "--repo", REPO,
+                        "--limit", "99999999999999999999999",
+                        "--format", "compact"]
+            )
+            self.assertEqual(rc, 2, argv[0])
+            self.assertIn("bad_request", out)
+            self.assertIn("exceeds the maximum of", out)
+
+    def test_search_limit_above_the_sql_bind_range_is_refused(self) -> None:
+        # search/open/churn bind their limit as a SQL parameter and reach the
+        # same 64-bit ceiling through _clamp_limit.
+        rc, out = self._run_capture([
+            "search", "row",
+            "--db", str(self.db), "--repo", REPO,
+            "--limit", "99999999999999999999999", "--format", "compact",
+        ])
+        self.assertEqual(rc, 2)
+        self.assertIn("bad_request", out)
 
 
 class CorruptDeflateStreamTest(unittest.TestCase):
@@ -406,8 +483,15 @@ class CorruptDeflateStreamTest(unittest.TestCase):
         with self.assertRaises(snapshot.SnapshotError) as ctx:
             snapshot._verify_staged(staged, raw, manifest)
         self.assertEqual(ctx.exception.code, "gz_bad")
-        # The cause must be the zlib error the widened tuple now names.
-        self.assertIsInstance(ctx.exception.__cause__, zlib.error)
+        # The cause must be one of the corruption family the widened tuple
+        # names. Asserting zlib.error specifically is zlib-build dependent:
+        # where the corruption lands, gzip raises zlib.error (85 windows),
+        # gzip.BadGzipFile (23) or EOFError (3) - and the latter two were
+        # already covered before this PR, so pinning the class would fail a
+        # CI leg whose zlib reports a different member for the same bytes.
+        self.assertIsInstance(
+            ctx.exception.__cause__, (zlib.error, gzip.BadGzipFile, EOFError)
+        )
 
 
 class PublishNullWatermarkTest(unittest.TestCase):
@@ -435,17 +519,23 @@ class PublishNullWatermarkTest(unittest.TestCase):
 
         with self.assertRaises(snapshot.SnapshotError) as ctx:
             snapshot.publish(store, str(remote), "trace-test", expected_repo=REPO)
-        # A store-state code, not bad_manifest: callers read bad_manifest as
-        # a malformed RECEIVED manifest on the pull side, and a publish
-        # refusal must be distinguishable from that (cubic run 1).
-        self.assertEqual(ctx.exception.code, "repo_not_synced")
-        # Nothing may have been pushed.
-        pushed = subprocess.run(
-            ["git", "-C", str(remote), "ls-remote",
-             "refs/zaxbygraph/snapshot"],
-            capture_output=True, text=True,
-        )
-        self.assertEqual(pushed.stdout.strip(), "")
+        # A store-state code distinct from both bad_manifest (a malformed
+        # RECEIVED manifest, pull side) and repo_not_synced (no sync_state
+        # row, which an empty repository already has) - one code spanning
+        # three conditions sends a consumer to the wrong remedy.
+        self.assertEqual(ctx.exception.code, "no_watermark")
+        # Nothing may have been pushed. `git -C <repo> ls-remote <ref>` reads
+        # the REF as the repository and exits 128 with empty stdout, so the
+        # emptiness assertion used to be unable to fail; the repository is
+        # the positional argument and the ref is a pattern.
+        for ref in ("refs/zaxbygraph/snapshot",
+                    "refs/heads/zaxbygraph-snapshot"):
+            pushed = subprocess.run(
+                ["git", "ls-remote", str(remote), ref],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(pushed.returncode, 0, pushed.stderr)
+            self.assertEqual(pushed.stdout.strip(), "", ref)
 
 
 class SiblingGuardrailTest(unittest.TestCase):
@@ -488,75 +578,153 @@ class SiblingGuardrailTest(unittest.TestCase):
         """True when `arg` is, or resolves within its function to, a
         `_readonly_uri(...)` call.
 
-        The direct call is the common shape. A name is resolved to its
-        assignment in the enclosing function so a correct refactor that
-        hoists the URI into a local does not trip the guard (cubic run 1
-        flagged exactly that text-only form).
+        The direct call is the common shape. A name is resolved to the LAST
+        assignment to that name BEFORE the call site, so a correct refactor
+        that hoists the URI into a local passes (cubic run 1 flagged the
+        text-only form), while a later rebinding to a hand-built URI is still
+        caught (the earlier form accepted any assignment anywhere in the
+        function, ignoring order).
         """
         import ast
 
         if isinstance(arg, ast.Call):
             return ast.unparse(arg.func).split(".")[-1] == "_readonly_uri"
-        if isinstance(arg, ast.Name):
-            fn = self._enclosing_function(path, node.lineno)
-            if fn is None:
-                return False
-            for stmt in ast.walk(fn):
-                if isinstance(stmt, ast.Assign):
-                    targets, value = stmt.targets, stmt.value
-                elif isinstance(stmt, ast.AnnAssign):
-                    targets, value = [stmt.target], stmt.value
-                else:
+        if not isinstance(arg, ast.Name):
+            return False
+        fn = self._enclosing_function(path, node.lineno)
+        if fn is None:
+            return False
+        # Collect every binding of this name with its line number, then take
+        # the last one that precedes the connect call.
+        bindings = []
+        for stmt in ast.walk(fn):
+            if isinstance(stmt, ast.Assign):
+                targets, value, line = stmt.targets, stmt.value, stmt.lineno
+            elif isinstance(stmt, ast.AnnAssign):
+                targets, value, line = [stmt.target], stmt.value, stmt.lineno
+            else:
+                continue
+            if not isinstance(value, ast.Call):
+                continue
+            if ast.unparse(value.func).split(".")[-1] != "_readonly_uri":
+                continue
+            for tgt in targets:
+                if isinstance(tgt, ast.Name) and tgt.id == arg.id:
+                    bindings.append(line)
+        if not bindings:
+            return False
+        return max(bindings) < node.lineno
+
+    def _uri_connects(self):
+        """Every `sqlite3.connect(..., uri=<truthy>)` call in src/, as
+        (path, node) pairs.
+
+        Truthy rather than the literal `True`: `uri=1` is honoured by sqlite3
+        and opens the same file, so a scan that requires the exact spelling
+        lets a hand-built URI through. The callee is matched on any spelling
+        that resolves to sqlite3's connect - `sqlite3.connect`,
+        `dbapi2.connect`, or a direct `from sqlite3 import connect` - because
+        a scan keyed on the literal attribute path is evaded by an alias.
+        """
+        import ast
+
+        out = []
+        for path in self._sources():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            imported = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "sqlite3":
+                    imported.update(a.name for a in node.names)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
                     continue
-                if not isinstance(value, ast.Call):
+                fn = ast.unparse(node.func)
+                if fn not in ("sqlite3.connect", "connect") and \
+                        not fn.endswith(".connect"):
                     continue
-                if ast.unparse(value.func).split(".")[-1] != "_readonly_uri":
+                if fn == "connect" and "connect" not in imported:
                     continue
-                for tgt in targets:
-                    if isinstance(tgt, ast.Name) and tgt.id == arg.id:
-                        return True
-        return False
+                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+                if kw.get("uri") not in ("True", "1"):
+                    continue
+                out.append((path, node))
+        return out
 
     def test_no_read_open_builds_its_uri_by_hand(self) -> None:
         offenders = []
-        for path in self._sources():
-            for node in self._calls(path):
-                if ast.unparse(node.func) != "sqlite3.connect":
-                    continue
-                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
-                if kw.get("uri") != "True":
-                    continue
-                if node.args and self._is_readonly_uri_arg(
-                    path, node, node.args[0]
-                ):
-                    continue
-                offenders.append("%s:%d" % (path.name, node.lineno))
+        for path, node in self._uri_connects():
+            if node.args and self._is_readonly_uri_arg(path, node, node.args[0]):
+                continue
+            offenders.append("%s:%d" % (path.name, node.lineno))
         self.assertEqual(offenders, [])
 
     def test_the_uri_guard_finds_every_uri_connect(self) -> None:
         # Positive control (cubic run 1): a guard that silently matches
         # nothing is indistinguishable from a clean tree. The scan must find
-        # exactly the three shipped read-open sites.
+        # the shipped read-open sites.
+        found = [path.name for path, _ in self._uri_connects()]
+        self.assertEqual(len(found), 3)
+        self.assertEqual(sorted(found), ["db.py", "db.py", "snapshot.py"])
+
+    def test_the_uri_guard_rejects_a_hand_built_uri(self) -> None:
+        # Negative control: without one, neutering the offender check leaves
+        # the whole module green, so the guard's bite is unverified. The scan
+        # must flag a planted hand-built read-open URI.
         import ast
 
-        found = []
-        for path in self._sources():
-            for node in self._calls(path):
-                if ast.unparse(node.func) != "sqlite3.connect":
-                    continue
-                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
-                if kw.get("uri") != "True":
-                    continue
-                found.append(path.name)
-        # Files and count, not line numbers: an edit that moves a call would
-        # otherwise fail a control whose only job is to prove the scan bites.
-        self.assertEqual(
-            sorted(found), ["db.py", "db.py", "snapshot.py"]
+        planted = (
+            "import sqlite3\n"
+            "def _open(p):\n"
+            "    return sqlite3.connect(f\"file:{p}?mode=ro\", uri=True)\n"
         )
+        path = self._sources()[0]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders = []
+        for node in ast.walk(ast.parse(planted)):
+            if not isinstance(node, ast.Call):
+                continue
+            if ast.unparse(node.func) != "sqlite3.connect":
+                continue
+            kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+            if kw.get("uri") != "True":
+                continue
+            if node.args and self._is_readonly_uri_arg(path, node, node.args[0]):
+                continue
+            offenders.append(node.lineno)
+        self.assertEqual(offenders, [3], "the guard did not flag a planted URI")
+
+    def test_the_uri_guard_rejects_a_rebound_local(self) -> None:
+        # The same-name-rebinding shape: assign from _readonly_uri, then
+        # rebind to a hand-built URI before the connect. The resolver must
+        # take the LAST binding before the call, not any binding.
+        import ast
+
+        planted = (
+            "import sqlite3\n"
+            "def _open(p):\n"
+            "    uri = _readonly_uri(p)\n"
+            "    uri = f\"file:{p}?mode=ro\"\n"
+            "    return sqlite3.connect(uri, uri=True)\n"
+        )
+        path = self._sources()[0]
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        offenders = []
+        for node in ast.walk(ast.parse(planted)):
+            if not isinstance(node, ast.Call):
+                continue
+            if ast.unparse(node.func) != "sqlite3.connect":
+                continue
+            kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+            if kw.get("uri") != "True":
+                continue
+            if node.args and self._is_readonly_uri_arg(path, node, node.args[0]):
+                continue
+            offenders.append(node.lineno)
+        self.assertEqual(offenders, [5], "the guard accepted a rebound local")
 
     def test_every_over_fetch_site_uses_the_ceiling(self) -> None:
-        # A `fetchmany(limit + 1)` site whose enclosing function normalizes
-        # with _clamp_limit instead of _clamp_fetch_limit re-opens AC3/AC4.
+        # A fetch site whose enclosing function normalizes with _clamp_limit
+        # instead of _clamp_fetch_limit re-opens AC3/AC4.
         import ast
 
         offenders = []
@@ -565,17 +733,65 @@ class SiblingGuardrailTest(unittest.TestCase):
             for node in self._calls(path):
                 if ast.unparse(node.func).split(".")[-1] != "fetchmany":
                     continue
+                # Every fetchmany counts, not only the ones whose argument
+                # text contains "limit": a sibling spelled `fetchmany(n + 1)`
+                # was invisible to the earlier filter.
+                scanned.append("%s:%d" % (path.name, node.lineno))
                 if not any("limit" in ast.unparse(a) for a in node.args):
                     continue
-                scanned.append(path.name)
                 fn = self._enclosing_function(path, node.lineno)
-                body = ast.unparse(fn) if fn is not None else ""
-                if "_clamp_fetch_limit" not in body:
-                    offenders.append(path.name)
-        # Positive control (cubic run 1): the scan must actually have found
-        # both shipped sites, or an empty offenders list proves nothing.
-        self.assertEqual(sorted(scanned), ["query.py", "query.py"])
+                # Check the function's ASSIGNMENTS, not its unparsed text:
+                # ast.unparse emits the docstring, so a prose mention of
+                # _clamp_fetch_limit satisfied the earlier predicate.
+                clamped = False
+                if fn is not None:
+                    for stmt in ast.walk(fn):
+                        if isinstance(stmt, ast.Assign):
+                            values = [stmt.value]
+                        elif isinstance(stmt, ast.AnnAssign):
+                            values = [stmt.value]
+                        else:
+                            continue
+                        for v in values:
+                            if (isinstance(v, ast.Call)
+                                    and ast.unparse(v.func).split(".")[-1]
+                                    == "_clamp_fetch_limit"):
+                                clamped = True
+                if not clamped:
+                    offenders.append("%s:%d" % (path.name, node.lineno))
+        # Positive control: the scan must actually have found both shipped
+        # over-fetch sites, or an empty offenders list proves nothing.
+        self.assertEqual(len(scanned), 2)
         self.assertEqual(offenders, [])
+
+    def test_the_fetch_guard_rejects_a_docstring_mention(self) -> None:
+        # Negative control for the prose-defeat: a function whose docstring
+        # names _clamp_fetch_limit but whose body uses _clamp_limit must be
+        # flagged.
+        import ast
+
+        planted = (
+            "def _sibling(conn, limit):\n"
+            "    \"\"\"Uses _clamp_fetch_limit for the ceiling.\"\"\"\n"
+            "    limit = _clamp_limit(limit)\n"
+            "    return conn.execute('SELECT 1').fetchmany(limit + 1)\n"
+        )
+        fn = next(n for n in ast.walk(ast.parse(planted))
+                  if isinstance(n, ast.FunctionDef))
+        clamped = False
+        for stmt in ast.walk(fn):
+            if isinstance(stmt, ast.Assign):
+                values = [stmt.value]
+            elif isinstance(stmt, ast.AnnAssign):
+                values = [stmt.value]
+            else:
+                continue
+            for v in values:
+                if (isinstance(v, ast.Call)
+                        and ast.unparse(v.func).split(".")[-1]
+                        == "_clamp_fetch_limit"):
+                    clamped = True
+        self.assertFalse(clamped, "a docstring mention satisfied the guard")
 
 
 if __name__ == "__main__":
