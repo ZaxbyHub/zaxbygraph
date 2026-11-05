@@ -705,6 +705,17 @@ connection is opened `mode=ro` with `PRAGMA query_only=ON` and a default-deny
 `RECURSIVE`) plus the `data_version` pragma that FTS5 needs internally.
 Denials surface at execution and exit **1**.
 
+Both read-open factories (`db.open_existing` and
+`db.connect_readonly_query`) build their URI through `db._readonly_uri`, which
+percent-encodes every character SQLite's URI parser would otherwise read as
+syntax. A `--db` path whose filename contains `#`, `?` or a `%XX` escape
+therefore opens the *named* database: without that, a `#` truncated the path
+and swallowed `mode=ro` into a URI fragment, so a read command created a
+0-byte file and answered from it, and a `%XX` decoded to a different existing
+database while the envelope still reported the typed path. A UNC destination
+keeps the backslash spelling, because SQLite's URI parser rejects an
+authority component.
+
 Verified behavior:
 
 | Statement | Result |
