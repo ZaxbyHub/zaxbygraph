@@ -308,17 +308,23 @@ def _publish_staged(staged: Path, tmp: Path, target: str,
             "SELECT issues_since FROM sync_state WHERE repo = ?", (repo,)
         ).fetchone()["issues_since"]
         # The same guard `pull` applies at the manifest boundary, applied here
-        # at the producing end. A store synced from a repository with zero
-        # issues and PRs carries a NULL watermark; publishing it produces a
-        # snapshot that every pull refuses with `bad_manifest`, so the
-        # transport would advertise a snapshot it can never deliver (issue
-        # #55 AC6). The predicate is copied verbatim from the pull side.
+        # at the producing end. A store for a repository with zero issues and
+        # PRs carries a NULL watermark; publishing it produces a snapshot that
+        # every pull refuses, so the transport would advertise a snapshot it
+        # can never deliver (issue #55 AC6).
+        #
+        # The code is `repo_not_synced`, not `bad_manifest`: callers read
+        # `bad_manifest` as a malformed RECEIVED manifest on the pull side,
+        # and a publish refusal must be distinguishable from that. The hint
+        # names the real precondition - re-syncing an empty repository leaves
+        # the watermark NULL, so "sync first" would not be actionable.
         if not isinstance(watermark, str) or not watermark:
             raise SnapshotError(
-                "bad_manifest",
-                "store watermark is empty; a snapshot with no watermark"
-                " cannot be pulled",
-                hint="sync the repository before publishing",
+                "repo_not_synced",
+                "store watermark is empty; publish needs a store that has"
+                " ingested at least one item for this repository",
+                hint="a repository with no issues or pull requests has no"
+                     " watermark to publish; sync a repository that has items",
             )
     finally:
         sc.close()

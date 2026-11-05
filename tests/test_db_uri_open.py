@@ -337,7 +337,9 @@ class FetchLimitBoundaryTest(unittest.TestCase):
             "--db", str(self.db), "--repo", REPO,
             "--limit", "2147483647", "--format", "compact",
         ])
-        self.assertNotEqual(rc, 0)
+        # cmd_sql maps the ValueError to exit 1; any other non-zero
+        # would be a different failure wearing the same shape.
+        self.assertEqual(rc, 1)
 
     def test_sql_limit_just_below_the_boundary_still_works(self) -> None:
         # The off-by-one guard: a fix that refuses one value too many breaks
@@ -356,7 +358,8 @@ class FetchLimitBoundaryTest(unittest.TestCase):
             "--db", str(self.db), "--repo", REPO,
             "--limit", "2147483647", "--format", "compact",
         ])
-        self.assertNotEqual(rc, 0)
+        # _run_read_promote_truncated maps it to bad_request exit 2.
+        self.assertEqual(rc, 2)
 
     def test_file_history_limit_just_below_the_boundary_still_works(self) -> None:
         rc = self._run([
@@ -432,7 +435,10 @@ class PublishNullWatermarkTest(unittest.TestCase):
 
         with self.assertRaises(snapshot.SnapshotError) as ctx:
             snapshot.publish(store, str(remote), "trace-test", expected_repo=REPO)
-        self.assertEqual(ctx.exception.code, "bad_manifest")
+        # A store-state code, not bad_manifest: callers read bad_manifest as
+        # a malformed RECEIVED manifest on the pull side, and a publish
+        # refusal must be distinguishable from that (cubic run 1).
+        self.assertEqual(ctx.exception.code, "repo_not_synced")
         # Nothing may have been pushed.
         pushed = subprocess.run(
             ["git", "-C", str(remote), "ls-remote",
@@ -478,6 +484,39 @@ class SiblingGuardrailTest(unittest.TestCase):
                     return node
         return None
 
+    def _is_readonly_uri_arg(self, path, node, arg) -> bool:
+        """True when `arg` is, or resolves within its function to, a
+        `_readonly_uri(...)` call.
+
+        The direct call is the common shape. A name is resolved to its
+        assignment in the enclosing function so a correct refactor that
+        hoists the URI into a local does not trip the guard (cubic run 1
+        flagged exactly that text-only form).
+        """
+        import ast
+
+        if isinstance(arg, ast.Call):
+            return ast.unparse(arg.func).split(".")[-1] == "_readonly_uri"
+        if isinstance(arg, ast.Name):
+            fn = self._enclosing_function(path, node.lineno)
+            if fn is None:
+                return False
+            for stmt in ast.walk(fn):
+                if isinstance(stmt, ast.Assign):
+                    targets, value = stmt.targets, stmt.value
+                elif isinstance(stmt, ast.AnnAssign):
+                    targets, value = [stmt.target], stmt.value
+                else:
+                    continue
+                if not isinstance(value, ast.Call):
+                    continue
+                if ast.unparse(value.func).split(".")[-1] != "_readonly_uri":
+                    continue
+                for tgt in targets:
+                    if isinstance(tgt, ast.Name) and tgt.id == arg.id:
+                        return True
+        return False
+
     def test_no_read_open_builds_its_uri_by_hand(self) -> None:
         offenders = []
         for path in self._sources():
@@ -487,10 +526,33 @@ class SiblingGuardrailTest(unittest.TestCase):
                 kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
                 if kw.get("uri") != "True":
                     continue
-                if any("_readonly_uri" in ast.unparse(a) for a in node.args):
+                if node.args and self._is_readonly_uri_arg(
+                    path, node, node.args[0]
+                ):
                     continue
                 offenders.append("%s:%d" % (path.name, node.lineno))
         self.assertEqual(offenders, [])
+
+    def test_the_uri_guard_finds_every_uri_connect(self) -> None:
+        # Positive control (cubic run 1): a guard that silently matches
+        # nothing is indistinguishable from a clean tree. The scan must find
+        # exactly the three shipped read-open sites.
+        import ast
+
+        found = []
+        for path in self._sources():
+            for node in self._calls(path):
+                if ast.unparse(node.func) != "sqlite3.connect":
+                    continue
+                kw = {k.arg: ast.unparse(k.value) for k in node.keywords}
+                if kw.get("uri") != "True":
+                    continue
+                found.append(path.name)
+        # Files and count, not line numbers: an edit that moves a call would
+        # otherwise fail a control whose only job is to prove the scan bites.
+        self.assertEqual(
+            sorted(found), ["db.py", "db.py", "snapshot.py"]
+        )
 
     def test_every_over_fetch_site_uses_the_ceiling(self) -> None:
         # A `fetchmany(limit + 1)` site whose enclosing function normalizes
@@ -498,16 +560,21 @@ class SiblingGuardrailTest(unittest.TestCase):
         import ast
 
         offenders = []
+        scanned = []
         for path in self._sources():
             for node in self._calls(path):
                 if ast.unparse(node.func).split(".")[-1] != "fetchmany":
                     continue
                 if not any("limit" in ast.unparse(a) for a in node.args):
                     continue
+                scanned.append(path.name)
                 fn = self._enclosing_function(path, node.lineno)
                 body = ast.unparse(fn) if fn is not None else ""
                 if "_clamp_fetch_limit" not in body:
-                    offenders.append("%s:%d" % (path.name, node.lineno))
+                    offenders.append(path.name)
+        # Positive control (cubic run 1): the scan must actually have found
+        # both shipped sites, or an empty offenders list proves nothing.
+        self.assertEqual(sorted(scanned), ["query.py", "query.py"])
         self.assertEqual(offenders, [])
 
 
