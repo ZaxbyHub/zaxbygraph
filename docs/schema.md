@@ -705,6 +705,27 @@ connection is opened `mode=ro` with `PRAGMA query_only=ON` and a default-deny
 `RECURSIVE`) plus the `data_version` pragma that FTS5 needs internally.
 Denials surface at execution and exit **1**.
 
+Both read-open factories (`db.open_existing` and
+`db.connect_readonly_query`) build their URI through `db._readonly_uri`, which
+percent-encodes every character SQLite's URI parser would otherwise read as
+syntax. `snapshot._open_readonly` routes through the same helper, so all three
+read-open sites share one implementation. A `--db` path whose filename contains
+`#`, `?` or a `%XX` escape therefore opens the *named* database: without that,
+a `#` truncated the path and swallowed `mode=ro` into a URI fragment, so a read
+command created a 0-byte file and answered from it, and a `%XX` decoded to a
+different existing database while the envelope still reported the typed path.
+A UNC destination keeps the backslash spelling, because SQLite's URI parser
+rejects an authority component.
+
+Row limits are bounded at both ends. A non-positive `--limit` is clamped to 1
+rather than forwarded, because SQLite reads a negative `LIMIT` as "no limit".
+A `--limit` above 2⁶³−1 is refused with `bad_request` and exit 2, because
+CPython's sqlite3 binds a Python int as a signed 64-bit integer and a larger
+value overflows at the bind. `sql` and `file-history`, which over-fetch by one
+row to detect truncation, refuse anything at or above 2³¹−1 for the same
+reason: their argument to `Cursor.fetchmany()` is converted to a C `int`, and
+the tightest safe bound is 2³¹−2. Every value below each ceiling keeps working.
+
 Verified behavior:
 
 | Statement | Result |

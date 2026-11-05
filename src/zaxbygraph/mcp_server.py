@@ -652,7 +652,7 @@ def _tool_search(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+        limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
         offset = _int_cursor(arguments.get("cursor"))
         result = search(conn, query, limit=limit + offset, repo=slug)
         items = result.get("items") or []
@@ -772,7 +772,7 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
+        limit = _clamp_limit(min(_int_arg(arguments, "limit", 30), _MAX_PAGE))
         offset = _int_cursor(arguments.get("cursor"))
         result = file_history(conn, path, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
@@ -805,7 +805,7 @@ def _tool_open_items(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        limit = min(_clamp_limit(_int_arg(arguments, "limit", 50)), _MAX_PAGE)
+        limit = _clamp_limit(min(_int_arg(arguments, "limit", 50), _MAX_PAGE))
         offset = _int_cursor(arguments.get("cursor"))
         # SQL-level paging: the fetch is bounded where the cost is (F1).
         rows = open_items(conn, repo=slug, limit=limit + 1, offset=offset)
@@ -857,7 +857,7 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         ) from None
     finally:
         conn.close()
-    limit = min(_clamp_limit(_int_arg(arguments, "limit", 200)), _MAX_PAGE)
+    limit = _clamp_limit(min(_int_arg(arguments, "limit", 200), _MAX_PAGE))
     try:
         data = run_sql(guarded, statement, limit=limit, repo=slug)
     except ValueError as exc:
@@ -1014,7 +1014,7 @@ def _tool_similar_items(arguments: dict, ctx) -> dict:
     # calls answer bad_request uniformly, and identity is simply unknown at
     # validation time on every tool.
     number = _item_number(arguments, "similar_items")
-    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+    limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
@@ -1025,7 +1025,7 @@ def _tool_similar_items(arguments: dict, ctx) -> dict:
 
 
 def _tool_triage(arguments: dict, ctx) -> dict:
-    limit = min(_clamp_limit(_int_arg(arguments, "limit", 20)), _MAX_PAGE)
+    limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
     cursor = arguments.get("cursor")
     if cursor is not None and not isinstance(cursor, str):
         raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
@@ -1092,7 +1092,7 @@ def _tool_brief(arguments: dict, ctx) -> dict:
 
 
 def _tool_churn(arguments: dict, ctx) -> dict:
-    limit = min(_clamp_limit(_int_arg(arguments, "limit", 30)), _MAX_PAGE)
+    limit = _clamp_limit(min(_int_arg(arguments, "limit", 30), _MAX_PAGE))
     merged_only = _bool_arg(arguments, "merged_only")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)

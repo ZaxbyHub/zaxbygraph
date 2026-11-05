@@ -34,10 +34,11 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .db import CURRENT_USER_VERSION, connect
+from .db import CURRENT_USER_VERSION, _readonly_uri, connect
 from .export import MIN_EXPORT_VERSION, canonical, iter_corpus_content_lines
 
 #: snapshot manifest format stamp
@@ -306,6 +307,28 @@ def _publish_staged(staged: Path, tmp: Path, target: str,
         watermark = sc.execute(
             "SELECT issues_since FROM sync_state WHERE repo = ?", (repo,)
         ).fetchone()["issues_since"]
+        # The same guard `pull` applies at the manifest boundary, applied here
+        # at the producing end. A store for a repository with zero issues and
+        # PRs carries a NULL watermark; publishing it produces a snapshot that
+        # every pull refuses, so the transport would advertise a snapshot it
+        # can never deliver (issue #55 AC6).
+        #
+        # The code is `no_watermark`, distinct from both `bad_manifest` (which
+        # callers read as a malformed RECEIVED manifest on the pull side) and
+        # `repo_not_synced` (which the publish path already raises for "no
+        # sync_state rows" and `_check_completeness` raises for "no row for
+        # this repo"). One code spanning three conditions with two different
+        # remedies sends a consumer keyed on error.code to the wrong fix: an
+        # empty repository is already synced, so "run sync first" can never
+        # clear it. The hint names the real precondition instead.
+        if not isinstance(watermark, str) or not watermark:
+            raise SnapshotError(
+                "no_watermark",
+                "store watermark is empty; publish needs a store that has"
+                " ingested at least one item for this repository",
+                hint="a repository with no issues or pull requests has no"
+                     " watermark to publish; sync a repository that has items",
+            )
     finally:
         sc.close()
     corpus_sha256 = _corpus_digest(staged, repo)
@@ -601,7 +624,24 @@ def _verify_staged(staged: Path, gz_bytes: bytes, manifest: dict) -> None:
             )
     except SnapshotError:
         raise
-    except (OSError, EOFError) as exc:
+    except (OSError, EOFError, zlib.error, MemoryError) as exc:
+        # zlib.error is the corrupt-DEFLATE-stream case: the gzip header, the
+        # CRC32 trailer and the ISIZE trailer are all intact, so gzip raises
+        # zlib.error rather than OSError/EOFError and the tuple below it used
+        # to let it escape as a traceback (issue #55 AC5). It derives from
+        # Exception, not OSError, so it has to be named explicitly.
+        #
+        # MemoryError is the resource-exhaustion sibling: the read is bounded
+        # at ceiling+1 bytes, but on a machine with less than that free the
+        # allocation can still fail, and MemoryError is not an OSError. The
+        # AGENTS.md contract is that a storage fault is a result object, never
+        # a traceback (PR #57 swarm review, reliability-performance lane).
+        if isinstance(exc, MemoryError):
+            raise SnapshotError(
+                "snapshot_too_large",
+                "snapshot could not be decompressed within available memory",
+                hint="the snapshot expands beyond what this machine can hold",
+            ) from exc
         raise SnapshotError(
             "gz_bad",
             f"snapshot payload is not a readable gzip stream: {exc}",
@@ -692,13 +732,20 @@ def _bind_destination(manifest: dict, expected_repo: str | None,
 
 def _open_readonly(db_path: Path) -> sqlite3.Connection:
     """Open a store read-only WITHOUT ever writing to it. The URI must be
-    built with as_uri(), which percent-encodes the path: a raw f-string
-    leaves a literal '?', '#' or '%' in the path to terminate or corrupt
-    the URI, sqlite3.connect then raises, and the caller's except branch
-    would silently skip the guard it is protecting (cubic run 3 - a
-    fail-open on the multi-repo and newer-local checks). as_uri() also
-    guarantees an absolute path, which the URI form requires."""
-    return sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True)
+    built by `db._readonly_uri`, which percent-encodes the path: a raw
+    f-string leaves a literal '?', '#' or '%' in the path to terminate or
+    corrupt the URI, sqlite3.connect then raises, and the caller's except
+    branch would silently skip the guard it is protecting (cubic run 3 - a
+    fail-open on the multi-repo and newer-local checks). The helper also
+    guarantees an absolute path, which the URI form requires, and keeps the
+    backslash spelling SQLite accepts for a UNC destination (issue #55).
+    `pull` resolves its destination first, so the relative branch is
+    unreachable here.
+
+    The import is at module scope: `snapshot` already imports `.db` for
+    `CURRENT_USER_VERSION` and `connect`, and `db` imports nothing from
+    `snapshot`, so there is no cycle for a deferred import to break."""
+    return sqlite3.connect(_readonly_uri(db_path), uri=True)
 
 
 def _check_destination_shape(db_path: Path, manifest: dict,

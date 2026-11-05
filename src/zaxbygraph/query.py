@@ -20,6 +20,25 @@ _BOM = "﻿"
 #: non-positive value must never be forwarded verbatim.
 _MIN_LIMIT = 1
 
+#: Ceiling for the row limit of a fetch that over-fetches by one to detect
+#: truncation. CPython's sqlite3 converts `Cursor.fetchmany()`'s argument to
+#: a C int, so any limit at or above 2**31-1 raises OverflowError before a
+#: single row is fetched (issue #55 AC3/AC4). The tightest safe bound is
+#: 2**31-2. This ceiling deliberately does NOT live in `_clamp_limit`: a
+#: plain SQL `LIMIT ?` is bound as a 64-bit integer and accepts far larger
+#: values, and search/churn/open_items route through `_clamp_limit`.
+_MAX_FETCH_LIMIT = 2**31 - 2
+
+#: Ceiling for ANY caller-supplied row limit, including the ones bound as a
+#: SQL parameter. CPython's sqlite3 binds a Python int as a signed 64-bit
+#: integer, so a limit above 2**63-1 raises OverflowError at the bind and
+#: escapes as a traceback (issue #55, found by the PR #57 swarm review:
+#: `search`/`open`/`churn --limit 99999999999999999999999` crashed at base
+#: and at head). Every value at or below this bound is one SQLite already
+#: accepts, so refusing above it removes a crash without changing any
+#: working request.
+_MAX_SQL_LIMIT = 2**63 - 1
+
 
 #: Small fixed English stopword set for the search fallback (issue #4). Kept
 #: in code with no dependency; tokens are always quoted, so user input never
@@ -73,9 +92,37 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
 def _clamp_limit(limit: int) -> int:
     """Clamp a caller-supplied row limit to a sane positive minimum before
     it reaches SQL. SQLite interprets a negative LIMIT as "unlimited", so
-    e.g. `search(limit=-1)` would otherwise return every row."""
+    e.g. `search(limit=-1)` would otherwise return every row.
+
+    A limit above `_MAX_SQL_LIMIT` is refused rather than clamped: CPython's
+    sqlite3 binds a Python int as a signed 64-bit integer, so a larger value
+    raises OverflowError at the bind and escapes as a traceback. Every value
+    at or below the ceiling is one SQLite already accepts.
+    """
     limit = int(limit)
+    if limit > _MAX_SQL_LIMIT:
+        raise ValueError(
+            f"row limit {limit} exceeds the maximum of {_MAX_SQL_LIMIT}"
+        )
     return limit if limit > 0 else _MIN_LIMIT
+
+
+def _clamp_fetch_limit(limit: int) -> int:
+    """`_clamp_limit` plus the C-int ceiling for a fetch that over-fetches by
+    one row to detect truncation (`fetchmany(limit + 1)`).
+
+    Above the ceiling the value is refused rather than clamped, so the caller
+    surfaces an error envelope instead of an OverflowError traceback
+    (issue #55 AC3/AC4). Only the two `fetchmany(limit + 1)` sites use this;
+    every other limit is bound as a SQL parameter, where 64-bit values are
+    legal and the tighter ceiling here would be a behavior change.
+    """
+    limit = _clamp_limit(limit)
+    if limit > _MAX_FETCH_LIMIT:
+        raise ValueError(
+            f"row limit {limit} exceeds the maximum of {_MAX_FETCH_LIMIT}"
+        )
+    return limit
 
 
 def _fold_repo(repo: str | None) -> str | None:
@@ -1291,7 +1338,7 @@ def assert_read_sql(sql: str) -> None:
 
 def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200, repo: str | None = None) -> dict:
     assert_read_sql(sql)
-    limit = _clamp_limit(limit)
+    limit = _clamp_fetch_limit(limit)
     cur = conn.cursor()
     try:
         cur.execute(sql)
@@ -1445,7 +1492,7 @@ def file_history(
     a REST-only store whose only closure evidence is keyword-derived still
     answers truthfully (issue #31 AC1). Over-fetches limit+1 rows so callers
     can set the envelope truncated flag without a COUNT."""
-    limit = _clamp_limit(limit)
+    limit = _clamp_fetch_limit(limit)
     repo = _fold_repo(repo)
     if not repo:
         # Number/path-keyed like its siblings: a no-filter scan would mix
