@@ -387,6 +387,28 @@ def _row_get(row: sqlite3.Row, column: str, default: object) -> object:
     return row[column] if column in row.keys() else default
 
 
+def _text_value(row: sqlite3.Row, column: str) -> str | None:
+    """A TEXT column's value, refusing any other storage class (issue #56).
+
+    `sync_state`'s timestamp columns are declared TEXT; a divergent schema
+    whose column lost its affinity can hold INTEGER or BLOB values, and
+    comparing those against strings raises an uncaught TypeError that
+    would abort the whole command. Raise `sqlite3.DatabaseError` instead,
+    so the caller's handler converts it to an unreadable candidate —
+    the migration path has no preflight in front of it, exactly as the
+    flag columns' fail-closed raise covers `include_patches`.
+    """
+    if column not in row.keys():
+        return None
+    value = row[column]
+    if value is None or isinstance(value, str):
+        return value
+    raise sqlite3.DatabaseError(
+        f"sync_state.{column} holds a {type(value).__name__} value: a"
+        " divergent storage class is refused"
+    )
+
+
 def _fold_sync_state(conn: sqlite3.Connection) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
@@ -419,16 +441,24 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     for lower_repo, group in groups.items():
         if len(group) == 1 and group[0]["repo"] == lower_repo:
             continue
+        # The timestamps are TEXT columns (or NULL); a divergent schema
+        # whose column lost its affinity can hold INTEGER or BLOB values,
+        # and max() over mixed storage classes raises an uncaught
+        # TypeError — the same isolation escape as a missing column, one
+        # type down (issue #56; implementation-review round-2 finding 1).
+        # Fail closed so the caller's sqlite3.DatabaseError handler
+        # converts it to an unreadable candidate.
         winner = max(
-            group, key=lambda r: (_row_get(r, "issues_since", None) or "", r["rid"])
+            group,
+            key=lambda r: (_text_value(r, "issues_since") or "", r["rid"]),
         )
         full = max(
-            (_row_get(r, "last_full_sync_at", None) for r in group
-             if _row_get(r, "last_full_sync_at", None)), default=None
+            (_text_value(r, "last_full_sync_at") for r in group
+             if _text_value(r, "last_full_sync_at")), default=None
         )
         incr = max(
-            (_row_get(r, "last_incr_sync_at", None) for r in group
-             if _row_get(r, "last_incr_sync_at", None)), default=None
+            (_text_value(r, "last_incr_sync_at") for r in group
+             if _text_value(r, "last_incr_sync_at")), default=None
         )
         if "include_patches" in columns:
             values = [r["include_patches"] for r in group]

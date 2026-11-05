@@ -116,10 +116,11 @@ database, an unreadable file — is listed with `unreadable: true` and an
 candidate never aborts the scan (the other candidates are still reported
 and the best one can still be adopted). The candidate the adoption reaches
 (the freshest complete one, and only under `--consolidate`) additionally has
-its schema validated before any store write: a missing table or column, or
-a fabricated `sync_state` flag value, refuses that candidate with the
-reason carried instead of adopting it as a truncated image. A divergent
-candidate that is not the winner is not probed — it is simply not adopted.
+its schema validated before any store write — a missing table or column, a
+fabricated `sync_state` flag value, or a divergent storage class in a TEXT
+column, refuses that candidate with the reason carried instead of adopting
+it as a truncated image or aborting the command. A divergent candidate that
+is not the winner is not probed — it is simply not adopted.
 `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);

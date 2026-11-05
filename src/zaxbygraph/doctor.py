@@ -329,6 +329,12 @@ _REQUIRED_SYNC_STATE_COLUMNS = (
 #: NULL DEFAULT 0), so it is refused rather than adopted as a value (issue
 #: #56, AC11).
 _REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
+#: TEXT columns the fold and the adoption compare or carry (issue #56):
+#: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
+#: would raise an uncaught TypeError at the fold's max() or at the scan's
+#: winner ranking — the same isolation escape as the flags, one type up.
+_REQUIRED_SYNC_STATE_TEXTS = ("issues_since", "last_full_sync_at",
+                              "last_incr_sync_at", "last_error")
 #: columns the wholesale `actors` copy names (issue #56, AC9/AC10).
 _REQUIRED_ACTOR_COLUMNS = ("login", "html_url")
 
@@ -384,6 +390,21 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
                 path,
                 f"the candidate's sync_state.{column} holds a non-integer"
                 f" value in {bad} row(s): a fabricated flag state is"
+                " refused, not adopted")
+    for column in _REQUIRED_SYNC_STATE_TEXTS:
+        # The DDL declares these TEXT; a divergent storage class would
+        # raise an uncaught TypeError at the fold's max() or at the scan's
+        # winner ranking (issue #56; implementation-review round-2
+        # finding 1). Refuse the candidate instead of aborting the command.
+        bad = conn.execute(
+            f"SELECT COUNT(*) FROM sync_state"
+            f" WHERE typeof({_quote_ident(column)}) NOT IN ('text', 'null')"
+        ).fetchone()[0]
+        if bad:
+            raise _UnreadableCandidate(
+                path,
+                f"the candidate's sync_state.{column} holds a non-text"
+                f" value in {bad} row(s): a divergent storage class is"
                 " refused, not adopted")
 
 
@@ -752,7 +773,16 @@ def doctor(
         entry["adopted"] = False
         scanned.append(entry)
         if entry["complete"] and entry["items"] > 0:
-            key = entry["issues_since"] or ""
+            # A candidate whose sync_state.issues_since lost its TEXT
+            # affinity can hold an INTEGER (or other) value; comparing
+            # that against a timestamp string raises an uncaught TypeError
+            # that would abort the whole scan (issue #56;
+            # implementation-review round-2 finding 1). Rank a non-text
+            # watermark as the oldest — the candidate is still reported,
+            # and the adoption's preflight refuses the divergent storage
+            # class before any store write.
+            raw_key = entry["issues_since"]
+            key = raw_key if isinstance(raw_key, str) else ""
             if best is None or key > best[0]:
                 best = (key, entry)
     if consolidate_flag and best is not None:

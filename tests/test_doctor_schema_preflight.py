@@ -271,6 +271,102 @@ class NullFlagPreflightTests(_SchemaPreflightCase):
                             f" {stored}")
 
 
+def _blob_timestamp_candidate(bad: Path) -> None:
+    """Add the second casing of a case-split pair whose
+    `last_full_sync_at` is a BLOB — a divergent storage class in a TEXT
+    column, which makes the fold's max() compare bytes against str."""
+    conn = sqlite3.connect(str(bad))
+    shared = ("issues_since, last_full_sync_at, last_incr_sync_at,"
+              " last_error, full_sync_pending, item_count,"
+              " comment_count, edge_count")
+    conn.execute(
+        f"INSERT INTO sync_state(repo, {shared})"
+        f" SELECT 'ACME/FORGEGATE', {shared} FROM sync_state"
+        " WHERE repo = ?", (REPO,))
+    conn.execute(
+        "UPDATE sync_state SET last_full_sync_at = x'00'"
+        " WHERE repo = 'ACME/FORGEGATE'")
+    conn.commit()
+    conn.close()
+
+
+def _affinity_divergent_candidate(bad: Path) -> None:
+    """Rebuild `sync_state` with `issues_since` carrying NO declared type
+    (a schema that lost its affinity) and store an INTEGER watermark —
+    which makes the scan's winner ranking compare int against str."""
+    conn = sqlite3.connect(str(bad))
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_state'"
+    ).fetchone()[0]
+    lines = []
+    for ln in ddl.splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("issues_since"):
+            ln = ln.replace("TEXT", "")  # drop the declared affinity
+        lines.append(ln)
+    conn.execute("ALTER TABLE sync_state RENAME TO sync_state_old")
+    conn.execute("\n".join(lines))
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(sync_state_old)")]
+    collist = ", ".join(cols)
+    conn.execute(
+        f"INSERT INTO sync_state ({collist}) SELECT {collist} FROM sync_state_old")
+    conn.execute("DROP TABLE sync_state_old")
+    conn.execute("UPDATE sync_state SET issues_since = 12345")
+    conn.commit()
+    conn.close()
+
+
+class AffinityDivergenceTests(_SchemaPreflightCase):
+    def test_divergent_storage_class_isolates_candidate(self) -> None:
+        """AC13: when a candidate's `sync_state` TEXT column holds a
+        divergent storage class — a BLOB timestamp in one casing, or an
+        INTEGER watermark in a column that lost its TEXT affinity — the
+        system does NOT abort the scan: the candidate the adoption reaches
+        is refused as unreadable, and the remaining candidates are still
+        scanned. RED at base, GREEN after the fix: at base the multi-cased
+        BLOB raises an uncaught TypeError inside the fold's max(), and the
+        INTEGER watermark raises an uncaught TypeError at the scan's winner
+        ranking — before consolidate is even called (implementation-review
+        round-2 finding 1)."""
+        # shape A: the BLOB timestamp reaches the fold's aggregation
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c13-blob", _blob_timestamp_candidate)
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except TypeError as exc:
+            self.fail(f"TypeError escaped candidate isolation and aborted"
+                      f" the whole command: {exc!r}")
+        self._assert_isolated(envelope, good, bad)
+
+        # shape B: the INTEGER watermark reaches the winner ranking first;
+        # the divergent candidate is reported and simply not adopted, and
+        # the healthy sibling is still the winner
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c13-affinity", _affinity_divergent_candidate)
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except TypeError as exc:
+            self.fail(f"TypeError escaped candidate isolation and aborted"
+                      f" the whole command: {exc!r}")
+        rows = {os.path.normcase(str(row.get("path", ""))): row
+                for row in envelope.get("scanned") or []}
+        self.assertIn(os.path.normcase(str(bad)), rows,
+                      "the divergent candidate vanished from the report")
+        self.assertIn(os.path.normcase(str(good)), rows,
+                      "the remaining candidates were not scanned")
+        self.assertTrue(envelope.get("ok"), envelope)
+        self.assertEqual(
+            os.path.normcase(str(envelope.get("adopted") or "")),
+            os.path.normcase(str(good)),
+            "the healthy sibling was not adopted")
+
+
 class DivergentLegacyFoldTests(_SchemaPreflightCase):
     def test_divergent_legacy_null_flag_fold_fails_closed(self) -> None:
         """AC12: when a legacy store's migration-time fold meets a present

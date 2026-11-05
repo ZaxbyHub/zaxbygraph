@@ -549,21 +549,28 @@ Before any store write, the adoption validates everything it reads from the
 candidate it reaches (the freshest complete one, under `--consolidate`) in
 one structural preflight (issue #56): every copied table exists (including
 `actors` with the `login`/`html_url` columns its wholesale copy names), the
-`sync_state` columns the fold and the adoption read exist, and the NOT NULL
-flag columns hold only integers (NULL, TEXT and other storage classes are
-fabricated states). A candidate failing the preflight is refused as an
-unreadable candidate — recorded on its scan entry with the reason, the scan
-continues, the store is untouched — so a divergent schema can never be
-adopted as a truncated image and can never abort the command with an
-uncaught `IndexError`/`OperationalError`/`TypeError`. The same fail-closed
-rule guards the migration-time fold: a fabricated flag value refuses the
-store instead of advancing it, and every attempt of the candidate copy
-starts from a clean copy directory, so a sidecar an earlier attempt wrote
-can never revert committed frames on recovery. A candidate that cannot be
-inspected at all is likewise reported (`unreadable: true` with a reason)
-rather than silently dropped — "no candidates" and "one unreadable
-candidate" never look the same in the report. A divergent candidate that is
-not the adoption winner is not probed; it is simply not adopted.
+`sync_state` columns the fold and the adoption read exist, the NOT NULL flag
+columns hold only integers (NULL, TEXT and other storage classes are
+fabricated states), and the TEXT columns hold only text or NULL (a
+divergent storage class would raise an uncaught TypeError at the fold's
+aggregation or at the scan's winner ranking). A candidate failing the
+preflight is refused as an unreadable candidate — recorded on its scan
+entry with the reason, the scan continues, the store is untouched — so a
+divergent schema can never be adopted as a truncated image and can never
+abort the command with an uncaught `IndexError`/`OperationalError`/
+`TypeError`. The same fail-closed rule guards the migration-time fold for
+case-split groups: a fabricated flag value or a divergent storage class in
+a case-split `sync_state` refuses the store instead of advancing it, and
+every attempt of the candidate copy starts from a clean copy directory, so
+a sidecar an earlier attempt wrote can never revert committed frames on
+recovery. (A single-cased store never reaches the fold's group body; its
+fabricated flag value is preserved by the migration and refused later, if
+that store is ever a consolidation candidate, by the preflight's
+storage-class check.) A candidate that cannot be inspected at all is
+likewise reported (`unreadable: true` with a reason) rather than silently
+dropped — "no candidates" and "one unreadable candidate" never look the
+same in the report. A divergent candidate that is not the adoption winner
+is not probed; it is simply not adopted.
 
 `complete` for a migrated legacy row means "no unresolved full sync since the
 last recorded one": v1 recorded nothing when a run crashed outside its caught
