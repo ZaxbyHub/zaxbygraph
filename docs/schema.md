@@ -545,6 +545,24 @@ collision cleanup and the `closes` survivor/evidence rules run before the
 row copy, and a case-split candidate is adopted with one row per folded key
 instead of aborting on a raw UNIQUE error.
 
+Before any store write, the adoption validates everything it reads from the
+candidate in one structural preflight (issue #56): every copied table exists
+(including `actors` with the `login`/`html_url` columns its wholesale copy
+names), the `sync_state` columns the fold and the adoption read exist, and
+the NOT NULL flag columns hold no NULLs. A candidate failing the preflight
+is refused as an unreadable candidate — recorded on its scan entry with the
+reason, the scan continues, the store is untouched — so a divergent schema
+can never be adopted as a truncated image and can never abort the command
+with an uncaught `IndexError`/`OperationalError`. The same fail-closed rule
+guards the migration-time fold: a fabricated flag value (a present NULL in a
+NOT NULL column) refuses the store instead of advancing it, and every
+attempt of the candidate copy starts from a clean copy directory, so a
+sidecar an earlier attempt wrote can never revert committed frames on
+recovery. A candidate that cannot be inspected at all is likewise reported
+(`unreadable: true` with a reason) rather than silently dropped — "no
+candidates" and "one unreadable candidate" never look the same in the
+report.
+
 `complete` for a migrated legacy row means "no unresolved full sync since the
 last recorded one": v1 recorded nothing when a run crashed outside its caught
 exception types, so a database whose last full sync completed and whose later

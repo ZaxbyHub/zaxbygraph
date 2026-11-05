@@ -831,64 +831,83 @@ def _install(staged: Path, db_path: Path) -> None:
     failure falls through — pull is the recovery path for a corrupt
     destination); the COMMITTED refusals are the guarded replace below,
     classified by cause: a busy reader, a cross-volume move, or a storage
-    fault each get their own code and hint."""
+    fault each get their own code and hint.
+
+    Once the replace has committed, dropping the OLD sidecars is best-effort
+    housekeeping: a failure there must NOT claim the store was not replaced
+    (issue #56, AC6 — the pre-fix code folded the cleanup's OSError into the
+    replace's refusal, so the envelope lied about a committed mutation and
+    the post-install check never ran). `pull` always reaches
+    `_post_install_check` after this returns, and that check's corpus-digest
+    verdict is the truthful outcome: a stale sidecar that reverts the pulled
+    corpus is exactly what `corpus_mismatch` exists to catch, and its hint
+    already discloses that the store was already replaced.
+    """
+    # best-effort WAL quiesce: back-fill pending frames into the main db so
+    # the replaced file never coexists with stale sidecar data.
     try:
-        # best-effort WAL quiesce: back-fill pending frames into the main
-        # db so the replaced file never coexists with stale sidecar data.
+        dest = sqlite3.connect(str(db_path))
         try:
-            dest = sqlite3.connect(str(db_path))
-            try:
-                dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            finally:
-                dest.close()
-        except (OSError, sqlite3.Error):
-            # pull is the recovery path for a corrupt destination (README
-            # recipes): a quiesce failure on unreadable bytes falls
-            # through to the guarded install, which replaces them
-            pass
-        try:
-            os.replace(staged, db_path)
-        except OSError as exc:
-            # a same-file open reader and a cross-volume move are different
-            # faults with different remedies; name them apart
-            winerr = getattr(exc, "winerror", None)
-            if winerr == 17 or exc.errno == errno.EXDEV:
-                raise SnapshotError(
-                    "dest_cross_volume",
-                    "destination store is on a different volume than the"
-                    " staging area; set TMPDIR onto the store's volume",
-                    hint="os.replace cannot move a file across volumes",
-                ) from exc
-            if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
-                                                  errno.EPERM, errno.ETXTBSY):
-                raise SnapshotError(
-                    "dest_open",
-                    "destination store is held open by another process",
-                    hint="close readers holding the store open and re-pull",
-                ) from exc
+            dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            dest.close()
+    except (OSError, sqlite3.Error):
+        # pull is the recovery path for a corrupt destination (README
+        # recipes): a quiesce failure on unreadable bytes falls through to
+        # the guarded install, which replaces them
+        pass
+    # ONE guarded replace: a same-file open reader, a cross-volume move, and
+    # a storage fault are different faults with different remedies.
+    try:
+        os.replace(staged, db_path)
+    except OSError as exc:
+        winerr = getattr(exc, "winerror", None)
+        if winerr == 17 or exc.errno == errno.EXDEV:
+            raise SnapshotError(
+                "dest_cross_volume",
+                "destination store is on a different volume than the"
+                " staging area; set TMPDIR onto the store's volume",
+                hint="os.replace cannot move a file across volumes",
+            ) from exc
+        if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
+                                              errno.EPERM, errno.ETXTBSY):
             raise SnapshotError(
                 "dest_open",
-                f"destination store could not be replaced: {exc}",
-                hint="check the destination path and its permissions",
+                "destination store is held open by another process",
+                hint="close readers holding the store open and re-pull",
             ) from exc
-        # only now are the OLD sidecars stale: the new main file is in place
-        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
-            if sidecar.exists():
-                sidecar.unlink()
-    except SnapshotError:
-        raise
-    except OSError as exc:
         raise SnapshotError(
             "dest_open",
             f"destination store could not be replaced: {exc}",
             hint="check the destination path and its permissions",
         ) from exc
+    # The replace has COMMITTED. Only now are the OLD sidecars stale, and
+    # dropping them is best-effort: a failure here (a locked or read-only
+    # sidecar) leaves the store REPLACED, so it is swallowed rather than
+    # reported as a failed replace. The post-install check that follows is
+    # the verdict on what the destination now serves.
+    try:
+        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+            if sidecar.exists():
+                sidecar.unlink()
+    except OSError:
+        pass
 
 
 def _post_install_check(db_path: Path, manifest: dict) -> dict:
     """Reopen dest, recompute the corpus digest, assert the manifest value
-    (AC5). Returns the result dict."""
-    conn = connect(db_path)
+    (AC5). Returns the result dict.
+
+    The reopen is READ-ONLY (issue #56, AC6): a read-write open of a
+    destination whose stale sidecar survived the install's best-effort
+    cleanup would recover that sidecar into the replaced main on close, so
+    the check's own close would bake the very revert it exists to report —
+    and the replaced bytes would no longer be provable. A read-only reopen
+    observes exactly what the destination now serves (the stale sidecar's
+    content, when one survived) without mutating it: the digest verdict is
+    the truth, and the install's evidence survives the check.
+    """
+    conn = _open_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         digest = _corpus_digest_conn(conn, manifest["repo"])

@@ -31,6 +31,7 @@ from pathlib import Path
 from zaxbygraph.db import (
     CURRENT_USER_VERSION,
     _quote_ident,
+    _table_exists,
     connect,
     fold_repo_casings,
     init_schema,
@@ -198,6 +199,20 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
             return False
         sources = sidecars + [path]
         try:
+            # A previous attempt may have left a sidecar beside the
+            # destination: a stale `-wal` would replay over THIS attempt's
+            # newer main file on the recovery open and revert committed
+            # frames, so the copy would be adopted as a truncated image of
+            # the candidate (issue #56, AC1/AC2). The copy path and its
+            # sidecars are wholly owned by this call, so every attempt
+            # starts from a clean copy directory; a directory that cannot
+            # be cleaned takes the same retry-then-refuse path as any other
+            # unusable candidate.
+            try:
+                for suffix in ("-wal", "-shm", "-journal"):
+                    Path(str(copy) + suffix).unlink(missing_ok=True)
+            except OSError:
+                continue
             before = {
                 p.name: (p.stat().st_size, p.stat().st_mtime_ns)
                 for p in sources
@@ -299,6 +314,70 @@ def inspect(path: Path, repo: str) -> dict | None:
             conn.close()
 
 
+#: `sync_state` columns the fold and the adoption read (issue #56, AC4/AC5).
+_REQUIRED_SYNC_STATE_COLUMNS = (
+    "repo",
+    "issues_since",
+    "last_full_sync_at",
+    "last_incr_sync_at",
+    "last_error",
+    "include_patches",
+    "full_sync_pending",
+)
+#: NOT NULL flag columns: a present NULL is a fabricated state no genuine
+#: store can produce (the DDL declares them NOT NULL DEFAULT 0), so it is
+#: refused rather than adopted as a value (issue #56, AC11).
+_REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
+#: columns the wholesale `actors` copy names (issue #56, AC9/AC10).
+_REQUIRED_ACTOR_COLUMNS = ("login", "html_url")
+
+
+def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
+    """Refuse a candidate whose schema cannot be adopted faithfully, BEFORE
+    any store write (issue #56). Every read `consolidate` performs on the
+    candidate is validated here — the `_COPY_TABLES` delete/copy loops, the
+    per-item revisions read, the `sync_state` reads, and the wholesale
+    `actors` copy — so a divergent schema is isolated as an unreadable
+    candidate (recorded on the scan entry, the scan continues) instead of
+    aborting the whole command: `sqlite3.Row` raises IndexError on a missing
+    key and a missing table raises OperationalError, neither of which the
+    sqlite3.DatabaseError handlers convert.
+
+    Runs after `_MigratedCopy`'s optional migration, so an ordinary older
+    candidate is repaired to the current shape first; only a genuinely
+    divergent candidate refuses. Raises `_UnreadableCandidate` with the
+    reason carried.
+    """
+    for table, _autoinc_pk in _COPY_TABLES:
+        if not _table_exists(conn, table):
+            raise _UnreadableCandidate(
+                path, f"the candidate's schema lacks the {table} table")
+    if not _table_exists(conn, "actors"):
+        raise _UnreadableCandidate(
+            path, "the candidate's schema lacks the actors table")
+    actor_cols = {row[1] for row in conn.execute("PRAGMA table_info(actors)")}
+    for column in _REQUIRED_ACTOR_COLUMNS:
+        if column not in actor_cols:
+            raise _UnreadableCandidate(
+                path,
+                f"the candidate's actors table lacks the {column} column")
+    state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+    for column in _REQUIRED_SYNC_STATE_COLUMNS:
+        if column not in state_cols:
+            raise _UnreadableCandidate(
+                path, f"the candidate's sync_state lacks the {column} column")
+    for column in _REQUIRED_SYNC_STATE_FLAGS:
+        nulls = conn.execute(
+            f"SELECT COUNT(*) FROM sync_state"
+            f" WHERE {_quote_ident(column)} IS NULL"
+        ).fetchone()[0]
+        if nulls:
+            raise _UnreadableCandidate(
+                path,
+                f"the candidate's sync_state.{column} is NULL in {nulls}"
+                " row(s): a fabricated flag state is refused, not adopted")
+
+
 class _MigratedCopy:
     """Temp copy of a legacy DB, migrated to the current schema if needed
     and then case-folded for EVERY candidate version (issue #52).
@@ -335,6 +414,12 @@ class _MigratedCopy:
             try:
                 if self.migrated:
                     init_schema(conn)
+                # One structural preflight for everything the adoption reads
+                # from the candidate (issue #56): an ordinary older
+                # candidate was just migrated to the current shape, so this
+                # refuses only genuinely divergent schemas — before any
+                # store write and before the fold sees them.
+                _require_adoptable_schema(conn, path)
                 fold_repo_casings(conn)
                 conn.commit()
             except sqlite3.DatabaseError as exc:
@@ -638,6 +723,22 @@ def doctor(
     for path in candidates(cwd, extra_scans or []):
         entry = inspect(path, repo_l)
         if entry is None:
+            # An uninspectable candidate is REPORTED, not silently dropped:
+            # "no candidates exist" and "one unreadable candidate" must
+            # never look the same in the report (issue #56, AC7). `inspect`'s
+            # None contract is unchanged (its direct callers pin it); the
+            # entry never competes for adoption (no items, not complete).
+            scanned.append({
+                "path": str(path),
+                "items": 0,
+                "garbled": 0,
+                "complete": False,
+                "issues_since": None,
+                "adopted": False,
+                "unreadable": True,
+                "unreadable_reason": "the candidate could not be read as a"
+                                     " database for this repo",
+            })
             continue
         entry["adopted"] = False
         scanned.append(entry)

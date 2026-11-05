@@ -373,6 +373,20 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
             )
 
 
+def _row_get(row: sqlite3.Row, column: str, default: object) -> object:
+    """A Row subscript that tolerates an ABSENT key (issue #56).
+
+    The migration chain runs `_fold_sync_state` over schemas whose column
+    set grows with the chain, and the consolidation path refuses divergent
+    candidates at `_MigratedCopy`'s preflight before the fold runs — this
+    accessor keeps the reads total for absent keys without changing the
+    aggregation for present ones. A PRESENT NULL is not "absent": for the
+    NOT NULL flag columns it is a fabricated state the fold refuses (see
+    `_fold_sync_state`), never silently defaulted.
+    """
+    return row[column] if column in row.keys() else default
+
+
 def _fold_sync_state(conn: sqlite3.Connection) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
@@ -385,6 +399,17 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     winner's values; counts are recomputed afterwards.
     `full_sync_pending` is never carried from a loser: it is derived from
     the merged timestamp.
+
+    Reads go through `_row_get` so an absent column (a mid-migration schema
+    shape) aggregates as its natural default instead of raising IndexError,
+    which is not a `sqlite3.DatabaseError` and would abort the whole
+    command (issue #56, AC4/AC5). A PRESENT NULL in the NOT NULL flag
+    column is a fabricated state no genuine store can produce (the DDL
+    declares it NOT NULL DEFAULT 0): the fold refuses with a
+    `sqlite3.DatabaseError`, which `_MigratedCopy` converts to an
+    unreadable candidate — adopting it as 0 would fabricate patch-retention
+    state, and `max()` over NULL would raise an uncaught TypeError (issue
+    #56, AC11/AC12).
     """
     rows = conn.execute("SELECT rowid AS rid, * FROM sync_state ORDER BY rowid").fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
@@ -394,14 +419,26 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     for lower_repo, group in groups.items():
         if len(group) == 1 and group[0]["repo"] == lower_repo:
             continue
-        winner = max(group, key=lambda r: (r["issues_since"] or "", r["rid"]))
+        winner = max(
+            group, key=lambda r: (_row_get(r, "issues_since", None) or "", r["rid"])
+        )
         full = max(
-            (r["last_full_sync_at"] for r in group if r["last_full_sync_at"]), default=None
+            (_row_get(r, "last_full_sync_at", None) for r in group
+             if _row_get(r, "last_full_sync_at", None)), default=None
         )
         incr = max(
-            (r["last_incr_sync_at"] for r in group if r["last_incr_sync_at"]), default=None
+            (_row_get(r, "last_incr_sync_at", None) for r in group
+             if _row_get(r, "last_incr_sync_at", None)), default=None
         )
-        patches = max(r["include_patches"] for r in group)
+        if "include_patches" in columns:
+            if any(r["include_patches"] is None for r in group):
+                raise sqlite3.DatabaseError(
+                    "sync_state.include_patches is NULL in a case-split group:"
+                    " a fabricated patch-retention state is refused"
+                )
+            patches = max(r["include_patches"] for r in group)
+        else:
+            patches = 0  # the column's own DDL default
         # A recorded fault is never merged away: the merged row keeps the
         # winner's last_error when it has one, else any casing's, so an
         # adopted corpus cannot report fault-free over a failed run
@@ -411,8 +448,8 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         # state, and dropping it would let a corpus that stopped early
         # report complete.
         last_error = next(
-            (r["last_error"] for r in (winner, *group)
-             if r["last_error"] is not None),
+            (_row_get(r, "last_error", None) for r in (winner, *group)
+             if _row_get(r, "last_error", None) is not None),
             None,
         )
         for row in group:

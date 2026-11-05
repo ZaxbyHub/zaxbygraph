@@ -109,7 +109,15 @@ command on stderr. A DB that holds other repos but not the resolved one exits
 the resolved repo itself, exit **2** says so and points at
 `doctor --consolidate` - it is never reported as another repo. `zaxbygraph where` prints the full resolution chain;
 `zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
-consolidates, copy-only) scattered legacy DBs. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
+consolidates, copy-only) scattered legacy DBs. Every scanned candidate
+appears in the report: a candidate that cannot be read — not a database,
+an unreadable file, or a schema the adoption cannot faithfully take — is
+listed with `unreadable: true` and an `unreadable_reason` instead of being
+silently dropped, and one such candidate never aborts the scan (the other
+candidates are still reported and the best one can still be adopted).
+A candidate whose schema diverges from the tool's (a missing table or
+column, a fabricated flag value) is refused the same way rather than
+adopted as a truncated image. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);
 `cwd`/`git_common_dir`/`slug`/`legacy` are the chain steps, and
@@ -735,6 +743,17 @@ to a target git repository (a dedicated store repo works best); `snapshot
 pull` verifies every sha, checks the schema and the corpus digest, and
 installs atomically under the sync lock. After the pull, a normal
 incremental `sync` fetches only the delta.
+
+A pull that cannot install refuses BEFORE the destination is touched, and
+the refusal names the cause. The one refusal that can fire after the
+replace has committed is the post-install corpus check: when the
+destination's stale `-wal`/`-shm` sidecars could not be cleaned up after
+the replace (a locked or read-only sidecar), the store WAS replaced, the
+pull says so, and the post-install digest check still runs — its
+`corpus_mismatch` verdict (hint: "the store was already replaced; re-pull
+or restore a known-good store") is the truth about what the destination
+now serves. Re-pull or restore; a stale sidecar that reverts the view is
+never silently accepted.
 
 ### Travel recipe
 

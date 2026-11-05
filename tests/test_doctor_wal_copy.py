@@ -634,16 +634,26 @@ class UnreadableCandidateTests(_DoctorWalCase):
     def test_non_database_file_reported_unusable_not_crash(self) -> None:
         scan_dir = self.scratch / "scan"
         scan_dir.mkdir()
-        (scan_dir / "history.db").write_bytes(b"this is not a database at all")
+        garbage = scan_dir / "history.db"
+        garbage.write_bytes(b"this is not a database at all")
         store = self.scratch / "store" / "history.db"
         store.parent.mkdir(parents=True)
         envelope = self._run_doctor(store, scan_dir, consolidate=False)
         self.assertTrue((envelope.get("data") or {}).get("ok", True))
-        for row in (envelope.get("data") or {}).get("scanned") or []:
-            self.assertNotEqual(
-                os.path.normcase(str(row.get("path", ""))),
-                os.path.normcase(str(scan_dir / "history.db")),
-            )
+        # issue #56 AC7: an uninspectable candidate is REPORTED with an
+        # unreadable reason, not silently dropped — "no candidates exist"
+        # and "one unreadable candidate" must never look the same in the
+        # report. (This test previously asserted the candidate's ABSENCE,
+        # which is the defect AC7 closes.)
+        rows = {
+            os.path.normcase(str(row.get("path", ""))): row
+            for row in (envelope.get("data") or {}).get("scanned") or []
+        }
+        entry = rows.get(os.path.normcase(str(garbage)))
+        self.assertIsNotNone(
+            entry, "the uninspectable candidate was dropped from the report")
+        self.assertTrue(entry.get("unreadable"), entry)
+        self.assertTrue(entry.get("unreadable_reason"), entry)
 
     def test_oserror_candidate_is_skipped_not_fatal(self) -> None:
         """One candidate the OS refuses (a locked or permission-denied file)
@@ -691,14 +701,20 @@ class UnreadableCandidateTests(_DoctorWalCase):
             report,
         )
         paths = {
-            os.path.normcase(str(row.get("path", "")))
+            os.path.normcase(str(row.get("path", ""))): row
             for row in report["scanned"]
         }
-        self.assertNotIn(
-            os.path.normcase(str(locked)),
-            paths,
-            "the unreadable candidate must be skipped, not abort the scan",
-        )
+        # issue #56 AC7: the OS-refused candidate is REPORTED as unreadable
+        # — it must never abort the scan (the docstring's contract above),
+        # and it must never be silently dropped either. (This test
+        # previously asserted the candidate's ABSENCE from the report,
+        # which is the defect AC7 closes.)
+        locked_entry = paths.get(os.path.normcase(str(locked)))
+        self.assertIsNotNone(
+            locked_entry, "the unreadable candidate was dropped from the"
+            " report")
+        self.assertTrue(locked_entry.get("unreadable"), locked_entry)
+        self.assertTrue(locked_entry.get("unreadable_reason"), locked_entry)
 
     def test_sidecar_vanishing_mid_copy_is_not_fatal(self) -> None:
         """A sidecar a finishing writer removes between exists() and the
