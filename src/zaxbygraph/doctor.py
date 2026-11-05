@@ -324,9 +324,10 @@ _REQUIRED_SYNC_STATE_COLUMNS = (
     "include_patches",
     "full_sync_pending",
 )
-#: NOT NULL flag columns: a present NULL is a fabricated state no genuine
-#: store can produce (the DDL declares them NOT NULL DEFAULT 0), so it is
-#: refused rather than adopted as a value (issue #56, AC11).
+#: NOT NULL flag columns: any non-integer storage class is a fabricated
+#: state no genuine store can produce (the DDL declares them INTEGER NOT
+#: NULL DEFAULT 0), so it is refused rather than adopted as a value (issue
+#: #56, AC11).
 _REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
 #: columns the wholesale `actors` copy names (issue #56, AC9/AC10).
 _REQUIRED_ACTOR_COLUMNS = ("login", "html_url")
@@ -367,15 +368,23 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
             raise _UnreadableCandidate(
                 path, f"the candidate's sync_state lacks the {column} column")
     for column in _REQUIRED_SYNC_STATE_FLAGS:
-        nulls = conn.execute(
+        # The DDL declares these INTEGER NOT NULL DEFAULT 0, so anything
+        # else — NULL, TEXT, REAL, BLOB — is a fabricated state: a NULL or
+        # a heterogeneous type would abort the fold's aggregation with an
+        # uncaught TypeError, and a single-cased TEXT value would be
+        # written into the store's INTEGER column as-is (issue #56,
+        # AC11; implementation-review finding 1). typeof() names the
+        # storage class, so one check covers every non-integer shape.
+        bad = conn.execute(
             f"SELECT COUNT(*) FROM sync_state"
-            f" WHERE {_quote_ident(column)} IS NULL"
+            f" WHERE typeof({_quote_ident(column)}) <> 'integer'"
         ).fetchone()[0]
-        if nulls:
+        if bad:
             raise _UnreadableCandidate(
                 path,
-                f"the candidate's sync_state.{column} is NULL in {nulls}"
-                " row(s): a fabricated flag state is refused, not adopted")
+                f"the candidate's sync_state.{column} holds a non-integer"
+                f" value in {bad} row(s): a fabricated flag state is"
+                " refused, not adopted")
 
 
 class _MigratedCopy:

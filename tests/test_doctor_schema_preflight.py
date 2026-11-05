@@ -76,12 +76,14 @@ def _drop_actors_column(db: Path, column: str) -> None:
     conn.close()
 
 
-def _make_flag_nullable_and_null(db: Path, multi: bool = True) -> None:
-    """Rebuild `sync_state` with `include_patches` NULLABLE and set the flag
-    NULL — a fabricated patch-retention state no genuine store can produce.
-    With multi=True a second casing is added so the fold's multi-row path
-    runs; with multi=False the single already-lowercase row skips the fold's
-    body and reaches the adoption INSERT instead."""
+def _make_flag_nullable_and_null(db: Path, multi: bool = True,
+                                 text: bool = False) -> None:
+    """Rebuild `sync_state` with `include_patches` holding a fabricated
+    value no genuine store can produce — NULL, or (with text=True) a TEXT
+    value in the INTEGER column. With multi=True a second casing is added
+    so the fold's multi-row path runs; with multi=False the single
+    already-lowercase row skips the fold's body and reaches the adoption
+    INSERT instead."""
     conn = sqlite3.connect(str(db))
     ddl = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='sync_state'"
@@ -105,7 +107,15 @@ def _make_flag_nullable_and_null(db: Path, multi: bool = True) -> None:
             f"INSERT INTO sync_state(repo, {shared})"
             f" SELECT 'ACME/FORGEGATE', {shared} FROM sync_state"
             " WHERE repo = ?", (REPO,))
-    conn.execute("UPDATE sync_state SET include_patches = NULL")
+    if text:
+        # one casing keeps the integer, the other carries the TEXT value:
+        # max() over the pair is a TypeError, and a single-cased TEXT value
+        # would be written into the store's INTEGER column as-is
+        conn.execute(
+            "UPDATE sync_state SET include_patches = 'yes'"
+            " WHERE repo = ?", ("ACME/FORGEGATE" if multi else REPO,))
+    else:
+        conn.execute("UPDATE sync_state SET include_patches = NULL")
     conn.commit()
     conn.close()
 
@@ -209,30 +219,56 @@ class ActorsColumnPreflightTests(_SchemaPreflightCase):
 
 class NullFlagPreflightTests(_SchemaPreflightCase):
     def test_null_flag_column_isolates_candidate(self) -> None:
-        """AC11: a candidate whose NOT NULL flag column holds NULL is
-        isolated as unreadable and the command continues — BOTH when the
-        fold's multi-row path runs and when a single casing skips it. RED at
-        base, GREEN after the fix: at base the multi-cased shape raises an
-        uncaught TypeError inside the fold's max() (plan critic round 2,
-        finding 2), and the single-cased shape escapes the fold's fast path
-        and aborts at the adoption INSERT's NOT NULL constraint (round 3,
-        finding 2) — so a fold-only fix cannot pass this check, and neither
-        can a preflight-only fix that leaves the fold unguarded."""
+        """AC11: a candidate whose NOT NULL flag column holds a value the
+        adoption cannot faithfully take is isolated as unreadable and the
+        command continues — for BOTH fabricated values (NULL and a TEXT
+        value in the INTEGER column) and BOTH shapes (the multi-cased fold
+        path and the single-cased adoption-INSERT path). RED at base, GREEN
+        after the fix: at base the multi-cased shapes raise an uncaught
+        TypeError inside the fold's max() (plan critic round 2, finding 2),
+        and the single-cased shapes escape the fold's fast path — the NULL
+        aborts at the adoption INSERT's NOT NULL constraint (round 3,
+        finding 2) and the TEXT is silently written into the store's
+        INTEGER column as-is (implementation-review round 1, finding 1) —
+        so neither a fold-only fix nor a preflight-only fix can pass this
+        check."""
         for multi in (True, False):
-            with self.subTest(multi_cased=multi):
-                good, bad, store, empty_cwd = self._divergent_pair(
-                    f"c11-{'multi' if multi else 'single'}",
-                    lambda bad, m=multi: _make_flag_nullable_and_null(bad, multi=m))
-                envelope = None
-                try:
-                    envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                                 extra_scans=[good, bad],
-                                                 consolidate_flag=True)
-                except (TypeError, sqlite3.IntegrityError) as exc:
-                    self.fail(f"{type(exc).__name__} escaped candidate"
-                              f" isolation and aborted the whole command:"
-                              f" {exc!r}")
-                self._assert_isolated(envelope, good, bad)
+            for text in (False, True):
+                with self.subTest(multi_cased=multi, text_value=text):
+                    good, bad, store, empty_cwd = self._divergent_pair(
+                        f"c11-{'multi' if multi else 'single'}"
+                        f"-{'text' if text else 'null'}",
+                        lambda bad, m=multi, t=text: _make_flag_nullable_and_null(
+                            bad, multi=m, text=t))
+                    envelope = None
+                    try:
+                        envelope = doctor_mod.doctor(
+                            empty_cwd, REPO, store, extra_scans=[good, bad],
+                            consolidate_flag=True)
+                    except (TypeError, sqlite3.IntegrityError) as exc:
+                        self.fail(f"{type(exc).__name__} escaped candidate"
+                                  f" isolation and aborted the whole"
+                                  f" command: {exc!r}")
+                    self._assert_isolated(envelope, good, bad)
+                    # a silently adopted fabricated value is the same
+                    # defect as an abort: the store must not hold it. A
+                    # refused adoption never creates the store at all (the
+                    # preflight precedes consolidate's body), so "no store"
+                    # and "a store without the value" are both clean.
+                    if store.exists():
+                        conn = sqlite3.connect(str(store))
+                        try:
+                            stored = conn.execute(
+                                "SELECT include_patches FROM sync_state"
+                                " WHERE repo = ?", (REPO,)).fetchall()
+                        except sqlite3.OperationalError:
+                            stored = []
+                        finally:
+                            conn.close()
+                        self.assertEqual(
+                            [tuple(r) for r in stored], [],
+                            "a fabricated flag value reached the store:"
+                            f" {stored}")
 
 
 class DivergentLegacyFoldTests(_SchemaPreflightCase):

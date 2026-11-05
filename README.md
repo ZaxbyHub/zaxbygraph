@@ -110,14 +110,17 @@ the resolved repo itself, exit **2** says so and points at
 `doctor --consolidate` - it is never reported as another repo. `zaxbygraph where` prints the full resolution chain;
 `zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
 consolidates, copy-only) scattered legacy DBs. Every scanned candidate
-appears in the report: a candidate that cannot be read — not a database,
-an unreadable file, or a schema the adoption cannot faithfully take — is
-listed with `unreadable: true` and an `unreadable_reason` instead of being
-silently dropped, and one such candidate never aborts the scan (the other
-candidates are still reported and the best one can still be adopted).
-A candidate whose schema diverges from the tool's (a missing table or
-column, a fabricated flag value) is refused the same way rather than
-adopted as a truncated image. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
+appears in the report: a candidate that cannot be read at all — not a
+database, an unreadable file — is listed with `unreadable: true` and an
+`unreadable_reason` instead of being silently dropped, and one such
+candidate never aborts the scan (the other candidates are still reported
+and the best one can still be adopted). The candidate the adoption reaches
+(the freshest complete one, and only under `--consolidate`) additionally has
+its schema validated before any store write: a missing table or column, or
+a fabricated `sync_state` flag value, refuses that candidate with the
+reason carried instead of adopting it as a truncated image. A divergent
+candidate that is not the winner is not probed — it is simply not adopted.
+`where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);
 `cwd`/`git_common_dir`/`slug`/`legacy` are the chain steps, and

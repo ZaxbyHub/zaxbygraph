@@ -403,13 +403,13 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     Reads go through `_row_get` so an absent column (a mid-migration schema
     shape) aggregates as its natural default instead of raising IndexError,
     which is not a `sqlite3.DatabaseError` and would abort the whole
-    command (issue #56, AC4/AC5). A PRESENT NULL in the NOT NULL flag
+    command (issue #56, AC4/AC5). A non-integer value in the NOT NULL flag
     column is a fabricated state no genuine store can produce (the DDL
-    declares it NOT NULL DEFAULT 0): the fold refuses with a
+    declares it INTEGER NOT NULL DEFAULT 0): the fold refuses with a
     `sqlite3.DatabaseError`, which `_MigratedCopy` converts to an
-    unreadable candidate — adopting it as 0 would fabricate patch-retention
-    state, and `max()` over NULL would raise an uncaught TypeError (issue
-    #56, AC11/AC12).
+    unreadable candidate — adopting it would fabricate patch-retention
+    state, and `max()` over mixed storage classes would raise an uncaught
+    TypeError (issue #56, AC11/AC12).
     """
     rows = conn.execute("SELECT rowid AS rid, * FROM sync_state ORDER BY rowid").fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
@@ -431,12 +431,20 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
              if _row_get(r, "last_incr_sync_at", None)), default=None
         )
         if "include_patches" in columns:
-            if any(r["include_patches"] is None for r in group):
+            values = [r["include_patches"] for r in group]
+            # Fail closed on a heterogeneous group: max() over mixed
+            # storage classes raises an uncaught TypeError (not a
+            # sqlite3.DatabaseError), which would abort the whole command
+            # — the same isolation escape as a missing column, one type
+            # down (issue #56, AC11; implementation-review finding 1).
+            if any(not isinstance(v, int) or isinstance(v, bool)
+                   for v in values):
                 raise sqlite3.DatabaseError(
-                    "sync_state.include_patches is NULL in a case-split group:"
-                    " a fabricated patch-retention state is refused"
+                    "sync_state.include_patches holds a non-integer value in"
+                    " a case-split group: a fabricated patch-retention state"
+                    " is refused"
                 )
-            patches = max(r["include_patches"] for r in group)
+            patches = max(values)
         else:
             patches = 0  # the column's own DDL default
         # A recorded fault is never merged away: the merged row keeps the
