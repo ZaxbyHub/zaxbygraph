@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import inspect
 import os
 import re
 import sqlite3
@@ -434,6 +435,36 @@ class FetchLimitBoundaryTest(unittest.TestCase):
             self.assertEqual(rc, 2, argv[0])
             self.assertIn("bad_request", out)
             self.assertIn("exceeds the maximum of", out)
+
+    def test_mcp_tools_cap_a_huge_limit_rather_than_refusing(self) -> None:
+        # MCP's documented contract is that a limit is CAPPED at _MAX_PAGE, so
+        # a client asking for more than that gets a capped page, not an error.
+        # Evaluating _clamp_limit before the cap made an oversized limit raise
+        # where the documented behaviour is a cap (cubic PR #57 run 3).
+        import inspect
+
+        from zaxbygraph import mcp_server
+
+        src = inspect.getsource(mcp_server)
+        # Every tool that clamps must cap the raw argument first.
+        offenders = re.findall(
+            r"min\(_clamp_limit\(_int_arg\([^)]*\)\), _MAX_PAGE\)", src
+        )
+        self.assertEqual(offenders, [], "a tool clamps before it caps")
+        self.assertGreaterEqual(
+            src.count("_clamp_limit(min(_int_arg("), 7
+        )
+
+    def test_run_read_does_not_map_an_internal_value_error(self) -> None:
+        # The new ValueError arm in _run_read must be narrow: an INTERNAL
+        # ValueError from the query layer is a different fault and must not
+        # be reported as a non-retryable caller error (cubic PR #57 run 3).
+        from zaxbygraph import cli
+
+        src = inspect.getsource(cli._run_read)
+        arm = src[src.index("except ValueError as exc:"):]
+        self.assertIn("_LIMIT_RE.match", arm)
+        self.assertIn("raise", arm.split("code_key=")[0])
 
     def test_search_limit_above_the_sql_bind_range_is_refused(self) -> None:
         # search/open/churn bind their limit as a SQL parameter and reach the

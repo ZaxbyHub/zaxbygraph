@@ -771,11 +771,14 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
     except ValueError as exc:
-        # A caller-supplied value the query layer refuses - an out-of-range
-        # row limit from query._clamp_limit / _clamp_fetch_limit - is a
-        # malformed request, not a store fault. Mapped exactly as
-        # _run_read_promote_truncated maps it, so every read command answers
-        # one way (issue #55).
+        # A caller-supplied row limit outside the driver's range is a
+        # malformed request, not a store fault, and is mapped exactly as
+        # _run_read_promote_truncated maps it so every read command answers
+        # one way (issue #55). The arm is deliberately narrow: an INTERNAL
+        # ValueError from the query layer is a different fault and must not
+        # be reported as a caller error with a non-retryable exit code.
+        if not _LIMIT_RE.match(str(exc)):
+            raise
         return emit_failure(
             args,
             2,
