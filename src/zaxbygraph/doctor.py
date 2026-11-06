@@ -11,7 +11,13 @@ Report payload (the CLI wraps it in the issue-#3 envelope; these keys live
 under `data`, with `ok`/`db`/`repo`/`freshness` on the envelope root):
     {"adopted": <path|null>,
      "revisions_adopted": <int>, "revisions_preserved": <int>,
+     "tables_preserved": [<table>, ...],
      "scanned": [{"path", "items", "garbled", "complete", "adopted"}, ...]}
+
+`tables_preserved` names the repo-keyed tables the adopted candidate's
+VERSION never had (issue #56): the migration recreates them empty, so the
+store's rows for them are preserved rather than deleted-and-not-recopied,
+and the report says which instead of implying a clean replace.
 
 Pinned semantics:
   complete = last_full_sync_at IS NOT NULL and, when the column exists
@@ -34,6 +40,7 @@ from zaxbygraph.db import (
     _table_exists,
     connect,
     current_table_columns,
+    current_text_columns,
     fold_repo_casings,
     init_schema,
     open_existing,
@@ -92,6 +99,16 @@ _COPY_TABLES = (
     ("item_signatures", None),
     ("item_events", None),
     ("pr_commits", None),
+)
+
+
+#: Every table whose rows the adoption reads or writes (issue #56): the
+#: copied tables plus the wholesale `actors` copy and the named
+#: `sync_state` insert. The schema-wide storage-class contract covers
+#: exactly these — a table the adoption never touches has no contract to
+#: violate.
+_ADOPTED_TABLES = frozenset(
+    [t for t, _pk in _COPY_TABLES] + ["actors", "sync_state"]
 )
 
 
@@ -347,6 +364,15 @@ _RAW_STORAGE_CLASS_CHECKS = (
     ("sync_state", "include_patches", ("integer",)),
     ("revisions", "number", ("integer",)),
     ("edges", "evidence", ("text", "null")),
+    # The migration's v8->v9 text backfill reads these three in Python
+    # (db.py _backfill_text_refs: parse_path_refs / branch_number_tokens),
+    # so a BLOB there aborts the whole command with an uncaught TypeError
+    # that no sqlite3.DatabaseError handler converts — the round-6
+    # reviewer's finding 2, the same class as edges.evidence one column
+    # family over.
+    ("items", "head_ref", ("text", "null")),
+    ("comments", "body", ("text", "null")),
+    ("reviews", "body", ("text", "null")),
 )
 #: TEXT columns the fold and the adoption compare or carry (issue #56):
 #: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
@@ -419,6 +445,29 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
                 path,
                 f"the candidate's {table}.{column} holds a divergent storage"
                 f" class in {bad} row(s): refused, not adopted")
+    # Every other TEXT column the adoption writes into the store (issue
+    # #56): the DDL declares them TEXT, so a divergent storage class would
+    # be copied verbatim into the store's TEXT column — a BLOB body read
+    # back as `blob`, the same fabricated-value class the sync_state and
+    # edges.evidence checks refuse (round-6 reviewer finding 2: a BLOB
+    # comments.body was silently adopted). One schema-derived rule covers
+    # the whole family instead of an enumerated list that drifts.
+    for table, columns in sorted(current_text_columns().items()):
+        if table not in _ADOPTED_TABLES:
+            continue
+        for column in sorted(columns):
+            allowed = ("text",) if (table, column) == ("sync_state", "repo") \
+                else ("text", "null")
+            bad = conn.execute(
+                f"SELECT COUNT(*) FROM {_quote_ident(table)}"
+                f" WHERE typeof({_quote_ident(column)}) NOT IN"
+                f" ({', '.join(repr(a) for a in allowed)})"
+            ).fetchone()[0]
+            if bad:
+                raise _UnreadableCandidate(
+                    path,
+                    f"the candidate's {table}.{column} holds a divergent"
+                    f" storage class in {bad} row(s): refused, not adopted")
     state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
     for column in _REQUIRED_SYNC_STATE_COLUMNS:
         if column not in state_cols:
@@ -518,6 +567,17 @@ class _MigratedCopy:
                     f"the candidate's schema (user_version {version}) is newer"
                     f" than this build supports ({CURRENT_USER_VERSION})")
             self.migrated = version < CURRENT_USER_VERSION
+            # The candidate's OWN table set, captured before any migration
+            # (issue #56, round-6 reviewer finding 1): `init_schema` recreates
+            # every table the candidate's version predates, so after the
+            # migration the adoption can no longer tell "the candidate never
+            # had item_events" from "the candidate has item_events and they
+            # are empty". The delete loop must know the difference: deleting
+            # the store's rows for a table the candidate never had copies
+            # zero rows back, which is the truncated-image outcome AC3
+            # refuses — the same class the per-item revisions scoping
+            # preserves (issue #40).
+            self.raw_tables: frozenset[str] = frozenset()
             if self.migrated:
                 # A pre-migration storage-class check for the shapes the
                 # migration-time fold reads (issue #56): the fold runs
@@ -529,6 +589,12 @@ class _MigratedCopy:
                 # none of the divergent shapes.
                 raw = sqlite3.connect(str(self.path))
                 try:
+                    self.raw_tables = frozenset(
+                        r[0] for r in raw.execute(
+                            "SELECT name FROM sqlite_master WHERE type='table'"
+                            " AND name NOT LIKE 'sqlite_%'"
+                        )
+                    )
                     for table, column, allowed in _RAW_STORAGE_CLASS_CHECKS:
                         if not _table_exists(raw, table):
                             continue
@@ -585,10 +651,14 @@ class _MigratedCopy:
 
 @contextmanager
 def _migrated_copy(path: Path):
-    """Context manager yielding the migrated temp copy path."""
+    """Context manager yielding the migrated temp copy (issue #56).
+
+    Yields the `_MigratedCopy` itself, not just its path: the adoption
+    needs the copy's pre-migration facts (`raw_tables`, `migrated`), which
+    the migration itself destroys."""
     copy = _MigratedCopy(path)
     try:
-        yield copy.path
+        yield copy
     finally:
         copy.close()
 
@@ -676,10 +746,23 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
     candidate; preserved = stored rows for numbers the candidate holds no
     revision rows for (a payload-identical covered number is a no-op —
     its rows are neither adopted nor preserved).
+
+    The same preservation rule covers every other table the candidate's
+    VERSION never had (issue #56, round-6 reviewer finding 1):
+    `_MigratedCopy` migrates a legacy candidate, which recreates the
+    tables that version predates as EMPTY, so the post-migration preflight
+    cannot see their absence and the delete loop would remove the store's
+    rows for them while the copy brought zero back — the truncated-image
+    outcome AC3 refuses, on the tool's primary input class (legacy DBs).
+    `_MigratedCopy.raw_tables` records the candidate's own table set before
+    the migration; a table outside it is preserved (neither deleted nor
+    copied) and named in the envelope's `tables_preserved`, so the report
+    says what happened instead of claiming a clean replace.
     """
     repo_l = repo.lower()
-    with _migrated_copy(path) as source:
-        src = open_existing(source)
+    preserved_tables: list[str] = []
+    with _migrated_copy(path) as copy:
+        src = open_existing(copy.path)
         dst = connect(store_db)
         init_schema(dst)  # the store may not exist yet; doctor may create it
         try:
@@ -688,6 +771,12 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # per-item scoping below (issue #40)
+                    if table not in copy.raw_tables and copy.migrated:
+                        # The candidate's version never had this table:
+                        # the migration recreated it empty, so deleting
+                        # the store's rows would copy zero back.
+                        preserved_tables.append(table)
+                        continue
                     dst.execute(
                         f"DELETE FROM {_quote_ident(table)} WHERE repo = ?",
                         (repo_l,)
@@ -860,7 +949,7 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
         finally:
             dst.close()
             src.close()
-    return (adopted_rows, preserved_rows)
+    return (adopted_rows, preserved_rows, preserved_tables)
 
 
 def doctor(
@@ -913,7 +1002,7 @@ def doctor(
     if consolidate_flag and best is not None:
         winner = best[1]
         try:
-            rev_adopted, rev_preserved = consolidate(
+            rev_adopted, rev_preserved, tables_preserved = consolidate(
                 store_db, Path(winner["path"]), repo_l
             )
         except _UnreadableCandidate as unreadable:
@@ -928,17 +1017,19 @@ def doctor(
             winner["adopted"] = False
             winner["unreadable"] = True
             winner["unreadable_reason"] = str(unreadable)
-            rev_adopted, rev_preserved = 0, 0
+            rev_adopted, rev_preserved, tables_preserved = 0, 0, []
         else:
             winner["adopted"] = True
             adopted = winner["path"]
     else:
         rev_adopted = 0
         rev_preserved = 0
+        tables_preserved = []
     return {
         "ok": True,
         "adopted": adopted,
         "revisions_adopted": rev_adopted,
         "revisions_preserved": rev_preserved,
+        "tables_preserved": sorted(tables_preserved),
         "scanned": scanned,
     }

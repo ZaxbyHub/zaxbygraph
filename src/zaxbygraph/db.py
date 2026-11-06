@@ -397,6 +397,33 @@ def current_table_columns() -> dict[str, set[str]]:
         conn.close()
 
 
+def current_text_columns() -> dict[str, set[str]]:
+    """Every table's TEXT-declared column set in the CURRENT schema (issue
+    #56, round-6 reviewer finding 2).
+
+    Built from the same in-memory schema DDL as `current_table_columns`, so
+    it is the exact shape `init_schema` gives the store at adoption time.
+    A column declared TEXT must hold text (or NULL): SQLite's dynamic
+    typing stores anything a divergent schema allows, and the adoption
+    copies the value verbatim into the store's TEXT column, so a BLOB body
+    would be adopted as a fabricated value. Callers refuse
+    `typeof(column) NOT IN ('text','null')` per column.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_schema_sql())
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        return {
+            table: {r[1] for r in conn.execute(f"PRAGMA table_info({table})")
+                    if (r[2] or "").upper() == "TEXT"}
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
 #: The optional TEXT state columns the fold carries from the winner (issue
 #: #56): the DDL declares them TEXT, so a divergent storage class is
 #: refused exactly as the compared columns are.
