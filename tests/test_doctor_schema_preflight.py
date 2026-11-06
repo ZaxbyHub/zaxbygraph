@@ -304,22 +304,16 @@ class NullFlagPreflightTests(_SchemaPreflightCase):
                     # a silently adopted fabricated value is the same
                     # defect as an abort: the store must not hold it. A
                     # refused adoption never creates the store at all (the
-                    # preflight precedes consolidate's body), so "no store"
-                    # and "a store without the value" are both clean.
-                    if store.exists():
-                        conn = sqlite3.connect(str(store))
-                        # No OperationalError swallow: a store whose
-                        # sync_state is missing or broken must fail the
-                        # check, not silently yield "no value reached the
-                        # store" (cubic review, PR #58).
-                        stored = conn.execute(
-                            "SELECT include_patches FROM sync_state"
-                            " WHERE repo = ?", (REPO,)).fetchall()
-                        conn.close()
-                        self.assertEqual(
-                            [tuple(r) for r in stored], [],
-                            "a fabricated flag value reached the store:"
-                            f" {stored}")
+                    # preflight precedes consolidate's body), so the
+                    # structural assertion is that the store was never
+                    # created (swarm-pr-review N-11: the previous
+                    # `if store.exists():` guard wrapped a query that could
+                    # never run).
+                    self.assertFalse(
+                        store.exists(),
+                        "the refusal path created the store before refusing,"
+                        " so 'no fabricated flag reached the store' is no"
+                        " longer structural")
 
 
 def _blob_timestamp_candidate(bad: Path) -> None:
@@ -451,19 +445,77 @@ class AffinityDivergenceTests(_SchemaPreflightCase):
                 self.fail(f"TypeError escaped candidate isolation and"
                           f" aborted the whole command: {exc!r}")
             self._assert_isolated(envelope, good, bad)
-            # the fabricated BLOB must not have reached the store either
-            if store.exists():
-                conn = sqlite3.connect(str(store))
-                try:
-                    stored = conn.execute(
-                        "SELECT typeof(last_full_sync_at) FROM sync_state"
-                        " WHERE repo = ?", (REPO,)).fetchall()
-                finally:
-                    conn.close()
-                self.assertEqual(
-                    [tuple(r) for r in stored], [],
-                    "a divergent storage class reached the store as a"
-                    f" truncated image: {stored}")
+            # The refusal precedes any store write, so the store is never
+            # created — the structural form of "the fabricated BLOB must not
+            # have reached the store" (swarm-pr-review N-11: the previous
+            # `if store.exists():` guard wrapped a query that could never
+            # run).
+            self.assertFalse(
+                store.exists(),
+                "the refusal path created the store before refusing, so 'no"
+                " divergent storage class reached the store' is no longer"
+                " structural")
+
+    def test_unrelated_repo_corruption_does_not_refuse_candidate(self) -> None:
+        """AC13 (swarm-pr-review N-09): the storage-class counts are scoped
+        to the repo the adoption copies (`WHERE lower(repo) = ?`, exactly
+        `_copy_table`'s predicate), so corruption in a repo the user is NOT
+        consolidating does not refuse the candidate. RED at the round-6
+        head: a table-wide count refused a multi-repo candidate for a BLOB
+        `items.title` belonging to `other/repo`, while base adopted such
+        candidates — a behavior narrowing the PR introduced. `actors` has no
+        repo column and IS copied wholesale, so it stays whole-table."""
+        bad = _prep(self.scratch / "c13-multi-repo" / "history.db")
+        _seed_store(bad, (7, 8), "2027-04-01T00:00:00Z")
+        conn = sqlite3.connect(str(bad))
+        # a healthy row for the target repo, plus a BLOB title for a
+        # DIFFERENT repo — a shape a multi-repo legacy DB legitimately has
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state,"
+            " updated_at, raw_json) VALUES (900, 'other/repo', 1, 'issue',"
+            " x'00', 'open', '2027-04-01T00:00:00Z', '{}')")
+        conn.commit()
+        conn.close()
+        good = _prep(self.scratch / "c13-multi-repo-good" / "history.db")
+        _seed_store(good, (3, 4), "2026-12-01T00:00:00Z")
+        store = _prep(self.scratch / "c13-multi-repo-store" / "history.db")
+        empty_cwd = _prep(self.scratch / "c13-multi-repo" / "cwd")
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[bad, good],
+                                         consolidate_flag=True)
+        except Exception as exc:  # noqa: BLE001 - any escape is a failure
+            self.fail(f"{type(exc).__name__} escaped candidate isolation and"
+                      f" aborted the whole command: {exc!r}")
+        entry = {os.path.normcase(str(row.get("path", ""))): row
+                 for row in envelope.get("scanned") or []}.get(
+                     os.path.normcase(str(bad)))
+        self.assertFalse(
+            entry is not None and entry.get("unreadable"),
+            f"corruption in an unrelated repo refused the candidate:"
+            f" {entry}")
+        # the candidate is the freshest complete one, so it is adopted and
+        # the OTHER repo's rows are simply not copied
+        self.assertTrue(envelope.get("adopted"), envelope)
+        if store.exists():
+            conn = sqlite3.connect(str(store))
+            try:
+                titles = conn.execute(
+                    "SELECT typeof(title) FROM items WHERE repo = ?",
+                    (REPO,)).fetchall()
+                foreign = conn.execute(
+                    "SELECT COUNT(*) FROM items WHERE repo = 'other/repo'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(
+                [tuple(r) for r in titles],
+                [("text",), ("text",)],
+                f"the adopted rows are not all text: {titles}")
+            self.assertEqual(foreign, 0,
+                             "an unrelated repo's rows were copied into the"
+                             f" store: {foreign}")
 
 
 class DivergentLegacyFoldTests(_SchemaPreflightCase):

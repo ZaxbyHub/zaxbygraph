@@ -752,12 +752,17 @@ pull` verifies every sha, checks the schema and the corpus digest, and
 installs atomically under the sync lock. After the pull, a normal
 incremental `sync` fetches only the delta.
 
-A pull that cannot install refuses BEFORE the destination is touched, and
-the refusal names the cause. The one refusal that can fire after the
-replace has committed is the post-install corpus check: when the
-destination's stale `-wal`/`-shm` sidecars could not be cleaned up after
-the replace (a locked or read-only sidecar), the store WAS replaced, the
-pull says so, and the post-install digest check still runs — its
+A pull that cannot install refuses BEFORE the destination's bytes are
+replaced, and the refusal names the cause. (The destination FILE may be
+created before the replace — the install opens it to quiesce its WAL, and
+that open creates a missing file — and the quiesce itself is a write, so
+"untouched" would overstate the guarantee; nothing is replaced and no
+corpus is written before a refusal.) The refusals that can fire after the
+replace has committed are the post-install checks: when the destination's
+stale `-wal`/`-shm` sidecars could not be cleaned up after the replace (a
+locked or read-only sidecar), the store WAS replaced, the pull says so,
+and the post-install checks still run — a surviving non-empty `-wal` is
+refused as `dest_sidecar_stale`, and the corpus digest's
 `corpus_mismatch` verdict (hint: "the store was already replaced; re-pull
 or restore a known-good store") is the truth about what the destination
 now serves. Re-pull or restore; a stale sidecar that reverts the view is

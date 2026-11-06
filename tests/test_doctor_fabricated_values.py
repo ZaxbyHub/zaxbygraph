@@ -145,6 +145,37 @@ def _null_revisions_number_candidate(bad: Path) -> None:
     conn.close()
 
 
+def _null_not_null_text_candidate(bad: Path) -> None:
+    """Rebuild the candidate's `revisions` table with a NULLable
+    `valid_from`/`valid_to` and insert a NULL row. No zaxbygraph build can
+    produce this (the DDL declares both NOT NULL), and the candidate's own
+    divergent DDL is what lets it exist — so the preflight's derived
+    storage-class rule must refuse it (swarm-pr-review N-01), because the
+    per-item revisions write would otherwise raise an uncaught
+    sqlite3.IntegrityError that the adoption's `except BaseException` does
+    not convert, losing the whole scan."""
+    conn = sqlite3.connect(str(bad))
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='revisions'"
+    ).fetchone()[0]
+    conn.execute("ALTER TABLE revisions RENAME TO revisions_old")
+    conn.execute(ddl.replace("valid_from TEXT NOT NULL", "valid_from TEXT", 1))
+    keep = [r[1] for r in conn.execute("PRAGMA table_info(revisions_old)")]
+    collist = ", ".join(keep)
+    conn.execute(
+        f"INSERT INTO revisions ({collist}) SELECT {collist} FROM revisions_old")
+    conn.execute("DROP TABLE revisions_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_revisions_item"
+        " ON revisions(repo, number)")
+    conn.execute(
+        "INSERT INTO revisions(repo, number, entity, entity_id, kind, origin,"
+        " content, valid_from, valid_to) VALUES (?, 5, 'item_body', '5',"
+        " 'body', 'edit', 'text', NULL, '2027-06-02T00:00:00Z')", (REPO,))
+    conn.commit()
+    conn.close()
+
+
 def _blob_evidence_candidate(bad: Path) -> None:
     """Make the candidate case-split and add two `rel='closes'` edge rows
     for the same pair and source — one per casing — with the upper
@@ -429,6 +460,29 @@ class FabricatedKeyValueTests(_FabricatedValueCase):
                           f" aborted the whole command: {exc!r}")
             self._assert_isolated(envelope, good, bad)
 
+        # shape H: a NULL in a NOT NULL TEXT column the candidate's own
+        # divergent DDL declares nullable (swarm-pr-review N-01). The
+        # preflight's derived rule refuses it up front — the value would
+        # otherwise reach the per-item revisions write and raise an
+        # uncaught sqlite3.IntegrityError, which the adoption's only
+        # handler (`except BaseException: rollback; raise`) does not
+        # convert, so the whole scan (healthy sibling included) would be
+        # lost. RED at the round-6 head: the probe aborted the command
+        # with `IntegrityError: NOT NULL constraint failed:
+        # revisions.valid_from`.
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c14-null-not-null-text", _null_not_null_text_candidate)
+        with self.subTest(shape="null_in_not_null_text_column"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except sqlite3.IntegrityError as exc:
+                self.fail(f"IntegrityError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, good, bad)
+
 
 class ColumnParityTests(_FabricatedValueCase):
     def test_missing_column_candidate_is_refused(self) -> None:
@@ -467,18 +521,16 @@ class ColumnParityTests(_FabricatedValueCase):
         # would leave a NULL author_association row here rather than an
         # empty result (cubic review, PR #58: the assertion was vacuous
         # while the candidate held no comments).
-        if store.exists():
-            conn = sqlite3.connect(str(store))
-            try:
-                stored = conn.execute(
-                    "SELECT author_association FROM comments WHERE repo = ?",
-                    (REPO,)).fetchall()
-            finally:
-                conn.close()
-            self.assertEqual(
-                [tuple(r) for r in stored], [],
-                "a candidate missing a current column was adopted as a"
-                f" truncated image: {stored}")
+        # The refusal precedes any store write, so the store is never
+        # created — the structural form of "the fabricated default must not
+        # have reached the store" (swarm-pr-review N-11: the previous
+        # `if store.exists():` guard wrapped a query that could never run,
+        # because the refusal is raised before `consolidate` opens the
+        # destination; planting a failure inside it still passed).
+        self.assertFalse(
+            store.exists(),
+            "the refusal path created the store before refusing, so 'no"
+            " truncated image reached the store' is no longer structural")
 
 
 class OptionalTextColumnTests(_FabricatedValueCase):

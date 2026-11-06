@@ -196,13 +196,20 @@ def _blob_column_candidate(bad: Path, table: str, column: str,
 
 
 def _wrong_typed_raw_json_candidate(bad: Path) -> None:
-    """Make one item's `raw_json` carry a wrong-typed title (the #53
-    malformed-payload class) and stamp the candidate at v1 so the v8→v9
-    backfill reads it before any preflight."""
+    """Make one item's `raw_json` carry wrong-typed title/body fields (the
+    #53 malformed-payload class) and stamp the candidate at v1 so the v8→v9
+    backfill reads them before any preflight.
+
+    The body's repr deliberately contains a backticked path AND a closing
+    keyword, so a `str()` coercion (the hazard the db.py comment names)
+    would fabricate an item_path_refs row and a closes_keyword edge from a
+    malformed payload, while the empty-text treatment yields none — the two
+    are observably different, which is what makes the check discriminating
+    (swarm-pr-review N-03)."""
     conn = sqlite3.connect(str(bad))
     conn.execute(
         "UPDATE items SET raw_json = ? WHERE repo = ? AND number = 5",
-        ('{"title": 5, "body": ["not", "a", "string"]}', REPO))
+        ('{"title": 5, "body": ["closes #1 via `src/app.py`"]}', REPO))
     conn.execute("PRAGMA user_version = 1")
     conn.commit()
     conn.close()
@@ -424,8 +431,13 @@ class LegacyTablePreservationTests(unittest.TestCase):
         keys collide, the plain INSERT raises IntegrityError, and the copy
         handler refused a perfectly genuine legacy candidate with "schema
         defeated the copy". The invariant is therefore neither deleted NOR
-        copied: the candidate is adopted and the preserved tables are
-        named."""
+        copied — and, because the candidate's own backfilled rows ARE an
+        observation, they are ADOPTED rather than silently dropped
+        (swarm-pr-review N-02: the reviewer's probe showed a genuine v1
+        candidate adopted with assignees/issue_field_values/item_path_refs
+        all EMPTY while base returned them populated). The preserved set is
+        therefore only the tables the migration does NOT populate from this
+        payload; the backfilled ones are adopted and asserted here."""
         for version in (1,):
             with self.subTest(version=version):
                 root = self.scratch / f"c19-genuine-v{version}"
@@ -442,7 +454,6 @@ class LegacyTablePreservationTests(unittest.TestCase):
                     conn.commit()
                 finally:
                     conn.close()
-                before = _count(store, "item_path_refs")
                 bad = _prep(root / "cand" / "history.db")
                 _genuine_legacy_candidate(bad, version)
                 cwd = _prep(root / "cwd")
@@ -460,15 +471,37 @@ class LegacyTablePreservationTests(unittest.TestCase):
                     entry is not None and not entry.get("unreadable"),
                     f"v{version}: the candidate is reported unreadable:"
                     f" {entry}")
+                # The payload names no assignee and no issue field value and
+                # carries no error signature, so those three stay empty and
+                # are preserved; the bodies DO carry backticked paths, so the
+                # v8->v9 backfill populates item_path_refs and the
+                # candidate's own rows are adopted. item_events/pr_commits
+                # have no backfill at all.
                 self.assertEqual(
                     envelope.get("tables_preserved"),
-                    sorted(("item_path_refs", "item_signatures",
-                            "assignees", "issue_field_values",
-                            "item_events", "pr_commits")),
+                    sorted(("assignees", "issue_field_values",
+                            "item_signatures", "item_events", "pr_commits")),
                     f"v{version}: the envelope does not name the preserved"
                     f" tables: {envelope.get('tables_preserved')}")
-                self.assertEqual(_count(store, "item_path_refs"), before,
-                                 "the preserved table's rows were replaced")
+                # The candidate's own derived rows landed — the invariant
+                # N-02 says was never asserted. The migrated copy holds 6:
+                # 2 items x 2 backticked body paths, plus the comment's 2.
+                conn = sqlite3.connect(str(store))
+                try:
+                    paths = [tuple(r) for r in conn.execute(
+                        "SELECT path FROM item_path_refs WHERE repo = ?"
+                        " ORDER BY path", (REPO,)).fetchall()]
+                finally:
+                    conn.close()
+                self.assertEqual(
+                    sorted({p for (p,) in paths}),
+                    ["src/app.py", "src/lib/util.py"],
+                    "the candidate's own backfilled item_path_refs rows were"
+                    f" dropped: {paths}")
+                self.assertEqual(
+                    len(paths), 6,
+                    "the candidate's own backfilled item_path_refs rows were"
+                    f" not adopted: {paths}")
 
     def test_current_version_candidate_replaces_normally(self) -> None:
         """PRESERVING: a candidate at the current version carries every
@@ -576,26 +609,30 @@ class TextStorageClassContractTests(unittest.TestCase):
                 self.fail(f"{type(exc).__name__} escaped candidate isolation"
                           f" and aborted the whole command: {exc!r}")
             self._assert_isolated(envelope, bad)
-            if store.exists():
-                conn = sqlite3.connect(str(store))
-                try:
-                    stored = conn.execute(
-                        "SELECT typeof(body) FROM comments WHERE repo = ?",
-                        (REPO,)).fetchall()
-                finally:
-                    conn.close()
-                self.assertEqual(
-                    [tuple(r) for r in stored], [],
-                    "a divergent storage class in a TEXT column was"
-                    f" adopted: {stored}")
+            # The refusal precedes any store write, so the store is never
+            # created — the structural form of "the BLOB was not copied into
+            # the store's TEXT column" (swarm-pr-review N-11: the previous
+            # `if store.exists():` guard wrapped a query that could never
+            # run).
+            self.assertFalse(
+                store.exists(),
+                "the refusal path created the store before refusing, so 'no"
+                " divergent storage class reached the store' is no longer"
+                " structural")
 
         # A wrong-typed payload FIELD is the same "one candidate kills the
         # whole run" outcome one coercion away: `{"title": 5}` fed the
         # v8→v9 backfill's str-only regexes and aborted the migration. The
-        # field is coerced to text, so a malformed payload degrades to "no
-        # references extracted" and the candidate is adopted normally
-        # (final critic, round-7 question; the recorded #53 deferral's
-        # abort half).
+        # field is treated as EMPTY text, never coerced with str() — a
+        # list's or dict's repr can contain backticked paths and `closes
+        # #N`, and extracting references from it would let a malformed
+        # payload write fabricated edges into the corpus (final critic,
+        # round-7 question; swarm-pr-review N-03: the shape asserted only
+        # that the candidate was adopted, so mutating the coercion to
+        # str() left the whole suite green). The payload below carries a
+        # repr with BOTH a backticked path and a closing keyword, so the
+        # two coercions diverge observably and this shape pins the named
+        # invariant.
         with self.subTest(shape="wrong_typed_raw_json"):
             good, bad, store, cwd = self._pair(
                 "c20-wrong-typed-raw-json", _wrong_typed_raw_json_candidate)
@@ -616,6 +653,29 @@ class TextStorageClassContractTests(unittest.TestCase):
                 entry.get("adopted"),
                 f"a malformed payload should degrade to 'no references"
                 f" extracted', not to an unreadable candidate: {entry}")
+            # THE INVARIANT: the malformed field yields no references. Under
+            # a str() coercion the list's repr — which contains a backticked
+            # path and `closes #1` — would fabricate an item_path_refs row
+            # and a closes_keyword edge; under empty-text it yields none.
+            if store.exists():
+                conn = sqlite3.connect(str(store))
+                try:
+                    paths = conn.execute(
+                        "SELECT COUNT(*) FROM item_path_refs WHERE repo = ?",
+                        (REPO,)).fetchone()[0]
+                    fabricated = conn.execute(
+                        "SELECT COUNT(*) FROM edges WHERE repo = ?"
+                        " AND rel = 'closes_keyword'", (REPO,)).fetchone()[0]
+                finally:
+                    conn.close()
+                self.assertEqual(
+                    paths, 0,
+                    "a malformed payload field fabricated item_path_refs"
+                    f" rows: {paths}")
+                self.assertEqual(
+                    fabricated, 0,
+                    "a malformed payload field fabricated closes_keyword"
+                    f" edges: {fabricated}")
 
 
 if __name__ == "__main__":

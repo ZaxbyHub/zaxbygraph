@@ -12,7 +12,8 @@ under `data`, with `ok`/`db`/`repo`/`freshness` on the envelope root):
     {"adopted": <path|null>,
      "revisions_adopted": <int>, "revisions_preserved": <int>,
      "tables_preserved": [<table>, ...],
-     "scanned": [{"path", "items", "garbled", "complete", "adopted"}, ...]}
+     "scanned": [{"path", "items", "garbled", "complete", "issues_since",
+                  "adopted", "unreadable", "unreadable_reason"}, ...]}
 
 `tables_preserved` names the repo-keyed tables the adopted candidate's
 VERSION never had (issue #56): the migration recreates them empty, so the
@@ -40,8 +41,8 @@ from zaxbygraph.db import (
     _quote_ident,
     _table_exists,
     connect,
+    current_column_rules,
     current_table_columns,
-    current_text_columns,
     fold_repo_casings,
     init_schema,
     open_existing,
@@ -343,11 +344,6 @@ _REQUIRED_SYNC_STATE_COLUMNS = (
     "include_patches",
     "full_sync_pending",
 )
-#: NOT NULL flag columns: any non-integer storage class is a fabricated
-#: state no genuine store can produce (the DDL declares them INTEGER NOT
-#: NULL DEFAULT 0), so it is refused rather than adopted as a value (issue
-#: #56, AC11).
-_REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
 #: The storage-class checks the migration-time fold needs BEFORE
 #: init_schema runs (issue #56): (table, column, allowed typeof values).
 #: The fold's closes-group merge reads edges.evidence as text, the per-item
@@ -381,18 +377,10 @@ _RAW_STORAGE_CLASS_CHECKS = (
     ("reviews", "body", ("text", "null")),
     ("pr_files", "path", ("text",)),
 )
-#: TEXT columns the fold and the adoption compare or carry (issue #56):
-#: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
-#: would raise an uncaught TypeError at the fold's max() or at the scan's
-#: winner ranking — the same isolation escape as the flags, one type up.
-#: The optional state columns are included because the fold carries them
-#: and the docs promise the storage-class contract for the TEXT columns.
-_REQUIRED_SYNC_STATE_TEXTS = ("issues_since", "last_full_sync_at",
-                              "last_incr_sync_at", "last_error",
-                              "rate_limit_reset_at", "fetch_source")
 
 
-def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
+def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
+                           repo: str) -> None:
     """Refuse a candidate whose schema cannot be adopted faithfully, BEFORE
     any store write (issue #56). Every read `consolidate` performs on the
     candidate is validated here — the `_COPY_TABLES` delete/copy loops, the
@@ -434,42 +422,46 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
                 path,
                 f"the candidate's {table} table lacks the"
                 f" {', '.join(sorted(missing))} column(s)")
-    # The per-item revisions read calls int() on revisions.number (a NULL
-    # is a fabricated state too — the DDL declares it NOT NULL — and the
-    # per-item conversion is the only other layer), and the fold's
-    # closes-group merge reads edges.evidence as text (a NULL evidence is
-    # legal: no provenance recorded) (issue #56). Refuse the divergent
-    # storage classes up front — typeof() names them exactly.
-    for table, column, allowed in (("revisions", "number", ("integer",)),
-                                   ("edges", "evidence", ("text", "null"))):
-        bad = conn.execute(
-            f"SELECT COUNT(*) FROM {table}"
-            f" WHERE typeof({column}) NOT IN"
-            f" ({', '.join(repr(a) for a in allowed)})"
-        ).fetchone()[0]
-        if bad:
-            raise _UnreadableCandidate(
-                path,
-                f"the candidate's {table}.{column} holds a divergent storage"
-                f" class in {bad} row(s): refused, not adopted")
-    # Every other TEXT column the adoption writes into the store (issue
-    # #56): the DDL declares them TEXT, so a divergent storage class would
-    # be copied verbatim into the store's TEXT column — a BLOB body read
-    # back as `blob`, the same fabricated-value class the sync_state and
-    # edges.evidence checks refuse (round-6 reviewer finding 2: a BLOB
-    # comments.body was silently adopted). One schema-derived rule covers
-    # the whole family instead of an enumerated list that drifts.
-    for table, columns in sorted(current_text_columns().items()):
+    # ONE schema-derived rule for every column the adoption writes into the
+    # store (issue #56): the DDL declares each column's type and
+    # NULLability, so a divergent storage class is refused — TEXT holding a
+    # BLOB or INTEGER, INTEGER holding text (items.number,
+    # sync_state.rate_limit_remaining), and a NULL in a NOT NULL column
+    # (revisions.valid_from, items.title), which the store's own DDL would
+    # reject at the copy with an uncaught IntegrityError that aborts the
+    # whole command (swarm-pr-review N-01/N-18). One derived rule replaces
+    # the enumerated per-column checks that preceded it, three of which it
+    # had made unreachable (N-14).
+    rules = current_column_rules()
+    for table in sorted(rules):
         if table not in _ADOPTED_TABLES:
             continue
-        for column in sorted(columns):
-            allowed = ("text",) if (table, column) == ("sync_state", "repo") \
-                else ("text", "null")
+        for column, (declared, not_null) in sorted(rules[table].items()):
+            if declared == "TEXT":
+                # `sync_state.repo` is a TEXT PRIMARY KEY, which SQLite
+                # permits to be NULL on a rowid table; the fold's grouping
+                # needs a real key, so NULL is refused there and only
+                # there.
+                allowed = ("text",) if (table, column) == \
+                    ("sync_state", "repo") else ("text", "null")
+            elif declared == "INTEGER":
+                allowed = ("integer",) if not_null else ("integer", "null")
+            else:
+                continue  # no declared type: the column carries anything
+            # Scope the count to the rows the adoption actually copies:
+            # `WHERE lower(repo) = ?`, exactly `_copy_table`'s predicate. A
+            # table-wide count would refuse the whole candidate for
+            # corruption in a repo the user is not consolidating — a scope
+            # the adoption never reads (swarm-pr-review N-09). `actors` has
+            # no repo column and IS copied wholesale, so it stays
+            # whole-table.
+            scope = "lower(repo) = ? AND " if table != "actors" else ""
+            params = (repo,) if table != "actors" else ()
             bad = conn.execute(
                 f"SELECT COUNT(*) FROM {_quote_ident(table)}"
-                f" WHERE typeof({_quote_ident(column)}) NOT IN"
-                f" ({', '.join(repr(a) for a in allowed)})"
-            ).fetchone()[0]
+                f" WHERE {scope}typeof({_quote_ident(column)}) NOT IN"
+                f" ({', '.join(repr(a) for a in allowed)})",
+                params).fetchone()[0]
             if bad:
                 raise _UnreadableCandidate(
                     path,
@@ -480,52 +472,27 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
         if column not in state_cols:
             raise _UnreadableCandidate(
                 path, f"the candidate's sync_state lacks the {column} column")
-    # repo is the fold's grouping key: a NULL or non-text value (SQLite
-    # permits NULL in a TEXT PRIMARY KEY on a rowid table) would raise an
-    # uncaught AttributeError at .lower() on the consolidation path AND
-    # through the migration fold (issue #56; implementation-review
-    # round-3 finding 2).
-    bad_repo = conn.execute(
-        "SELECT COUNT(*) FROM sync_state WHERE typeof(repo) <> 'text'"
-    ).fetchone()[0]
-    if bad_repo:
+    # NOTE: the repo NULL/non-text guard, the flag-column guard and the
+    # TEXT-column guard that used to sit here are all subsumed by the
+    # derived rule above (swarm-pr-review N-14): `sync_state.repo` is
+    # special-cased to require text there, and the two flag columns are
+    # INTEGER NOT NULL. Keeping them would leave three unreachable
+    # enumerations of one column family to drift apart.
+    # `actors.login` is the global table's key: a TEXT PRIMARY KEY on a
+    # rowid table permits NULL in SQLite, and the adoption's upsert never
+    # matches one, so every re-adoption of such a candidate would append
+    # another NULL-login row and grow the store's global actors table
+    # without bound (swarm-pr-review N-06). The table has no repo column,
+    # so the count is whole-table — exactly the scope the copy reads.
+    null_login = conn.execute(
+        "SELECT COUNT(*) FROM actors WHERE login IS NULL"
+        " OR typeof(login) <> 'text'").fetchone()[0]
+    if null_login:
         raise _UnreadableCandidate(
             path,
-            f"the candidate's sync_state.repo is NULL or non-text in"
-            f" {bad_repo} row(s): a divergent key value is refused")
-    for column in _REQUIRED_SYNC_STATE_FLAGS:
-        # The DDL declares these INTEGER NOT NULL DEFAULT 0, so anything
-        # else — NULL, TEXT, REAL, BLOB — is a fabricated state: a NULL or
-        # a heterogeneous type would abort the fold's aggregation with an
-        # uncaught TypeError, and a single-cased TEXT value would be
-        # written into the store's INTEGER column as-is (issue #56,
-        # AC11; implementation-review finding 1). typeof() names the
-        # storage class, so one check covers every non-integer shape.
-        bad = conn.execute(
-            f"SELECT COUNT(*) FROM sync_state"
-            f" WHERE typeof({_quote_ident(column)}) <> 'integer'"
-        ).fetchone()[0]
-        if bad:
-            raise _UnreadableCandidate(
-                path,
-                f"the candidate's sync_state.{column} holds a non-integer"
-                f" value in {bad} row(s): a fabricated flag state is"
-                " refused, not adopted")
-    for column in _REQUIRED_SYNC_STATE_TEXTS:
-        # The DDL declares these TEXT; a divergent storage class would
-        # raise an uncaught TypeError at the fold's max() or at the scan's
-        # winner ranking (issue #56; implementation-review round-2
-        # finding 1). Refuse the candidate instead of aborting the command.
-        bad = conn.execute(
-            f"SELECT COUNT(*) FROM sync_state"
-            f" WHERE typeof({_quote_ident(column)}) NOT IN ('text', 'null')"
-        ).fetchone()[0]
-        if bad:
-            raise _UnreadableCandidate(
-                path,
-                f"the candidate's sync_state.{column} holds a non-text"
-                f" value in {bad} row(s): a divergent storage class is"
-                " refused, not adopted")
+            f"the candidate's actors table holds {null_login} row(s) with a"
+            f" NULL or non-text login: a fabricated actor key is refused,"
+            " not adopted")
 
 
 class _MigratedCopy:
@@ -542,8 +509,9 @@ class _MigratedCopy:
     --consolidate used to leak a full DB copy into the system temp dir).
     """
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, repo: str) -> None:
         self._td = tempfile.mkdtemp(prefix="zaxbygraph-doctor-")
+        self.repo = repo
         try:
             self.path = Path(self._td) / path.name
             if not _faithful_copy(path, self.path):
@@ -634,7 +602,7 @@ class _MigratedCopy:
                 # candidate was just migrated to the current shape, so this
                 # refuses only genuinely divergent schemas — before any
                 # store write and before the fold sees them.
-                _require_adoptable_schema(conn, path)
+                _require_adoptable_schema(conn, path, self.repo)
                 fold_repo_casings(conn)
                 conn.commit()
             except sqlite3.DatabaseError as exc:
@@ -658,13 +626,14 @@ class _MigratedCopy:
 
 
 @contextmanager
-def _migrated_copy(path: Path):
+def _migrated_copy(path: Path, repo: str):
     """Context manager yielding the migrated temp copy (issue #56).
 
     Yields the `_MigratedCopy` itself, not just its path: the adoption
     needs the copy's pre-migration facts (`raw_tables`, `migrated`), which
-    the migration itself destroys."""
-    copy = _MigratedCopy(path)
+    the migration itself destroys. `repo` scopes the preflight's
+    storage-class counts to the rows the adoption copies."""
+    copy = _MigratedCopy(path, repo)
     try:
         yield copy
     finally:
@@ -777,7 +746,7 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
     """
     repo_l = repo.lower()
     preserved_tables: list[str] = []
-    with _migrated_copy(path) as copy:
+    with _migrated_copy(path, repo_l) as copy:
         src = open_existing(copy.path)
         dst = connect(store_db)
         init_schema(dst)  # the store may not exist yet; doctor may create it
@@ -792,9 +761,10 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                     # 2); clamp so a v1-shaped store stamped 0 is not read as
                     # predating every table.
                     stamped = max(copy.version, 1)
-                    if (table not in copy.raw_tables and copy.migrated) or (
-                            stamped
-                            < _TABLE_INTRODUCED_VERSION.get(table, 1)):
+                    never_had = (table not in copy.raw_tables and copy.migrated)
+                    stamp_predates = (
+                        stamped < _TABLE_INTRODUCED_VERSION.get(table, 1))
+                    if never_had or stamp_predates:
                         # Either the candidate's schema never carried the
                         # table (the migration recreated it), or its version
                         # predates the table's slot while the schema DOES
@@ -802,11 +772,30 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         # init_schema commits the current schema DDL and only
                         # then runs the migration chain, so a crash between
                         # them leaves the newer tables present under the old
-                        # stamp, never populated. Deleting the store's rows
-                        # for either shape copies zero back: the truncated
-                        # image AC19 refuses (round-9 reviewer finding 1).
-                        preserved_tables.append(table)
-                        continue
+                        # stamp. Deleting the store's rows for either shape
+                        # and copying nothing back is the truncated image
+                        # AC19 refuses (round-9 reviewer finding 1) — BUT the
+                        # migration BACKFILLS several of these tables from the
+                        # candidate's own payload (v6→v7 assignees /
+                        # issue_field_values from raw_json, v8→v9
+                        # item_path_refs / item_signatures from the bodies),
+                        # so a candidate that DID make an observation must
+                        # have it adopted rather than silently dropped
+                        # (swarm-pr-review N-02/N-05). Preserve the store's
+                        # rows only when the candidate holds none for this
+                        # repo — the interrupted-upgrade signature, since the
+                        # migration that would have populated the table never
+                        # ran — and otherwise adopt the candidate's rows
+                        # normally.
+                        cand_rows = src.execute(
+                            f"SELECT COUNT(*) FROM {_quote_ident(table)}"
+                            " WHERE lower(repo) = ?", (repo_l,)).fetchone()[0]
+                        if cand_rows:
+                            # fall through to the replace below
+                            pass
+                        else:
+                            preserved_tables.append(table)
+                            continue
                     dst.execute(
                         f"DELETE FROM {_quote_ident(table)} WHERE repo = ?",
                         (repo_l,)
@@ -882,10 +871,29 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         f"INSERT INTO revisions ({', '.join(rev_payload_cols)}, repo, number) "
                         f"VALUES ({', '.join('?' for _ in rev_payload_cols)}, ?, ?)"
                     )
-                    dst.executemany(
-                        insert_sql,
-                        [tuple(r) + (repo_l, number) for r in cand_rows],
-                    )
+                    try:
+                        dst.executemany(
+                            insert_sql,
+                            [tuple(r) + (repo_l, number) for r in cand_rows],
+                        )
+                    except sqlite3.DatabaseError as exc:
+                        # The candidate's revisions rows can carry a value
+                        # the STORE's DDL rejects — a NULL in a NOT NULL
+                        # column such as valid_from/valid_to, which the
+                        # schema-wide preflight cannot see because the
+                        # candidate's own divergent DDL declares the column
+                        # nullable. IntegrityError is a sqlite3.DatabaseError
+                        # but NOT one the outer `except BaseException`
+                        # converts: it would escape consolidate() and
+                        # doctor() and lose the whole scan, healthy sibling
+                        # included (swarm-pr-review N-01). The adoption is one
+                        # transaction, so nothing has been written; report the
+                        # candidate unusable, exactly as _copy_table does.
+                        raise _UnreadableCandidate(
+                            path,
+                            f"the candidate's revisions rows cannot be written"
+                            f" into the store: {exc}",
+                        ) from exc
                     adopted_rows += len(cand_rows)
                 # Preserved = stored rows for numbers the candidate holds no
                 # revision rows for: store total minus EVERY covered number's
@@ -899,18 +907,14 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                     if table == "revisions":
                         continue  # adopted per item above (issue #40)
                     if table in preserved_tables:
-                        # The same rule as the delete loop (issue #56,
-                        # round-7 reviewer finding 1): a table the
-                        # candidate's version never had is preserved, not
-                        # replaced. The migration BACKFILLS some of these
-                        # tables from the candidate's own payload (v6->v7
-                        # assignees/issue_field_values from raw_json,
-                        # v8->v9 item_path_refs/item_signatures from text),
-                        # so copying them would insert the backfilled rows
-                        # on top of the store's preserved ones — the same
-                        # keys collide, the plain INSERT raises
-                        # IntegrityError, and the copy handler would refuse
-                        # a perfectly genuine legacy candidate.
+                        # The same set the delete loop preserved (issue #56,
+                        # round-7 reviewer finding 1): the candidate holds no
+                        # rows for this repo in a table its version never
+                        # populated, so there is nothing to copy and the
+                        # store's rows stand. A table the candidate DID
+                        # observe — including the rows the migration
+                        # backfilled from its own payload — is not in the
+                        # set and is adopted here (swarm-pr-review N-02).
                         continue
                     try:
                         _copy_table(src, dst, table, autoinc_pk, repo_l)

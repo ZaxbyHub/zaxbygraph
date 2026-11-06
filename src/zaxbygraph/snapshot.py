@@ -844,18 +844,23 @@ def _install(staged: Path, db_path: Path) -> None:
     already discloses that the store was already replaced.
     """
     # best-effort WAL quiesce: back-fill pending frames into the main db so
-    # the replaced file never coexists with stale sidecar data.
-    try:
-        dest = sqlite3.connect(str(db_path))
+    # the replaced file never coexists with stale sidecar data. Skipped
+    # when the destination does not exist yet — sqlite3.connect CREATES a
+    # missing file, and a pull that then refuses would leave a 0-byte store
+    # behind that `resolve_db` prefers over a legacy in-repo DB holding the
+    # corpus (swarm-pr-review N-08).
+    if db_path.exists():
         try:
-            dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            dest.close()
-    except (OSError, sqlite3.Error):
-        # pull is the recovery path for a corrupt destination (README
-        # recipes): a quiesce failure on unreadable bytes falls through to
-        # the guarded install, which replaces them
-        pass
+            dest = sqlite3.connect(str(db_path))
+            try:
+                dest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            finally:
+                dest.close()
+        except (OSError, sqlite3.Error):
+            # pull is the recovery path for a corrupt destination (README
+            # recipes): a quiesce failure on unreadable bytes falls through
+            # to the guarded install, which replaces them
+            pass
     # ONE guarded replace: a same-file open reader, a cross-volume move, and
     # a storage fault are different faults with different remedies.
     try:
@@ -918,7 +923,31 @@ def _post_install_check(db_path: Path, manifest: dict) -> dict:
     observes exactly what the destination now serves (the stale sidecar's
     content, when one survived) without mutating it: the digest verdict is
     the truth, and the install's evidence survives the check.
+
+    A surviving non-empty `-wal` is refused BEFORE the digest
+    (swarm-pr-review N-07): the corpus digest covers items, their children,
+    releases and orphan edges, so a stale WAL whose frames touch only
+    `revisions`, `sync_state`, `fetch_log` or `actors` leaves the digest
+    matching while the destination serves the OLD watermark, the OLD edit
+    history and the OLD actor URLs — and every later read-write open
+    recovers those frames into the replaced main, so the corruption outlives
+    the pull. After `os.replace` any surviving WAL belongs to the pre-replace
+    main by construction, so its presence (with frames in it) is itself the
+    defect; a surviving `-shm` without a `-wal` is inert and not refused.
     """
+    stale_wal = Path(str(db_path) + "-wal")
+    try:
+        stale_frames = stale_wal.exists() and stale_wal.stat().st_size > 0
+    except OSError:
+        stale_frames = False  # unreadable: let the digest be the verdict
+    if stale_frames:
+        raise SnapshotError(
+            "dest_sidecar_stale",
+            "a stale -wal survived the install beside the replaced store, so"
+            " the destination can serve pre-replace frames on its next open",
+            hint="the store was already replaced; close every reader of it and"
+                 " re-pull, or restore a known-good store",
+        )
     conn = _open_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:

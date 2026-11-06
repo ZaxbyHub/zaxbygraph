@@ -515,14 +515,148 @@ class SnapshotInstallTruthfulnessTests(_StoreIntegrityCase):
         self.assertIsNotNone(exc,
                              "the pull neither refused truthfully nor"
                              f" returned a result: result={result!r}")
-        self.assertEqual(getattr(exc, "code", None), "corpus_mismatch",
-                         "the post-install check did not report the stale"
-                         f" sidecar it exists to catch: exc={exc!r}")
+        # A surviving non-empty -wal is refused as dest_sidecar_stale
+        # (swarm-pr-review N-07): the corpus digest covers items, children,
+        # releases and orphan edges, so a WAL touching only revisions /
+        # sync_state / fetch_log / actors would leave the digest matching
+        # while the destination served the pre-replace corpus — the exact
+        # silent-revert class this PR exists to close.
+        self.assertEqual(getattr(exc, "code", None), "dest_sidecar_stale",
+                         "the post-install check did not refuse the stale"
+                         f" -wal it exists to catch: exc={exc!r}")
         self.assertIn(
             "already replaced",
             f"{getattr(exc, 'message', '')} {getattr(exc, 'hint', '')}",
             "the truthful refusal did not disclose that the store was"
             f" already replaced: exc={exc!r}")
+
+    def test_post_replace_single_sidecar_failure_still_drops_the_others(
+            self) -> None:
+        """AC6 (swarm-pr-review N-04): when the cleanup fails for ONE
+        sidecar, the OTHERS are still dropped — the per-unlink guard added
+        in b790e3c, which a single shared try/except around the loop would
+        silently undo. The fixture refuses ONLY the `-wal` (the `-shm`
+        unlink succeeds), so the two implementations diverge observably:
+        with the per-unlink guard the `-shm` is gone; with a shared try the
+        first refusal skips it and a stale `-shm` is left beside the
+        replaced store. RED at the shared-try mutant, GREEN at head.
+
+        The surviving `-wal` also proves N-07's refusal: the pull refuses
+        with dest_sidecar_stale rather than reporting success."""
+        from test_doctor_wal_copy import _spawn_writer
+
+        crepo = "probe/clinic"
+        root = self.scratch / "c6b"
+        root.mkdir(parents=True)
+        old_db = root / "history.db"
+        # killed writer: the OLD corpus's frames live only in the -wal
+        self.assertEqual(
+            _spawn_writer(old_db, 3, 4, "kill", "2026-01-01T00:00:00Z"), 9)
+        old_wal = old_db.with_name(old_db.name + "-wal")
+        old_shm = old_db.with_name(old_db.name + "-shm")
+        self.assertTrue(old_wal.exists() and old_wal.stat().st_size > 0)
+        self.assertTrue(old_shm.exists(), "the rig needs a -shm to survive")
+
+        new_db = _prep(root / "new" / "history.db")
+        conn = connect(new_db)
+        init_schema(conn)
+        for n in range(201, 205):
+            ingest_item(conn, crepo, _item(n, f"t{n}"), pull_raw=None,
+                        issue_comments=[], review_comments=[], reviews=[],
+                        files=[], include_patches=False)
+        conn.execute(
+            "UPDATE sync_state SET last_full_sync_at = '2027-06-01T00:00:00Z',"
+            " full_sync_pending = 0, issues_since = '2027-06-01T00:00:00Z'"
+            " WHERE repo = ?", (crepo,))
+        conn.commit(); conn.close()
+        bare = root / "bare.git"
+        bare.mkdir()
+        subprocess.run(["git", "init", "--bare", str(bare)], check=True,
+                       capture_output=True)
+        publish(new_db, str(bare), publisher="probe")
+
+        dest_norm = os.path.normcase(str(old_db.resolve()))
+        wal_norm = dest_norm + "-wal"
+        real_unlink = pathlib.Path.unlink
+        real_connect = sqlite3.connect
+        real_install = snapshot_mod._install
+        real_post = snapshot_mod._post_install_check
+        quiesce_refused = {"n": 0}
+        # Recorded INSIDE the post-install check, before its own read-only
+        # reopen: that reopen materializes a fresh -shm/-wal pair (the
+        # documented cost of observing what the destination really serves,
+        # doctor.py:5-8), so the -shm's existence AFTER the pull says
+        # nothing about the cleanup. Its existence at this moment does.
+        shm_at_check: list[bool] = []
+
+        def wal_refusing_unlink(self_path, *a, **kw):
+            if os.path.normcase(str(self_path)) == wal_norm:
+                raise OSError(13, "Permission denied (fixture)", str(self_path))
+            return real_unlink(self_path, *a, **kw)
+
+        def recording_post(db_path, manifest):
+            shm_at_check.append(old_shm.exists())
+            return real_post(db_path, manifest)
+
+        def quiesce_refusing_connect(target, *a, **kw):
+            # the best-effort quiesce fails once, exactly as on an
+            # unreadable destination, so the killed writer's frames stay in
+            # the -wal and the install's cleanup has real work to do
+            if (not kw.get("uri")
+                    and os.path.normcase(os.fspath(target)) == dest_norm):
+                quiesce_refused["n"] += 1
+                if quiesce_refused["n"] == 1:
+                    raise sqlite3.OperationalError(
+                        "unable to quiesce destination (fixture)")
+            return real_connect(target, *a, **kw)
+
+        def rigged_install(staged, db_path):
+            with mock.patch.object(sqlite3, "connect", quiesce_refusing_connect):
+                return real_install(staged, db_path)
+
+        exc = None
+        result = None
+        with mock.patch.object(pathlib.Path, "unlink", wal_refusing_unlink),                 mock.patch.object(snapshot_mod, "_install", rigged_install),                 mock.patch.object(snapshot_mod, "_post_install_check",
+                                  recording_post):
+            try:
+                result = pull(old_db, str(bare), force=False)
+            except SnapshotError as caught:
+                exc = caught
+
+        self.assertTrue(shm_at_check, "the post-install check never ran")
+        # the -shm WAS dropped despite the -wal's refusal — the per-unlink
+        # guard, which is what distinguishes it from a shared try
+        self.assertFalse(
+            shm_at_check[0],
+            "the -wal's refusal stopped the -shm being dropped: the cleanup"
+            " is one shared try/except, not one guard per sidecar")
+        # the replaced bytes provably landed (immutable=1 reads the main
+        # alone, so the surviving stale sidecar cannot hide them)
+        try:
+            probe = sqlite3.connect(f"file:{old_db}?immutable=1", uri=True)
+            try:
+                landed = probe.execute(
+                    "SELECT COUNT(*) FROM items WHERE repo = ? AND number >= 201",
+                    (crepo,)).fetchone()[0]
+            finally:
+                probe.close()
+        except sqlite3.Error as read_exc:
+            landed = 0
+            read_failure = repr(read_exc)
+        else:
+            read_failure = None
+        self.assertGreater(landed, 0,
+                           "the replace never committed, so this run did not"
+                           " exercise the AC6 scenario"
+                           + (f" (probe read failed: {read_failure})"
+                              if read_failure else ""))
+        # and the surviving stale -wal is refused, not reported as success
+        self.assertIsNotNone(exc,
+                             "the pull neither refused truthfully nor"
+                             f" returned a result: result={result!r}")
+        self.assertEqual(getattr(exc, "code", None), "dest_sidecar_stale",
+                         "a surviving stale -wal was not refused:"
+                         f" exc={exc!r}")
 
 
 class UninspectableCandidateTests(_StoreIntegrityCase):

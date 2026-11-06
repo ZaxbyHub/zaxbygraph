@@ -397,17 +397,23 @@ def current_table_columns() -> dict[str, set[str]]:
         conn.close()
 
 
-def current_text_columns() -> dict[str, set[str]]:
-    """Every table's TEXT-declared column set in the CURRENT schema (issue
-    #56, round-6 reviewer finding 2).
+def current_column_rules() -> dict[str, dict[str, tuple[str, bool]]]:
+    """Every table's {column: (declared type, NOT NULL)} in the CURRENT
+    schema (issue #56; swarm-pr-review N-14/N-18).
 
     Built from the same in-memory schema DDL as `current_table_columns`, so
     it is the exact shape `init_schema` gives the store at adoption time.
-    A column declared TEXT must hold text (or NULL): SQLite's dynamic
-    typing stores anything a divergent schema allows, and the adoption
-    copies the value verbatim into the store's TEXT column, so a BLOB body
-    would be adopted as a fabricated value. Callers refuse
-    `typeof(column) NOT IN ('text','null')` per column.
+    ONE derived rule replaces the four enumerated per-column checks that
+    preceded it: a column declared TEXT must hold text (or NULL when the
+    DDL allows it), a column declared INTEGER must hold an integer, and a
+    column declared NOT NULL must not be NULL — SQLite's dynamic typing
+    stores anything a divergent schema allows, and the adoption copies the
+    value verbatim into a store column that then rejects it either
+    silently (a fabricated value) or loudly (an IntegrityError that aborts
+    the whole command). Columns with no declared type carry anything and
+    are not constrained. `sync_state.repo` is special-cased by the caller:
+    a TEXT PRIMARY KEY on a rowid table permits NULL in SQLite, but the
+    fold's grouping needs a real key.
     """
     conn = sqlite3.connect(":memory:")
     try:
@@ -416,8 +422,8 @@ def current_text_columns() -> dict[str, set[str]]:
             "SELECT name FROM sqlite_master WHERE type='table'"
         )]
         return {
-            table: {r[1] for r in conn.execute(f"PRAGMA table_info({table})")
-                    if (r[2] or "").upper() == "TEXT"}
+            table: {r[1]: ((r[2] or "").upper(), bool(r[3]))
+                    for r in conn.execute(f"PRAGMA table_info({table})")}
             for table in tables
         }
     finally:

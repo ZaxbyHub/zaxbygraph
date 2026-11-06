@@ -390,7 +390,7 @@ Write rules:
   it carries the item itself. The same preservation rule covers every OTHER
   repo-keyed table the adopted candidate's version never had (issue #56): a
   pre-v10 candidate's `item_events`, `pr_commits` and `issue_field_values`
-  are recreated EMPTY by the migration, so replace-the-slug would delete
+  are recreated by the migration — EMPTY for item_events and pr_commits (v10 has no backfill), and BACKFILLED from the candidate's own payload for assignees and issue_field_values (v6->v7) and item_path_refs/item_signatures (v8->v9) — so replace-the-slug would delete
   the store's rows and copy zero back — a truncated image. The adoption
   records the candidate's own table set before migrating and preserves the
   store's rows for any table outside it, naming them in the report's

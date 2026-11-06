@@ -12,6 +12,7 @@ Stdlib only; unittest.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -599,6 +600,46 @@ class SnapshotReviewFixTests(unittest.TestCase):
                     (REPO,)).fetchone()
                 conn.close()
                 self.assertEqual(row["issues_since"], wmark)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_dest_open_names_the_permission_cause(self) -> None:
+        """AC6 (swarm-pr-review N-12): the `dest_open` refusal distinguishes
+        a reader holding the destination from a permissions problem, because
+        `EACCES` and `EPERM` are ambiguous between the two and telling a
+        user to close readers when the real fix is a permission change
+        wastes a support round. RED at the mutant that drops the cause
+        clause (the suite was green with the message reverted to the
+        generic form — the only prior dest_open assertion was the code
+        string)."""
+        td = Path(tempfile.mkdtemp(prefix="destopen_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="do")
+            dest = td / "dest" / "history.db"
+            dest.parent.mkdir(parents=True)
+            shutil.copyfile(db, dest)
+            def refusing_replace(src, dst, *a, **kw):
+                raise PermissionError(
+                    errno.EACCES, "Permission denied (fixture)",
+                    str(src), None, str(dst))
+
+            with mock.patch.object(os, "replace", refusing_replace):
+                with self.assertRaises(SnapshotError) as ctx:
+                    pull(dest, str(bare), force=True)
+            exc = ctx.exception
+            self.assertEqual(exc.code, "dest_open")
+            text = f"{exc.message} {getattr(exc, 'hint', '')}"
+            self.assertIn("Permission denied", text,
+                          f"the refusal did not name the underlying"
+                          f" permission cause: {text!r}")
+            self.assertIn("permission", text.lower(),
+                          f"the hint did not cover the permissions reading"
+                          f" of EACCES: {text!r}")
+            self.assertIn("close readers", text.lower(),
+                          f"the hint dropped the open-reader reading:"
+                          f" {text!r}")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
