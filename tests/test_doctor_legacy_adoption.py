@@ -43,6 +43,17 @@ from zaxbygraph.store import ingest_item  # noqa: E402
 
 #: The v10-era repo-keyed tables a pre-v10 candidate's schema never has.
 _V10_TABLES = ("item_events", "pr_commits", "issue_field_values")
+#: A raw_json payload whose title/body carry BACKTICKED paths and a
+#: closing keyword, so the v8→v9 backfill really produces
+#: `item_path_refs`/`item_signatures` rows for a genuine legacy candidate
+#: (a plain path without backticks produces nothing).
+_RAW_JSON = (
+    '{"title": "fix `src/app.py`", "body": "closes #1 via `src/app.py` and'
+    ' `src/lib/util.py`"}'
+)
+#: A comment body with the same backfillable text (the v8→v9 backfill
+#: reads `comments.body` with a `comment:<github_id>` origin).
+_COMMENT_BODY = "see `src/app.py` and `src/lib/util.py` for the fix"
 
 
 def _rmtree(path: Path) -> None:
@@ -112,6 +123,40 @@ def _strip_v10_tables(bad: Path, version: int) -> None:
     for table in _V10_TABLES:
         conn.execute(f"DROP TABLE IF EXISTS {table}")
     conn.execute(f"PRAGMA user_version = {version}")
+    conn.commit()
+    conn.close()
+
+
+def _genuine_legacy_candidate(bad: Path, version: int) -> None:
+    """A GENUINE pre-v7/pre-v9 schema: the v6→v7 and v8→v9 migrations
+    BACKFILL `assignees`/`issue_field_values` from `raw_json` and
+    `item_path_refs`/`item_signatures` from the bodies, so the tables the
+    candidate's version never had are recreated POPULATED, not empty —
+    the round-7 reviewer's finding 1, which a table-drop fixture cannot
+    see (its bodies carry no backfillable text)."""
+    from test_migrations import V1_SCHEMA_SQL
+
+    conn = sqlite3.connect(str(bad))
+    conn.executescript(V1_SCHEMA_SQL)
+    conn.execute(f"PRAGMA user_version = {version}")
+    # v1's sync_state carries no full_sync_pending; the v1->v2 migration
+    # adds it, which is exactly the shape a genuine legacy store has.
+    conn.execute(
+        "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+        " include_patches) VALUES (?, '2027-06-01T00:00:00Z',"
+        " '2027-06-01T00:00:00Z', 0)", (REPO,))
+    conn.execute(
+        "INSERT INTO items(id, repo, number, kind, title, state, updated_at,"
+        " raw_json) VALUES (1, ?, 1, 'issue', 'one', 'open',"
+        " '2027-06-01T00:00:00Z', ?)", (REPO, _RAW_JSON))
+    conn.execute(
+        "INSERT INTO items(id, repo, number, kind, title, state, updated_at,"
+        " raw_json) VALUES (2, ?, 2, 'issue', 'two', 'open',"
+        " '2027-06-01T00:00:00Z', ?)", (REPO, _RAW_JSON))
+    conn.execute(
+        "INSERT INTO comments(github_id, repo, number, kind, author, body,"
+        " raw_json) VALUES (7001, ?, 1, 'issue_comment', 'bob', ?, '{}')",
+        (REPO, _COMMENT_BODY))
     conn.commit()
     conn.close()
 
@@ -195,6 +240,63 @@ class LegacyTablePreservationTests(unittest.TestCase):
                     entry.get(os.path.normcase(str(bad)), {}).get("adopted"),
                     "the legacy candidate was not adopted")
 
+    def test_genuine_legacy_candidate_is_adopted_not_refused(self) -> None:
+        """RED at base's fix, GREEN after the round-7 correction: a GENUINE
+        pre-v7/pre-v9 schema (V1_SCHEMA_SQL, path-bearing bodies) is
+        migrated by a chain that BACKFILLS `assignees`,
+        `issue_field_values`, `item_path_refs` and `item_signatures` from
+        the candidate's own payload, so the tables its version never had
+        come back POPULATED. Skipping only the delete made the copy insert
+        those backfilled rows on top of the store's preserved ones — the
+        keys collide, the plain INSERT raises IntegrityError, and the copy
+        handler refused a perfectly genuine legacy candidate with "schema
+        defeated the copy". The invariant is therefore neither deleted NOR
+        copied: the candidate is adopted and the preserved tables are
+        named."""
+        for version in (1,):
+            with self.subTest(version=version):
+                root = self.scratch / f"c19-genuine-v{version}"
+                store = _prep(root / "store" / "history.db")
+                _seed_store(store, (1, 2), "2027-05-01T00:00:00Z")
+                # the store already holds the rows the candidate's
+                # migration would backfill for the same items
+                conn = sqlite3.connect(str(store))
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO item_path_refs(repo, number,"
+                        " origin, path, backticked) VALUES (?, 1, 'body',"
+                        " 'src/app.py', 1)", (REPO,))
+                    conn.commit()
+                finally:
+                    conn.close()
+                before = _count(store, "item_path_refs")
+                bad = _prep(root / "cand" / "history.db")
+                _genuine_legacy_candidate(bad, version)
+                cwd = _prep(root / "cwd")
+                envelope = doctor_mod.doctor(cwd, REPO, store,
+                                             extra_scans=[bad],
+                                             consolidate_flag=True)
+                entry = {os.path.normcase(str(r.get("path", ""))): r
+                         for r in envelope.get("scanned") or []}.get(
+                             os.path.normcase(str(bad)))
+                self.assertTrue(
+                    envelope.get("adopted"),
+                    f"v{version}: a genuine legacy candidate was refused:"
+                    f" {entry}")
+                self.assertTrue(
+                    entry is not None and not entry.get("unreadable"),
+                    f"v{version}: the candidate is reported unreadable:"
+                    f" {entry}")
+                self.assertEqual(
+                    envelope.get("tables_preserved"),
+                    sorted(("item_path_refs", "item_signatures",
+                            "assignees", "issue_field_values",
+                            "item_events", "pr_commits")),
+                    f"v{version}: the envelope does not name the preserved"
+                    f" tables: {envelope.get('tables_preserved')}")
+                self.assertEqual(_count(store, "item_path_refs"), before,
+                                 "the preserved table's rows were replaced")
+
     def test_current_version_candidate_replaces_normally(self) -> None:
         """PRESERVING: a candidate at the current version carries every
         table, so nothing is preserved and the store's rows are replaced as
@@ -225,6 +327,14 @@ class TextStorageClassContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.scratch = Path(tempfile.mkdtemp(prefix="zgt56-text-class-"))
         self.addCleanup(_rmtree, self.scratch)
+        # The rule's own scope is derived, so it must stay derived: a table
+        # dropped from `_ADOPTED_TABLES` silently re-admits a BLOB, and the
+        # suite has to notice (round-7 reviewer finding 2).
+        self.assertEqual(
+            set(doctor_mod._ADOPTED_TABLES),
+            {t for t, _pk in doctor_mod._COPY_TABLES} | {"actors", "sync_state"},
+            "_ADOPTED_TABLES drifted from the copied tables plus actors and"
+            " sync_state")
 
     def _pair(self, tag: str, diverge):
         root = self.scratch / tag

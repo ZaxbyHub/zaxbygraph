@@ -711,7 +711,7 @@ def _copy_table(
     dst.executemany(insert_sql, [tuple(r) for r in rows])
 
 
-def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
+def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[str]]:
     """Adopt one candidate into the store: REPLACE-THE-SLUG, revisions scoped per item.
 
     One transaction: delete every store row whose repo is the folded slug,
@@ -742,22 +742,30 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
     replaced (within-item depth loss for a shallower candidate remains a
     recorded boundary — the candidate's rows are a real observation for
     that item); uncovered numbers' history is preserved. Returns
-    (adopted_rows, preserved_rows): adopted = rows copied from the
-    candidate; preserved = stored rows for numbers the candidate holds no
-    revision rows for (a payload-identical covered number is a no-op —
-    its rows are neither adopted nor preserved).
+    (adopted_rows, preserved_rows, preserved_tables): adopted = rows copied
+    from the candidate; preserved = stored rows for numbers the candidate
+    holds no revision rows for (a payload-identical covered number is a
+    no-op — its rows are neither adopted nor preserved); preserved_tables =
+    the repo-keyed tables the candidate's version never had, whose store
+    rows are kept rather than replaced.
 
     The same preservation rule covers every other table the candidate's
     VERSION never had (issue #56, round-6 reviewer finding 1):
     `_MigratedCopy` migrates a legacy candidate, which recreates the
-    tables that version predates as EMPTY, so the post-migration preflight
-    cannot see their absence and the delete loop would remove the store's
-    rows for them while the copy brought zero back — the truncated-image
-    outcome AC3 refuses, on the tool's primary input class (legacy DBs).
+    tables that version predates — and BACKFILLS some of them from the
+    candidate's own payload (v6→v7 `assignees`/`issue_field_values` from
+    `raw_json`, v8→v9 `item_path_refs`/`item_signatures` from text) — so
+    the post-migration preflight cannot see the absence and the
+    unconditional delete would remove the store's rows for them while the
+    copy brought the backfilled rows back: the truncated-image outcome
+    AC3 refuses, on the tool's primary input class (legacy DBs).
     `_MigratedCopy.raw_tables` records the candidate's own table set before
-    the migration; a table outside it is preserved (neither deleted nor
-    copied) and named in the envelope's `tables_preserved`, so the report
-    says what happened instead of claiming a clean replace.
+    the migration; a table outside it is preserved — neither deleted nor
+    copied (round-7 reviewer finding 1: the migration's backfill populates
+    it, so copying it would collide with the store's preserved rows and
+    refuse a genuine candidate) — and named in the envelope's
+    `tables_preserved`, so the report says what happened instead of claiming
+    a clean replace.
     """
     repo_l = repo.lower()
     preserved_tables: list[str] = []
@@ -868,6 +876,20 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # adopted per item above (issue #40)
+                    if table in preserved_tables:
+                        # The same rule as the delete loop (issue #56,
+                        # round-7 reviewer finding 1): a table the
+                        # candidate's version never had is preserved, not
+                        # replaced. The migration BACKFILLS some of these
+                        # tables from the candidate's own payload (v6->v7
+                        # assignees/issue_field_values from raw_json,
+                        # v8->v9 item_path_refs/item_signatures from text),
+                        # so copying them would insert the backfilled rows
+                        # on top of the store's preserved ones — the same
+                        # keys collide, the plain INSERT raises
+                        # IntegrityError, and the copy handler would refuse
+                        # a perfectly genuine legacy candidate.
+                        continue
                     try:
                         _copy_table(src, dst, table, autoinc_pk, repo_l)
                     except sqlite3.DatabaseError as exc:
