@@ -70,6 +70,20 @@ def _seed_store(db: Path, numbers: tuple[int, ...], stamp: str,
     conn.close()
 
 
+def _seed_comment(db: Path) -> None:
+    """Add one issue comment to the candidate, so a store-side assertion
+    about a comment column is not vacuous (cubic review, PR #58)."""
+    conn = connect(db)
+    conn.execute(
+        "INSERT INTO comments(github_id, repo, number, kind, author, body,"
+        " created_at, updated_at, html_url, raw_json)"
+        " VALUES (?, ?, 5, 'issue_comment', 'bob', 'hello',"
+        " '2027-06-02T00:00:00Z', '2027-06-02T00:00:00Z',"
+        " 'https://github.com/bob', '{}')", (7100 + 5, REPO))
+    conn.commit()
+    conn.close()
+
+
 def _text_revisions_number_candidate(bad: Path, literal: str) -> None:
     """Add a `revisions` row whose number is the given SQL literal — a
     REAL, a numeric BLOB, or a large REAL. SQLite's dynamic typing stores
@@ -429,7 +443,9 @@ class ColumnParityTests(_FabricatedValueCase):
         finding 1's sibling: the TEXT-column loop pins sync_state, this
         pins the copied tables)."""
         good, bad, store, empty_cwd = self._divergent_pair(
-            "c15", lambda bad: _drop_comments_column(bad, "author_association"))
+            "c15", lambda bad: (_drop_comments_column(bad,
+                                                      "author_association"),
+                                _seed_comment(bad)))
         envelope = None
         try:
             envelope = doctor_mod.doctor(empty_cwd, REPO, store,
@@ -446,7 +462,11 @@ class ColumnParityTests(_FabricatedValueCase):
             "a candidate missing a current column was adopted as a truncated"
             f" image: {entry}")
         self._assert_isolated(envelope, good, bad)
-        # the fabricated default must not have reached the store either
+        # the fabricated default must not have reached the store either. The
+        # divergent candidate carries a comment, so a truncated adoption
+        # would leave a NULL author_association row here rather than an
+        # empty result (cubic review, PR #58: the assertion was vacuous
+        # while the candidate held no comments).
         if store.exists():
             conn = sqlite3.connect(str(store))
             try:

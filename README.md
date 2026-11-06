@@ -119,8 +119,12 @@ and the best one can still be adopted). The candidate the adoption reaches
 its schema validated before any store write — a missing table or column, a
 fabricated `sync_state` flag value, or a divergent storage class in a TEXT
 column, refuses that candidate with the reason carried instead of adopting
-it as a truncated image or aborting the command. A divergent candidate that
-is not the winner is not probed — it is simply not adopted.
+it as a truncated image or aborting the command. Every candidate is inspected
+(its `sync_state` is read to rank it), but only the adoption winner gets that
+schema validation; a divergent candidate that is not the winner is not
+schema-probed — it is simply not adopted. If the winner itself is refused,
+nothing is adopted and the next candidate is NOT tried: the report says why
+nothing was adopted instead of falling back.
 `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);

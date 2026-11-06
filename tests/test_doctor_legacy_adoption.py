@@ -308,18 +308,23 @@ class LegacyTablePreservationTests(unittest.TestCase):
                                  f"v{version}: the store's rows for a table"
                                  f" the candidate's version never had were"
                                  f" deleted: {before} -> {after}")
-                # v9's schema predates only the v10 slot, so the three
-                # dropped tables are the preserved set; v5's stamp predates
-                # the v7/v8/v9 slots too, so the tables those migrations
-                # introduce are preserved as well — the version rule, not
-                # just the absent-table rule.
-                # `revisions` is excluded: it has its own per-item
-                # scoping (issue #40) and never enters the preserved list.
-                expected = sorted(_V10_TABLES if version >= 10 else
-                                  (set(_V10_TABLES) | {
-                                      t for t, v in
-                                      _TABLE_INTRODUCED_VERSION.items()
-                                      if v > version}) - {"revisions"})
+                # The expected set is HARD-CODED per version, not derived
+                # from the implementation's own slot map: a wrong slot value
+                # in `_TABLE_INTRODUCED_VERSION` must make this assertion
+                # fail (cubic review, PR #58). v9's schema predates only the
+                # v10 slot, so the three dropped tables are the preserved
+                # set; v5's stamp predates the v7/v8/v9 slots too, so the
+                # tables those migrations introduce are preserved as well —
+                # the version rule, not just the absent-table rule.
+                # `revisions` is excluded: it has its own per-item scoping
+                # (issue #40) and never enters the preserved list.
+                expected = {
+                    9: sorted(_V10_TABLES),
+                    5: sorted((set(_V10_TABLES) | {"assignees",
+                                                   "issue_field_values",
+                                                   "item_path_refs",
+                                                   "item_signatures"})),
+                }[version]
                 self.assertEqual(
                     envelope.get("tables_preserved"), expected,
                     f"v{version}: the envelope does not name the preserved"

@@ -584,8 +584,11 @@ that store is ever a consolidation candidate, by the preflight's
 storage-class check.) A candidate that cannot be inspected at all is
 likewise reported (`unreadable: true` with a reason) rather than silently
 dropped — "no candidates" and "one unreadable candidate" never look the
-same in the report. A divergent candidate that is not the adoption winner
-is not probed; it is simply not adopted.
+same in the report. Every candidate is inspected (its `sync_state` is read to
+rank it), but only the adoption winner gets the full schema preflight; a
+divergent candidate that is not the winner is not schema-probed — it is
+simply not adopted. A refused winner leaves nothing adopted and the next
+candidate is not tried.
 
 `complete` for a migrated legacy row means "no unresolved full sync since the
 last recorded one": v1 recorded nothing when a run crashed outside its caught

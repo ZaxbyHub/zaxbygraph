@@ -1527,17 +1527,17 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
         # malformed-data class, but the regexes below take str only, so it
         # used to raise an uncaught TypeError that aborted the whole
         # migration — one candidate killing the entire doctor run, the same
-        # observable outcome as a divergent storage class. Coerce to text
-        # (the JSON scalar's rendering) so a malformed payload no longer
-        # aborts the command; whatever references the coerced rendering
-        # happens to contain are then extracted, which for a genuine
-        # malformed payload is none (final critic, round-7 question).
-        title = raw.get("title") or ""
-        body = raw.get("body") or ""
+        # observable outcome as a divergent storage class. A non-string
+        # value is treated as EMPTY text, never coerced with str(): a list's
+        # or dict's repr can contain backticked paths and `closes #N`, and
+        # extracting references from it would let a malformed payload write
+        # edges (final critic round-7 question; cubic review, PR #58).
+        title = raw.get("title")
+        body = raw.get("body")
         if not isinstance(title, str):
-            title = str(title)
+            title = ""
         if not isinstance(body, str):
-            body = str(body)
+            body = ""
         for path, backticked in _extract.parse_path_refs(body, repo):
             conn.execute(
                 "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"

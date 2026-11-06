@@ -308,14 +308,14 @@ class NullFlagPreflightTests(_SchemaPreflightCase):
                     # and "a store without the value" are both clean.
                     if store.exists():
                         conn = sqlite3.connect(str(store))
-                        try:
-                            stored = conn.execute(
-                                "SELECT include_patches FROM sync_state"
-                                " WHERE repo = ?", (REPO,)).fetchall()
-                        except sqlite3.OperationalError:
-                            stored = []
-                        finally:
-                            conn.close()
+                        # No OperationalError swallow: a store whose
+                        # sync_state is missing or broken must fail the
+                        # check, not silently yield "no value reached the
+                        # store" (cubic review, PR #58).
+                        stored = conn.execute(
+                            "SELECT include_patches FROM sync_state"
+                            " WHERE repo = ?", (REPO,)).fetchall()
+                        conn.close()
                         self.assertEqual(
                             [tuple(r) for r in stored], [],
                             "a fabricated flag value reached the store:"
@@ -436,16 +436,21 @@ class AffinityDivergenceTests(_SchemaPreflightCase):
         conn.close()
         store = _prep(self.scratch / "c13-single-blob-store" / "history.db")
         empty_cwd = _prep(self.scratch / "c13-single-blob" / "cwd")
+        # A healthy sibling, so "the remaining candidates were still
+        # scanned" is a real assertion rather than a self-comparison
+        # (cubic review, PR #58).
+        good = _prep(self.scratch / "c13-single-blob-good" / "history.db")
+        _seed_store(good, (3, 4), "2026-12-01T00:00:00Z")
         with self.subTest(shape="single_cased_blob_winner"):
             envelope = None
             try:
                 envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                             extra_scans=[bad],
+                                             extra_scans=[bad, good],
                                              consolidate_flag=True)
             except TypeError as exc:
                 self.fail(f"TypeError escaped candidate isolation and"
                           f" aborted the whole command: {exc!r}")
-            self._assert_isolated(envelope, bad, bad)
+            self._assert_isolated(envelope, good, bad)
             # the fabricated BLOB must not have reached the store either
             if store.exists():
                 conn = sqlite3.connect(str(store))

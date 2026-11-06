@@ -871,10 +871,19 @@ def _install(staged: Path, db_path: Path) -> None:
             ) from exc
         if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
                                               errno.EPERM, errno.ETXTBSY):
+            # EACCES and EPERM are ambiguous: a reader holding the file open,
+            # or a permissions problem on the destination. Name the cause so
+            # the user is not told to close readers when the real fix is a
+            # permission change (cubic review, PR #58).
+            cause = (f"{exc.__class__.__name__}: {exc}"
+                     if exc.errno in (errno.EACCES, errno.EPERM) else "")
             raise SnapshotError(
                 "dest_open",
-                "destination store is held open by another process",
-                hint="close readers holding the store open and re-pull",
+                "destination store could not be replaced: held open by"
+                " another process, or not writable"
+                + (f" ({cause})" if cause else ""),
+                hint="close readers holding the store open, or check the"
+                " destination path's permissions, and re-pull",
             ) from exc
         raise SnapshotError(
             "dest_open",
@@ -886,13 +895,15 @@ def _install(staged: Path, db_path: Path) -> None:
     # sidecar) leaves the store REPLACED, so it is swallowed rather than
     # reported as a failed replace. The post-install check that follows is
     # the verdict on what the destination now serves.
-    try:
-        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"),
-                        Path(str(db_path) + "-journal")):
+    for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"),
+                    Path(str(db_path) + "-journal")):
+        # Each unlink gets its own guard: one locked sidecar must not stop
+        # the others being dropped (cubic review, PR #58).
+        try:
             if sidecar.exists():
                 sidecar.unlink()
-    except OSError:
-        pass
+        except OSError:
+            pass
 
 
 def _post_install_check(db_path: Path, manifest: dict) -> dict:

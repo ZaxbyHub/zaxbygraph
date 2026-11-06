@@ -473,17 +473,29 @@ class SnapshotInstallTruthfulnessTests(_StoreIntegrityCase):
 
         # immutable=1 reads the main file ALONE (no WAL recovery), so a
         # stale sidecar cannot hide the replaced bytes from this proof
-        probe = sqlite3.connect(f"file:{old_db}?immutable=1", uri=True)
         try:
-            landed = probe.execute(
-                "SELECT COUNT(*) FROM items WHERE repo = ? AND number >= 201",
-                (crepo,)).fetchone()[0]
-        finally:
-            probe.close()
+            probe = sqlite3.connect(f"file:{old_db}?immutable=1", uri=True)
+            try:
+                landed = probe.execute(
+                    "SELECT COUNT(*) FROM items WHERE repo = ? AND number >= 201",
+                    (crepo,)).fetchone()[0]
+            finally:
+                probe.close()
+        except sqlite3.Error as read_exc:
+            # A destination that was never replaced cannot answer this
+            # query; report that as landed=0 so the intended diagnostic
+            # fires instead of an opaque "no such table: items"
+            # (cubic review, PR #58).
+            landed = 0
+            read_failure = repr(read_exc)
+        else:
+            read_failure = None
 
         self.assertGreater(landed, 0,
                            "the replace never committed, so this run did not"
-                           " exercise the AC6 scenario")
+                           " exercise the AC6 scenario"
+                           + (f" (probe read failed: {read_failure})"
+                              if read_failure else ""))
         self.assertFalse(
             exc is not None
             and "destination store could not be replaced" in str(
