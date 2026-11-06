@@ -330,6 +330,24 @@ _REQUIRED_SYNC_STATE_COLUMNS = (
 #: NULL DEFAULT 0), so it is refused rather than adopted as a value (issue
 #: #56, AC11).
 _REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
+#: The storage-class checks the migration-time fold needs BEFORE
+#: init_schema runs (issue #56): (table, column, allowed typeof values).
+#: The fold's closes-group merge reads edges.evidence as text, the per-item
+#: revisions read calls int() on revisions.number, and the grouping and
+#: aggregations read sync_state's key and TEXT columns — all reachable
+#: from a pre-migration schema, so each check is gated on the column
+#: existing. A NULL evidence is legal (no provenance recorded); a NULL
+#: number is not (the DDL declares it NOT NULL).
+_RAW_STORAGE_CLASS_CHECKS = (
+    ("sync_state", "repo", ("text",)),
+    ("sync_state", "issues_since", ("text", "null")),
+    ("sync_state", "last_full_sync_at", ("text", "null")),
+    ("sync_state", "last_incr_sync_at", ("text", "null")),
+    ("sync_state", "last_error", ("text", "null")),
+    ("sync_state", "include_patches", ("integer",)),
+    ("revisions", "number", ("integer",)),
+    ("edges", "evidence", ("text", "null")),
+)
 #: TEXT columns the fold and the adoption compare or carry (issue #56):
 #: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
 #: would raise an uncaught TypeError at the fold's max() or at the scan's
@@ -369,8 +387,11 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
     # current column would be adopted with the store's defaults for it — a
     # truncated image (a candidate whose comments table lacked
     # author_association was probe-verified to be adopted with NULLs). A
-    # candidate carrying EXTRA columns fails the copy's INSERT and is
-    # already converted to a refusal.
+    # candidate carrying EXTRA columns in a copied table fails the copy's
+    # INSERT and is already converted to a refusal; extras in the
+    # non-copied tables (sync_state, actors, revisions) are named
+    # column-by-column and silently ignored — a same-version extra column
+    # is recorded as a considered-not-filed boundary in the PR body.
     expected = current_table_columns()
     for table in [t for t, _pk in _COPY_TABLES] + ["actors"]:
         have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -380,17 +401,18 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
                 path,
                 f"the candidate's {table} table lacks the"
                 f" {', '.join(sorted(missing))} column(s)")
-    # The per-item revisions read calls int() on revisions.number, and the
-    # fold's closes-group merge reads edges.evidence as text (issue #56):
-    # a non-integer number is silently localized to a WRONG item (or
-    # aborts the binder with OverflowError for a large REAL), and a
-    # non-text evidence raises an uncaught TypeError inside merge_evidence.
-    # Refuse both storage classes up front — typeof() names them exactly.
-    for table, column, allowed in (("revisions", "number", "integer"),
-                                   ("edges", "evidence", "text")):
+    # The per-item revisions read calls int() on revisions.number (a NULL
+    # is a fabricated state too — the DDL declares it NOT NULL — and the
+    # per-item conversion is the only other layer), and the fold's
+    # closes-group merge reads edges.evidence as text (a NULL evidence is
+    # legal: no provenance recorded) (issue #56). Refuse the divergent
+    # storage classes up front — typeof() names them exactly.
+    for table, column, allowed in (("revisions", "number", ("integer",)),
+                                   ("edges", "evidence", ("text", "null"))):
         bad = conn.execute(
             f"SELECT COUNT(*) FROM {table}"
-            f" WHERE typeof({column}) NOT IN ('{allowed}', 'null')"
+            f" WHERE typeof({column}) NOT IN"
+            f" ({', '.join(repr(a) for a in allowed)})"
         ).fetchone()[0]
         if bad:
             raise _UnreadableCandidate(
@@ -496,6 +518,39 @@ class _MigratedCopy:
                     f"the candidate's schema (user_version {version}) is newer"
                     f" than this build supports ({CURRENT_USER_VERSION})")
             self.migrated = version < CURRENT_USER_VERSION
+            if self.migrated:
+                # A pre-migration storage-class check for the shapes the
+                # migration-time fold reads (issue #56): the fold runs
+                # inside init_schema's migrate_v1_to_v2, which the
+                # post-migration preflight cannot precede, so a divergent
+                # value there aborts the whole command. The raw candidate's
+                # schema is pre-migration, so every check is gated on the
+                # table and column existing — a genuine v1 store carries
+                # none of the divergent shapes.
+                raw = sqlite3.connect(str(self.path))
+                try:
+                    for table, column, allowed in _RAW_STORAGE_CLASS_CHECKS:
+                        if not _table_exists(raw, table):
+                            continue
+                        raw_cols = {
+                            row[1] for row in raw.execute(
+                                f"PRAGMA table_info({table})")
+                        }
+                        if column not in raw_cols:
+                            continue
+                        bad = raw.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                            f" WHERE typeof({column}) NOT IN"
+                            f" ({', '.join(repr(a) for a in allowed)})"
+                        ).fetchone()[0]
+                        if bad:
+                            raise _UnreadableCandidate(
+                                path,
+                                f"the candidate's {table}.{column} holds a"
+                                f" divergent storage class in {bad} row(s):"
+                                " refused, not adopted")
+                finally:
+                    raw.close()
             conn = connect(self.path)
             try:
                 if self.migrated:

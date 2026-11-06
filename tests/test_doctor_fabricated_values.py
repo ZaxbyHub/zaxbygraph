@@ -27,6 +27,9 @@ import zaxbygraph.doctor as doctor_mod  # noqa: E402
 from zaxbygraph.db import connect, init_schema  # noqa: E402
 from zaxbygraph.store import ingest_item  # noqa: E402
 
+#: The upper casing of `REPO`, for the case-split shapes.
+UPPER = "ACME/FORGEGATE"
+
 
 def _rmtree(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
@@ -81,13 +84,47 @@ def _text_revisions_number_candidate(bad: Path, literal: str) -> None:
     conn.close()
 
 
-def _optional_text_blob_candidate(bad: Path) -> None:
-    """Set the optional TEXT state column `rate_limit_reset_at` to a BLOB —
-    the fold carries the winner's value and the adoption writes it into
-    the store's TEXT column verbatim."""
+def _optional_text_blob_candidate(bad: Path,
+                                  column: str = "rate_limit_reset_at") -> None:
+    """Set the optional TEXT state column `column` to a BLOB — the fold
+    carries the winner's value and the adoption writes it into the store's
+    TEXT column verbatim."""
     conn = sqlite3.connect(str(bad))
-    conn.execute("UPDATE sync_state SET rate_limit_reset_at = x'00'"
+    conn.execute(f"UPDATE sync_state SET {column} = x'00'"
                  " WHERE repo = ?", (REPO,))
+    conn.commit()
+    conn.close()
+
+
+def _null_revisions_number_candidate(bad: Path) -> None:
+    """Rebuild the candidate's `revisions` table with a NULLable `number`
+    and insert a NULL row. No zaxbygraph build can produce this (the DDL
+    declares NOT NULL), but SQLite's dynamic typing stores whatever a
+    divergent schema allows, and the adoption's per-item read calls int()
+    on it — int(None) raises TypeError, which is not a
+    sqlite3.DatabaseError and would abort the whole command
+    (implementation-review round-5 finding 2: the NULL shape was the one
+    storage class the round-3 guard's conversion could raise on that no
+    frozen check exercised)."""
+    conn = sqlite3.connect(str(bad))
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='revisions'"
+    ).fetchone()[0]
+    conn.execute("ALTER TABLE revisions RENAME TO revisions_old")
+    conn.execute(ddl.replace("number INTEGER NOT NULL", "number INTEGER", 1))
+    keep = [r[1] for r in conn.execute("PRAGMA table_info(revisions_old)")]
+    collist = ", ".join(keep)
+    conn.execute(
+        f"INSERT INTO revisions ({collist}) SELECT {collist} FROM revisions_old")
+    conn.execute("DROP TABLE revisions_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_revisions_item"
+        " ON revisions(repo, number)")
+    conn.execute(
+        "INSERT INTO revisions(repo, number, entity, entity_id, kind, origin,"
+        " content, valid_from, valid_to) VALUES (?, NULL, 'item_body', '5',"
+        " 'body', 'edit', 'text', '2027-06-01T00:00:00Z',"
+        " '2027-06-02T00:00:00Z')", (REPO,))
     conn.commit()
     conn.close()
 
@@ -115,6 +152,54 @@ def _blob_evidence_candidate(bad: Path) -> None:
         " confidence, evidence, source)"
         " VALUES ('ACME/FORGEGATE', 'item', '5', 'closes', 'item', '1',"
         " 'EXTRACTED', x'00', 'keyword')")
+    conn.commit()
+    conn.close()
+
+
+def _legacy_blob_evidence_candidate(bad: Path) -> None:
+    """Stamp the candidate at schema v5 — `source` inside the edges unique
+    key — with case-split `closes` rows sharing ONE source, the upper
+    casing's `evidence` a BLOB. The migration-time fold's same-source union
+    reads BOTH rows' evidence (merge_evidence), and it runs inside
+    init_schema, which the post-migration preflight can never precede: the
+    fold aborts first (probe-verified at the base code: an uncaught
+    TypeError escapes every handler and aborts the whole command). This is
+    the only legacy shape the pre-migration raw storage-class check is
+    REQUIRED for — the pre-v5 shapes complete the fold and are refused by
+    the post-migration preflight, where the raw check is
+    defense-in-depth."""
+    conn = sqlite3.connect(str(bad))
+    conn.execute("DROP TABLE edges")
+    conn.execute(
+        "CREATE TABLE edges ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " repo TEXT NOT NULL, src_type TEXT NOT NULL, src_id TEXT NOT NULL,"
+        " rel TEXT NOT NULL, dst_type TEXT NOT NULL, dst_id TEXT NOT NULL,"
+        " confidence TEXT NOT NULL, evidence TEXT, source TEXT NOT NULL,"
+        " UNIQUE (repo, src_type, src_id, rel, dst_type, dst_id, source))")
+    for name, cols in (("idx_edges_src", "repo, src_type, src_id"),
+                       ("idx_edges_dst", "repo, dst_type, dst_id"),
+                       ("idx_edges_rel", "repo, rel")):
+        conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON edges({cols})")
+    conn.execute(
+        "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+        " last_incr_sync_at, last_error, full_sync_pending, item_count,"
+        " comment_count, edge_count, include_patches)"
+        " SELECT 'ACME/FORGEGATE', issues_since, last_full_sync_at,"
+        " last_incr_sync_at, last_error, full_sync_pending, item_count,"
+        " comment_count, edge_count, include_patches"
+        " FROM sync_state WHERE repo = ?", (REPO,))
+    conn.execute(
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES (?, 'item', '5', 'closes', 'item', '1', 'EXTRACTED',"
+        " 'body #1', 'keyword')", (REPO,))
+    conn.execute(
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES (?, 'item', '5', 'closes', 'item', '1', 'EXTRACTED',"
+        " x'00', 'keyword')", (UPPER,))
+    conn.execute("PRAGMA user_version = 5")
     conn.commit()
     conn.close()
 
@@ -319,6 +404,24 @@ class FabricatedKeyValueTests(_FabricatedValueCase):
                               f" {exc!r}")
                 self._assert_isolated(envelope, good, bad)
 
+        # shape G: the NULL revisions.number — the one storage class the
+        # round-3 per-item guard's int() conversion raises TypeError on
+        # that no frozen check exercised until now (round-5 finding 2).
+        # The preflight refuses it, so the conversion's TypeError is the
+        # second layer rather than the only one.
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c14-null-number", _null_revisions_number_candidate)
+        with self.subTest(shape="null_revisions_number"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, good, bad)
+
 
 class ColumnParityTests(_FabricatedValueCase):
     def test_missing_column_candidate_is_refused(self) -> None:
@@ -376,45 +479,72 @@ class OptionalTextColumnTests(_FabricatedValueCase):
         store's column reads back `blob`), contradicting the storage-class
         contract the docs promise (implementation-review round-4 finding
         2)."""
-        good, bad, store, empty_cwd = self._divergent_pair(
-            "c16", _optional_text_blob_candidate)
-        envelope = None
-        try:
-            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                         extra_scans=[good, bad],
-                                         consolidate_flag=True)
-        except Exception as exc:  # noqa: BLE001 - any escape is a failure
-            self.fail(f"{type(exc).__name__} escaped candidate isolation and"
-                      f" aborted the whole command: {exc!r}")
-        entry = {os.path.normcase(str(row.get("path", ""))): row
-                 for row in envelope.get("scanned") or []}.get(
-                     os.path.normcase(str(bad)))
-        self.assertTrue(
-            entry is not None and entry.get("unreadable"),
-            "a divergent storage class in an optional TEXT column was"
-            f" adopted: {entry}")
-        self._assert_isolated(envelope, good, bad)
+        for column in ("rate_limit_reset_at", "fetch_source"):
+            with self.subTest(column=column):
+                good, bad, store, empty_cwd = self._divergent_pair(
+                    f"c16-{column}",
+                    lambda bad, c=column: _optional_text_blob_candidate(bad, c))
+                envelope = None
+                try:
+                    envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                                 extra_scans=[good, bad],
+                                                 consolidate_flag=True)
+                except Exception as exc:  # noqa: BLE001 - any escape is a failure
+                    self.fail(f"{type(exc).__name__} escaped candidate"
+                              f" isolation and aborted the whole command:"
+                              f" {exc!r}")
+                entry = {os.path.normcase(str(row.get("path", ""))): row
+                         for row in envelope.get("scanned") or []}.get(
+                             os.path.normcase(str(bad)))
+                self.assertTrue(
+                    entry is not None and entry.get("unreadable"),
+                    "a divergent storage class in an optional TEXT column"
+                    f" was adopted: {entry}")
+                self._assert_isolated(envelope, good, bad)
 
 
 class EvidenceStorageClassTests(_FabricatedValueCase):
     def test_blob_evidence_is_refused(self) -> None:
-        """AC17: when a case-split candidate's `edges.evidence` holds a
-        divergent storage class, the candidate is refused as unreadable
-        instead of aborting the whole command. RED at base, GREEN after
-        the fix: at base the fold's closes-group merge reads the evidence
-        as text and raises an uncaught TypeError inside merge_evidence
-        (probe-verified; implementation-review round-4 finding 3)."""
+        """AC17: when a candidate's `edges.evidence` holds a divergent
+        storage class, the candidate is refused as unreadable instead of
+        aborting the whole command. RED at base, GREEN after the fix.
+
+        Shape 1 (a current-version candidate): at base the fold's
+        closes-group merge reads the evidence as text and raises an
+        uncaught TypeError inside merge_evidence (probe-verified;
+        implementation-review round-4 finding 3).
+
+        Shape 2 (a v5 candidate — `source` inside the edges unique key):
+        at base the MIGRATION-time fold's same-source union reads both
+        casings' evidence and aborts the same way, before any preflight
+        can run (probe-verified). This is the shape the pre-migration raw
+        storage-class check is required for: the post-migration preflight
+        never gets a turn, because the fold aborts first."""
         good, bad, store, empty_cwd = self._divergent_pair(
             "c17", _blob_evidence_candidate)
-        envelope = None
-        try:
-            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                         extra_scans=[good, bad],
-                                         consolidate_flag=True)
-        except TypeError as exc:
-            self.fail(f"TypeError escaped candidate isolation and aborted"
-                      f" the whole command: {exc!r}")
-        self._assert_isolated(envelope, good, bad)
+        with self.subTest(shape="blob_evidence"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, good, bad)
+
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c17-legacy", _legacy_blob_evidence_candidate)
+        with self.subTest(shape="blob_evidence_legacy_migration"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, good, bad)
 
 
 class NewerCandidateTests(_FabricatedValueCase):
