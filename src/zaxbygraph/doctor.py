@@ -787,8 +787,13 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # per-item scoping below (issue #40)
+                    # A version-0 stamp means "before the v1 schema", which
+                    # the migration chain treats as v1 (its first target is
+                    # 2); clamp so a v1-shaped store stamped 0 is not read as
+                    # predating every table.
+                    stamped = max(copy.version, 1)
                     if (table not in copy.raw_tables and copy.migrated) or (
-                            copy.version
+                            stamped
                             < _TABLE_INTRODUCED_VERSION.get(table, 1)):
                         # Either the candidate's schema never carried the
                         # table (the migration recreated it), or its version
