@@ -140,7 +140,7 @@ def _blob_evidence_candidate(bad: Path) -> None:
               " comment_count, edge_count")
     conn.execute(
         f"INSERT INTO sync_state(repo, {shared})"
-        f" SELECT 'ACME/FORGEGATE', {shared} FROM sync_state"
+        f" SELECT '{UPPER}', {shared} FROM sync_state"
         " WHERE repo = ?", (REPO,))
     conn.execute(
         "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
@@ -150,24 +150,23 @@ def _blob_evidence_candidate(bad: Path) -> None:
     conn.execute(
         "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
         " confidence, evidence, source)"
-        " VALUES ('ACME/FORGEGATE', 'item', '5', 'closes', 'item', '1',"
+        f" VALUES ('{UPPER}', 'item', '5', 'closes', 'item', '1',"
         " 'EXTRACTED', x'00', 'keyword')")
     conn.commit()
     conn.close()
 
 
 def _legacy_blob_evidence_candidate(bad: Path) -> None:
-    """Stamp the candidate at schema v5 — `source` inside the edges unique
-    key — with case-split `closes` rows sharing ONE source, the upper
-    casing's `evidence` a BLOB. The migration-time fold's same-source union
-    reads BOTH rows' evidence (merge_evidence), and it runs inside
-    init_schema, which the post-migration preflight can never precede: the
-    fold aborts first (probe-verified at the base code: an uncaught
-    TypeError escapes every handler and aborts the whole command). This is
-    the only legacy shape the pre-migration raw storage-class check is
-    REQUIRED for — the pre-v5 shapes complete the fold and are refused by
-    the post-migration preflight, where the raw check is
-    defense-in-depth."""
+    """Stamp the candidate at schema v5 and give it two `closes` edge rows
+    for the SAME pair under the two GitHub-reported streams — issue #19's
+    shape, which production ingest really produces — with the timeline
+    row's `evidence` a BLOB. The v5->v6 migration's closes-pair collapse
+    merges the two rows' evidence INSIDE init_schema, so no preflight can
+    precede it: at base the merge raises an uncaught TypeError that every
+    handler misses and the whole command aborts (probe-verified). This is
+    the shape the pre-migration raw storage-class check exists for — the
+    post-migration preflight never gets a turn, because the migration
+    aborts first."""
     conn = sqlite3.connect(str(bad))
     conn.execute("DROP TABLE edges")
     conn.execute(
@@ -182,23 +181,15 @@ def _legacy_blob_evidence_candidate(bad: Path) -> None:
                        ("idx_edges_rel", "repo, rel")):
         conn.execute(f"CREATE INDEX IF NOT EXISTS {name} ON edges({cols})")
     conn.execute(
-        "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
-        " last_incr_sync_at, last_error, full_sync_pending, item_count,"
-        " comment_count, edge_count, include_patches)"
-        " SELECT 'ACME/FORGEGATE', issues_since, last_full_sync_at,"
-        " last_incr_sync_at, last_error, full_sync_pending, item_count,"
-        " comment_count, edge_count, include_patches"
-        " FROM sync_state WHERE repo = ?", (REPO,))
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES (?, 'item', '5', 'closes', 'item', '1', 'EXTRACTED',"
+        " 'body #1', 'closing_ref')", (REPO,))
     conn.execute(
         "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
         " confidence, evidence, source)"
         " VALUES (?, 'item', '5', 'closes', 'item', '1', 'EXTRACTED',"
-        " 'body #1', 'keyword')", (REPO,))
-    conn.execute(
-        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
-        " confidence, evidence, source)"
-        " VALUES (?, 'item', '5', 'closes', 'item', '1', 'EXTRACTED',"
-        " x'00', 'keyword')", (UPPER,))
+        " x'00', 'timeline')", (REPO,))
     conn.execute("PRAGMA user_version = 5")
     conn.commit()
     conn.close()
@@ -515,11 +506,11 @@ class EvidenceStorageClassTests(_FabricatedValueCase):
         implementation-review round-4 finding 3).
 
         Shape 2 (a v5 candidate — `source` inside the edges unique key):
-        at base the MIGRATION-time fold's same-source union reads both
-        casings' evidence and aborts the same way, before any preflight
+        at base the MIGRATION's v5->v6 closes-pair collapse merges the two
+        streams' evidence and aborts the same way, before any preflight
         can run (probe-verified). This is the shape the pre-migration raw
-        storage-class check is required for: the post-migration preflight
-        never gets a turn, because the fold aborts first."""
+        storage-class check exists for: the post-migration preflight never
+        gets a turn, because the migration aborts first."""
         good, bad, store, empty_cwd = self._divergent_pair(
             "c17", _blob_evidence_candidate)
         with self.subTest(shape="blob_evidence"):
