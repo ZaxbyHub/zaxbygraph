@@ -394,7 +394,10 @@ class TextStorageClassContractTests(unittest.TestCase):
         way (final critic finding 1: the whole `doctor` run died, healthy
         sibling included, while the current-version twin was refused
         cleanly). Current-version shape: at base the BLOB is copied
-        verbatim into the store's TEXT column and read back as `blob`."""
+        verbatim into the store's TEXT column and read back as `blob`.
+        Wrong-typed-payload shape: at base a `{"title": 5}` raw_json aborts
+        the migration the same way; after the fix the field is coerced and
+        the candidate is adopted with no references extracted."""
         for table, column in (("comments", "body"), ("reviews", "body"),
                               ("items", "head_ref"), ("pr_files", "path")):
             with self.subTest(shape="legacy", table=table, column=column):
@@ -437,34 +440,33 @@ class TextStorageClassContractTests(unittest.TestCase):
                     "a divergent storage class in a TEXT column was"
                     f" adopted: {stored}")
 
-    def test_wrong_typed_payload_field_is_refused_not_aborted(self) -> None:
-        """RED at base, GREEN after the fix: at base a legacy candidate
-        whose `raw_json` carries a wrong-typed field (`{"title": 5}`) aborts
-        the whole migration with an uncaught TypeError, because the v8→v9
-        backfill feeds it to str-only regexes — one candidate killing the
-        entire doctor run. The field is coerced to text, so a malformed
-        payload degrades to "no references extracted" and the candidate is
-        adopted normally (final critic, round-7 question; the recorded #53
-        deferral's abort half)."""
-        good, bad, store, cwd = self._pair(
-            "c20-wrong-typed-raw-json", _wrong_typed_raw_json_candidate)
-        try:
-            envelope = doctor_mod.doctor(cwd, REPO, store,
-                                         extra_scans=[good, bad],
-                                         consolidate_flag=True)
-        except TypeError as exc:
-            self.fail(f"TypeError escaped candidate isolation and aborted"
-                      f" the whole command: {exc!r}")
-        self.assertTrue(envelope.get("ok"), envelope)
-        entry = {os.path.normcase(str(r.get("path", ""))): r
-                 for r in envelope.get("scanned") or []}.get(
-                     os.path.normcase(str(bad)))
-        self.assertIsNotNone(entry, "the malformed-payload candidate vanished"
-                                   " from the report")
-        self.assertTrue(
-            entry.get("adopted"),
-            f"a malformed payload should degrade to 'no references"
-            f" extracted', not to an unreadable candidate: {entry}")
+        # A wrong-typed payload FIELD is the same "one candidate kills the
+        # whole run" outcome one coercion away: `{"title": 5}` fed the
+        # v8→v9 backfill's str-only regexes and aborted the migration. The
+        # field is coerced to text, so a malformed payload degrades to "no
+        # references extracted" and the candidate is adopted normally
+        # (final critic, round-7 question; the recorded #53 deferral's
+        # abort half).
+        with self.subTest(shape="wrong_typed_raw_json"):
+            good, bad, store, cwd = self._pair(
+                "c20-wrong-typed-raw-json", _wrong_typed_raw_json_candidate)
+            try:
+                envelope = doctor_mod.doctor(cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self.assertTrue(envelope.get("ok"), envelope)
+            entry = {os.path.normcase(str(r.get("path", ""))): r
+                     for r in envelope.get("scanned") or []}.get(
+                         os.path.normcase(str(bad)))
+            self.assertIsNotNone(entry, "the malformed-payload candidate"
+                                       " vanished from the report")
+            self.assertTrue(
+                entry.get("adopted"),
+                f"a malformed payload should degrade to 'no references"
+                f" extracted', not to an unreadable candidate: {entry}")
 
 
 if __name__ == "__main__":
