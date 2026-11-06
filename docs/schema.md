@@ -387,7 +387,14 @@ Write rules:
   table is a schema artifact, not an observation — deleting unobserved
   history would destroy evidence that cannot be re-derived). "Covered"
   means the candidate holds revision ROWS for the number, whether or not
-  it carries the item itself. Two recorded consequences of that scoping:
+  it carries the item itself. The same preservation rule covers every OTHER
+  repo-keyed table the adopted candidate's version never had (issue #56): a
+  pre-v10 candidate's `item_events`, `pr_commits` and `issue_field_values`
+  are recreated EMPTY by the migration, so replace-the-slug would delete
+  the store's rows and copy zero back — a truncated image. The adoption
+  records the candidate's own table set before migrating and preserves the
+  store's rows for any table outside it, naming them in the report's
+  `tables_preserved`. Two recorded consequences of that scoping:
   within-item depth loss (a shallower candidate for a covered number still
   replaces its deeper history, because the candidate's rows are a real
   observation), and preserved rows can outlive their item rows when the
@@ -553,11 +560,19 @@ one structural preflight (issue #56): every copied table exists (including
 columns hold only integers (NULL, TEXT and other storage classes are
 fabricated states), and the TEXT columns hold only text or NULL (a
 divergent storage class would raise an uncaught TypeError at the fold's
-aggregation or at the scan's winner ranking). A candidate failing the
-preflight is refused as an unreadable candidate — recorded on its scan
-entry with the reason, the scan continues, the store is untouched — so a
-divergent schema can never be adopted as a truncated image and can never
-abort the command with an uncaught `IndexError`/`OperationalError`/
+aggregation or at the scan's winner ranking). The storage-class rule is
+schema-wide: every column the current schema declares TEXT, in every table
+the adoption reads, must hold text or NULL — SQLite's dynamic typing stores
+anything a divergent schema allows, and the adoption copies the value
+verbatim, so a BLOB `comments.body` would be adopted as a fabricated value.
+The migration's own Python reads (`comments.body`, `reviews.body`,
+`items.head_ref` in the v8→v9 text backfill) are checked on the RAW
+candidate before `init_schema` runs, because that migration aborts with an
+uncaught `TypeError` before any post-migration preflight can. A candidate
+failing the preflight is refused as an unreadable candidate — recorded on
+its scan entry with the reason, the scan continues, the store is untouched
+— so a divergent schema can never be adopted as a truncated image and can
+never abort the command with an uncaught `IndexError`/`OperationalError`/
 `TypeError`. The same fail-closed rule guards the migration-time fold for
 case-split groups: a fabricated flag value or a divergent storage class in
 a case-split `sync_state` refuses the store instead of advancing it, and
