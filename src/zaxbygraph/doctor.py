@@ -33,6 +33,7 @@ from zaxbygraph.db import (
     _quote_ident,
     _table_exists,
     connect,
+    current_table_columns,
     fold_repo_casings,
     init_schema,
     open_existing,
@@ -362,6 +363,22 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
     if not _table_exists(conn, "actors"):
         raise _UnreadableCandidate(
             path, "the candidate's schema lacks the actors table")
+    # Column parity for every copied table (issue #56): the copy loops read
+    # the candidate's columns into the store's, so a candidate lacking a
+    # current column would be adopted with the store's defaults for it — a
+    # truncated image (a candidate whose comments table lacked
+    # author_association was probe-verified to be adopted with NULLs). A
+    # candidate carrying EXTRA columns fails the copy's INSERT and is
+    # already converted to a refusal.
+    expected = current_table_columns()
+    for table in [t for t, _pk in _COPY_TABLES] + ["actors"]:
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        missing = expected.get(table, set()) - have
+        if missing:
+            raise _UnreadableCandidate(
+                path,
+                f"the candidate's {table} table lacks the"
+                f" {', '.join(sorted(missing))} column(s)")
     actor_cols = {row[1] for row in conn.execute("PRAGMA table_info(actors)")}
     for column in _REQUIRED_ACTOR_COLUMNS:
         if column not in actor_cols:
@@ -373,6 +390,19 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
         if column not in state_cols:
             raise _UnreadableCandidate(
                 path, f"the candidate's sync_state lacks the {column} column")
+    # repo is the fold's grouping key: a NULL or non-text value (SQLite
+    # permits NULL in a TEXT PRIMARY KEY on a rowid table) would raise an
+    # uncaught AttributeError at .lower() on the consolidation path AND
+    # through the migration fold (issue #56; implementation-review
+    # round-3 finding 2).
+    bad_repo = conn.execute(
+        "SELECT COUNT(*) FROM sync_state WHERE typeof(repo) <> 'text'"
+    ).fetchone()[0]
+    if bad_repo:
+        raise _UnreadableCandidate(
+            path,
+            f"the candidate's sync_state.repo is NULL or non-text in"
+            f" {bad_repo} row(s): a divergent key value is refused")
     for column in _REQUIRED_SYNC_STATE_FLAGS:
         # The DDL declares these INTEGER NOT NULL DEFAULT 0, so anything
         # else — NULL, TEXT, REAL, BLOB — is a fabricated state: a NULL or
@@ -605,14 +635,28 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int]:
                     "valid_from", "valid_to",
                 )
                 covered_rows: dict[int, list] = {}
-                for row in src.execute(
-                    "SELECT number, " + ", ".join(rev_payload_cols)
-                    + " FROM revisions WHERE repo = ? ORDER BY number, id",
-                    (repo_l,),
-                ):
-                    covered_rows.setdefault(int(row[0]), []).append(
-                        tuple(row[1:])
-                    )
+                try:
+                    for row in src.execute(
+                        "SELECT number, " + ", ".join(rev_payload_cols)
+                        + " FROM revisions WHERE repo = ? ORDER BY number, id",
+                        (repo_l,),
+                    ):
+                        covered_rows.setdefault(int(row[0]), []).append(
+                            tuple(row[1:])
+                        )
+                except (ValueError, TypeError) as exc:
+                    # A TEXT (or NULL) revisions.number is a fabricated
+                    # value the per-item read cannot take (SQLite's dynamic
+                    # typing stores it despite the INTEGER declaration), and
+                    # int() raises ValueError/TypeError — neither is a
+                    # sqlite3.DatabaseError, so it would abort the whole
+                    # command (issue #56; implementation-review round-3
+                    # finding 3). Isolate the candidate instead.
+                    raise _UnreadableCandidate(
+                        path,
+                        f"the candidate's revisions.number is not an integer:"
+                        f" {exc!r}"
+                    ) from exc
                 store_revs_before = dst.execute(
                     "SELECT COUNT(*) FROM revisions WHERE repo = ?", (repo_l,)
                 ).fetchone()[0]

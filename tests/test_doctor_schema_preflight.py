@@ -370,52 +370,95 @@ def _affinity_divergent_candidate(bad: Path) -> None:
 class AffinityDivergenceTests(_SchemaPreflightCase):
     def test_divergent_storage_class_isolates_candidate(self) -> None:
         """AC13: when a candidate's `sync_state` TEXT column holds a
-        divergent storage class — a BLOB timestamp in one casing, or an
-        INTEGER watermark in a column that lost its TEXT affinity — the
-        system does NOT abort the scan: the candidate the adoption reaches
-        is refused as unreadable, and the remaining candidates are still
-        scanned. RED at base, GREEN after the fix: at base the multi-cased
-        BLOB raises an uncaught TypeError inside the fold's max(), and the
-        INTEGER watermark raises an uncaught TypeError at the scan's winner
-        ranking — before consolidate is even called (implementation-review
-        round-2 finding 1)."""
+        divergent storage class — a BLOB timestamp in one casing, an
+        INTEGER watermark in a column that lost its TEXT affinity, or a
+        BLOB timestamp on a SINGLE-cased winner — the system does NOT
+        abort the scan and does NOT adopt the fabricated value: the
+        candidate the adoption reaches is refused as unreadable, and the
+        remaining candidates are still scanned. RED at base, GREEN after
+        the fix: at base the multi-cased BLOB raises an uncaught TypeError
+        inside the fold's max(), the INTEGER watermark raises an uncaught
+        TypeError at the scan's winner ranking — before consolidate is
+        even called — and the single-cased BLOB winner skips the fold's
+        fast path and is silently ADOPTED with the BLOB written into the
+        store's TEXT column (implementation-review round-2 finding 1 and
+        round-3 finding 1: the preflight's TEXT-column loop is the only
+        layer that reaches that shape, so it needs its own leg)."""
         # shape A: the BLOB timestamp reaches the fold's aggregation
         good, bad, store, empty_cwd = self._divergent_pair(
             "c13-blob", _blob_timestamp_candidate)
-        envelope = None
-        try:
-            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                         extra_scans=[good, bad],
-                                         consolidate_flag=True)
-        except TypeError as exc:
-            self.fail(f"TypeError escaped candidate isolation and aborted"
-                      f" the whole command: {exc!r}")
-        self._assert_isolated(envelope, good, bad)
+        with self.subTest(shape="multi_cased_blob_timestamp"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, good, bad)
 
         # shape B: the INTEGER watermark reaches the winner ranking first;
         # the divergent candidate is reported and simply not adopted, and
         # the healthy sibling is still the winner
         good, bad, store, empty_cwd = self._divergent_pair(
             "c13-affinity", _affinity_divergent_candidate)
-        envelope = None
-        try:
-            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
-                                         extra_scans=[good, bad],
-                                         consolidate_flag=True)
-        except TypeError as exc:
-            self.fail(f"TypeError escaped candidate isolation and aborted"
-                      f" the whole command: {exc!r}")
-        rows = {os.path.normcase(str(row.get("path", ""))): row
-                for row in envelope.get("scanned") or []}
-        self.assertIn(os.path.normcase(str(bad)), rows,
-                      "the divergent candidate vanished from the report")
-        self.assertIn(os.path.normcase(str(good)), rows,
-                      "the remaining candidates were not scanned")
-        self.assertTrue(envelope.get("ok"), envelope)
-        self.assertEqual(
-            os.path.normcase(str(envelope.get("adopted") or "")),
-            os.path.normcase(str(good)),
-            "the healthy sibling was not adopted")
+        with self.subTest(shape="integer_watermark_non_winner"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[good, bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            rows = {os.path.normcase(str(row.get("path", ""))): row
+                    for row in envelope.get("scanned") or []}
+            self.assertIn(os.path.normcase(str(bad)), rows,
+                          "the divergent candidate vanished from the report")
+            self.assertIn(os.path.normcase(str(good)), rows,
+                          "the remaining candidates were not scanned")
+            self.assertTrue(envelope.get("ok"), envelope)
+            self.assertEqual(
+                os.path.normcase(str(envelope.get("adopted") or "")),
+                os.path.normcase(str(good)),
+                "the healthy sibling was not adopted")
+
+        # shape C: the single-cased BLOB winner — the fold's fast path
+        # skips it and the ranking never compares it, so only the
+        # preflight's TEXT-column loop can refuse it
+        bad = _prep(self.scratch / "c13-single-blob" / "history.db")
+        _seed_store(bad, (7, 8), "2027-04-01T00:00:00Z")
+        conn = sqlite3.connect(str(bad))
+        conn.execute("UPDATE sync_state SET last_full_sync_at = x'00'"
+                     " WHERE repo = ?", (REPO,))
+        conn.commit()
+        conn.close()
+        store = _prep(self.scratch / "c13-single-blob-store" / "history.db")
+        empty_cwd = _prep(self.scratch / "c13-single-blob" / "cwd")
+        with self.subTest(shape="single_cased_blob_winner"):
+            envelope = None
+            try:
+                envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                             extra_scans=[bad],
+                                             consolidate_flag=True)
+            except TypeError as exc:
+                self.fail(f"TypeError escaped candidate isolation and"
+                          f" aborted the whole command: {exc!r}")
+            self._assert_isolated(envelope, bad, bad)
+            # the fabricated BLOB must not have reached the store either
+            if store.exists():
+                conn = sqlite3.connect(str(store))
+                try:
+                    stored = conn.execute(
+                        "SELECT typeof(last_full_sync_at) FROM sync_state"
+                        " WHERE repo = ?", (REPO,)).fetchall()
+                finally:
+                    conn.close()
+                self.assertEqual(
+                    [tuple(r) for r in stored], [],
+                    "a divergent storage class reached the store as a"
+                    f" truncated image: {stored}")
 
 
 class DivergentLegacyFoldTests(_SchemaPreflightCase):
@@ -436,8 +479,10 @@ class DivergentLegacyFoldTests(_SchemaPreflightCase):
         divergent-legacy shapes need their own check."""
         null_db = _prep(self.scratch / "c12-null" / "history.db")
         _divergent_v1_null_flag(null_db)
-        _assert_legacy_fold_fails_closed(null_db, "null flag")
+        with self.subTest(shape="null_flag"):
+            _assert_legacy_fold_fails_closed(null_db, "null flag")
 
         blob_db = _prep(self.scratch / "c12-blob" / "history.db")
         _divergent_v1_blob_timestamp(blob_db)
-        _assert_legacy_fold_fails_closed(blob_db, "blob timestamp")
+        with self.subTest(shape="blob_timestamp"):
+            _assert_legacy_fold_fails_closed(blob_db, "blob timestamp")

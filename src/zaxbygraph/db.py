@@ -387,6 +387,30 @@ def _row_get(row: sqlite3.Row, column: str, default: object) -> object:
     return row[column] if column in row.keys() else default
 
 
+def current_table_columns() -> dict[str, set[str]]:
+    """Every table's column set in the CURRENT schema (issue #56).
+
+    Built from an in-memory database created by the schema DDL, so it is
+    the exact shape `init_schema` gives the store at adoption time. The
+    adoption's copy loops read the candidate's columns into the store's,
+    so a candidate that lacks a current column would be adopted with the
+    store's defaults for it — a truncated image. Callers compare the
+    candidate's `PRAGMA table_info` against this and refuse the gap.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_schema_sql())
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        return {
+            table: {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
 def _text_value(row: sqlite3.Row, column: str) -> str | None:
     """A TEXT column's value, refusing any other storage class (issue #56).
 
@@ -436,7 +460,19 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     rows = conn.execute("SELECT rowid AS rid, * FROM sync_state ORDER BY rowid").fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
-        groups.setdefault(row["repo"].lower(), []).append(row)
+        # A NULL or non-text repo (SQLite permits NULL in a TEXT PRIMARY KEY
+        # on a rowid table) would raise an uncaught AttributeError at
+        # .lower() — the same isolation escape as a missing column, one
+        # type up (issue #56; implementation-review round-3 finding 2).
+        # Fail closed so the caller's sqlite3.DatabaseError handler
+        # converts it to an unreadable candidate.
+        repo_key = _text_value(row, "repo")
+        if repo_key is None:
+            raise sqlite3.DatabaseError(
+                "sync_state.repo is NULL or non-text: a divergent key value"
+                " is refused"
+            )
+        groups.setdefault(repo_key.lower(), []).append(row)
     columns = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
     for lower_repo, group in groups.items():
         if len(group) == 1 and group[0]["repo"] == lower_repo:
@@ -486,8 +522,8 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         # state, and dropping it would let a corpus that stopped early
         # report complete.
         last_error = next(
-            (_row_get(r, "last_error", None) for r in (winner, *group)
-             if _row_get(r, "last_error", None) is not None),
+            (_text_value(r, "last_error") for r in (winner, *group)
+             if _text_value(r, "last_error") is not None),
             None,
         )
         for row in group:

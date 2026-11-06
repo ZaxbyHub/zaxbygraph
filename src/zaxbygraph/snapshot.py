@@ -887,7 +887,8 @@ def _install(staged: Path, db_path: Path) -> None:
     # reported as a failed replace. The post-install check that follows is
     # the verdict on what the destination now serves.
     try:
-        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
+        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"),
+                        Path(str(db_path) + "-journal")):
             if sidecar.exists():
                 sidecar.unlink()
     except OSError:
