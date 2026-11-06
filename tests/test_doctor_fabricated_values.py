@@ -1,8 +1,10 @@
-"""Issue #56 frozen acceptance checks C14-C15: fabricated values the
+"""Issue #56 frozen acceptance checks C14-C18: fabricated values the
 adoption reads — a NULL or non-text `sync_state.repo`, a non-integer
-`revisions.number`, and a copied table that lacks a current column.
-Authored independently of any fix as a frozen spec: every test is RED at
-base 80ea01c6ae202ea03373cc26ad9ff8cc561fe39a for the reason its docstring
+`revisions.number`, a copied table that lacks a current column, a
+divergent storage class in an optional TEXT state column or in
+`edges.evidence`, and a candidate newer than this build. Authored
+independently of any fix as a frozen spec: every test is RED at base
+80ea01c6ae202ea03373cc26ad9ff8cc561fe39a for the reason its docstring
 names, and GREEN after the fix. All fault injection is in-process;
 fixtures are local SQLite/temp-dir builds — no network, no gh, no
 credentials.
