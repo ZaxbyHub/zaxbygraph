@@ -351,6 +351,24 @@ class _FabricatedValueCase(unittest.TestCase):
         self.assertTrue(envelope.get("ok"), envelope)
         self.assertIsNone(envelope.get("adopted"), envelope)
 
+    def _assert_refused_by_storage_class(self, envelope, bad: Path,
+                                         column: str) -> None:
+        """The refusal must come from the preflight's derived storage-class
+        rule, which is the layer that runs BEFORE any store write. A
+        candidate whose reason names a later layer (the per-item revisions
+        write's `cannot be written into the store`, the fold's `defeated
+        the fold`) was refused by a backstop, not by the rule the comment
+        claims — the round-11 false claim the final critic caught (F1).
+        """
+        rows = {os.path.normcase(str(row.get("path", ""))): row
+                for row in envelope.get("scanned") or []}
+        entry = rows[os.path.normcase(str(bad))]
+        reason = entry.get("unreadable_reason") or ""
+        self.assertIn("divergent storage class", reason,
+                      f"{column} was not refused by the preflight's derived"
+                      f" storage-class rule: {reason}")
+        self.assertIn(column, reason, reason)
+
 
 class FabricatedKeyValueTests(_FabricatedValueCase):
     def test_fabricated_sync_state_values_isolate_candidate(self) -> None:
@@ -482,6 +500,18 @@ class FabricatedKeyValueTests(_FabricatedValueCase):
                 self.fail(f"IntegrityError escaped candidate isolation and"
                           f" aborted the whole command: {exc!r}")
             self._assert_isolated(envelope, good, bad)
+            # Which LAYER refused is part of the contract, not a detail:
+            # the derived rule must refuse a NULL in a NOT NULL TEXT column
+            # at the preflight, before any store write. The final critic's
+            # round-1 finding F1 verified that at c67ca97 the TEXT branch
+            # hardcoded `("text", "null")` for every column except
+            # `sync_state.repo`, so the preflight ADMITTED the NULL and the
+            # executemany conversion was the only layer — the round-11
+            # comment asserted a defense that did not exist, and the
+            # layer-1 mutation was behaviorally inert. Assert the reason
+            # names the storage class, so the preflight layer must bite.
+            self._assert_refused_by_storage_class(envelope, bad,
+                                                  "revisions.valid_from")
 
 
 class ColumnParityTests(_FabricatedValueCase):

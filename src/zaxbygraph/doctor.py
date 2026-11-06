@@ -438,12 +438,13 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
             continue
         for column, (declared, not_null) in sorted(rules[table].items()):
             if declared == "TEXT":
-                # `sync_state.repo` is a TEXT PRIMARY KEY, which SQLite
-                # permits to be NULL on a rowid table; the fold's grouping
-                # needs a real key, so NULL is refused there and only
-                # there.
-                allowed = ("text",) if (table, column) == \
-                    ("sync_state", "repo") else ("text", "null")
+                # A NOT NULL TEXT column refuses NULL; a nullable one
+                # admits it. `sync_state.repo` is a TEXT PRIMARY KEY, which
+                # SQLite permits to be NULL on a rowid table, so it needs
+                # the same refusal although its own DDL omits NOT NULL.
+                allowed = ("text",) if (not_null or (table, column) ==
+                                        ("sync_state", "repo")) \
+                    else ("text", "null")
             elif declared == "INTEGER":
                 allowed = ("integer",) if not_null else ("integer", "null")
             else:
@@ -478,6 +479,12 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
     # special-cased to require text there, and the two flag columns are
     # INTEGER NOT NULL. Keeping them would leave three unreachable
     # enumerations of one column family to drift apart.
+    # A candidate whose `sync_state.repo` is NULL can still slip past this
+    # loop when it LOSES the ranking — the scope is `lower(repo) = ?`, so
+    # a NULL-repo row is invisible to it. The backstop for that shape is
+    # the fold's own `_text_value` fail-closed (db.py), which the winner's
+    # consolidation runs through; the old whole-table guard is NOT what
+    # covers it. Disclosed by the final critic's round-1 finding F2.
     # `actors.login` is the global table's key: a TEXT PRIMARY KEY on a
     # rowid table permits NULL in SQLite, and the adoption's upsert never
     # matches one, so every re-adoption of such a candidate would append

@@ -394,7 +394,13 @@ Write rules:
   the store's rows and copy zero back — a truncated image. The adoption
   records the candidate's own table set before migrating and preserves the
   store's rows for any table outside it, naming them in the report's
-  `tables_preserved`. Two recorded consequences of that scoping:
+  `tables_preserved`. "Outside its own table set" is a schema fact, not an
+  emptiness one: a BACKFILLED table is IN the candidate's post-migration
+  table set even though the candidate's version never had it, so its
+  backfilled rows are the candidate's own observation and they REPLACE the
+  store's (a genuine v1 candidate's six `item_path_refs` rows land in the
+  store). Only a table the migration recreates EMPTY is preserved. Two
+  recorded consequences of that scoping:
   within-item depth loss (a shallower candidate for a covered number still
   replaces its deeper history, because the candidate's rows are a real
   observation), and preserved rows can outlive their item rows when the

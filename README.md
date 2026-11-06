@@ -117,9 +117,11 @@ candidate never aborts the scan (the other candidates are still reported
 and the best one can still be adopted). The candidate the adoption reaches
 (the freshest complete one, and only under `--consolidate`) additionally has
 its schema validated before any store write — a missing table or column, a
-fabricated `sync_state` flag value, or a divergent storage class in a TEXT
-column, refuses that candidate with the reason carried instead of adopting
-it as a truncated image or aborting the command. Every candidate is inspected
+fabricated `sync_state` flag value, or a divergent storage class in any
+column (a TEXT or INTEGER value in the wrong column, or a NULL in a NOT
+NULL one), refuses that candidate with the reason carried instead of
+adopting it as a truncated image or aborting the command. Every candidate is
+inspected
 (its `sync_state` is read to rank it), but only the adoption winner gets that
 schema validation; a divergent candidate that is not the winner is not
 schema-probed — it is simply not adopted. If the winner itself is refused,
