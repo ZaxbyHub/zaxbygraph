@@ -166,10 +166,34 @@ def _blob_column_candidate(bad: Path, table: str, column: str,
     """Set one row's `table.column` to a BLOB, optionally stamping the
     candidate at v1 so the migration chain reads it before any preflight."""
     conn = sqlite3.connect(str(bad))
-    conn.execute(
-        f"UPDATE {table} SET {column} = x'00' WHERE repo = ?", (REPO,))
+    if table == "pr_files":
+        # The v6->v7 rebuild reads pr_files.path only for PR items, so the
+        # fixture needs a PR whose file row carries the BLOB.
+        conn.execute(
+            "INSERT INTO pr_files(repo, number, path, status, additions,"
+            " deletions, changes, sha) VALUES (?, ?, x'00', 'modified', 1,"
+            " 1, 2, 'abc')", (REPO, 5))
+        conn.execute(
+            "UPDATE items SET kind = 'pr' WHERE repo = ? AND number = 5",
+            (REPO,))
+    else:
+        conn.execute(
+            f"UPDATE {table} SET {column} = x'00' WHERE repo = ?", (REPO,))
     if legacy:
         conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
+def _wrong_typed_raw_json_candidate(bad: Path) -> None:
+    """Make one item's `raw_json` carry a wrong-typed title (the #53
+    malformed-payload class) and stamp the candidate at v1 so the v8→v9
+    backfill reads it before any preflight."""
+    conn = sqlite3.connect(str(bad))
+    conn.execute(
+        "UPDATE items SET raw_json = ? WHERE repo = ? AND number = 5",
+        ('{"title": 5, "body": ["not", "a", "string"]}', REPO))
+    conn.execute("PRAGMA user_version = 1")
     conn.commit()
     conn.close()
 
@@ -362,13 +386,17 @@ class TextStorageClassContractTests(unittest.TestCase):
 
     def test_blob_text_column_is_refused_not_aborted_or_adopted(self) -> None:
         """RED at base, GREEN after the fix. Legacy shapes: at base the
-        migration's v8->v9 backfill reads the column with a str-only regex
+        migration's v8→v9 backfill reads the column with a str-only regex
         and raises an uncaught TypeError that aborts the whole command
         (probe-verified for comments.body, reviews.body and
-        items.head_ref). Current-version shape: at base the BLOB is copied
+        items.head_ref), and the v6→v7 rebuild joins `pr_files.path` into
+        `items.paths_text` with `" ".join`, so a BLOB there aborts the same
+        way (final critic finding 1: the whole `doctor` run died, healthy
+        sibling included, while the current-version twin was refused
+        cleanly). Current-version shape: at base the BLOB is copied
         verbatim into the store's TEXT column and read back as `blob`."""
         for table, column in (("comments", "body"), ("reviews", "body"),
-                              ("items", "head_ref")):
+                              ("items", "head_ref"), ("pr_files", "path")):
             with self.subTest(shape="legacy", table=table, column=column):
                 good, bad, store, cwd = self._pair(
                     f"c20-legacy-{table}-{column}",
@@ -408,6 +436,35 @@ class TextStorageClassContractTests(unittest.TestCase):
                     [tuple(r) for r in stored], [],
                     "a divergent storage class in a TEXT column was"
                     f" adopted: {stored}")
+
+    def test_wrong_typed_payload_field_is_refused_not_aborted(self) -> None:
+        """RED at base, GREEN after the fix: at base a legacy candidate
+        whose `raw_json` carries a wrong-typed field (`{"title": 5}`) aborts
+        the whole migration with an uncaught TypeError, because the v8→v9
+        backfill feeds it to str-only regexes — one candidate killing the
+        entire doctor run. The field is coerced to text, so a malformed
+        payload degrades to "no references extracted" and the candidate is
+        adopted normally (final critic, round-7 question; the recorded #53
+        deferral's abort half)."""
+        good, bad, store, cwd = self._pair(
+            "c20-wrong-typed-raw-json", _wrong_typed_raw_json_candidate)
+        try:
+            envelope = doctor_mod.doctor(cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except TypeError as exc:
+            self.fail(f"TypeError escaped candidate isolation and aborted"
+                      f" the whole command: {exc!r}")
+        self.assertTrue(envelope.get("ok"), envelope)
+        entry = {os.path.normcase(str(r.get("path", ""))): r
+                 for r in envelope.get("scanned") or []}.get(
+                     os.path.normcase(str(bad)))
+        self.assertIsNotNone(entry, "the malformed-payload candidate vanished"
+                                   " from the report")
+        self.assertTrue(
+            entry.get("adopted"),
+            f"a malformed payload should degrade to 'no references"
+            f" extracted', not to an unreadable candidate: {entry}")
 
 
 if __name__ == "__main__":

@@ -1523,8 +1523,20 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
             continue
         if not isinstance(raw, dict):
             continue
+        # A wrong-typed payload field (`{"title": 5}`) is the #53
+        # malformed-data class, but the regexes below take str only, so it
+        # used to raise an uncaught TypeError that aborted the whole
+        # migration — one candidate killing the entire doctor run, the same
+        # observable outcome as a divergent storage class. Coerce to text
+        # (the JSON scalar's rendering) so a malformed payload degrades to
+        # "no references extracted" instead of an abort (final critic,
+        # round-7 question).
         title = raw.get("title") or ""
         body = raw.get("body") or ""
+        if not isinstance(title, str):
+            title = str(title)
+        if not isinstance(body, str):
+            body = str(body)
         for path, backticked in _extract.parse_path_refs(body, repo):
             conn.execute(
                 "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"

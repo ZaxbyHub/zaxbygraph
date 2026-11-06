@@ -366,13 +366,19 @@ _RAW_STORAGE_CLASS_CHECKS = (
     ("edges", "evidence", ("text", "null")),
     # The migration's v8->v9 text backfill reads these three in Python
     # (db.py _backfill_text_refs: parse_path_refs / branch_number_tokens),
-    # so a BLOB there aborts the whole command with an uncaught TypeError
-    # that no sqlite3.DatabaseError handler converts — the round-6
-    # reviewer's finding 2, the same class as edges.evidence one column
-    # family over.
+    # and the v6->v7 rebuild joins `pr_files.path` into `items.paths_text`
+    # (db.py migrate_v6_to_v7), so a BLOB in any of them aborts the whole
+    # command with an uncaught TypeError that no sqlite3.DatabaseError
+    # handler converts — the round-6 reviewer's finding 2, the same class
+    # as edges.evidence one column family over, and the final critic's
+    # finding 1 (a v6 candidate with a BLOB pr_files.path killed the whole
+    # doctor run, healthy sibling included, while its current-version twin
+    # was refused cleanly). `path` is declared NOT NULL, so a NULL is a
+    # fabricated state too.
     ("items", "head_ref", ("text", "null")),
     ("comments", "body", ("text", "null")),
     ("reviews", "body", ("text", "null")),
+    ("pr_files", "path", ("text",)),
 )
 #: TEXT columns the fold and the adoption compare or carry (issue #56):
 #: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
