@@ -36,9 +36,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from fixtures import REPO, issue, pull, review  # noqa: E402
+from test_migrations import V1_SCHEMA_SQL  # noqa: E402
 
 import zaxbygraph.doctor as doctor_mod  # noqa: E402
-from zaxbygraph.db import connect, init_schema  # noqa: E402
+from zaxbygraph import db as _db  # noqa: E402
+from zaxbygraph.db import (  # noqa: E402
+    connect,
+    init_schema,
+)
+
+#: `_TABLE_INTRODUCED_VERSION` and `current_table_columns` are this branch's
+#: own; at the frozen base they do not exist and the census pin is skipped.
+_TABLE_INTRODUCED_VERSION = getattr(_db, "_TABLE_INTRODUCED_VERSION", None)
+current_table_columns = getattr(_db, "current_table_columns", None)
 from zaxbygraph.store import ingest_item  # noqa: E402
 
 #: The v10-era repo-keyed tables a pre-v10 candidate's schema never has.
@@ -198,6 +208,18 @@ def _wrong_typed_raw_json_candidate(bad: Path) -> None:
     conn.close()
 
 
+def _tables(db: Path) -> set[str]:
+    if not db.exists():
+        return set()
+    conn = sqlite3.connect(str(db))
+    try:
+        return {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name NOT LIKE 'sqlite_%'")}
+    finally:
+        conn.close()
+
+
 def _count(db: Path, table: str) -> int:
     if not db.exists():
         return 0
@@ -209,13 +231,47 @@ def _count(db: Path, table: str) -> int:
 
 
 class LegacyTablePreservationTests(unittest.TestCase):
-    """AC19: a table the adopted candidate's VERSION never had keeps the
-    store's rows — the migration recreates it empty, so deleting would copy
-    zero back (the truncated-image outcome AC3 refuses)."""
+    """AC19: a repo-keyed table the adopted candidate's VERSION never had
+    keeps the store's rows — deleting would copy zero back (the
+    truncated-image outcome AC3 refuses). Two shapes: the schema never
+    carried the table (the migration recreated it), and the schema DOES
+    carry it while the version stamp predates its slot (an
+    interrupted-upgrade remnant, because `init_schema` commits the current
+    schema DDL and only then runs the migration chain)."""
 
     def setUp(self) -> None:
         self.scratch = Path(tempfile.mkdtemp(prefix="zgt56-legacy-adopt-"))
         self.addCleanup(_rmtree, self.scratch)
+        # The version→slot map is hand-maintained, so it is pinned against
+        # drift here: every table in the current schema is either in the v1
+        # DDL or named in `_TABLE_INTRODUCED_VERSION`. A new table whose
+        # slot is missing from the map silently stops being preserved.
+        # Guarded because both symbols are this branch's own — at the frozen
+        # base the shapes carry the RED evidence instead.
+        if _TABLE_INTRODUCED_VERSION is None:
+            return
+        v1 = sqlite3.connect(":memory:")
+        try:
+            v1.executescript(V1_SCHEMA_SQL)
+            v1_tables = {r[0] for r in v1.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+                " AND name NOT LIKE 'sqlite_%'")}
+        finally:
+            v1.close()
+        # FTS shadow tables and sqlite_* are machinery, not repo-keyed
+        # tables the preservation rule reasons about.
+        current = {t for t in current_table_columns()
+                   if not t.startswith("sqlite_")
+                   and "_fts" not in t}
+        self.assertEqual(
+            current - v1_tables - set(_TABLE_INTRODUCED_VERSION), set(),
+            "a current table is in neither the v1 DDL nor the"
+            " introduced-version map, so the preservation rule cannot know"
+            " its slot")
+        self.assertEqual(
+            set(_TABLE_INTRODUCED_VERSION) - current, set(),
+            "the introduced-version map names a table the current schema"
+            " does not have")
 
     def _pair(self, tag: str, version: int):
         """(good, bad, store, cwd): a store holding v10-table rows and a
@@ -252,8 +308,20 @@ class LegacyTablePreservationTests(unittest.TestCase):
                                  f"v{version}: the store's rows for a table"
                                  f" the candidate's version never had were"
                                  f" deleted: {before} -> {after}")
+                # v9's schema predates only the v10 slot, so the three
+                # dropped tables are the preserved set; v5's stamp predates
+                # the v7/v8/v9 slots too, so the tables those migrations
+                # introduce are preserved as well — the version rule, not
+                # just the absent-table rule.
+                # `revisions` is excluded: it has its own per-item
+                # scoping (issue #40) and never enters the preserved list.
+                expected = sorted(_V10_TABLES if version >= 10 else
+                                  (set(_V10_TABLES) | {
+                                      t for t, v in
+                                      _TABLE_INTRODUCED_VERSION.items()
+                                      if v > version}) - {"revisions"})
                 self.assertEqual(
-                    envelope.get("tables_preserved"), sorted(_V10_TABLES),
+                    envelope.get("tables_preserved"), expected,
                     f"v{version}: the envelope does not name the preserved"
                     f" tables: {envelope.get('tables_preserved')}")
                 # the store's own corpus is still the candidate's: the
@@ -263,6 +331,82 @@ class LegacyTablePreservationTests(unittest.TestCase):
                 self.assertTrue(
                     entry.get(os.path.normcase(str(bad)), {}).get("adopted"),
                     "the legacy candidate was not adopted")
+
+    def test_interrupted_upgrade_candidate_preserves_newer_tables(
+            self) -> None:
+        """RED at base's fix, GREEN after the round-9 correction: a candidate
+        left by an INTERRUPTED UPGRADE — `init_schema` commits the current
+        schema DDL and only then runs the migration chain, so a crash
+        between them leaves the newer tables present under the old
+        `user_version`, never populated — is tool-produced, not hand-mangled
+        (round-9 reviewer finding 1: the round-8 disclosure claimed the
+        divergence was limited to a hand-mangled stamp, which this probe
+        refutes). The version rule preserves the tables whose slot the
+        stamp predates, so the store's rows survive and the envelope names
+        them."""
+        from zaxbygraph.db import MIGRATIONS, _schema_sql
+
+        root = self.scratch / "c19-interrupted"
+        store = _prep(root / "store" / "history.db")
+        _seed_store(store, (1, 2), "2027-05-01T00:00:00Z", with_v10=True)
+        bad = _prep(root / "cand" / "history.db")
+        # A genuine v9 store: the real migration chain, stopped at 9.
+        conn = sqlite3.connect(str(bad))
+        conn.executescript(V1_SCHEMA_SQL)
+        for target, migrate in MIGRATIONS:
+            if target > 9:
+                break
+            conn.execute("BEGIN IMMEDIATE")
+            migrate(conn)
+            conn.execute(f"PRAGMA user_version = {target}")
+            conn.commit()
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at,"
+            " include_patches) VALUES (?, '2027-06-01T00:00:00Z',"
+            " '2027-06-01T00:00:00Z', 0)", (REPO,))
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state,"
+            " updated_at, raw_json) VALUES (1, ?, 1, 'issue', 'one', 'open',"
+            " '2027-06-01T00:00:00Z', ?)", (REPO, _RAW_JSON))
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state,"
+            " updated_at, raw_json) VALUES (2, ?, 2, 'issue', 'two', 'open',"
+            " '2027-06-01T00:00:00Z', ?)", (REPO, _RAW_JSON))
+        conn.commit()
+        conn.close()
+        self.assertNotIn("item_events", _tables(bad),
+                         "a genuine v9 schema carries no item_events")
+        # The interrupted upgrade: the current DDL is committed, creating
+        # item_events/pr_commits empty, and the v9->v10 migration never
+        # runs, so the stamp stays at 9 with the newer tables present.
+        conn = sqlite3.connect(str(bad))
+        conn.executescript(_schema_sql())
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+        conn.close()
+        self.assertEqual(_tables(bad) & set(_V10_TABLES), set(_V10_TABLES),
+                         "the fixture does not carry the v10 tables under a"
+                         " v9 stamp")
+        # `issue_field_values` (introduced at v7, so at or below the
+        # candidate's stamp) is NOT preserved: a genuine v9 candidate that
+        # carries the table makes a claim about it, and replace-the-slug
+        # honours that claim. Only the tables whose slot the stamp predates
+        # are preserved.
+        preserved = sorted(set(_V10_TABLES) - {"issue_field_values"})
+        before = {t: _count(store, t) for t in preserved}
+        cwd = _prep(root / "cwd")
+        envelope = doctor_mod.doctor(cwd, REPO, store, extra_scans=[bad],
+                                     consolidate_flag=True)
+        self.assertTrue(envelope.get("adopted"), envelope)
+        after = {t: _count(store, t) for t in preserved}
+        self.assertEqual(after, before,
+                         f"an interrupted-upgrade candidate took the store's"
+                         f" rows for tables its version never populated:"
+                         f" {before} -> {after}")
+        self.assertEqual(
+            envelope.get("tables_preserved"), preserved,
+            "the envelope does not name the preserved tables:"
+            f" {envelope.get('tables_preserved')}")
 
     def test_genuine_legacy_candidate_is_adopted_not_refused(self) -> None:
         """RED at base's fix, GREEN after the round-7 correction: a GENUINE

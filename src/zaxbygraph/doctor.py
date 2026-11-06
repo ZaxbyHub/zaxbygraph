@@ -36,6 +36,7 @@ from pathlib import Path
 
 from zaxbygraph.db import (
     CURRENT_USER_VERSION,
+    _TABLE_INTRODUCED_VERSION,
     _quote_ident,
     _table_exists,
     connect,
@@ -573,6 +574,7 @@ class _MigratedCopy:
                     f"the candidate's schema (user_version {version}) is newer"
                     f" than this build supports ({CURRENT_USER_VERSION})")
             self.migrated = version < CURRENT_USER_VERSION
+            self.version = version
             # The candidate's OWN table set, captured before any migration
             # (issue #56, round-6 reviewer finding 1): `init_schema` recreates
             # every table the candidate's version predates, so after the
@@ -785,10 +787,19 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # per-item scoping below (issue #40)
-                    if table not in copy.raw_tables and copy.migrated:
-                        # The candidate's version never had this table:
-                        # the migration recreated it empty, so deleting
-                        # the store's rows would copy zero back.
+                    if (table not in copy.raw_tables and copy.migrated) or (
+                            copy.version
+                            < _TABLE_INTRODUCED_VERSION.get(table, 1)):
+                        # Either the candidate's schema never carried the
+                        # table (the migration recreated it), or its version
+                        # predates the table's slot while the schema DOES
+                        # carry it — an interrupted-upgrade remnant, because
+                        # init_schema commits the current schema DDL and only
+                        # then runs the migration chain, so a crash between
+                        # them leaves the newer tables present under the old
+                        # stamp, never populated. Deleting the store's rows
+                        # for either shape copies zero back: the truncated
+                        # image AC19 refuses (round-9 reviewer finding 1).
                         preserved_tables.append(table)
                         continue
                     dst.execute(

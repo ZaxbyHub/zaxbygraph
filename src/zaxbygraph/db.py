@@ -1528,9 +1528,10 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
         # used to raise an uncaught TypeError that aborted the whole
         # migration — one candidate killing the entire doctor run, the same
         # observable outcome as a divergent storage class. Coerce to text
-        # (the JSON scalar's rendering) so a malformed payload degrades to
-        # "no references extracted" instead of an abort (final critic,
-        # round-7 question).
+        # (the JSON scalar's rendering) so a malformed payload no longer
+        # aborts the command; whatever references the coerced rendering
+        # happens to contain are then extracted, which for a genuine
+        # malformed payload is none (final critic, round-7 question).
         title = raw.get("title") or ""
         body = raw.get("body") or ""
         if not isinstance(title, str):
@@ -1718,6 +1719,27 @@ MIGRATIONS = [
     (10, migrate_v9_to_v10),
     (11, migrate_v10_to_v11),
 ]
+
+
+#: The schema version whose migration CREATES each table that the v1 DDL
+#: does not carry (issue #56): a candidate whose `user_version` predates a
+#: table its schema DOES carry was left by an interrupted upgrade —
+#: `init_schema` commits the current schema DDL and only then runs the
+#: migration chain in separate transactions, so a crash between them
+#: leaves the newer tables present under the old stamp, never populated.
+#: The consolidation's preservation rule keys off this map so such a
+#: candidate cannot take the store's rows for a table its version never
+#: wrote. Pinned against drift by a census test: every table in the
+#: current schema is either in the v1 DDL or named here.
+_TABLE_INTRODUCED_VERSION = {
+    "assignees": 7,
+    "issue_field_values": 7,
+    "revisions": 8,
+    "item_path_refs": 9,
+    "item_signatures": 9,
+    "item_events": 10,
+    "pr_commits": 10,
+}
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
