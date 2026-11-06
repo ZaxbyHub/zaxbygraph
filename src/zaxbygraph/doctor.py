@@ -334,10 +334,11 @@ _REQUIRED_SYNC_STATE_FLAGS = ("include_patches", "full_sync_pending")
 #: the DDL declares them TEXT, so a divergent storage class (INTEGER, BLOB)
 #: would raise an uncaught TypeError at the fold's max() or at the scan's
 #: winner ranking — the same isolation escape as the flags, one type up.
+#: The optional state columns are included because the fold carries them
+#: and the docs promise the storage-class contract for the TEXT columns.
 _REQUIRED_SYNC_STATE_TEXTS = ("issues_since", "last_full_sync_at",
-                              "last_incr_sync_at", "last_error")
-#: columns the wholesale `actors` copy names (issue #56, AC9/AC10).
-_REQUIRED_ACTOR_COLUMNS = ("login", "html_url")
+                              "last_incr_sync_at", "last_error",
+                              "rate_limit_reset_at", "fetch_source")
 
 
 def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
@@ -379,12 +380,23 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path) -> None:
                 path,
                 f"the candidate's {table} table lacks the"
                 f" {', '.join(sorted(missing))} column(s)")
-    actor_cols = {row[1] for row in conn.execute("PRAGMA table_info(actors)")}
-    for column in _REQUIRED_ACTOR_COLUMNS:
-        if column not in actor_cols:
+    # The per-item revisions read calls int() on revisions.number, and the
+    # fold's closes-group merge reads edges.evidence as text (issue #56):
+    # a non-integer number is silently localized to a WRONG item (or
+    # aborts the binder with OverflowError for a large REAL), and a
+    # non-text evidence raises an uncaught TypeError inside merge_evidence.
+    # Refuse both storage classes up front — typeof() names them exactly.
+    for table, column, allowed in (("revisions", "number", "integer"),
+                                   ("edges", "evidence", "text")):
+        bad = conn.execute(
+            f"SELECT COUNT(*) FROM {table}"
+            f" WHERE typeof({column}) NOT IN ('{allowed}', 'null')"
+        ).fetchone()[0]
+        if bad:
             raise _UnreadableCandidate(
                 path,
-                f"the candidate's actors table lacks the {column} column")
+                f"the candidate's {table}.{column} holds a divergent storage"
+                f" class in {bad} row(s): refused, not adopted")
     state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
     for column in _REQUIRED_SYNC_STATE_COLUMNS:
         if column not in state_cols:
@@ -469,6 +481,20 @@ class _MigratedCopy:
                 raise _UnreadableCandidate(
                     path, "the candidate is not a readable database"
                 ) from exc
+            if version > CURRENT_USER_VERSION:
+                # A candidate newer than this build cannot be adopted
+                # faithfully: its schema carries facts this build does not
+                # know, and the adoption would silently drop them (the
+                # sync_state INSERT names the store's columns, so an extra
+                # column is lost; _COPY_TABLES members fail their INSERT,
+                # but actors/revisions extras are ignored). Refuse it the
+                # way `snapshot` refuses a newer store (store_too_new) —
+                # the policy existed at one surface and not its sibling
+                # (issue #56, the claim-2 prior-art reconciliation).
+                raise _UnreadableCandidate(
+                    path,
+                    f"the candidate's schema (user_version {version}) is newer"
+                    f" than this build supports ({CURRENT_USER_VERSION})")
             self.migrated = version < CURRENT_USER_VERSION
             conn = connect(self.path)
             try:

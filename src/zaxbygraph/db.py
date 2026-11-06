@@ -373,20 +373,6 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
             )
 
 
-def _row_get(row: sqlite3.Row, column: str, default: object) -> object:
-    """A Row subscript that tolerates an ABSENT key (issue #56).
-
-    The migration chain runs `_fold_sync_state` over schemas whose column
-    set grows with the chain, and the consolidation path refuses divergent
-    candidates at `_MigratedCopy`'s preflight before the fold runs — this
-    accessor keeps the reads total for absent keys without changing the
-    aggregation for present ones. A PRESENT NULL is not "absent": for the
-    NOT NULL flag columns it is a fabricated state the fold refuses (see
-    `_fold_sync_state`), never silently defaulted.
-    """
-    return row[column] if column in row.keys() else default
-
-
 def current_table_columns() -> dict[str, set[str]]:
     """Every table's column set in the CURRENT schema (issue #56).
 
@@ -409,6 +395,12 @@ def current_table_columns() -> dict[str, set[str]]:
         }
     finally:
         conn.close()
+
+
+#: The optional TEXT state columns the fold carries from the winner (issue
+#: #56): the DDL declares them TEXT, so a divergent storage class is
+#: refused exactly as the compared columns are.
+_OPTIONAL_SYNC_STATE_TEXTS = ("rate_limit_reset_at", "fetch_source")
 
 
 def _text_value(row: sqlite3.Row, column: str) -> str | None:
@@ -446,10 +438,11 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     `full_sync_pending` is never carried from a loser: it is derived from
     the merged timestamp.
 
-    Reads go through `_row_get` so an absent column (a mid-migration schema
-    shape) aggregates as its natural default instead of raising IndexError,
-    which is not a `sqlite3.DatabaseError` and would abort the whole
-    command (issue #56, AC4/AC5). A non-integer value in the NOT NULL flag
+    Reads go through `_text_value`, which tolerates an ABSENT column (a
+    mid-migration schema shape) by returning None — the aggregation's
+    natural default — instead of raising IndexError, which is not a
+    `sqlite3.DatabaseError` and would abort the whole command (issue #56,
+    AC4/AC5). A non-integer value in the NOT NULL flag
     column is a fabricated state no genuine store can produce (the DDL
     declares it INTEGER NOT NULL DEFAULT 0): the fold refuses with a
     `sqlite3.DatabaseError`, which `_MigratedCopy` converts to an
@@ -544,6 +537,15 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
                 values[column] = 0
             elif column == "full_sync_pending":
                 values[column] = 1 if full is None else 0
+            elif column in _OPTIONAL_SYNC_STATE_TEXTS:
+                # The optional TEXT state columns are carried from the
+                # winner through the same storage-class guard the compared
+                # columns use (issue #56): a BLOB value would be written
+                # into the store's TEXT column verbatim, contradicting the
+                # storage-class contract the docs promise. `_text_value`
+                # refuses it (sqlite3.DatabaseError -> the caller converts
+                # to an unreadable candidate).
+                values[column] = _text_value(winner, column)
             else:
                 keys = winner.keys()
                 values[column] = winner[column] if column in keys else None

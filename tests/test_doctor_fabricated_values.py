@@ -65,6 +65,72 @@ def _seed_store(db: Path, numbers: tuple[int, ...], stamp: str,
     conn.close()
 
 
+def _text_revisions_number_candidate(bad: Path, literal: str) -> None:
+    """Add a `revisions` row whose number is the given SQL literal — a
+    REAL, a numeric BLOB, or a large REAL. SQLite's dynamic typing stores
+    them despite the INTEGER declaration; int() accepts REAL and numeric
+    BLOB (silently localizing the revision to a WRONG item number) and a
+    large REAL overflows the destination binder."""
+    conn = sqlite3.connect(str(bad))
+    conn.execute(
+        "INSERT INTO revisions(repo, number, entity, entity_id, kind,"
+        " origin, content, valid_from, valid_to)"
+        f" VALUES (?, {literal}, 'item_body', '5', 'body', 'edit', 'text',"
+        " '2027-06-01T00:00:00Z', '2027-06-02T00:00:00Z')", (REPO,))
+    conn.commit()
+    conn.close()
+
+
+def _optional_text_blob_candidate(bad: Path) -> None:
+    """Set the optional TEXT state column `rate_limit_reset_at` to a BLOB —
+    the fold carries the winner's value and the adoption writes it into
+    the store's TEXT column verbatim."""
+    conn = sqlite3.connect(str(bad))
+    conn.execute("UPDATE sync_state SET rate_limit_reset_at = x'00'"
+                 " WHERE repo = ?", (REPO,))
+    conn.commit()
+    conn.close()
+
+
+def _blob_evidence_candidate(bad: Path) -> None:
+    """Make the candidate case-split and add two `rel='closes'` edge rows
+    for the same pair and source — one per casing — with the upper
+    casing's `evidence` a BLOB. The fold's closes-group merge reads the
+    evidence as text."""
+    conn = sqlite3.connect(str(bad))
+    shared = ("issues_since, last_full_sync_at, last_incr_sync_at,"
+              " last_error, full_sync_pending, item_count,"
+              " comment_count, edge_count")
+    conn.execute(
+        f"INSERT INTO sync_state(repo, {shared})"
+        f" SELECT 'ACME/FORGEGATE', {shared} FROM sync_state"
+        " WHERE repo = ?", (REPO,))
+    conn.execute(
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES ('acme/forgegate', 'item', '5', 'closes', 'item', '1',"
+        " 'EXTRACTED', 'body #1', 'keyword')")
+    conn.execute(
+        "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES ('ACME/FORGEGATE', 'item', '5', 'closes', 'item', '1',"
+        " 'EXTRACTED', x'00', 'keyword')")
+    conn.commit()
+    conn.close()
+
+
+def _newer_candidate(bad: Path) -> None:
+    """Stamp the candidate's schema version above the current build's —
+    a database written by a FUTURE zaxbygraph, whose extra facts this
+    build cannot know."""
+    from zaxbygraph.db import CURRENT_USER_VERSION
+
+    conn = sqlite3.connect(str(bad))
+    conn.execute(f"PRAGMA user_version = {CURRENT_USER_VERSION + 1}")
+    conn.commit()
+    conn.close()
+
+
 def _null_repo_candidate(bad: Path) -> None:
     """Add a `sync_state` row whose repo is NULL — SQLite permits NULL in a
     TEXT PRIMARY KEY on a rowid table, and the fold's grouping calls
@@ -76,20 +142,6 @@ def _null_repo_candidate(bad: Path) -> None:
         " edge_count, include_patches)"
         " VALUES (NULL, '2027-03-02T00:00:00Z', '2027-03-02T00:00:00Z',"
         " NULL, 0, 0, 0, 0, 0)")
-    conn.commit()
-    conn.close()
-
-
-def _text_revisions_number_candidate(bad: Path) -> None:
-    """Add a `revisions` row whose number is TEXT — SQLite's dynamic typing
-    stores it despite the INTEGER declaration, and the per-item read calls
-    int() on it."""
-    conn = sqlite3.connect(str(bad))
-    conn.execute(
-        "INSERT INTO revisions(repo, number, entity, entity_id, kind,"
-        " origin, content, valid_from, valid_to)"
-        " VALUES (?, 'abc', 'item_body', '5', 'body', 'edit', 'text',"
-        " '2027-06-01T00:00:00Z', '2027-06-02T00:00:00Z')", (REPO,))
     conn.commit()
     conn.close()
 
@@ -206,7 +258,8 @@ class FabricatedKeyValueTests(_FabricatedValueCase):
 
         # shape B: the TEXT revisions.number reaches the per-item read
         good, bad, store, empty_cwd = self._divergent_pair(
-            "c14-text-number", _text_revisions_number_candidate)
+            "c14-text-number",
+            lambda bad: _text_revisions_number_candidate(bad, "'abc'"))
         with self.subTest(shape="text_revisions_number"):
             envelope = None
             try:
@@ -243,6 +296,28 @@ class FabricatedKeyValueTests(_FabricatedValueCase):
             self.assertEqual(version, 1,
                              "the refused store still advanced its schema"
                              " version")
+
+        # shapes D-F: REAL / numeric BLOB / large REAL revisions.number —
+        # int() accepts REAL and numeric BLOB (silently localizing the
+        # revision to a WRONG item number), and a large REAL overflows the
+        # destination binder (implementation-review round-4 finding 1)
+        for label, literal in (("real_number", "3.5"),
+                               ("blob_number", "x'3132'"),
+                               ("large_real_number", "1e300")):
+            with self.subTest(shape=label):
+                good, bad, store, empty_cwd = self._divergent_pair(
+                    f"c14-{label}",
+                    lambda bad, v=literal: _text_revisions_number_candidate(bad, v))
+                envelope = None
+                try:
+                    envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                                 extra_scans=[good, bad],
+                                                 consolidate_flag=True)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    self.fail(f"{type(exc).__name__} escaped candidate"
+                              f" isolation and aborted the whole command:"
+                              f" {exc!r}")
+                self._assert_isolated(envelope, good, bad)
 
 
 class ColumnParityTests(_FabricatedValueCase):
@@ -288,3 +363,85 @@ class ColumnParityTests(_FabricatedValueCase):
                 [tuple(r) for r in stored], [],
                 "a candidate missing a current column was adopted as a"
                 f" truncated image: {stored}")
+
+
+class OptionalTextColumnTests(_FabricatedValueCase):
+    def test_optional_text_blob_is_refused(self) -> None:
+        """AC16: when a candidate's optional TEXT state column
+        (`rate_limit_reset_at`, `fetch_source`) holds a divergent storage
+        class, the candidate is refused as unreadable instead of being
+        adopted with the BLOB written into the store's TEXT column. RED at
+        base, GREEN after the fix: at base the fold carries the winner's
+        value untouched and the adoption writes it (probe-verified: the
+        store's column reads back `blob`), contradicting the storage-class
+        contract the docs promise (implementation-review round-4 finding
+        2)."""
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c16", _optional_text_blob_candidate)
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except Exception as exc:  # noqa: BLE001 - any escape is a failure
+            self.fail(f"{type(exc).__name__} escaped candidate isolation and"
+                      f" aborted the whole command: {exc!r}")
+        entry = {os.path.normcase(str(row.get("path", ""))): row
+                 for row in envelope.get("scanned") or []}.get(
+                     os.path.normcase(str(bad)))
+        self.assertTrue(
+            entry is not None and entry.get("unreadable"),
+            "a divergent storage class in an optional TEXT column was"
+            f" adopted: {entry}")
+        self._assert_isolated(envelope, good, bad)
+
+
+class EvidenceStorageClassTests(_FabricatedValueCase):
+    def test_blob_evidence_is_refused(self) -> None:
+        """AC17: when a case-split candidate's `edges.evidence` holds a
+        divergent storage class, the candidate is refused as unreadable
+        instead of aborting the whole command. RED at base, GREEN after
+        the fix: at base the fold's closes-group merge reads the evidence
+        as text and raises an uncaught TypeError inside merge_evidence
+        (probe-verified; implementation-review round-4 finding 3)."""
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c17", _blob_evidence_candidate)
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except TypeError as exc:
+            self.fail(f"TypeError escaped candidate isolation and aborted"
+                      f" the whole command: {exc!r}")
+        self._assert_isolated(envelope, good, bad)
+
+
+class NewerCandidateTests(_FabricatedValueCase):
+    def test_newer_candidate_is_refused(self) -> None:
+        """AC18: when a candidate's schema is NEWER than this build
+        (`user_version` above the current), the candidate is refused as
+        unreadable instead of being adopted. RED at base, GREEN after the
+        fix: at base such a candidate is admitted and its extra facts are
+        silently dropped (the sync_state INSERT names the store's columns;
+        actors/revisions extras are ignored) — the asymmetry the issue's
+        claim-2 prior-art reconciliation named, resolved the way
+        `snapshot` refuses a newer store (implementation-review round-4
+        disproved the narrower RECORD rationale)."""
+        good, bad, store, empty_cwd = self._divergent_pair(
+            "c18", _newer_candidate)
+        envelope = None
+        try:
+            envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                         extra_scans=[good, bad],
+                                         consolidate_flag=True)
+        except Exception as exc:  # noqa: BLE001 - any escape is a failure
+            self.fail(f"{type(exc).__name__} escaped candidate isolation and"
+                      f" aborted the whole command: {exc!r}")
+        entry = {os.path.normcase(str(row.get("path", ""))): row
+                 for row in envelope.get("scanned") or []}.get(
+                     os.path.normcase(str(bad)))
+        self.assertTrue(
+            entry is not None and entry.get("unreadable"),
+            f"a candidate newer than this build was adopted: {entry}")
+        self._assert_isolated(envelope, good, bad)
