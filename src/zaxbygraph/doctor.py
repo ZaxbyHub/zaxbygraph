@@ -482,20 +482,23 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
                     path,
                     f"the candidate's {table}.{column} holds a divergent"
                     f" storage class in {bad} row(s): refused, not adopted")
-    # NOTE: the repo NULL/non-text guard, the flag-column guard and the
-    # TEXT-column guard that used to sit here are all subsumed by the
-    # derived rule above (swarm-pr-review N-14): the two flag columns are
-    # INTEGER NOT NULL, and the TEXT branch honours `not_null` for every
-    # other column. Keeping them would leave three unreachable
-    # enumerations of one column family to drift apart.
-    # A candidate whose `sync_state.repo` is NULL can still slip past this
-    # loop when it LOSES the ranking — the scope is `lower(repo) = ?`, so
-    # a NULL-repo row is invisible to it, which is also why the column
-    # needs no special case HERE (the round-2 final critic proved the
-    # branch inert and it was deleted). The backstop for that shape is the
-    # fold's own `_text_value` fail-closed (db.py), which the winner's
-    # consolidation runs through; the old whole-table guard is NOT what
-    # covers it. Disclosed by the final critic's round-1 finding F2.
+    # NOTE: TWO of the three guards that used to sit here are subsumed by
+    # the derived rule above (swarm-pr-review N-14) — the flag-column guard
+    # (both flag columns are INTEGER NOT NULL) and the TEXT-column guard
+    # (the TEXT branch honours `not_null` for every column). Keeping them
+    # would leave two unreachable enumerations of one column family to
+    # drift apart.
+    # The THIRD, the repo NULL/non-text guard, is NOT subsumed and is not
+    # redundant either: this rule's scope is `lower(repo) = ?`, which a
+    # NULL or non-text repo can never satisfy, so those rows are outside
+    # the count it makes and no column-level `allowed` set can reach them.
+    # Its backstop is separate — the fold's own `_text_value` fail-closed
+    # (db.py), which the winner's consolidation runs through. That is also
+    # why `sync_state.repo` needs no special case in the rule: the round-2
+    # final critic proved such a branch inert and it was deleted. Disclosed
+    # by the final critic's round-1 finding F2, and corrected again after
+    # cubic's re-review (PR #58), which caught this NOTE still claiming all
+    # three were subsumed.
     # `actors.login` is the global table's key: a TEXT PRIMARY KEY on a
     # rowid table permits NULL in SQLite, and the adoption's upsert never
     # matches one, so every re-adoption of such a candidate would append
