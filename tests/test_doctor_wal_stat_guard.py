@@ -228,6 +228,56 @@ class _UninspectableSidecarTest(unittest.TestCase):
             "the copy proceeded past a source whose stat raised")
 
 
+    def test_late_sidecar_with_uninspectable_stat_is_refused(self) -> None:
+        """AC5, the after-snapshot stat-stability filter: RED at base, GREEN
+        after the fix.
+
+        A sidecar a writer creates DURING the copy is absent from `before`
+        and present in `after_sidecars`.  The after-snapshot gates each
+        source on `p.exists()` before `p.stat()`, so a source whose stat
+        faults is dropped from `after` while `before` never had it -- the two
+        dicts then agree and a main-only image is accepted, reopening the
+        issue #53 late-sidecar protection.  C3 pins the BEFORE filter; this
+        is the AFTER one.
+
+        The fault is keyed on `follow_symlinks`: `Path.exists()` follows, so
+        it faults, while `Path.stat(follow_symlinks=False)` does not, so the
+        stat-first guard still classifies the sidecar.  The 3.14 oracle is
+        modeled on `Path.exists` exactly as in C1, so the leg is
+        interpreter-independent rather than depending on which pathlib
+        version happens to be running."""
+        stashed = self.scratch / "stashed-wal"
+        shutil.move(str(self.wal), stashed)  # the log appears mid-copy
+        real_stat = Path.stat
+        real_copy2 = doctor_mod.shutil.copy2
+        state = {"created": False}
+
+        def late_sidecar_copy2(src, dst, *a, **kw):
+            result = real_copy2(src, dst, *a, **kw)
+            if not state["created"] and _norm(src) == _norm(self.db):
+                state["created"] = True
+                shutil.move(str(stashed), self.wal)  # the writer commits
+            return result
+
+        def faulting_stat(p, *a, **kw):
+            if _norm(p) != _norm(self.wal):
+                return real_stat(p, *a, **kw)
+            if kw.get("follow_symlinks", True):
+                raise PermissionError(
+                    errno.EACCES, "Permission denied (fixture)")
+            return real_stat(p, *a, **kw)
+
+        with mock.patch.object(Path, "stat", faulting_stat),                 mock.patch.object(Path, "exists", _swallowing_exists),                 mock.patch.object(
+                    doctor_mod.shutil, "copy2", late_sidecar_copy2):
+            faithful = doctor_mod._faithful_copy(self.db, self.copy)
+        self.assertTrue(
+            state["created"], "the late sidecar was never created")
+        self.assertFalse(
+            faithful,
+            "a sidecar created during the copy whose stat could not be"
+            " inspected was dropped from the stability comparison")
+
+
 class _SidecarClassificationTest(unittest.TestCase):
     """The stat-first rewrite must keep every existing classification."""
 
