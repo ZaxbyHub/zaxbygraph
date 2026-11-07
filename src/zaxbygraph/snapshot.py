@@ -945,11 +945,17 @@ def _post_install_check(db_path: Path, manifest: dict) -> dict:
     A sidecar that CANNOT be inspected is refused too, never assumed empty:
     an OSError on `stat` would otherwise fail open and let the digest be the
     only verdict, which is the exact hole this guard closes (cubic review,
-    PR #58).
+    PR #58). `stat` is called FIRST and only `FileNotFoundError` means
+    "absent", because `Path.exists()` is not a stable oracle: on 3.14 it
+    delegates to `os.path.exists`, which swallows EACCES and answers False,
+    so an exists()-first shape would fail open on exactly the interpreters
+    this repo supports (final-critic round 3).
     """
     stale_wal = Path(str(db_path) + "-wal")
     try:
-        wal_size = stale_wal.stat().st_size if stale_wal.exists() else 0
+        wal_size = stale_wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0  # no sidecar survived the install: nothing to refuse
     except OSError as exc:
         # Fail CLOSED: an unreadable sidecar is not evidence of an absent
         # one. The digest covers only part of the store, so "cannot inspect"

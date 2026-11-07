@@ -484,14 +484,16 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
                     f" storage class in {bad} row(s): refused, not adopted")
     # NOTE: the repo NULL/non-text guard, the flag-column guard and the
     # TEXT-column guard that used to sit here are all subsumed by the
-    # derived rule above (swarm-pr-review N-14): `sync_state.repo` is
-    # special-cased to require text there, and the two flag columns are
-    # INTEGER NOT NULL. Keeping them would leave three unreachable
+    # derived rule above (swarm-pr-review N-14): the two flag columns are
+    # INTEGER NOT NULL, and the TEXT branch honours `not_null` for every
+    # other column. Keeping them would leave three unreachable
     # enumerations of one column family to drift apart.
     # A candidate whose `sync_state.repo` is NULL can still slip past this
     # loop when it LOSES the ranking — the scope is `lower(repo) = ?`, so
-    # a NULL-repo row is invisible to it. The backstop for that shape is
-    # the fold's own `_text_value` fail-closed (db.py), which the winner's
+    # a NULL-repo row is invisible to it, which is also why the column
+    # needs no special case HERE (the round-2 final critic proved the
+    # branch inert and it was deleted). The backstop for that shape is the
+    # fold's own `_text_value` fail-closed (db.py), which the winner's
     # consolidation runs through; the old whole-table guard is NOT what
     # covers it. Disclosed by the final critic's round-1 finding F2.
     # `actors.login` is the global table's key: a TEXT PRIMARY KEY on a
