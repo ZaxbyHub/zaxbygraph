@@ -450,12 +450,15 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
         for column, (declared, not_null) in sorted(rules[table].items()):
             if declared == "TEXT":
                 # A NOT NULL TEXT column refuses NULL; a nullable one
-                # admits it. `sync_state.repo` is a TEXT PRIMARY KEY, which
-                # SQLite permits to be NULL on a rowid table, so it needs
-                # the same refusal although its own DDL omits NOT NULL.
-                allowed = ("text",) if (not_null or (table, column) ==
-                                        ("sync_state", "repo")) \
-                    else ("text", "null")
+                # admits it. `sync_state.repo` is a TEXT PRIMARY KEY whose
+                # own DDL omits NOT NULL, and it needs no special case
+                # here: the scope is `lower(repo) = ?`, which a NULL repo
+                # can never satisfy, so such a row is outside the count
+                # this rule makes — the fold's own `_text_value`
+                # fail-closed is what refuses it (see the NOTE below).
+                # Probe-verified inert by the round-2 final critic: with
+                # the branch deleted the full suite is green.
+                allowed = ("text",) if not_null else ("text", "null")
             elif declared == "INTEGER":
                 allowed = ("integer",) if not_null else ("integer", "null")
             else:
