@@ -12,6 +12,7 @@ Stdlib only; unittest.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -33,6 +34,7 @@ from zaxbygraph.snapshot import (
     SNAPSHOT_BRANCH,
     SNAPSHOT_REF,
     SnapshotError,
+    _post_install_check,
     publish,
     pull,
 )
@@ -599,6 +601,135 @@ class SnapshotReviewFixTests(unittest.TestCase):
                     (REPO,)).fetchone()
                 conn.close()
                 self.assertEqual(row["issues_since"], wmark)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_dest_open_names_the_permission_cause(self) -> None:
+        """AC6 (swarm-pr-review N-12): the `dest_open` refusal distinguishes
+        a reader holding the destination from a permissions problem, because
+        `EACCES` and `EPERM` are ambiguous between the two and telling a
+        user to close readers when the real fix is a permission change
+        wastes a support round. RED at the mutant that drops the cause
+        clause (the suite was green with the message reverted to the
+        generic form — the only prior dest_open assertion was the code
+        string)."""
+        td = Path(tempfile.mkdtemp(prefix="destopen_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="do")
+            dest = td / "dest" / "history.db"
+            dest.parent.mkdir(parents=True)
+            shutil.copyfile(db, dest)
+            def refusing_replace(src, dst, *a, **kw):
+                raise PermissionError(
+                    errno.EACCES, "Permission denied (fixture)",
+                    str(src), None, str(dst))
+
+            with mock.patch.object(os, "replace", refusing_replace):
+                with self.assertRaises(SnapshotError) as ctx:
+                    pull(dest, str(bare), force=True)
+            exc = ctx.exception
+            self.assertEqual(exc.code, "dest_open")
+            text = f"{exc.message} {getattr(exc, 'hint', '')}"
+            self.assertIn("Permission denied", text,
+                          f"the refusal did not name the underlying"
+                          f" permission cause: {text!r}")
+            self.assertIn("permission", text.lower(),
+                          f"the hint did not cover the permissions reading"
+                          f" of EACCES: {text!r}")
+            self.assertIn("close readers", text.lower(),
+                          f"the hint dropped the open-reader reading:"
+                          f" {text!r}")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_stale_wal_guard_fails_closed_on_an_uninspectable_sidecar(
+            self) -> None:
+        """AC6 (cubic review, PR #58, P1): a `-wal` that cannot be inspected
+        is refused, never assumed empty. `except OSError: stale_frames =
+        False` failed open, so the corpus digest became the only verdict on
+        the exact class it cannot see — the digest covers items, children,
+        releases and orphan edges, so a WAL touching only `revisions`,
+        `sync_state`, `fetch_log` or `actors` leaves it matching while the
+        destination serves pre-replace frames.
+
+        `stat` is called FIRST and only `FileNotFoundError` means "absent",
+        because `Path.exists()` is not a stable oracle: on 3.14 it delegates
+        to `os.path.exists`, which swallows EACCES and answers False, so an
+        exists()-first shape would fail open on an interpreter this repo
+        supports. The mutant that restores `if stale_wal.exists()` makes the
+        EACCES shape pass (final-critic round 3)."""
+        import os as _os
+        td = Path(tempfile.mkdtemp(prefix="walguard_"))
+        try:
+            db = _build_store(td)
+            bare = _bare(td)
+            publish(db, str(bare), publisher="wg")
+            dest = td / "dest" / "history.db"
+            dest.parent.mkdir(parents=True)
+            shutil.copyfile(db, dest)
+            manifest = {
+                "format": MANIFEST_FORMAT,
+                "repo": "acme/forgegate",
+                "created_at": "2027-01-01T00:00:00Z",
+                "watermark": "2027-01-01T00:00:00Z",
+                "schema_version": 11,
+                "corpus_sha256": "0" * 64,
+                "snapshot_ref": "refs/zaxbygraph-snapshot/main",
+            }
+            wal = Path(str(dest) + "-wal")
+
+            # shape 1: an OSError on stat refuses, naming the cause. The
+            # probe runs with `Path.exists` ALSO patched to swallow EACCES
+            # and answer False, which is what 3.14's `os.path.exists` does
+            # (3.11-3.13 re-raise it) — so an exists()-first guard would
+            # fail open here on the interpreter this repo supports. The
+            # mutant that restores `if stale_wal.exists()` makes this
+            # shape pass, which is why the patch is part of the probe.
+            real_stat = Path.stat
+            real_exists = Path.exists
+
+            def refusing_stat(self, *a, **kw):
+                if self == wal:
+                    raise PermissionError(
+                        errno.EACCES, "Permission denied (fixture)")
+                return real_stat(self, *a, **kw)
+
+            def swallowing_exists(self, *a, **kw):
+                try:
+                    return real_exists(self, *a, **kw)
+                except PermissionError:
+                    return False  # 3.14's os.path.exists behaviour
+
+            with mock.patch.object(_os, "replace", lambda s, d: None),                     mock.patch.object(Path, "stat", refusing_stat),                     mock.patch.object(Path, "exists", swallowing_exists):
+                with self.assertRaises(SnapshotError) as ctx:
+                    _post_install_check(dest, manifest)
+            exc = ctx.exception
+            self.assertEqual(exc.code, "dest_sidecar_stale")
+            self.assertIn("could not be inspected", exc.message,
+                          f"the uninspectable sidecar was not refused by"
+                          f" name: {exc.message!r}")
+
+            # shape 2: a header-only WAL is NOT refused (it carries no
+            # frames), so the guard's threshold is the 32-byte header
+            wal.write_bytes(b"\x00" * 32)
+            with mock.patch.object(_os, "replace", lambda s, d: None):
+                with self.assertRaises(SnapshotError) as ctx:
+                    _post_install_check(dest, manifest)
+            self.assertEqual(ctx.exception.code, "corpus_mismatch",
+                             "a header-only -wal was refused as stale, but"
+                             " it carries no frames and cannot revert"
+                             " anything")
+
+            # shape 3: a WAL with anything beyond the header IS refused
+            wal.write_bytes(b"\x00" * 33)
+            with mock.patch.object(_os, "replace", lambda s, d: None):
+                with self.assertRaises(SnapshotError) as ctx:
+                    _post_install_check(dest, manifest)
+            self.assertEqual(ctx.exception.code, "dest_sidecar_stale",
+                             "a -wal holding more than its 32-byte header"
+                             " was not refused")
         finally:
             shutil.rmtree(td, ignore_errors=True)
 

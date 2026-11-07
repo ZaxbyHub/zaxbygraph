@@ -109,7 +109,25 @@ command on stderr. A DB that holds other repos but not the resolved one exits
 the resolved repo itself, exit **2** says so and points at
 `doctor --consolidate` - it is never reported as another repo. `zaxbygraph where` prints the full resolution chain;
 `zaxbygraph doctor [--consolidate] [--scan DIR]` reports (and optionally
-consolidates, copy-only) scattered legacy DBs. `where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
+consolidates, copy-only) scattered legacy DBs. Every scanned candidate
+appears in the report: a candidate that cannot be read at all — not a
+database, an unreadable file — is listed with `unreadable: true` and an
+`unreadable_reason` instead of being silently dropped, and one such
+candidate never aborts the scan (the other candidates are still reported
+and the best one can still be adopted). The candidate the adoption reaches
+(the freshest complete one, and only under `--consolidate`) additionally has
+its schema validated before any store write — a missing table or column, a
+fabricated `sync_state` flag value, or a divergent storage class in any
+column (a TEXT or INTEGER value in the wrong column, or a NULL in a NOT
+NULL one), refuses that candidate with the reason carried instead of
+adopting it as a truncated image or aborting the command. Every candidate is
+inspected
+(its `sync_state` is read to rank it), but only the adoption winner gets that
+schema validation; a divergent candidate that is not the winner is not
+schema-probed — it is simply not adopted. If the winner itself is refused,
+nothing is adopted and the next candidate is NOT tried: the report says why
+nothing was adopted instead of falling back.
+`where`'s `db`/`exists`/`items`/`watermark`/`complete` describe the
 user-level store for the slug, while `serving` names the DB reads
 actually use (they differ while a legacy DB is being served);
 `cwd`/`git_common_dir`/`slug`/`legacy` are the chain steps, and
@@ -735,6 +753,23 @@ to a target git repository (a dedicated store repo works best); `snapshot
 pull` verifies every sha, checks the schema and the corpus digest, and
 installs atomically under the sync lock. After the pull, a normal
 incremental `sync` fetches only the delta.
+
+A pull that cannot install refuses BEFORE the destination's bytes are
+replaced, and the refusal names the cause. (An EXISTING destination may be
+opened to quiesce its WAL, and that quiesce is itself a write, so
+"untouched" would overstate the guarantee; a MISSING destination is not
+created — the quiesce is skipped for it, so no schema-less store appears —
+and nothing is replaced and no corpus is written before a refusal.) The
+refusals that can fire after the replace has committed are the post-install
+checks: when the destination's stale `-wal`/`-shm` sidecars could not be
+cleaned up after the replace (a locked or read-only sidecar), the store WAS
+replaced, the pull says so, and the post-install checks still run — a
+surviving `-wal` holding more than its 32-byte header is
+refused as `dest_sidecar_stale`, and the corpus digest's
+`corpus_mismatch` verdict (hint: "the store was already replaced; re-pull
+or restore a known-good store") is the truth about what the destination
+now serves. Re-pull or restore; a stale sidecar that reverts the view is
+never silently accepted.
 
 ### Travel recipe
 

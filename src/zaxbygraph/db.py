@@ -373,7 +373,93 @@ def _drop_collision_losers(conn: sqlite3.Connection) -> None:
             )
 
 
-def _fold_sync_state(conn: sqlite3.Connection) -> None:
+def current_table_columns() -> dict[str, set[str]]:
+    """Every table's column set in the CURRENT schema (issue #56).
+
+    Built from an in-memory database created by the schema DDL, so it is
+    the exact shape `init_schema` gives the store at adoption time. The
+    adoption's copy loops read the candidate's columns into the store's,
+    so a candidate that lacks a current column would be adopted with the
+    store's defaults for it — a truncated image. Callers compare the
+    candidate's `PRAGMA table_info` against this and refuse the gap.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_schema_sql())
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        return {
+            table: {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def current_column_rules() -> dict[str, dict[str, tuple[str, bool]]]:
+    """Every table's {column: (declared type, NOT NULL)} in the CURRENT
+    schema (issue #56; swarm-pr-review N-14/N-18).
+
+    Built from the same in-memory schema DDL as `current_table_columns`, so
+    it is the exact shape `init_schema` gives the store at adoption time.
+    ONE derived rule replaces the four enumerated per-column checks that
+    preceded it: a column declared TEXT must hold text (or NULL when the
+    DDL allows it), a column declared INTEGER must hold an integer, and a
+    column declared NOT NULL must not be NULL — SQLite's dynamic typing
+    stores anything a divergent schema allows, and the adoption copies the
+    value verbatim into a store column that then rejects it either
+    silently (a fabricated value) or loudly (an IntegrityError that aborts
+    the whole command). Columns with no declared type carry anything and
+    are not constrained. `sync_state.repo` is special-cased by the caller:
+    a TEXT PRIMARY KEY on a rowid table permits NULL in SQLite, but the
+    fold's grouping needs a real key.
+    """
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_schema_sql())
+        tables = [r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )]
+        return {
+            table: {r[1]: ((r[2] or "").upper(), bool(r[3]))
+                    for r in conn.execute(f"PRAGMA table_info({table})")}
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+#: The optional TEXT state columns the fold carries from the winner (issue
+#: #56): the DDL declares them TEXT, so a divergent storage class is
+#: refused exactly as the compared columns are.
+_OPTIONAL_SYNC_STATE_TEXTS = ("rate_limit_reset_at", "fetch_source")
+
+
+def _text_value(row: sqlite3.Row, column: str) -> str | None:
+    """A TEXT column's value, refusing any other storage class (issue #56).
+
+    `sync_state`'s timestamp columns are declared TEXT; a divergent schema
+    whose column lost its affinity can hold INTEGER or BLOB values, and
+    comparing those against strings raises an uncaught TypeError that
+    would abort the whole command. Raise `sqlite3.DatabaseError` instead,
+    so the caller's handler converts it to an unreadable candidate —
+    the migration path has no preflight in front of it, exactly as the
+    flag columns' fail-closed raise covers `include_patches`.
+    """
+    if column not in row.keys():
+        return None
+    value = row[column]
+    if value is None or isinstance(value, str):
+        return value
+    raise sqlite3.DatabaseError(
+        f"sync_state.{column} holds a {type(value).__name__} value: a"
+        " divergent storage class is refused"
+    )
+
+
+def _fold_sync_state(conn: sqlite3.Connection,
+                     repo: str | None = None) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
     The insert is driven by `PRAGMA table_info`, NOT a hardcoded column
@@ -385,23 +471,88 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     winner's values; counts are recomputed afterwards.
     `full_sync_pending` is never carried from a loser: it is derived from
     the merged timestamp.
+
+    `repo` scopes the fold to one identity (case-insensitively). The
+    adoption passes it, because a candidate's rows for a repo the user is
+    NOT consolidating are never copied into the store, so a malformed row
+    there must not refuse the adoption — the same isolation the preflight's
+    repo-scoped storage-class count gives (swarm-pr-review N-09; cubic
+    review, PR #58). Only the per-IDENTITY steps are scoped: a NULL or
+    non-text `repo` is still refused whole-table, because it is a broken
+    primary key rather than another identity's row, and the fold's grouping
+    genuinely needs a real key for it (issue #56; C14's null-repo shape
+    pins that refusal).
+
+    Reads go through `_text_value`, which tolerates an ABSENT column (a
+    mid-migration schema shape) by returning None — the aggregation's
+    natural default — instead of raising IndexError, which is not a
+    `sqlite3.DatabaseError` and would abort the whole command (issue #56,
+    AC4/AC5). A non-integer value in the NOT NULL flag
+    column is a fabricated state no genuine store can produce (the DDL
+    declares it INTEGER NOT NULL DEFAULT 0): the fold refuses with a
+    `sqlite3.DatabaseError`, which `_MigratedCopy` converts to an
+    unreadable candidate — adopting it would fabricate patch-retention
+    state, and `max()` over mixed storage classes would raise an uncaught
+    TypeError (issue #56, AC11/AC12).
     """
     rows = conn.execute("SELECT rowid AS rid, * FROM sync_state ORDER BY rowid").fetchall()
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in rows:
-        groups.setdefault(row["repo"].lower(), []).append(row)
+        # A NULL or non-text repo (SQLite permits NULL in a TEXT PRIMARY KEY
+        # on a rowid table) would raise an uncaught AttributeError at
+        # .lower() — the same isolation escape as a missing column, one
+        # type up (issue #56; implementation-review round-3 finding 2).
+        # Fail closed so the caller's sqlite3.DatabaseError handler
+        # converts it to an unreadable candidate.
+        repo_key = _text_value(row, "repo")
+        if repo_key is None:
+            raise sqlite3.DatabaseError(
+                "sync_state.repo is NULL or non-text: a divergent key value"
+                " is refused"
+            )
+        groups.setdefault(repo_key.lower(), []).append(row)
     columns = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
     for lower_repo, group in groups.items():
+        if repo is not None and lower_repo != repo.lower():
+            continue  # not the consolidated identity: its rows are not copied
         if len(group) == 1 and group[0]["repo"] == lower_repo:
             continue
-        winner = max(group, key=lambda r: (r["issues_since"] or "", r["rid"]))
+        # The timestamps are TEXT columns (or NULL); a divergent schema
+        # whose column lost its affinity can hold INTEGER or BLOB values,
+        # and max() over mixed storage classes raises an uncaught
+        # TypeError — the same isolation escape as a missing column, one
+        # type down (issue #56; implementation-review round-2 finding 1).
+        # Fail closed so the caller's sqlite3.DatabaseError handler
+        # converts it to an unreadable candidate.
+        winner = max(
+            group,
+            key=lambda r: (_text_value(r, "issues_since") or "", r["rid"]),
+        )
         full = max(
-            (r["last_full_sync_at"] for r in group if r["last_full_sync_at"]), default=None
+            (_text_value(r, "last_full_sync_at") for r in group
+             if _text_value(r, "last_full_sync_at")), default=None
         )
         incr = max(
-            (r["last_incr_sync_at"] for r in group if r["last_incr_sync_at"]), default=None
+            (_text_value(r, "last_incr_sync_at") for r in group
+             if _text_value(r, "last_incr_sync_at")), default=None
         )
-        patches = max(r["include_patches"] for r in group)
+        if "include_patches" in columns:
+            values = [r["include_patches"] for r in group]
+            # Fail closed on a heterogeneous group: max() over mixed
+            # storage classes raises an uncaught TypeError (not a
+            # sqlite3.DatabaseError), which would abort the whole command
+            # — the same isolation escape as a missing column, one type
+            # down (issue #56, AC11; implementation-review finding 1).
+            if any(not isinstance(v, int) or isinstance(v, bool)
+                   for v in values):
+                raise sqlite3.DatabaseError(
+                    "sync_state.include_patches holds a non-integer value in"
+                    " a case-split group: a fabricated patch-retention state"
+                    " is refused"
+                )
+            patches = max(values)
+        else:
+            patches = 0  # the column's own DDL default
         # A recorded fault is never merged away: the merged row keeps the
         # winner's last_error when it has one, else any casing's, so an
         # adopted corpus cannot report fault-free over a failed run
@@ -411,8 +562,8 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         # state, and dropping it would let a corpus that stopped early
         # report complete.
         last_error = next(
-            (r["last_error"] for r in (winner, *group)
-             if r["last_error"] is not None),
+            (_text_value(r, "last_error") for r in (winner, *group)
+             if _text_value(r, "last_error") is not None),
             None,
         )
         for row in group:
@@ -433,6 +584,15 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
                 values[column] = 0
             elif column == "full_sync_pending":
                 values[column] = 1 if full is None else 0
+            elif column in _OPTIONAL_SYNC_STATE_TEXTS:
+                # The optional TEXT state columns are carried from the
+                # winner through the same storage-class guard the compared
+                # columns use (issue #56): a BLOB value would be written
+                # into the store's TEXT column verbatim, contradicting the
+                # storage-class contract the docs promise. `_text_value`
+                # refuses it (sqlite3.DatabaseError -> the caller converts
+                # to an unreadable candidate).
+                values[column] = _text_value(winner, column)
             else:
                 keys = winner.keys()
                 values[column] = winner[column] if column in keys else None
@@ -641,7 +801,8 @@ def _prime_fts_for_fold(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
 
 
-def fold_repo_casings(conn: sqlite3.Connection) -> None:
+def fold_repo_casings(conn: sqlite3.Connection,
+                      repo: str | None = None) -> None:
     """Collapse case-split repo identities to the folded slug.
 
     One mechanism, two callers: `migrate_v1_to_v2` (every store open below
@@ -649,6 +810,15 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
     `_MigratedCopy` has already migrated the copy to the current shape, so
     the source-bearing steps are open there). Idempotent: a second call on
     already-folded data writes nothing.
+
+    `repo` scopes the `sync_state` half of the fold to one identity, which
+    the adoption passes so a malformed row for a repo it is not
+    consolidating cannot refuse the candidate (swarm-pr-review N-09; cubic
+    review, PR #58). The repo-keyed TABLE dedupes stay whole-table: they are
+    conflict-target upserts over rows the copy filters by repo anyway, and
+    scoping them would change the genuine single-repo behavior they exist
+    to guarantee. A store the tool itself writes holds exactly one repo, so
+    the two paths agree on every real input.
 
     Order matters: distinct-id collisions are resolved FIRST (so a loser's
     children can never attach to the winner's number), then the
@@ -697,11 +867,12 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
         )
     conn.execute("UPDATE reviews SET repo = lower(repo)")
     conn.execute("UPDATE fetch_log SET repo = lower(repo)")
-    _fold_sync_state(conn)
+    _fold_sync_state(conn, repo)
     from zaxbygraph.store import recount  # local import: store owns the counts
 
-    for (repo,) in conn.execute("SELECT DISTINCT repo FROM sync_state").fetchall():
-        recount(conn, repo)
+    for (repo_name,) in conn.execute(
+            "SELECT DISTINCT repo FROM sync_state").fetchall():
+        recount(conn, repo_name)
 
 
 def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
@@ -1383,8 +1554,21 @@ def _backfill_text_refs(conn: sqlite3.Connection) -> None:
             continue
         if not isinstance(raw, dict):
             continue
-        title = raw.get("title") or ""
-        body = raw.get("body") or ""
+        # A wrong-typed payload field (`{"title": 5}`) is the #53
+        # malformed-data class, but the regexes below take str only, so it
+        # used to raise an uncaught TypeError that aborted the whole
+        # migration — one candidate killing the entire doctor run, the same
+        # observable outcome as a divergent storage class. A non-string
+        # value is treated as EMPTY text, never coerced with str(): a list's
+        # or dict's repr can contain backticked paths and `closes #N`, and
+        # extracting references from it would let a malformed payload write
+        # edges (final critic round-7 question; cubic review, PR #58).
+        title = raw.get("title")
+        body = raw.get("body")
+        if not isinstance(title, str):
+            title = ""
+        if not isinstance(body, str):
+            body = ""
         for path, backticked in _extract.parse_path_refs(body, repo):
             conn.execute(
                 "INSERT OR IGNORE INTO item_path_refs(repo, number, origin,"
@@ -1566,6 +1750,27 @@ MIGRATIONS = [
     (10, migrate_v9_to_v10),
     (11, migrate_v10_to_v11),
 ]
+
+
+#: The schema version whose migration CREATES each table that the v1 DDL
+#: does not carry (issue #56): a candidate whose `user_version` predates a
+#: table its schema DOES carry was left by an interrupted upgrade —
+#: `init_schema` commits the current schema DDL and only then runs the
+#: migration chain in separate transactions, so a crash between them
+#: leaves the newer tables present under the old stamp, never populated.
+#: The consolidation's preservation rule keys off this map so such a
+#: candidate cannot take the store's rows for a table its version never
+#: wrote. Pinned against drift by a census test: every table in the
+#: current schema is either in the v1 DDL or named here.
+_TABLE_INTRODUCED_VERSION = {
+    "assignees": 7,
+    "issue_field_values": 7,
+    "revisions": 8,
+    "item_path_refs": 9,
+    "item_signatures": 9,
+    "item_events": 10,
+    "pr_commits": 10,
+}
 
 
 def init_schema(conn: sqlite3.Connection) -> None:

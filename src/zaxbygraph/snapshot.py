@@ -72,6 +72,12 @@ SNAPSHOT_BRANCH = "zaxbygraph-snapshot"
 #: byte-deterministic for identical content (plan v2 finding 8)
 _FIXED_DATE = "1970-01-01T00:00:00Z"
 
+#: a SQLite `-wal` file's own header, which every open writes even when the
+#: connection makes no change. A sidecar of exactly this size carries no
+#: frames and cannot revert anything, so the post-install stale-WAL refusal
+#: compares the size against it rather than against zero.
+_WAL_HEADER_BYTES = 32
+
 
 class SnapshotError(Exception):
     """Snapshot failure with an envelope-shaped payload."""
@@ -831,10 +837,25 @@ def _install(staged: Path, db_path: Path) -> None:
     failure falls through — pull is the recovery path for a corrupt
     destination); the COMMITTED refusals are the guarded replace below,
     classified by cause: a busy reader, a cross-volume move, or a storage
-    fault each get their own code and hint."""
-    try:
-        # best-effort WAL quiesce: back-fill pending frames into the main
-        # db so the replaced file never coexists with stale sidecar data.
+    fault each get their own code and hint.
+
+    Once the replace has committed, dropping the OLD sidecars is best-effort
+    housekeeping: a failure there must NOT claim the store was not replaced
+    (issue #56, AC6 — the pre-fix code folded the cleanup's OSError into the
+    replace's refusal, so the envelope lied about a committed mutation and
+    the post-install check never ran). `pull` always reaches
+    `_post_install_check` after this returns, and that check's corpus-digest
+    verdict is the truthful outcome: a stale sidecar that reverts the pulled
+    corpus is exactly what `corpus_mismatch` exists to catch, and its hint
+    already discloses that the store was already replaced.
+    """
+    # best-effort WAL quiesce: back-fill pending frames into the main db so
+    # the replaced file never coexists with stale sidecar data. Skipped
+    # when the destination does not exist yet — sqlite3.connect CREATES a
+    # missing file, and a pull that then refuses would leave a 0-byte store
+    # behind that `resolve_db` prefers over a legacy in-repo DB holding the
+    # corpus (swarm-pr-review N-08).
+    if db_path.exists():
         try:
             dest = sqlite3.connect(str(db_path))
             try:
@@ -843,52 +864,120 @@ def _install(staged: Path, db_path: Path) -> None:
                 dest.close()
         except (OSError, sqlite3.Error):
             # pull is the recovery path for a corrupt destination (README
-            # recipes): a quiesce failure on unreadable bytes falls
-            # through to the guarded install, which replaces them
+            # recipes): a quiesce failure on unreadable bytes falls through
+            # to the guarded install, which replaces them
             pass
-        try:
-            os.replace(staged, db_path)
-        except OSError as exc:
-            # a same-file open reader and a cross-volume move are different
-            # faults with different remedies; name them apart
-            winerr = getattr(exc, "winerror", None)
-            if winerr == 17 or exc.errno == errno.EXDEV:
-                raise SnapshotError(
-                    "dest_cross_volume",
-                    "destination store is on a different volume than the"
-                    " staging area; set TMPDIR onto the store's volume",
-                    hint="os.replace cannot move a file across volumes",
-                ) from exc
-            if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
-                                                  errno.EPERM, errno.ETXTBSY):
-                raise SnapshotError(
-                    "dest_open",
-                    "destination store is held open by another process",
-                    hint="close readers holding the store open and re-pull",
-                ) from exc
+    # ONE guarded replace: a same-file open reader, a cross-volume move, and
+    # a storage fault are different faults with different remedies.
+    try:
+        os.replace(staged, db_path)
+    except OSError as exc:
+        winerr = getattr(exc, "winerror", None)
+        if winerr == 17 or exc.errno == errno.EXDEV:
+            raise SnapshotError(
+                "dest_cross_volume",
+                "destination store is on a different volume than the"
+                " staging area; set TMPDIR onto the store's volume",
+                hint="os.replace cannot move a file across volumes",
+            ) from exc
+        if winerr in (5, 32) or exc.errno in (errno.EACCES, errno.EBUSY,
+                                              errno.EPERM, errno.ETXTBSY):
+            # EACCES and EPERM are ambiguous: a reader holding the file open,
+            # or a permissions problem on the destination. Name the cause so
+            # the user is not told to close readers when the real fix is a
+            # permission change (cubic review, PR #58).
+            cause = (f"{exc.__class__.__name__}: {exc}"
+                     if exc.errno in (errno.EACCES, errno.EPERM) else "")
             raise SnapshotError(
                 "dest_open",
-                f"destination store could not be replaced: {exc}",
-                hint="check the destination path and its permissions",
+                "destination store could not be replaced: held open by"
+                " another process, or not writable"
+                + (f" ({cause})" if cause else ""),
+                hint="close readers holding the store open, or check the"
+                " destination path's permissions, and re-pull",
             ) from exc
-        # only now are the OLD sidecars stale: the new main file is in place
-        for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm")):
-            if sidecar.exists():
-                sidecar.unlink()
-    except SnapshotError:
-        raise
-    except OSError as exc:
         raise SnapshotError(
             "dest_open",
             f"destination store could not be replaced: {exc}",
             hint="check the destination path and its permissions",
         ) from exc
+    # The replace has COMMITTED. Only now are the OLD sidecars stale, and
+    # dropping them is best-effort: a failure here (a locked or read-only
+    # sidecar) leaves the store REPLACED, so it is swallowed rather than
+    # reported as a failed replace. The post-install check that follows is
+    # the verdict on what the destination now serves.
+    for sidecar in (Path(str(db_path) + "-wal"), Path(str(db_path) + "-shm"),
+                    Path(str(db_path) + "-journal")):
+        # Each unlink gets its own guard: one locked sidecar must not stop
+        # the others being dropped (cubic review, PR #58).
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except OSError:
+            pass
 
 
 def _post_install_check(db_path: Path, manifest: dict) -> dict:
     """Reopen dest, recompute the corpus digest, assert the manifest value
-    (AC5). Returns the result dict."""
-    conn = connect(db_path)
+    (AC5). Returns the result dict.
+
+    The reopen is READ-ONLY (issue #56, AC6): a read-write open of a
+    destination whose stale sidecar survived the install's best-effort
+    cleanup would recover that sidecar into the replaced main on close, so
+    the check's own close would bake the very revert it exists to report —
+    and the replaced bytes would no longer be provable. A read-only reopen
+    observes exactly what the destination now serves (the stale sidecar's
+    content, when one survived) without mutating it: the digest verdict is
+    the truth, and the install's evidence survives the check.
+
+    A surviving `-wal` with anything in it beyond its 32-byte header is
+    refused BEFORE the digest (swarm-pr-review N-07): the corpus digest
+    covers items, their children, releases and orphan edges, so a stale WAL
+    whose frames touch only `revisions`, `sync_state`, `fetch_log` or
+    `actors` leaves the digest matching while the destination serves the OLD
+    watermark, the OLD edit history and the OLD actor URLs — and every later
+    read-write open recovers those frames into the replaced main, so the
+    corruption outlives the pull. After `os.replace` any surviving WAL
+    belongs to the pre-replace main by construction, so its presence beyond
+    the header SQLite itself writes on any open is itself the defect. The
+    header alone (exactly 32 bytes) carries no frames and is inert, so it is
+    NOT refused; a surviving `-shm` without a `-wal` is likewise inert.
+    A sidecar that CANNOT be inspected is refused too, never assumed empty:
+    an OSError on `stat` would otherwise fail open and let the digest be the
+    only verdict, which is the exact hole this guard closes (cubic review,
+    PR #58). `stat` is called FIRST and only `FileNotFoundError` means
+    "absent", because `Path.exists()` is not a stable oracle: on 3.14 it
+    delegates to `os.path.exists`, which swallows EACCES and answers False,
+    so an exists()-first shape would fail open on exactly the interpreters
+    this repo supports (final-critic round 3).
+    """
+    stale_wal = Path(str(db_path) + "-wal")
+    try:
+        wal_size = stale_wal.stat().st_size
+    except FileNotFoundError:
+        wal_size = 0  # no sidecar survived the install: nothing to refuse
+    except OSError as exc:
+        # Fail CLOSED: an unreadable sidecar is not evidence of an absent
+        # one. The digest covers only part of the store, so "cannot inspect"
+        # must refuse rather than defer to a verdict that cannot see this
+        # class of corruption.
+        raise SnapshotError(
+            "dest_sidecar_stale",
+            "the destination's -wal could not be inspected after the install,"
+            " so whether it carries pre-replace frames is unknown",
+            hint="the store was already replaced; close every reader of it and"
+                 " re-pull, or restore a known-good store",
+        ) from exc
+    stale_frames = wal_size > _WAL_HEADER_BYTES
+    if stale_frames:
+        raise SnapshotError(
+            "dest_sidecar_stale",
+            "a stale -wal survived the install beside the replaced store, so"
+            " the destination can serve pre-replace frames on its next open",
+            hint="the store was already replaced; close every reader of it and"
+                 " re-pull, or restore a known-good store",
+        )
+    conn = _open_readonly(db_path)
     conn.row_factory = sqlite3.Row
     try:
         digest = _corpus_digest_conn(conn, manifest["repo"])
