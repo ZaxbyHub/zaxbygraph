@@ -355,7 +355,13 @@ class _SidecarClassificationTest(unittest.TestCase):
             if _norm(p) != _norm(wal):
                 return real_stat(p, *a, **kw)
             if kw.get("follow_symlinks", True):
-                return _fake_mode(stat.S_IFREG)  # the link was followed
+                # The link's TARGET does not exist, so a link-following stat
+                # answers FileNotFoundError -- which is what makes this test
+                # bite on 3.11 as well as 3.14: 3.11's own `Path.exists()`
+                # calls `self.stat()`, gets ENOENT, and `_ignore_error` turns
+                # it into False, so an exists-first ordering skips the
+                # dangling link.
+                raise FileNotFoundError(2, "No such file", str(p))
             return _fake_mode(stat.S_IFLNK)
 
         with mock.patch.object(Path, "is_symlink", fake_islink), \
