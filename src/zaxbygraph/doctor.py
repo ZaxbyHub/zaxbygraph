@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import stat
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -138,9 +139,7 @@ def _sidecars(path: Path) -> list[Path] | None:
     non-regular sidecar (FIFO/device) is not a recovery log this copy can
     faithfully take — skipping it would silently truncate the candidate,
     and copying a FIFO would block forever, so such a candidate is reported
-    unusable instead. `is_symlink()` is checked BEFORE `exists()` because
-    `exists()` follows symlinks and a dangling one would otherwise be
-    skipped silently (cubic PR #54 round 1).
+    unusable instead.
 
     There is deliberately NO size bound. A size ceiling was tried first and
     removed: it refuses a legitimate crash-damaged candidate whose
@@ -151,20 +150,35 @@ def _sidecars(path: Path) -> list[Path] | None:
     check in `_faithful_copy`, which sees a growing source and refuses after
     bounded retries; a LARGE BUT STABLE log is a real crash-damaged
     candidate, not a runaway one.
+
+    `stat` is called FIRST and only `FileNotFoundError` means "absent",
+    because `is_symlink()`/`exists()`/`is_file()` are not stable oracles
+    (issue #59): on 3.14 they delegate to `os.path.islink`/
+    `os.path.exists`, which swallow an OSError and answer False, so an
+    exists()-first shape would drop an uninspectable sidecar from the copy
+    and let `_faithful_copy` adopt a truncated image — its own documented
+    worst case. On 3.11-3.13 the same oracles re-raise, which is why the old
+    shape failed open only on the newest interpreter this repo supports.
+    Any other OSError makes the candidate unusable, exactly as
+    `snapshot.py`'s `_post_install_check` already treats a destination
+    sidecar it cannot inspect.
     """
     sidecars = []
     for suffix in ("-wal", "-journal"):
         sidecar = Path(str(path) + suffix)
-        # `is_symlink()` BEFORE `exists()` (cubic PR #54 round 1): `exists()`
-        # follows symlinks, so a DANGLING one is silently skipped and the
-        # guard below never sees it. `is_symlink()` answers for a dangling
-        # link too, so every symlinked sidecar is refused rather than
-        # quietly dropped.
-        if sidecar.is_symlink():
-            return None
-        if not sidecar.exists():
+        # `follow_symlinks=False` is `lstat`: it answers for the link
+        # itself, so a symlinked sidecar — including a dangling one — is
+        # refused rather than quietly dropped, and the classification
+        # never follows the link to its target.
+        try:
+            st = sidecar.stat(follow_symlinks=False)
+        except FileNotFoundError:
             continue
-        if not sidecar.is_file():
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            return None
+        if not stat.S_ISREG(st.st_mode):
             return None
         sidecars.append(sidecar)
     return sidecars
@@ -208,12 +222,12 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
     """
     for _ in range(3):
         try:
+            # Defence in depth: `_sidecars` now fails closed by returning
+            # None, so this guard covers a future enumeration that raises
+            # rather than today's. One unreadable candidate must never
+            # abort the scan (PRR-003).
             sidecars = _sidecars(path)
         except OSError:
-            # The sidecar set itself could not be stat'd (the main file was
-            # removed while a `-wal` lingers). Not a database fault: retry,
-            # then refuse — one unreadable candidate must never abort the
-            # scan (PRR-003).
             continue
         if sidecars is None:
             return False
@@ -233,20 +247,25 @@ def _faithful_copy(path: Path, copy: Path) -> bool:
                     Path(str(copy) + suffix).unlink(missing_ok=True)
             except OSError:
                 continue
+            # No `if p.exists()` guard (issue #59): the guard swallowed a
+            # stat fault into a missing dict entry on 3.14, so a source that
+            # could not be stat'd dropped out of the comparison instead of
+            # failing the attempt. An OSError here now reaches the
+            # retry-then-refuse path below, which is where an unusable
+            # candidate belongs.
             before = {
                 p.name: (p.stat().st_size, p.stat().st_mtime_ns)
                 for p in sources
-                if p.exists()
             }
             for src in sources:
                 shutil.copy2(src, Path(str(copy) + src.name[len(path.name):]))
             after_sidecars = _sidecars(path)
             if after_sidecars is None:
                 continue  # a sidecar appeared that is not a log: retry
+            # Same stat-first shape as `before` above (issue #59).
             after = {
                 p.name: (p.stat().st_size, p.stat().st_mtime_ns)
                 for p in after_sidecars + [path]
-                if p.exists()
             }
         except OSError:
             # A source the OS refuses (a locked or permission-denied file) or
