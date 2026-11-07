@@ -505,9 +505,8 @@ class SnapshotInstallTruthfulnessTests(_StoreIntegrityCase):
             f" corpus is in the destination main): exc={exc!r}"
             f" result={result!r}")
         # The truthful outcome is the post-install check's own verdict: the
-        # stale sidecar reverts the pulled corpus, so the digest check runs
-        # and refuses with corpus_mismatch, disclosing that the store was
-        # already replaced. Assert the concrete outcome, not merely the
+        # stale sidecar reverts the pulled corpus, so the post-install check
+        # runs and refuses. Assert the concrete outcome, not merely the
         # absence of one phrase (plan critic round 1, finding 4).
         self.assertTrue(post_install_ran,
                         "the post-install verification never ran after the"
@@ -515,12 +514,14 @@ class SnapshotInstallTruthfulnessTests(_StoreIntegrityCase):
         self.assertIsNotNone(exc,
                              "the pull neither refused truthfully nor"
                              f" returned a result: result={result!r}")
-        # A surviving non-empty -wal is refused as dest_sidecar_stale
-        # (swarm-pr-review N-07): the corpus digest covers items, children,
-        # releases and orphan edges, so a WAL touching only revisions /
-        # sync_state / fetch_log / actors would leave the digest matching
-        # while the destination served the pre-replace corpus — the exact
-        # silent-revert class this PR exists to close.
+        # A surviving -wal holding more than its 32-byte header is refused
+        # as dest_sidecar_stale (swarm-pr-review N-07): the corpus digest
+        # covers items, children, releases and orphan edges, so a WAL
+        # touching only revisions / sync_state / fetch_log / actors would
+        # leave the digest matching while the destination served the
+        # pre-replace corpus — the exact silent-revert class this PR exists
+        # to close. The refusal therefore fires BEFORE the digest, so the
+        # digest's own corpus_mismatch verdict is not reached in this shape.
         self.assertEqual(getattr(exc, "code", None), "dest_sidecar_stale",
                          "the post-install check did not refuse the stale"
                          f" -wal it exists to catch: exc={exc!r}")

@@ -657,25 +657,30 @@ class TextStorageClassContractTests(unittest.TestCase):
             # a str() coercion the list's repr — which contains a backticked
             # path and `closes #1` — would fabricate an item_path_refs row
             # and a closes_keyword edge; under empty-text it yields none.
-            if store.exists():
-                conn = sqlite3.connect(str(store))
-                try:
-                    paths = conn.execute(
-                        "SELECT COUNT(*) FROM item_path_refs WHERE repo = ?",
-                        (REPO,)).fetchone()[0]
-                    fabricated = conn.execute(
-                        "SELECT COUNT(*) FROM edges WHERE repo = ?"
-                        " AND rel = 'closes_keyword'", (REPO,)).fetchone()[0]
-                finally:
-                    conn.close()
-                self.assertEqual(
-                    paths, 0,
-                    "a malformed payload field fabricated item_path_refs"
-                    f" rows: {paths}")
-                self.assertEqual(
-                    fabricated, 0,
-                    "a malformed payload field fabricated closes_keyword"
-                    f" edges: {fabricated}")
+            # Adoption already proved the store was written, so its existence
+            # is asserted rather than guarded: a guard here would silently
+            # skip the invariant (cubic review, PR #58).
+            self.assertTrue(
+                store.exists(),
+                "the candidate was adopted but no store was written")
+            conn = sqlite3.connect(str(store))
+            try:
+                paths = conn.execute(
+                    "SELECT COUNT(*) FROM item_path_refs WHERE repo = ?",
+                    (REPO,)).fetchone()[0]
+                fabricated = conn.execute(
+                    "SELECT COUNT(*) FROM edges WHERE repo = ?"
+                    " AND rel = 'closes_keyword'", (REPO,)).fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(
+                paths, 0,
+                "a malformed payload field fabricated item_path_refs"
+                f" rows: {paths}")
+            self.assertEqual(
+                fabricated, 0,
+                "a malformed payload field fabricated closes_keyword"
+                f" edges: {fabricated}")
 
 
 if __name__ == "__main__":

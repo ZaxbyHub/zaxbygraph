@@ -72,6 +72,12 @@ SNAPSHOT_BRANCH = "zaxbygraph-snapshot"
 #: byte-deterministic for identical content (plan v2 finding 8)
 _FIXED_DATE = "1970-01-01T00:00:00Z"
 
+#: a SQLite `-wal` file's own header, which every open writes even when the
+#: connection makes no change. A sidecar of exactly this size carries no
+#: frames and cannot revert anything, so the post-install stale-WAL refusal
+#: compares the size against it rather than against zero.
+_WAL_HEADER_BYTES = 32
+
 
 class SnapshotError(Exception):
     """Snapshot failure with an envelope-shaped payload."""
@@ -924,22 +930,39 @@ def _post_install_check(db_path: Path, manifest: dict) -> dict:
     content, when one survived) without mutating it: the digest verdict is
     the truth, and the install's evidence survives the check.
 
-    A surviving non-empty `-wal` is refused BEFORE the digest
-    (swarm-pr-review N-07): the corpus digest covers items, their children,
-    releases and orphan edges, so a stale WAL whose frames touch only
-    `revisions`, `sync_state`, `fetch_log` or `actors` leaves the digest
-    matching while the destination serves the OLD watermark, the OLD edit
-    history and the OLD actor URLs — and every later read-write open
-    recovers those frames into the replaced main, so the corruption outlives
-    the pull. After `os.replace` any surviving WAL belongs to the pre-replace
-    main by construction, so its presence (with frames in it) is itself the
-    defect; a surviving `-shm` without a `-wal` is inert and not refused.
+    A surviving `-wal` with anything in it beyond its 32-byte header is
+    refused BEFORE the digest (swarm-pr-review N-07): the corpus digest
+    covers items, their children, releases and orphan edges, so a stale WAL
+    whose frames touch only `revisions`, `sync_state`, `fetch_log` or
+    `actors` leaves the digest matching while the destination serves the OLD
+    watermark, the OLD edit history and the OLD actor URLs — and every later
+    read-write open recovers those frames into the replaced main, so the
+    corruption outlives the pull. After `os.replace` any surviving WAL
+    belongs to the pre-replace main by construction, so its presence beyond
+    the header SQLite itself writes on any open is itself the defect. The
+    header alone (exactly 32 bytes) carries no frames and is inert, so it is
+    NOT refused; a surviving `-shm` without a `-wal` is likewise inert.
+    A sidecar that CANNOT be inspected is refused too, never assumed empty:
+    an OSError on `stat` would otherwise fail open and let the digest be the
+    only verdict, which is the exact hole this guard closes (cubic review,
+    PR #58).
     """
     stale_wal = Path(str(db_path) + "-wal")
     try:
-        stale_frames = stale_wal.exists() and stale_wal.stat().st_size > 0
-    except OSError:
-        stale_frames = False  # unreadable: let the digest be the verdict
+        wal_size = stale_wal.stat().st_size if stale_wal.exists() else 0
+    except OSError as exc:
+        # Fail CLOSED: an unreadable sidecar is not evidence of an absent
+        # one. The digest covers only part of the store, so "cannot inspect"
+        # must refuse rather than defer to a verdict that cannot see this
+        # class of corruption.
+        raise SnapshotError(
+            "dest_sidecar_stale",
+            "the destination's -wal could not be inspected after the install,"
+            " so whether it carries pre-replace frames is unknown",
+            hint="the store was already replaced; close every reader of it and"
+                 " re-pull, or restore a known-good store",
+        ) from exc
+    stale_frames = wal_size > _WAL_HEADER_BYTES
     if stale_frames:
         raise SnapshotError(
             "dest_sidecar_stale",

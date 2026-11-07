@@ -432,6 +432,17 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
     # whole command (swarm-pr-review N-01/N-18). One derived rule replaces
     # the enumerated per-column checks that preceded it, three of which it
     # had made unreachable (N-14).
+    # The required-column presence check runs BEFORE the derived rule: the
+    # rule reads `sync_state`'s columns through PRAGMA-derived names, so a
+    # candidate missing one of them would otherwise be refused by the rule's
+    # generic "divergent storage class" message instead of by the specific
+    # "sync_state lacks the X column" one (cubic review, PR #58). Presence
+    # is the cheaper and more diagnosable fact, so it is asked first.
+    state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+    for column in _REQUIRED_SYNC_STATE_COLUMNS:
+        if column not in state_cols:
+            raise _UnreadableCandidate(
+                path, f"the candidate's sync_state lacks the {column} column")
     rules = current_column_rules()
     for table in sorted(rules):
         if table not in _ADOPTED_TABLES:
@@ -468,11 +479,6 @@ def _require_adoptable_schema(conn: sqlite3.Connection, path: Path,
                     path,
                     f"the candidate's {table}.{column} holds a divergent"
                     f" storage class in {bad} row(s): refused, not adopted")
-    state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
-    for column in _REQUIRED_SYNC_STATE_COLUMNS:
-        if column not in state_cols:
-            raise _UnreadableCandidate(
-                path, f"the candidate's sync_state lacks the {column} column")
     # NOTE: the repo NULL/non-text guard, the flag-column guard and the
     # TEXT-column guard that used to sit here are all subsumed by the
     # derived rule above (swarm-pr-review N-14): `sync_state.repo` is
@@ -610,7 +616,12 @@ class _MigratedCopy:
                 # refuses only genuinely divergent schemas — before any
                 # store write and before the fold sees them.
                 _require_adoptable_schema(conn, path, self.repo)
-                fold_repo_casings(conn)
+                # Scope the fold's `sync_state` half to the consolidated
+                # identity, so a malformed row for a repo this adoption
+                # never copies cannot refuse the candidate — the same
+                # isolation the repo-scoped storage-class count gives
+                # (swarm-pr-review N-09; cubic review, PR #58).
+                fold_repo_casings(conn, self.repo)
                 conn.commit()
             except sqlite3.DatabaseError as exc:
                 # A candidate whose schema diverges from the tool's can still

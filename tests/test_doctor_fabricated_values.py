@@ -176,6 +176,36 @@ def _null_not_null_text_candidate(bad: Path) -> None:
     conn.close()
 
 
+def _drop_sync_state_column(bad: Path, column: str) -> None:
+    """Rebuild the candidate's `sync_state` without `column`, so the
+    required-column presence check is the layer that refuses it."""
+    conn = sqlite3.connect(str(bad))
+    ddl = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table'"
+        " AND name='sync_state'").fetchone()[0]
+    conn.execute("ALTER TABLE sync_state RENAME TO sync_state_old")
+    lines = [ln for ln in ddl.splitlines()
+             if ln.strip().split()[0] != column]
+    for i in range(len(lines) - 2, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.startswith("(") or not stripped:
+            continue
+        if lines[i].rstrip().endswith(",") and \
+                lines[i + 1].strip().startswith(")"):
+            lines[i] = lines[i].rstrip()[:-1]
+        break
+    conn.execute("\n".join(lines))
+    keep = [r[1] for r in conn.execute("PRAGMA table_info(sync_state_old)")
+            if r[1] != column]
+    collist = ", ".join(keep)
+    conn.execute(
+        f"INSERT INTO sync_state ({collist}) SELECT {collist}"
+        " FROM sync_state_old")
+    conn.execute("DROP TABLE sync_state_old")
+    conn.commit()
+    conn.close()
+
+
 def _blob_evidence_candidate(bad: Path) -> None:
     """Make the candidate case-split and add two `rel='closes'` edge rows
     for the same pair and source — one per casing — with the upper
@@ -670,3 +700,51 @@ class NewerCandidateTests(_FabricatedValueCase):
             entry is not None and entry.get("unreadable"),
             f"a candidate newer than this build was adopted: {entry}")
         self._assert_isolated(envelope, good, bad)
+
+class MissingSyncStateColumnTests(_FabricatedValueCase):
+    def test_missing_sync_state_column_names_the_column(self) -> None:
+        """AC15 (cubic review, PR #58): a candidate whose `sync_state`
+        lacks a required column is refused by the presence check, which
+        runs BEFORE the derived storage-class rule. The rule builds its
+        `SELECT typeof(...)` from the CURRENT schema's column names, so a
+        candidate missing one raises `OperationalError: no such column`
+        inside the rule loop — a `sqlite3.DatabaseError`, which the fold's
+        handler converts to the generic "defeated the fold" reason. The
+        specific "sync_state lacks the X column" message is the actionable
+        one, and presence is the cheaper fact, so it is asked first. RED at
+        the round-12 head: the reason was the generic fold message."""
+        for column in ("last_error", "include_patches"):
+            with self.subTest(column=column):
+                good, bad, store, empty_cwd = self._divergent_pair(
+                    f"c15-state-{column}",
+                    lambda bad, c=column: _drop_sync_state_column(bad, c))
+                envelope = None
+                try:
+                    envelope = doctor_mod.doctor(empty_cwd, REPO, store,
+                                                 extra_scans=[good, bad],
+                                                 consolidate_flag=True)
+                except Exception as exc:  # noqa: BLE001 - any escape fails
+                    self.fail(f"{type(exc).__name__} escaped candidate"
+                              f" isolation and aborted the whole command:"
+                              f" {exc!r}")
+                self._assert_isolated(envelope, good, bad)
+                entry = {
+                    os.path.normcase(str(row.get("path", ""))): row
+                    for row in envelope.get("scanned") or []}.get(
+                        os.path.normcase(str(bad)))
+                reason = (entry or {}).get("unreadable_reason") or ""
+                self.assertIn(
+                    f"sync_state lacks the {column} column", reason,
+                    f"the refusal did not name the missing column: {reason}")
+                # Pin the LAYER, not only the words: a refusal that names
+                # the column but was produced by the rule loop's
+                # `no such column` escaping into the fold's generic handler
+                # is the wrong outcome with a right-looking message.
+                self.assertNotIn(
+                    "defeated the fold", reason,
+                    f"the missing column escaped to the fold's generic"
+                    f" handler instead of the presence check: {reason}")
+                self.assertNotIn(
+                    "holds a divergent storage class", reason,
+                    f"the missing column was misreported as a divergent"
+                    f" storage class: {reason}")

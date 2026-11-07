@@ -458,7 +458,8 @@ def _text_value(row: sqlite3.Row, column: str) -> str | None:
     )
 
 
-def _fold_sync_state(conn: sqlite3.Connection) -> None:
+def _fold_sync_state(conn: sqlite3.Connection,
+                     repo: str | None = None) -> None:
     """Merge case-split `sync_state` rows, column by column.
 
     The insert is driven by `PRAGMA table_info`, NOT a hardcoded column
@@ -470,6 +471,17 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
     winner's values; counts are recomputed afterwards.
     `full_sync_pending` is never carried from a loser: it is derived from
     the merged timestamp.
+
+    `repo` scopes the fold to one identity (case-insensitively). The
+    adoption passes it, because a candidate's rows for a repo the user is
+    NOT consolidating are never copied into the store, so a malformed row
+    there must not refuse the adoption — the same isolation the preflight's
+    repo-scoped storage-class count gives (swarm-pr-review N-09; cubic
+    review, PR #58). Only the per-IDENTITY steps are scoped: a NULL or
+    non-text `repo` is still refused whole-table, because it is a broken
+    primary key rather than another identity's row, and the fold's grouping
+    genuinely needs a real key for it (issue #56; C14's null-repo shape
+    pins that refusal).
 
     Reads go through `_text_value`, which tolerates an ABSENT column (a
     mid-migration schema shape) by returning None — the aggregation's
@@ -501,6 +513,8 @@ def _fold_sync_state(conn: sqlite3.Connection) -> None:
         groups.setdefault(repo_key.lower(), []).append(row)
     columns = [r[1] for r in conn.execute("PRAGMA table_info(sync_state)")]
     for lower_repo, group in groups.items():
+        if repo is not None and lower_repo != repo.lower():
+            continue  # not the consolidated identity: its rows are not copied
         if len(group) == 1 and group[0]["repo"] == lower_repo:
             continue
         # The timestamps are TEXT columns (or NULL); a divergent schema
@@ -787,7 +801,8 @@ def _prime_fts_for_fold(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO reviews_fts(reviews_fts) VALUES('rebuild')")
 
 
-def fold_repo_casings(conn: sqlite3.Connection) -> None:
+def fold_repo_casings(conn: sqlite3.Connection,
+                      repo: str | None = None) -> None:
     """Collapse case-split repo identities to the folded slug.
 
     One mechanism, two callers: `migrate_v1_to_v2` (every store open below
@@ -795,6 +810,15 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
     `_MigratedCopy` has already migrated the copy to the current shape, so
     the source-bearing steps are open there). Idempotent: a second call on
     already-folded data writes nothing.
+
+    `repo` scopes the `sync_state` half of the fold to one identity, which
+    the adoption passes so a malformed row for a repo it is not
+    consolidating cannot refuse the candidate (swarm-pr-review N-09; cubic
+    review, PR #58). The repo-keyed TABLE dedupes stay whole-table: they are
+    conflict-target upserts over rows the copy filters by repo anyway, and
+    scoping them would change the genuine single-repo behavior they exist
+    to guarantee. A store the tool itself writes holds exactly one repo, so
+    the two paths agree on every real input.
 
     Order matters: distinct-id collisions are resolved FIRST (so a loser's
     children can never attach to the winner's number), then the
@@ -843,11 +867,12 @@ def fold_repo_casings(conn: sqlite3.Connection) -> None:
         )
     conn.execute("UPDATE reviews SET repo = lower(repo)")
     conn.execute("UPDATE fetch_log SET repo = lower(repo)")
-    _fold_sync_state(conn)
+    _fold_sync_state(conn, repo)
     from zaxbygraph.store import recount  # local import: store owns the counts
 
-    for (repo,) in conn.execute("SELECT DISTINCT repo FROM sync_state").fetchall():
-        recount(conn, repo)
+    for (repo_name,) in conn.execute(
+            "SELECT DISTINCT repo FROM sync_state").fetchall():
+        recount(conn, repo_name)
 
 
 def migrate_v1_to_v2(conn: sqlite3.Connection) -> None:

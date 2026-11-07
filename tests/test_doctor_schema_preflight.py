@@ -496,26 +496,105 @@ class AffinityDivergenceTests(_SchemaPreflightCase):
             f"corruption in an unrelated repo refused the candidate:"
             f" {entry}")
         # the candidate is the freshest complete one, so it is adopted and
-        # the OTHER repo's rows are simply not copied
-        self.assertTrue(envelope.get("adopted"), envelope)
-        if store.exists():
-            conn = sqlite3.connect(str(store))
-            try:
-                titles = conn.execute(
-                    "SELECT typeof(title) FROM items WHERE repo = ?",
-                    (REPO,)).fetchall()
-                foreign = conn.execute(
-                    "SELECT COUNT(*) FROM items WHERE repo = 'other/repo'"
-                ).fetchone()[0]
-            finally:
+        # the OTHER repo's rows are simply not copied. Adoption already
+        # proved the store was written, so its existence is asserted rather
+        # than guarded — a guard here would silently skip the invariant
+        # (cubic review, PR #58) — and the adopted candidate is named, not
+        # merely "something was adopted".
+        self.assertEqual(
+            os.path.normcase(str(envelope.get("adopted") or "")),
+            os.path.normcase(str(bad)),
+            f"the unrelated-repo candidate was not the one adopted:"
+            f" {envelope.get('adopted')}")
+        self.assertTrue(store.exists(),
+                        "a candidate was adopted but no store was written")
+        conn = sqlite3.connect(str(store))
+        try:
+            titles = conn.execute(
+                "SELECT typeof(title) FROM items WHERE repo = ?",
+                (REPO,)).fetchall()
+            foreign = conn.execute(
+                "SELECT COUNT(*) FROM items WHERE repo = 'other/repo'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(
+            [tuple(r) for r in titles],
+            [("text",), ("text",)],
+            f"the adopted rows are not all text: {titles}")
+        self.assertEqual(foreign, 0,
+                         "an unrelated repo's rows were copied into the"
+                         f" store: {foreign}")
+
+    def test_unrelated_repo_sync_state_corruption_does_not_refuse(self) -> None:
+        """AC13 (cubic review, PR #58): the repo scope covers the FOLD's
+        `sync_state` reads too, not only the storage-class counts. The
+        adoption copies only `lower(repo) = ?` rows, so a malformed row for
+        another identity — a case-split group whose `include_patches` values
+        disagree in storage class, or an optional TEXT state column holding
+        a BLOB — is a row the adoption never reads and must not refuse the
+        candidate. RED at the round-12 head: `fold_repo_casings` ran on
+        every `sync_state` row, so `_fold_sync_state` raised
+        `sync_state.include_patches holds a non-integer value in a
+        case-split group` for a foreign group and the candidate became
+        unreadable although its own rows were healthy. A NULL or non-text
+        `repo` stays refused whole-table: it is a broken primary key rather
+        than another identity's row, and C14's null-repo shape pins that."""
+        for shape in ("bad_foreign_flag", "blob_foreign_text"):
+            with self.subTest(shape=shape):
+                bad = _prep(
+                    self.scratch / f"c13-fold-{shape}" / "history.db")
+                _seed_store(bad, (7, 8), "2027-04-01T00:00:00Z")
+                conn = sqlite3.connect(str(bad))
+                # a case-split pair for the FOREIGN identity
+                shared = ("issues_since, last_full_sync_at,"
+                          " last_incr_sync_at, last_error,"
+                          " full_sync_pending, item_count,"
+                          " comment_count, edge_count, include_patches")
+                conn.execute(
+                    f"INSERT INTO sync_state(repo, {shared})"
+                    f" SELECT 'Other/Repo', {shared} FROM sync_state"
+                    " WHERE repo = ?", (REPO,))
+                if shape == "bad_foreign_flag":
+                    conn.execute(
+                        "UPDATE sync_state SET include_patches = 'nope'"
+                        " WHERE repo = 'Other/Repo'")
+                else:
+                    # the fold reads the group WINNER's optional TEXT state
+                    # columns through `_text_value`, which refuses a BLOB
+                    conn.execute(
+                        "UPDATE sync_state SET fetch_source = x'00'"
+                        " WHERE repo = 'Other/Repo'")
+                conn.commit()
                 conn.close()
-            self.assertEqual(
-                [tuple(r) for r in titles],
-                [("text",), ("text",)],
-                f"the adopted rows are not all text: {titles}")
-            self.assertEqual(foreign, 0,
-                             "an unrelated repo's rows were copied into the"
-                             f" store: {foreign}")
+                good = _prep(
+                    self.scratch / f"c13-fold-{shape}-good" / "history.db")
+                _seed_store(good, (3, 4), "2026-12-01T00:00:00Z")
+                store = _prep(
+                    self.scratch / f"c13-fold-{shape}-store" / "history.db")
+                empty_cwd = _prep(
+                    self.scratch / f"c13-fold-{shape}" / "cwd")
+                envelope = None
+                try:
+                    envelope = doctor_mod.doctor(
+                        empty_cwd, REPO, store, extra_scans=[bad, good],
+                        consolidate_flag=True)
+                except Exception as exc:  # noqa: BLE001 - any escape fails
+                    self.fail(f"{type(exc).__name__} escaped candidate"
+                              f" isolation and aborted the whole command:"
+                              f" {exc!r}")
+                entry = {
+                    os.path.normcase(str(row.get("path", ""))): row
+                    for row in envelope.get("scanned") or []}.get(
+                        os.path.normcase(str(bad)))
+                self.assertFalse(
+                    entry is not None and entry.get("unreadable"),
+                    f"a malformed sync_state row for another repo refused"
+                    f" the candidate: {entry}")
+                self.assertEqual(
+                    os.path.normcase(str(envelope.get("adopted") or "")),
+                    os.path.normcase(str(bad)),
+                    f"the candidate was not adopted: {envelope}")
 
 
 class DivergentLegacyFoldTests(_SchemaPreflightCase):
