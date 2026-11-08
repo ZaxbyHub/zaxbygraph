@@ -8,16 +8,20 @@ uninspectable sidecar as an absent one -- `is_symlink()` then
 False, so a `-wal` whose stat faults is dropped from the copy sources,
 `_faithful_copy` returns True, and `_MigratedCopy` adopts the main-only
 image -- `_faithful_copy`'s own documented worst case, a truncated image
-that REPLACES the store's richer corpus.  On 3.11-3.13 the same shape
-re-raises, which is why it fails open only on the newest interpreter.
+that REPLACES the store's richer corpus.
 
-The interpreter split is real and was verified on this box across the whole
-CI matrix:
+The interpreter split is real and was verified per-errno on this box across
+the whole CI matrix. On 3.11-3.13 the three oracles are pathlib's own
+implementation: they re-raise an OSError outside `_ignore_error`'s swallow set
+(`ENOENT`, `ENOTDIR`, `EBADF`, `ELOOP`/`WSAELOOP`, plus Windows winerror
+21/123/1921) and answer `False` for the rest. On 3.14 they delegate to
+`os.path.islink`/`os.path.exists`, which swallow every `OSError`. So the old
+shape failed open on 3.14 for every fault class, and on 3.11-3.13 for the
+ignored classes -- not on 3.14 alone:
 
-    3.11 / 3.12 / 3.13   Path.exists()      -> self.stat()   (re-raises EACCES)
-                          Path.is_symlink() -> self.lstat()  (re-raises EACCES)
-    3.14                 Path.exists()      -> os.path.exists   (swallows)
-                          Path.is_symlink() -> os.path.islink   (swallows)
+    3.11 / 3.12 / 3.13   EACCES / EIO / ENODEV / EMFILE   -> re-raised
+                          ENOTDIR / EBADF / ELOOP / ENOENT -> answered False
+    3.14                 every fault class                -> swallowed
 
 so every oracle in this module is modeled EXPLICITLY rather than inherited
 from the running interpreter: a "3.14" stub calls `self.stat()` /
@@ -278,6 +282,46 @@ class _UninspectableSidecarTest(unittest.TestCase):
             " inspected was dropped from the stability comparison")
 
 
+    def test_second_suffix_fault_is_refused(self) -> None:
+        """The loop covers BOTH suffixes, and a healthy first sidecar must not
+        mask an uninspectable second one. `_sidecars` walks `("-wal",
+        "-journal")` and returns `None` on the first uninspectable sidecar it
+        meets, so a faulted `-journal` beside a perfectly readable `-wal`
+        still refuses the whole candidate -- and it must, because copying the
+        pair without the rollback journal is the same truncated-image shape
+        AC1 refuses.
+
+        Pinned on the 3.14 oracle, like C1, so the leg is
+        interpreter-independent."""
+        # a rollback journal beside the healthy recovery log
+        self.journal = Path(str(self.db) + "-journal")
+        self.journal.write_bytes(b"not a real journal, only stat-ed")
+        self.addCleanup(self.journal.unlink, missing_ok=True)
+        real_lstat, real_stat = os.lstat, os.stat
+        with mock.patch.object(
+                os, "lstat", _faulting(real_lstat, self.journal)),              mock.patch.object(
+                os, "stat", _faulting(real_stat, self.journal)),              mock.patch.object(Path, "exists", _swallowing_exists),              mock.patch.object(Path, "is_symlink", _swallowing_islink):
+            sidecars = doctor_mod._sidecars(self.db)
+            faithful = doctor_mod._faithful_copy(self.db, self.copy)
+        self.assertIsNone(
+            sidecars,
+            "an uninspectable -journal was skipped instead of refusing the"
+            " candidate")
+        self.assertFalse(
+            faithful,
+            "a candidate whose -journal could not be inspected was copied")
+        self.assertFalse(
+            self.copy.exists(),
+            "the main file was copied without its rollback journal")
+
+        # Without the fault both sidecars enumerate, which proves the loop
+        # really did reach the second suffix rather than stopping early.
+        self.assertEqual(
+            doctor_mod._sidecars(self.db),
+            [self.wal, self.journal],
+            "the loop stopped enumerating before the second suffix")
+
+
 class _SidecarClassificationTest(unittest.TestCase):
     """The stat-first rewrite must keep every existing classification."""
 
@@ -297,7 +341,7 @@ class _SidecarClassificationTest(unittest.TestCase):
         self.assertTrue(doctor_mod._faithful_copy(self.db, self.copy))
         conn = sqlite3.connect(str(self.copy))
         try:
-            rows = [r[0] for r in conn.execute("SELECT a FROM t")]
+            rows = [r[0] for r in conn.execute("SELECT a FROM t ORDER BY rowid")]
         finally:
             conn.close()
         self.assertEqual(

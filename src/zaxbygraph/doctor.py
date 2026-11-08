@@ -153,12 +153,18 @@ def _sidecars(path: Path) -> list[Path] | None:
 
     `stat` is called FIRST and only `FileNotFoundError` means "absent",
     because `is_symlink()`/`exists()`/`is_file()` are not stable oracles
-    (issue #59): on 3.14 they delegate to `os.path.islink`/
-    `os.path.exists`, which swallow an OSError and answer False, so an
-    exists()-first shape would drop an uninspectable sidecar from the copy
-    and let `_faithful_copy` adopt a truncated image — its own documented
-    worst case. On 3.11-3.13 the same oracles re-raise, which is why the old
-    shape failed open only on the newest interpreter this repo supports.
+    (issue #59). On 3.11-3.13 those three are pathlib's own implementation,
+    which re-raises only an OSError outside `_ignore_error`'s swallow set
+    (`ENOENT`, `ENOTDIR`, `EBADF`, `ELOOP`/`WSAELOOP`, plus Windows winerror
+    21/123/1921) and answers `False` for the rest; on 3.14 they delegate to
+    `os.path.islink`/`os.path.exists`, which swallow every `OSError`. So the
+    old shape classified an uninspectable sidecar as absent on 3.14 for every
+    fault class, and on 3.11-3.13 for the ignored classes — measured per-errno
+    on this box across 3.11-3.14. Either way an exists()-first shape drops an
+    uninspectable sidecar from the copy and lets `_faithful_copy` adopt a
+    truncated image — its own documented worst case. `stat` is called first
+    and only `FileNotFoundError` means absent, so every other fault class
+    refuses on every supported interpreter.
     Any other OSError makes the candidate unusable, exactly as
     `snapshot.py`'s `_post_install_check` already treats a destination
     sidecar it cannot inspect.
