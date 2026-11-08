@@ -157,11 +157,15 @@ def _sidecars(path: Path) -> list[Path] | None:
     which re-raises only an OSError outside `_ignore_error`'s swallow set
     (`ENOENT`, `ENOTDIR`, `EBADF`, `ELOOP`/`WSAELOOP`, plus Windows winerror
     21/123/1921) and answers `False` for the rest; on 3.14 they delegate to
-    `os.path.islink`/`os.path.exists`, which swallow every `OSError`. So the
-    old shape classified an uninspectable sidecar as absent on 3.14 for every
-    fault class, and on 3.11-3.13 for the ignored classes — measured per-errno
-    on this box across 3.11-3.14. Either way an exists()-first shape drops an
-    uninspectable sidecar from the copy and lets `_faithful_copy` adopt a
+    `os.path.islink`/`os.path.exists`/`os.path.isfile`, which swallow every
+    `OSError`. So the old shape classified an uninspectable sidecar as absent
+    on 3.14 for every fault class, and on 3.11-3.13 for the swallowed classes
+    that are not a genuine absence (`ENOTDIR`, `EBADF`, `ELOOP` — `ENOENT` is
+    correctly "absent" and by design indistinguishable from it). The 3.11-3.13
+    row is measured per-errno on this box; the 3.14 row is read from CPython's
+    `pathlib`/`genericpath` source, because 3.14's `os.path.*` are C builtins
+    that bypass a patched `os.stat`. Either way an exists()-first shape drops
+    an uninspectable sidecar from the copy and lets `_faithful_copy` adopt a
     truncated image — its own documented worst case. `stat` is called first
     and only `FileNotFoundError` means absent, so every other fault class
     refuses on every supported interpreter.

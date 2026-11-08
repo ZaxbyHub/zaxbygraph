@@ -15,9 +15,9 @@ the whole CI matrix. On 3.11-3.13 the three oracles are pathlib's own
 implementation: they re-raise an OSError outside `_ignore_error`'s swallow set
 (`ENOENT`, `ENOTDIR`, `EBADF`, `ELOOP`/`WSAELOOP`, plus Windows winerror
 21/123/1921) and answer `False` for the rest. On 3.14 they delegate to
-`os.path.islink`/`os.path.exists`, which swallow every `OSError`. So the old
-shape failed open on 3.14 for every fault class, and on 3.11-3.13 for the
-ignored classes -- not on 3.14 alone:
+`os.path.islink`/`os.path.exists`/`os.path.isfile`, which swallow every
+`OSError`. So the old shape failed open on 3.14 for every fault class, and on
+3.11-3.13 for the swallowed non-absence classes -- not on 3.14 alone:
 
     3.11 / 3.12 / 3.13   EACCES / EIO / ENODEV / EMFILE   -> re-raised
                           ENOTDIR / EBADF / ELOOP / ENOENT -> answered False
