@@ -271,7 +271,9 @@ class _UninspectableSidecarTest(unittest.TestCase):
                     errno.EACCES, "Permission denied (fixture)")
             return real_stat(p, *a, **kw)
 
-        with mock.patch.object(Path, "stat", faulting_stat),                 mock.patch.object(Path, "exists", _swallowing_exists),                 mock.patch.object(
+        with mock.patch.object(Path, "stat", faulting_stat), \
+                mock.patch.object(Path, "exists", _swallowing_exists), \
+                mock.patch.object(
                     doctor_mod.shutil, "copy2", late_sidecar_copy2):
             faithful = doctor_mod._faithful_copy(self.db, self.copy)
         self.assertTrue(
