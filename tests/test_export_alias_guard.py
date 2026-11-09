@@ -22,7 +22,6 @@ because on 3.12+ `os.path.exists` is a C builtin that bypasses a patched
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import sqlite3
 import sys
@@ -52,7 +51,6 @@ def _norm(p) -> str:
     return os.path.normcase(os.fspath(p))
 
 
-_real_exists = os.path.exists
 _real_stat = os.stat
 
 
@@ -63,6 +61,25 @@ def _swallowing_exists(path, *a, **kw):
     except (OSError, ValueError):
         return False
     return True
+
+
+_real_realpath = os.path.realpath
+
+
+def _make_realpath_fault(path):
+    """A candidate whose realpath cannot be resolved.
+
+    The candidate-side leg had no covering test: deleting its try/except left
+    34 export tests green, while deleting the sibling stat leg failed two. This
+    is that leg's pin."""
+    target = _norm(path)
+
+    def _faulting_realpath(p, *a, **kw):
+        if _norm(p) == target:
+            raise FAULT
+        return _real_realpath(p, *a, **kw)
+
+    return _faulting_realpath
 
 
 def _make_stat_fault(path):
@@ -110,6 +127,26 @@ class AliasGuardFaultTests(unittest.TestCase):
         out = self.td / "linked.jsonl"
         os.link(db, out)
         return db, out
+
+    def test_a_provable_alias_outranks_the_uninspectable_refusal(self):
+        """PRR-007: hoisting `os.stat(out_path)` ahead of the alias comparison
+        made a provably-aliasing `--out` answer 1 "whether it aliases the
+        database is unknown" -- on a path whose answer the guard had already
+        computed from the realpaths. The base answered 2 "resolves to the
+        database (or a sidecar)". Only out_path's own stat faults here, so the
+        alias comparison must still win.
+
+        This is an exit-CLASS regression, not a lost refusal: both answers
+        stop the export, and the store survives either way."""
+        db = _build_store(self.td)
+        out = Path(str(db) + "-wal")
+        out.write_bytes(b"x")
+        with mock.patch("os.stat", _make_stat_fault(out)):
+            with self.assertRaises(ExportError) as ctx:
+                _reject_database_alias(str(out), str(db))
+        self.assertEqual(ctx.exception.code, "out_is_database")
+        self.assertEqual(ctx.exception.exit_code, 2)
+        self.assertIn("resolves to the database", ctx.exception.message)
 
     def test_out_faulted_is_refused(self):
         db, out = self._linked()
@@ -191,12 +228,27 @@ class AliasGuardFaultTests(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, "out_is_database")
                 self.assertEqual(ctx.exception.exit_code, 1)
 
+    def test_an_uninspectable_candidate_answers_the_coded_refusal(self):
+        # The candidate-side realpath leg. `--out` is a perfectly ordinary
+        # path here; what cannot be inspected is the candidate, so the answer
+        # is the same coded refusal with exit 1, not a traceback and not a
+        # silent pass.
+        db = _build_store(self.td)
+        out = self.td / "corpus.jsonl"
+        out.write_bytes(b"sentinel")
+        with mock.patch("os.path.realpath",
+                        _make_realpath_fault(str(db) + "-wal")):
+            with self.assertRaises(ExportError) as ctx:
+                _reject_database_alias(str(out), str(db))
+        self.assertEqual(ctx.exception.code, "out_is_database")
+        self.assertEqual(ctx.exception.exit_code, 1)
+        self.assertIn("could not be inspected", ctx.exception.message)
+
     def test_samefile_file_not_found_is_not_an_alias(self):
         # A path that vanished mid-check is not evidence of an alias.
         db = _build_store(self.td)
         out = self.td / "corpus.jsonl"
         out.write_bytes(b"sentinel")
-        real_samefile = os.path.samefile
 
         def _vanishing_samefile(a, b, *args, **kw):
             raise FileNotFoundError(2, "No such file or directory")
@@ -222,15 +274,19 @@ class EndToEndWriteTests(unittest.TestCase):
         patches = _fault_patches(out if which == "out" else db)
         for p in patches:
             p.start()
+        conn = None
         try:
             conn = connect(db)
             write_corpus(conn, REPO, None, str(out), frozenset({"items"}),
                          True, str(db))
-            conn.close()
             raised = None
         except ExportError as exc:
             raised = exc
         finally:
+            # Closed on BOTH paths: the refusal legs are the ones that used to
+            # leak it, and a leaked handle keeps the temp dir locked on Windows.
+            if conn is not None:
+                conn.close()
             for p in reversed(patches):
                 p.stop()
         return db, out, store_before, out_before, raised

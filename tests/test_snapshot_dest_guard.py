@@ -8,7 +8,7 @@ destination whose stat faulted read as an absent one -- skipping the multi-repo
 refusal immediately before `_install`'s whole-file `os.replace` -- and a
 destination that was busy or I/O-faulted read as "no local corpus" / "no other
 repos", skipping the `local_newer` refusal too. The second shape fails open on
-EVER interpreter, which is why a stat-only fix does not close the class.
+EVERY interpreter, which is why a stat-only fix does not close the class.
 
 Every oracle is modelled EXPLICITLY rather than inherited from the running
 interpreter: the fault is injected at `Path.stat` for one path, and
@@ -111,10 +111,17 @@ def _exists_reraise(self, *a, **kw):
 
 
 def _oracle_patches(leg: str, target: Path):
-    """Every existence oracle the guarded path consults, modelled explicitly."""
+    """Every existence oracle the guarded path consults, modelled explicitly.
+
+    The two legs are named for the ORACLE they install, not for an interpreter
+    version. The fixed guard consults `stat` alone, so both legs drive the same
+    production path -- the point of running both is that the refusal does not
+    depend on which existence oracle happens to be installed, which is exactly
+    what made the base `is_file()` guard interpreter-dependent. A leg labelled
+    "3.14" would claim a version split the code no longer has."""
     if leg == "control":
         return []
-    swallow = leg == "3.14"
+    swallow = leg == "swallowing_oracle"
     return [
         mock.patch.object(Path, "stat", _make_stat_fault(target)),
         mock.patch.object(
@@ -239,13 +246,15 @@ class StatFaultTests(unittest.TestCase):
 
     def test_shape_refuses_on_both_oracle_models(self):
         dest = _build_two_repo_store(self.td)
-        for leg in ("3.14", "3.11"):
+        for leg in ("swallowing_oracle", "reraising_oracle"):
             with self.subTest(leg=leg):
                 with mock.patch.multiple(
                         Path,
                         stat=_make_stat_fault(dest),
-                        is_file=_is_file_swallow if leg == "3.14" else _is_file_reraise,
-                        exists=_exists_swallow if leg == "3.14" else _exists_reraise):
+                        is_file=_is_file_swallow if leg == "swallowing_oracle"
+                        else _is_file_reraise,
+                        exists=_exists_swallow if leg == "swallowing_oracle"
+                        else _exists_reraise):
                     with self.assertRaises(SnapshotError) as ctx:
                         _check_destination_shape(dest, MANIFEST, False)
                 self.assertEqual(ctx.exception.code, "dest_uninspectable")
@@ -254,7 +263,7 @@ class StatFaultTests(unittest.TestCase):
 
     def test_watermark_refuses_rather_than_reading_none(self):
         dest = _build_store(self.td)
-        for leg in ("3.14", "3.11"):
+        for leg in ("swallowing_oracle", "reraising_oracle"):
             with self.subTest(leg=leg):
                 patches = _oracle_patches(leg, dest)
                 for p in patches:
@@ -272,7 +281,7 @@ class StatFaultTests(unittest.TestCase):
         dest = _build_two_repo_store(self.td)
         resolved = Path(dest).resolve()
         before = dest.read_bytes()
-        patches = _oracle_patches("3.14", resolved)
+        patches = _oracle_patches("swallowing_oracle", resolved)
         for p in patches:
             p.start()
         try:
@@ -288,7 +297,7 @@ class StatFaultTests(unittest.TestCase):
         bare = _published(self.td)
         dest = _build_two_repo_store(self.td)
         resolved = Path(dest).resolve()
-        patches = _oracle_patches("3.14", resolved)
+        patches = _oracle_patches("swallowing_oracle", resolved)
         for p in patches:
             p.start()
         try:
@@ -298,6 +307,31 @@ class StatFaultTests(unittest.TestCase):
             for p in reversed(patches):
                 p.stop()
         self.assertEqual(ctx.exception.code, "dest_uninspectable")
+
+    def test_a_null_byte_in_the_path_is_a_coded_refusal_not_a_traceback(self):
+        """PRR-003: `stat` raises ValueError, not OSError, for a path carrying
+        an embedded null character. Both guards caught only OSError, so such a
+        destination escaped as an uncaught ValueError -- while the sibling
+        guard hardened in the same diff (`export._reject_database_alias`) caught
+        `(OSError, ValueError)` and answered its coded refusal.
+
+        Reachability through the public `pull` is nil -- `resolve_db` and
+        `acquire_sync_lock` refuse the path first -- so this is a contract-
+        surface pin on the two guards, which is where the inconsistency lived,
+        not a claim that a CLI user could reach it."""
+        nul = chr(0)
+        for bad in (Path(str(self.td) + nul + "history.db"),
+                    Path(nul + "history.db")):
+            with self.subTest(path=str(bad)[:20] + "...NUL"):
+                for fn, args in ((_check_destination_shape,
+                                  (bad, MANIFEST, False)),
+                                 (_local_watermark, (bad, REPO))):
+                    with self.subTest(guard=fn.__name__):
+                        with self.assertRaises(SnapshotError) as ctx:
+                            fn(*args)
+                        self.assertEqual(ctx.exception.code,
+                                         "dest_uninspectable")
+                        self.assertEqual(ctx.exception.exit_code, 1)
 
 
 class SqliteLegTests(unittest.TestCase):
