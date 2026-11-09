@@ -1934,10 +1934,11 @@ def cmd_snapshot_publish(args: argparse.Namespace) -> int:
         result = snapshot_publish(store_db, args.target, args.publisher,
                                expected_repo=repo)
     except SnapshotError as exc:
-        # The refusal's own exit code, honoured here as in cmd_snapshot_pull:
-        # a publish raise that tells the user to retry answers 1, a knowable
-        # guard rejection answers 2. Every current publish raise uses the
-        # default 2, so this is consistency rather than a behaviour change.
+        # The refusal's own exit code, honoured here as in cmd_snapshot_pull.
+        # Only the two inspection refusals pass 1; every publish-reachable raise
+        # -- including git_timeout, whose hint says to retry -- uses the default
+        # 2, because what blocked it is a knowable fact retrying cannot change.
+        # So this is consistency, not a behaviour change.
         return emit_failure(args, exc.exit_code, exc.message, slug=repo,
                             db_path=store_db, code_key=exc.code, hint=exc.hint)
     except (OSError, sqlite3.Error) as exc:
