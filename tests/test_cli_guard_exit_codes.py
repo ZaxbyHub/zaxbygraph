@@ -198,7 +198,8 @@ class SnapshotPullExitTests(_CliCase):
              "--repo", REPO, "--format", "json"])
         self.assert_envelope(code, out, exit_code=2,
                              error_code="multi_repo_destination",
-                             message_part="also holds acme/other")
+                             message_part="also holds acme/other",
+                             hint_part="single-repo store")
 
     def test_newer_local_answers_exit_two(self):
         bare = self._published()
@@ -212,7 +213,8 @@ class SnapshotPullExitTests(_CliCase):
             ["snapshot", "pull", bare, "--db", str(dest),
              "--repo", REPO, "--format", "json"])
         self.assert_envelope(code, out, exit_code=2, error_code="local_newer",
-                             message_part="local store is newer")
+                             message_part="local store is newer",
+                             hint_part="newer local store")
 
 
 class ExportCorpusExitTests(_CliCase):
