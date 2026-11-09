@@ -1935,14 +1935,14 @@ def cmd_snapshot_publish(args: argparse.Namespace) -> int:
                                expected_repo=repo)
     except SnapshotError as exc:
         # The refusal's own exit code, honoured here as in cmd_snapshot_pull.
-        # Only the two inspection refusals pass 1: they fire before the
-        # destination is touched, so a retry is a genuinely fresh attempt.
+        # Only the two inspection refusals pass 1: what blocked them was a stat
+        # or open fault on the destination or store path, which is per-attempt.
         # Every publish-reachable raise -- including git_timeout, whose hint
-        # says to retry -- uses the default 2. That is a policy about where the
-        # refusal fires, not a claim about its cause: dest_open can be caused
-        # by a busy destination and dest_sidecar_stale's first leg is an
-        # uninspectable -wal, and both still stay 2 because they fire once the
-        # install is underway. So this is consistency, not a behaviour change.
+        # says to retry -- uses the default 2. That is a policy, not a claim
+        # about causes: dest_open can be a busy destination and
+        # dest_sidecar_stale's first leg is an uninspectable -wal, and
+        # git_timeout fires from the transport before the destination is
+        # inspected at all. So this is consistency, not a behaviour change.
         return emit_failure(args, exc.exit_code, exc.message, slug=repo,
                             db_path=store_db, code_key=exc.code, hint=exc.hint)
     except (OSError, sqlite3.Error) as exc:
@@ -1968,13 +1968,16 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
                                expected_repo=repo, expected_host=host)
     except SnapshotError as exc:
         # The refusal's own exit code. The default is 2; only the two inspection
-        # refusals pass 1, because they fire before the destination is touched
-        # -- a per-attempt condition. A hint that says "re-pull" does NOT by
-        # itself mean 1: git_timeout, dest_open, dest_sidecar_stale and
-        # corpus_mismatch all say that and stay 2, not because their causes are
-        # knowable but because they fire once the install is underway, so the
-        # operator has to inspect the destination before re-running rather
-        # than simply retry (README's exit-code table).
+        # refusals pass 1, because what blocked them was a stat or open fault on
+        # the destination or store path -- a per-attempt condition. A hint that
+        # says "re-pull" does NOT by itself mean 1: git_timeout, dest_open,
+        # dest_sidecar_stale and corpus_mismatch all say that and stay 2. That
+        # is a policy, not a claim about their causes -- dest_open can be a busy
+        # destination and dest_sidecar_stale's first leg is an uninspectable
+        # -wal. Three of the four fire once the install is underway or has
+        # landed; git_timeout fires earlier still, from the transport before the
+        # destination is inspected, and stays 2 as transport-policy continuity
+        # rather than because of where it fires (README's exit-code table).
         return emit_failure(args, exc.exit_code, exc.message, slug=repo,
                             db_path=store_db, code_key=exc.code, hint=exc.hint)
     except (OSError, sqlite3.Error) as exc:

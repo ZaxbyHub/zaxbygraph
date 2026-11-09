@@ -226,10 +226,14 @@ class ExitCodeTableDocTests(unittest.TestCase):
                     continue
                 for m in re.finditer(re.escape(code), span):
                     tail = span[m.end():]
-                    two = tail.find("`2`")
-                    if two < 0:
+                    # The opposite digit, in any of the shapes _EXIT_DIGIT
+                    # parses -- a bare backticked `2` AND the prose "exit 2".
+                    # Scanning only the backticked literal let "answers exit 2"
+                    # (lowercase) and "answers Exit 2" survive.
+                    hit = re.search(r"`2`|exit[ -]2", tail, re.I)
+                    if not hit:
                         continue
-                    between = tail[:two]
+                    between = tail[:hit.start()]
                     if re.search(r"\blegs?\b|\bonly\b", between, re.I):
                         continue          # a disclosed split, not a contradiction
                     self.fail(

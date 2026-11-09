@@ -89,17 +89,17 @@ class SnapshotError(Exception):
     code.
 
     A raise passes 1 only when what blocked it was a stat or open fault on the
-    destination path itself -- an uninspectable, busy or I/O-faulted
+    destination or store path itself -- an uninspectable, busy or I/O-faulted
     destination. That is a per-attempt condition, so it belongs to the class
     ``README.md`` says "sometimes will" succeed on retry.
 
-    The criterion is WHERE the refusal fires, not what caused it and not what
-    the hint says. ``dest_open`` can be caused by a busy destination and
-    ``dest_sidecar_stale``'s first leg is an uninspectable ``-wal``, yet both
-    stay 2: they fire once the install is underway, so the operator has to
-    inspect the destination before re-running rather than simply retry. The
-    two exit-1 refusals are the ones that fire before the destination is
-    touched.
+    Everything else keeps the default 2, and that is a POLICY rather than a
+    claim about causes or about where a refusal fires. Three reasons it cannot
+    be stated any other way: ``dest_open`` can be caused by a busy destination,
+    ``dest_sidecar_stale``'s first leg is an uninspectable ``-wal``, and
+    ``git_timeout`` fires from the transport before the destination is inspected
+    at all -- so neither "the cause was transient" nor "it fired before the
+    destination was touched" separates the 1s from the 2s.
     """
 
     def __init__(self, code: str, message: str, hint: str | None = None,

@@ -288,10 +288,14 @@ class SnapshotExitClassCensusTests(unittest.TestCase):
     The CLI-level rows above already prove the CLI honours ``exc.exit_code``,
     so pinning the class here pins the observable answer.
 
-    The census is also the guard against the opposite drift: a new raise site
-    that answers 1 without being one of the two inspection refusals fails
-    here, which is the reading the doc's "narrow, not a general rule" sentence
-    exists to prevent."""
+    The census is also a partial guard against the opposite drift: a new raise
+    site answering 1 fails ``test_only_the_inspection_refusal_answers_one``,
+    which is the reading the doc's "narrow, not a general rule" sentence exists
+    to prevent. It is PARTIAL and deliberately so -- a code whose raise sites
+    disagree (one 1, one 2) is dropped as unclassifiable rather than failed,
+    because such a code is a split-class refusal like ``out_is_database`` and
+    the census has no way to tell a legitimate split from a mistake. A split
+    class therefore has to be pinned by a targeted test, not by this census."""
 
     #: Codes the docs name as answering 2 by name.
     EXIT_TWO = ("git_timeout", "dest_open", "dest_sidecar_stale",
