@@ -86,13 +86,19 @@ class SnapshotError(Exception):
     ``exit_code`` is the process exit the CLI answers with. It defaults to 2
     (usage or guard rejection: ``README.md`` promises a 2 "will never succeed
     on retry unchanged"), so every existing raise site keeps its current exit
-    code. A refusal whose hint tells the user to retry -- an uninspectable, busy
-    or I/O-faulted destination -- passes 1 instead, because that is the class
-    ``README.md`` says "sometimes will" succeed on retry.
+    code.
+
+    A raise passes 1 only when what blocked it was a stat or open fault on the
+    destination path itself -- an uninspectable, busy or I/O-faulted
+    destination. That is a per-attempt condition, so it belongs to the class
+    ``README.md`` says "sometimes will" succeed on retry. The criterion is the
+    *cause*, never the hint: ``git_timeout``'s hint tells the user to retry,
+    but what blocked it was a transfer past its ceiling, which retrying the
+    identical command cannot clear, so it stays 2.
     """
 
     def __init__(self, code: str, message: str, hint: str | None = None,
-                 exit_code: int = 2):
+                 *, exit_code: int = 2):
         super().__init__(message)
         self.code = code
         self.message = message
@@ -862,12 +868,17 @@ def _check_destination_shape(db_path: Path, manifest: dict,
     it re-raises only outside pathlib's own swallow set. Either way an
     uninspectable destination read as an absent one, and the early return that
     exists for the absent case then skipped the guard immediately before
-    ``_install``'s whole-file ``os.replace`` (issue #61)."""
+    ``_install``'s whole-file ``os.replace`` (issue #61).
+
+    ``ValueError`` is caught alongside ``OSError`` because ``stat`` raises it
+    for a path carrying an embedded null character, and this guard's contract
+    is a coded refusal rather than a traceback -- the same pair the sibling
+    guard in ``export._reject_database_alias`` catches."""
     try:
         st = db_path.stat()
     except FileNotFoundError:
         return                       # genuinely absent: nothing to refuse
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise _dest_uninspectable(db_path) from exc
     if not stat.S_ISREG(st.st_mode):
         # Legacy behaviour preserved, NOT a safety claim: a directory fails
@@ -908,12 +919,14 @@ def _local_watermark(db_path: Path, repo: str) -> str | None:
     prefers over the real store (PRR-F3). An UNINSPECTABLE store is a
     different thing and raises: reading it as None silently overwrote a newer
     local store, because the `local_newer` refusal it feeds never fired
-    (issue #61, frozen AC4)."""
+    (issue #61, frozen AC4). ``ValueError`` is caught with ``OSError`` for the
+    same reason as in ``_check_destination_shape``: a null-byte path is
+    "cannot inspect", not "absent"."""
     try:
         st = db_path.stat()
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise _dest_uninspectable(db_path) from exc
     if not stat.S_ISREG(st.st_mode):
         return None
@@ -929,6 +942,8 @@ def _local_watermark(db_path: Path, repo: str) -> str | None:
         _reject_unless_not_a_store(exc, db_path)
         return None
     return row[0] if row else None
+
+
 def _write_provenance(staged: Path, manifest: dict) -> None:
     """Provenance lands in the STAGED db before install (critic round-1
     finding 5): provenance and corpus arrive together."""
