@@ -138,7 +138,22 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
         db_path + "-shm",
         db_path + "-journal",
     ]
-    out_real = os.path.realpath(out_path)
+    # `realpath` is itself an inspection, so it gets the same coded refusal as
+    # the stats. On Windows `ntpath.realpath` answers for a path carrying an
+    # embedded null byte; on Linux `posixpath.realpath` raises ValueError for
+    # it -- CI proved the Linux leg. Both are "cannot inspect", and neither may
+    # escape as a traceback.
+    try:
+        out_real = os.path.realpath(out_path)
+    except (OSError, ValueError) as exc:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} could not be inspected, so whether it aliases"
+            " the database is unknown",
+            hint="check the path's permissions and the underlying storage,"
+                 " then re-run the export",
+            exit_code=1,
+        ) from exc
     if out_real.startswith("\\\\.\\") or out_real.startswith("/dev/"):
         raise ExportError(
             "out_is_database",
@@ -161,7 +176,18 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
     else:
         out_present = True
     for cand in candidates:
-        if os.path.realpath(cand) == out_real:
+        try:
+            cand_real = os.path.realpath(cand)
+        except (OSError, ValueError) as exc:
+            raise ExportError(
+                "out_is_database",
+                f"{cand} could not be inspected, so whether --out aliases it"
+                " is unknown",
+                hint="check the path's permissions and the underlying"
+                     " storage, then re-run the export",
+                exit_code=1,
+            ) from exc
+        if cand_real == out_real:
             raise ExportError(
                 "out_is_database",
                 f"--out {out_path} resolves to the database (or a sidecar);"
