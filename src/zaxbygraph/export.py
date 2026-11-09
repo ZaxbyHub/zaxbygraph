@@ -160,21 +160,13 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
             f"--out {out_path} resolves to a device, not a file;"
             " refusing to discard the corpus",
         )
-    try:
-        os.stat(out_path)
-    except FileNotFoundError:
-        out_present = False            # --out does not exist yet: nothing to alias
-    except (OSError, ValueError) as exc:
-        raise ExportError(
-            "out_is_database",
-            f"--out {out_path} could not be inspected, so whether it aliases"
-            " the database is unknown",
-            hint="check the path's permissions and the underlying storage,"
-                 " then re-run the export",
-            exit_code=1,
-        ) from exc
-    else:
-        out_present = True
+    # Pass 1 -- the alias comparison. It needs only the two realpaths, so it
+    # runs BEFORE out_path's own stat is known to work: a --out that provably
+    # resolves to the store (or a sidecar) is refused as an alias (exit 2, a
+    # knowable fact) rather than as "cannot inspect" (exit 1), which is what
+    # hoisting the stat ahead of this comparison used to answer. Hoisting the
+    # stat first made the guard claim the alias question was unknown on a path
+    # whose answer it had already computed.
     for cand in candidates:
         try:
             cand_real = os.path.realpath(cand)
@@ -193,8 +185,23 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
                 f"--out {out_path} resolves to the database (or a sidecar);"
                 " refusing to overwrite the store",
             )
-        if not out_present:
-            continue
+    # Pass 2 -- the hard-link comparison, which needs out_path to exist. An
+    # absent --out cannot hard-link anything, so this is where "absent" ends
+    # the guard; everything above it has already run.
+    try:
+        os.stat(out_path)
+    except FileNotFoundError:
+        return                  # --out does not exist yet: nothing to alias
+    except (OSError, ValueError) as exc:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} could not be inspected, so whether it aliases"
+            " the database is unknown",
+            hint="check the path's permissions and the underlying storage,"
+                 " then re-run the export",
+            exit_code=1,
+        ) from exc
+    for cand in candidates:
         try:
             os.stat(cand)
         except FileNotFoundError:
