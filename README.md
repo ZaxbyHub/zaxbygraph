@@ -859,15 +859,23 @@ Machine-readable rules, worth knowing before scripting against this:
   **The two inspection refusals that answer `1` are narrow, not a general
   rule.** `snapshot pull`'s `dest_uninspectable` and `export-corpus`'s
   `out_is_database`-on-an-uninspectable-path answer `1`, because what blocked
-  them was a stat or open fault that a retry can clear. The *destination* guard
-  rejections stay `2` — including the ones whose hint says to retry or re-pull
-  (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`) —
-  because what blocked them is a knowable fact about the request or the
-  destination that retrying unchanged cannot change. Two pre-existing exit-1
-  refusals are unrelated to this rule and are not destination guard rejections:
-  `export-corpus --require-complete`'s `incomplete_store` (the store is
-  genuinely not ready, so a retry after a sync can succeed) and the runtime
-  class above.
+  them was a stat or open fault on the destination path itself — a per-attempt
+  condition a retry can clear. Every other snapshot guard rejection stays `2`,
+  including the four whose hint says to retry or re-pull (`git_timeout`,
+  `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). Those are not
+  destination inspections and their blockers are not transient — a transfer
+  past its ceiling, a destination that will not open, a sidecar that is
+  genuinely stale, a corpus that is genuinely the wrong one — so retrying the
+  identical command clears none of them; you must change the link, the
+  destination, or the snapshot. `out_is_database` answers `2` on its alias,
+  hard-link and device legs (a provable fact) and `1` only on its
+  cannot-inspect legs, so the code alone does not tell you the exit class.
+  Four pre-existing exit-1 refusals are unrelated to this rule and are not
+  snapshot guard rejections: `export-corpus --require-complete`'s
+  `incomplete_store` (the store is genuinely not ready, so a retry after a
+  sync can succeed), `store_unreadable` (the store could not be opened at
+  all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime`
+  class above (a storage fault at execution time).
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
