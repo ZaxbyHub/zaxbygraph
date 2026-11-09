@@ -95,5 +95,47 @@ class MachineModeSilenceDocTests(unittest.TestCase):
         self.assertIn("`json`/`compact` when you need them", skill)
 
 
+class ExitCodeTableDocTests(unittest.TestCase):
+    """Issues #61/#62: the exit-code split is the one contract decision in that
+    PR, and it is documented on two surfaces. The CLI tests pin the behaviour;
+    this pins the DESCRIPTION of it, so the two doc surfaces cannot drift away
+    from what the code answers -- the same shape as the machine-mode pin above.
+
+    The failure this guards against is specific: the sentence "every other guard
+    rejection stays 2" was itself false (export-corpus --require-complete answers
+    1 with incomplete_store), and it read plausibly until cubic caught it."""
+
+    @staticmethod
+    def _flat(text: str) -> str:
+        return re.sub(r"\s+", " ", text)
+
+    def _assert_table(self, surface: str) -> None:
+        text = self._flat(surface)
+        low = text.lower()
+        # The two exit-1 inspection refusals, named.
+        self.assertIn("dest_uninspectable", text)
+        self.assertIn("out_is_database", text)
+        # The narrowing: a retry hint does NOT by itself mean exit 1. Compared
+        # case-insensitively because README opens the sentence with a lowercase
+        # "narrow" and SKILL with an uppercase "Narrow".
+        self.assertIn("not a general", low)
+        # The four retry-hinted refusals that still answer 2 -- without these
+        # named, the "retry means 1" over-reading comes straight back.
+        for code in ("git_timeout", "dest_open", "dest_sidecar_stale",
+                     "corpus_mismatch"):
+            self.assertIn(code, text, f"{code} missing from the exit-2 carve-out")
+        # The unrelated pre-existing exit-1 refusal must be carved out too, or
+        # the sentence "every destination guard rejection stays 2" reads as
+        # false the moment someone checks --require-complete.
+        self.assertIn("incomplete_store", text)
+
+    def test_readme_carries_the_exit_code_split(self) -> None:
+        self._assert_table(
+            (REPO_ROOT / "README.md").read_text(encoding="utf-8"))
+
+    def test_skill_carries_the_exit_code_split(self) -> None:
+        self._assert_table(SKILL.read_text(encoding="utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()
