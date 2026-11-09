@@ -15,6 +15,7 @@ answers 1 for a stat fault and 2 for an ordinary hard-link refusal.
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -273,6 +274,69 @@ def _swallow(path):
     except (OSError, ValueError):
         return False
     return True
+
+
+class SnapshotExitClassCensusTests(unittest.TestCase):
+    """README names four refusals as answering 2 by name, and nothing pinned
+    that: forcing ``exit_code=1`` on exactly those four left every test green,
+    so the documented carve-out was unfalsifiable.
+
+    Rather than drive each of the four through the CLI -- `git_timeout` needs a
+    subprocess timeout, `dest_open` an unopenable destination, and two of them
+    live past the install leg -- this walks every ``SnapshotError(...)``
+    construction in the source and asserts the exit class each one carries.
+    The CLI-level rows above already prove the CLI honours ``exc.exit_code``,
+    so pinning the class here pins the observable answer.
+
+    The census is also the guard against the opposite drift: a new raise site
+    that answers 1 without being one of the two inspection refusals fails
+    here, which is the reading the doc's "narrow, not a general rule" sentence
+    exists to prevent."""
+
+    #: Codes the docs name as answering 2 by name.
+    EXIT_TWO = ("git_timeout", "dest_open", "dest_sidecar_stale",
+                "corpus_mismatch")
+    #: The only refusals allowed to answer 1.
+    EXIT_ONE = ("dest_uninspectable",)
+
+    @staticmethod
+    def _census():
+        """``{code: exit_code}`` over every ``SnapshotError(...)`` construction."""
+        found = {}
+        for path in sorted((ROOT / "src").rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and getattr(node.func, "id", "") == "SnapshotError"):
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.Constant):
+                    continue
+                code = node.args[0].value
+                exit_code = 2
+                for kw in node.keywords:
+                    if kw.arg == "exit_code" and isinstance(kw.value,
+                                                            ast.Constant):
+                        exit_code = kw.value.value
+                found.setdefault(code, set()).add(exit_code)
+        return {k: v for k, v in found.items() if len(v) == 1}
+
+    def test_every_documented_code_is_present(self) -> None:
+        census = self._census()
+        for code in self.EXIT_TWO + self.EXIT_ONE:
+            self.assertIn(code, census, f"{code} is never raised")
+
+    def test_the_four_retry_hinted_codes_answer_two(self) -> None:
+        census = self._census()
+        for code in self.EXIT_TWO:
+            self.assertEqual(census.get(code), {2},
+                             f"{code} does not answer exit 2")
+
+    def test_only_the_inspection_refusal_answers_one(self) -> None:
+        census = self._census()
+        ones = sorted(c for c, v in census.items() if v == {1})
+        self.assertEqual(ones, sorted(self.EXIT_ONE),
+                         "a refusal other than the documented inspection"
+                         " refusal answers exit 1")
 
 
 if __name__ == "__main__":
