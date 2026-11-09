@@ -113,39 +113,157 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _reject_database_alias(out_path: str, db_path: str) -> None:
-    """--out must never name the database or its sidecars: the destination is
-    opened with a plain writable open after the read connection exists, and
-    ``open(path, "wb")`` would truncate an aliased store despite SQLite
-    running mode=ro. A stray ``-journal`` file is the worst case: SQLite
-    treats it as a hot journal and refuses every subsequent read-only open
-    until it is deleted by hand."""
+    """--out must never name the database or its sidecars.
+
+    A stray ``-journal`` file is the worst case: SQLite treats it as a hot
+    journal and refuses every subsequent read-only open until it is deleted by
+    hand. ``write_corpus`` reaches the destination through ``tempfile.mkstemp``
+    plus ``os.replace``, so the store's bytes survive an aliased ``--out`` --
+    but the corpus still lands on a path this guard forbids and the hard link
+    is silently broken, which is the contract being enforced here.
+
+    The existence question is answered by ``stat`` and only
+    ``FileNotFoundError`` means "absent". ``ValueError`` is caught alongside
+    ``OSError`` in all three handlers: ``os.stat`` raises ``ValueError``, not
+    ``OSError``, for a path carrying an embedded null character, and this
+    guard's contract is a coded refusal rather than a traceback.
+    ``os.path.exists`` swallows every
+    ``OSError`` into ``False`` on 3.11 through 3.14 -- 3.11 through the
+    pure-Python ``genericpath.exists``, 3.12 and later through the C builtin
+    ``_path_exists`` -- so the hard-link half of this guard was skipped on
+    every interpreter for any per-file stat fault (issue #62)."""
     candidates = [
         db_path,
         db_path + "-wal",
         db_path + "-shm",
         db_path + "-journal",
     ]
-    out_real = os.path.realpath(out_path)
+    # `realpath` is itself an inspection, so it gets the same coded refusal as
+    # the stats. On Windows `ntpath.realpath` answers for a path carrying an
+    # embedded null byte; on Linux `posixpath.realpath` raises ValueError for
+    # it -- CI proved the Linux leg. Both are "cannot inspect", and neither may
+    # escape as a traceback.
+    try:
+        out_real = os.path.realpath(out_path)
+    except (OSError, ValueError) as exc:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} could not be inspected, so whether it aliases"
+            " the database is unknown",
+            hint="check the path's permissions and the underlying storage,"
+                 " then re-run the export",
+            exit_code=1,
+        ) from exc
     if out_real.startswith("\\\\.\\") or out_real.startswith("/dev/"):
         raise ExportError(
             "out_is_database",
             f"--out {out_path} resolves to a device, not a file;"
             " refusing to discard the corpus",
         )
+    # The guard PROVES what it can before it reports what it cannot. A
+    # determinable alias -- realpath equality, or a hard link proven by
+    # samefile -- answers 2, a knowable fact; a path that cannot be inspected
+    # answers 1. Reporting the fault first makes the guard say "whether it
+    # aliases the database is unknown" about a path whose answer it has already
+    # computed, which is both a false statement and the wrong exit class
+    # (PRR-007). So every inspection fault is remembered and raised only once
+    # nothing determinable turns up.
+    deferred = None
+
+    def note_fault(err: ExportError) -> None:
+        """Keep the FIRST inspection fault; raise it only at the end."""
+        nonlocal deferred
+        if deferred is None:
+            deferred = err
+
+    # Pass 1 -- realpath equality. It needs neither path to be stat-able, so a
+    # fault here is deferrable rather than decisive.
+    alias = None
     for cand in candidates:
-        if os.path.realpath(cand) == out_real:
-            raise ExportError(
+        try:
+            cand_real = os.path.realpath(cand)
+        except (OSError, ValueError) as exc:
+            note_fault(ExportError(
                 "out_is_database",
-                f"--out {out_path} resolves to the database (or a sidecar);"
-                " refusing to overwrite the store",
-            )
-        if os.path.exists(out_path) and os.path.exists(cand):
-            if os.path.samefile(out_path, cand):
-                raise ExportError(
-                    "out_is_database",
-                    f"--out {out_path} is a hard link (or alias) of the"
-                    " database; refusing to overwrite the store",
-                )
+                f"{cand} could not be inspected, so whether --out aliases it"
+                " is unknown",
+                hint="check the path's permissions and the underlying"
+                     " storage, then re-run the export",
+                exit_code=1,
+            ))
+            continue
+        if cand_real == out_real:
+            alias = cand
+            break
+
+    # Pass 2 -- the hard-link comparison, which needs out_path to exist. An
+    # absent --out cannot hard-link anything, so this is where "absent" ends
+    # the guard; everything above it has already run.
+    hard_link = None
+    if alias is None:
+        out_present = False
+        try:
+            os.stat(out_path)
+        except FileNotFoundError:
+            pass                          # absent: no hard link is possible
+        except (OSError, ValueError) as exc:
+            note_fault(ExportError(
+                "out_is_database",
+                f"--out {out_path} could not be inspected, so whether it"
+                " aliases the database is unknown",
+                hint="check the path's permissions and the underlying storage,"
+                     " then re-run the export",
+                exit_code=1,
+            ))
+        else:
+            out_present = True
+        if out_present:
+            for cand in candidates:
+                try:
+                    os.stat(cand)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError) as exc:
+                    note_fault(ExportError(
+                        "out_is_database",
+                        f"{cand} could not be inspected, so whether --out"
+                        " aliases it is unknown",
+                        hint="check the path's permissions and the underlying"
+                             " storage, then re-run the export",
+                        exit_code=1,
+                    ))
+                    continue
+                try:
+                    same = os.path.samefile(out_path, cand)
+                except FileNotFoundError:
+                    continue          # not an alias (a path vanished mid-check)
+                except (OSError, ValueError) as exc:
+                    note_fault(ExportError(
+                        "out_is_database",
+                        f"--out {out_path} could not be compared with {cand}",
+                        hint="check the path's permissions and the underlying"
+                             " storage, then re-run the export",
+                        exit_code=1,
+                    ))
+                    continue
+                if same:
+                    hard_link = cand
+                    break
+
+    if alias is not None:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} resolves to the database (or a sidecar);"
+            " refusing to overwrite the store",
+        )
+    if hard_link is not None:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} is a hard link (or alias) of the"
+            " database; refusing to overwrite the store",
+        )
+    if deferred is not None:
+        raise deferred
 
 
 def _check_completeness(

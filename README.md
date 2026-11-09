@@ -850,12 +850,39 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
   request was malformed (bad flags, non-read SQL, multiple statements), or the
   resolved DB holds other repos but not this one. **`1`** — a runtime failure:
-  item not found, sync error, or an authorizer denial at execution time.
-  **`3`** — no corpus for the resolved repo (issue #2): the resolved DB is
-  missing or holds nothing for it; the message names the path and the exact
-  `sync` command. The distinction matters for retry logic: a `2` or `3` will
-  never succeed on retry unchanged (fix the request, or sync first), while a
-  `1` sometimes will.
+  item not found, sync error, an authorizer denial at execution time, or one of
+  the two inspection refusals below. **`3`** — no corpus for the resolved repo
+  (issue #2): the resolved DB is missing or holds nothing for it; the message
+  names the path and the exact `sync` command. The distinction matters for
+  retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
+  request, or sync first), while a `1` sometimes will.
+  **The two inspection refusals that answer `1` are narrow, not a general
+  rule.** `snapshot pull`'s `dest_uninspectable` and `export-corpus`'s
+  `out_is_database`-on-an-uninspectable-path answer `1`, because what blocked
+  them was a stat or open fault on the destination or store path itself — a
+  per-attempt condition a retry can clear. Every other snapshot guard rejection
+  stays `2`, including the four whose hint says to retry or re-pull
+  (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). That is
+  a **policy**, not a claim about what caused them: two of the four can have a
+  busy or an uninspectable destination as their immediate cause — `dest_open`
+  covers a store held open by another process, and `dest_sidecar_stale`'s first
+  leg is an uninspectable `-wal` — so the boundary cannot be stated as
+  "transient causes answer 1". Three of the four (`dest_open`,
+  `dest_sidecar_stale`, `corpus_mismatch`) fire once the install is underway or
+  has landed, so the operator has to inspect the destination before trying
+  again rather than simply re-running. `git_timeout` fires earlier still, from
+  the transport before the destination is inspected, and answers 2 as
+  transport-policy continuity rather than because of where it fires — a
+  destination guard that never ran is not what answered. `out_is_database`
+  answers `2` on its alias, hard-link and device legs (a provable fact) and `1`
+  only on its cannot-inspect legs, so the code alone does not tell you the exit
+  class. Several pre-existing exit-1 refusals are unrelated to this rule and
+  are not snapshot guard rejections: `export-corpus --require-complete`'s
+  `incomplete_store` (the store is genuinely not ready, so a retry after a
+  sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`),
+  `store_unreadable` (the store could not be opened at all), `refresh_failed`
+  (a `--max-age` refresh failed), and the `runtime` class above (a storage
+  fault at execution time).
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
