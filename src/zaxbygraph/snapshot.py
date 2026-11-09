@@ -91,10 +91,15 @@ class SnapshotError(Exception):
     A raise passes 1 only when what blocked it was a stat or open fault on the
     destination path itself -- an uninspectable, busy or I/O-faulted
     destination. That is a per-attempt condition, so it belongs to the class
-    ``README.md`` says "sometimes will" succeed on retry. The criterion is the
-    *cause*, never the hint: ``git_timeout``'s hint tells the user to retry,
-    but what blocked it was a transfer past its ceiling, which retrying the
-    identical command cannot clear, so it stays 2.
+    ``README.md`` says "sometimes will" succeed on retry.
+
+    The criterion is WHERE the refusal fires, not what caused it and not what
+    the hint says. ``dest_open`` can be caused by a busy destination and
+    ``dest_sidecar_stale``'s first leg is an uninspectable ``-wal``, yet both
+    stay 2: they fire once the install is underway, so the operator has to
+    inspect the destination before re-running rather than simply retry. The
+    two exit-1 refusals are the ones that fire before the destination is
+    touched.
     """
 
     def __init__(self, code: str, message: str, hint: str | None = None,

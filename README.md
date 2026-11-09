@@ -862,20 +862,25 @@ Machine-readable rules, worth knowing before scripting against this:
   them was a stat or open fault on the destination path itself — a per-attempt
   condition a retry can clear. Every other snapshot guard rejection stays `2`,
   including the four whose hint says to retry or re-pull (`git_timeout`,
-  `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). Those are not
-  destination inspections and their blockers are not transient — a transfer
-  past its ceiling, a destination that will not open, a sidecar that is
-  genuinely stale, a corpus that is genuinely the wrong one — so retrying the
-  identical command clears none of them; you must change the link, the
-  destination, or the snapshot. `out_is_database` answers `2` on its alias,
-  hard-link and device legs (a provable fact) and `1` only on its
-  cannot-inspect legs, so the code alone does not tell you the exit class.
-  Four pre-existing exit-1 refusals are unrelated to this rule and are not
-  snapshot guard rejections: `export-corpus --require-complete`'s
+  `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). That is a **policy**,
+  not a claim about what caused them: two of the four can have a busy or an
+  uninspectable destination as their immediate cause — `dest_open` covers a
+  store held open by another process, and `dest_sidecar_stale`'s first leg is
+  an uninspectable `-wal` — so the boundary cannot be stated as "transient
+  causes answer 1". What the two exit-1 refusals have in common is that they
+  fire *before* the destination is touched, so a retry is a genuinely fresh
+  attempt. The four answer 2 because each of them fires once the install is
+  underway or has landed, which means the operator has to look at the
+  destination before trying again rather than simply re-running. `out_is_database`
+  answers `2` on its alias, hard-link and device legs (a provable fact) and `1`
+  only on its cannot-inspect legs, so the code alone does not tell you the exit
+  class. Several pre-existing exit-1 refusals are unrelated to this rule and
+  are not snapshot guard rejections: `export-corpus --require-complete`'s
   `incomplete_store` (the store is genuinely not ready, so a retry after a
-  sync can succeed), `store_unreadable` (the store could not be opened at
-  all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime`
-  class above (a storage fault at execution time).
+  sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`),
+  `store_unreadable` (the store could not be opened at all), `refresh_failed`
+  (a `--max-age` refresh failed), and the `runtime` class above (a storage
+  fault at execution time).
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,

@@ -122,8 +122,11 @@ class ExitCodeTableDocTests(unittest.TestCase):
     #: Pre-existing refusals that answer 1 for reasons unrelated to the
     #: destination-inspection rule. Named, but not part of the mapping: they
     #: are carve-outs, and their absence is what made the README sentence read
-    #: as false.
-    CARVED_OUT = ("incomplete_store", "store_unreadable", "refresh_failed")
+    #: as false. `bad_as_of` is here because PRR-010's first fix hand-counted
+    #: the set as four and missed it -- the count is gone from the docs, and
+    #: this tuple is what keeps the enumeration honest.
+    CARVED_OUT = ("incomplete_store", "bad_as_of", "store_unreadable",
+                  "refresh_failed")
 
     _CODE_TOKEN = re.compile(r"`([a-z][a-z0-9_]{3,})`")
     _EXIT_DIGIT = re.compile(r"`([123])`|exit[ -]([123])")
@@ -160,9 +163,8 @@ class ExitCodeTableDocTests(unittest.TestCase):
                     continue
                 row_digit = cells[0].strip("`")
                 if row_digit in ("1", "2", "3"):
-                    # The row's own code is the binding for its meaning cell;
-                    # prefix it so the digit is stated inside the span.
-                    out.append((row_digit, f"`{row_digit}` {cells[1]}"))
+                    # The row's own code is the binding for its meaning cell.
+                    out.append((row_digit, cells[1]))
                 # The action cell is advice, not a binding -- unless it states
                 # exactly one digit, in which case it is one.
                 if len(cells) > 2 and cells[2]:
@@ -209,6 +211,31 @@ class ExitCodeTableDocTests(unittest.TestCase):
                          "an exit-2 refusal is stated as answering 1")
         self.assertFalse(set(self.EXIT_ONE) & by_class["2"],
                          "an exit-1 refusal is stated as answering 2")
+        # A contradiction INSIDE a binding span is the one shape the mapping
+        # assertions above cannot see, because the row's own code cell still
+        # says 1. A meaning cell may legitimately disclose a second exit class
+        # for a DIFFERENT leg of the same code -- `out_is_database` answers 2
+        # on its alias legs -- and that disclosure says "legs"/"only" between
+        # the code and the digit. The check is therefore per-CLAUSE, not
+        # per-sentence: the legitimate disclosure and an injected
+        # "`dest_uninspectable` answers `2`" land in the same sentence, and
+        # only the intervening text tells them apart.
+        for code in self.EXIT_ONE:
+            for digit, span in bindings:
+                if digit != "1":
+                    continue
+                for m in re.finditer(re.escape(code), span):
+                    tail = span[m.end():]
+                    two = tail.find("`2`")
+                    if two < 0:
+                        continue
+                    between = tail[:two]
+                    if re.search(r"\blegs?\b|\bonly\b", between, re.I):
+                        continue          # a disclosed split, not a contradiction
+                    self.fail(
+                        f"{code} is bound to exit 1 but this span states it"
+                        f" answers 2 with no leg qualifier:"
+                        f" {between[-90:]!r}")
         # The narrowing survives: a retry hint does not by itself mean 1.
         # Compared case-insensitively because README opens the sentence with a
         # lowercase "narrow" and SKILL with an uppercase "Narrow".
