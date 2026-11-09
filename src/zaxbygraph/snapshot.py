@@ -104,9 +104,13 @@ class SnapshotError(Exception):
 #: zaxbygraph store", as opposed to "this file could not be inspected".
 #:
 #: ``SQLITE_NOTADB`` -- the bytes are not a database. ``SQLITE_CORRUPT`` -- a
-#: database whose pages are damaged. ``SQLITE_ERROR`` -- for the two fixed
-#: SELECT literals below, a schema outcome: no ``sync_state`` table, or no
-#: ``repo`` / ``issues_since`` column. All three are permanent, readable
+#: database whose pages are damaged. ``SQLITE_ERROR`` -- the reachable outcomes
+#: for the two fixed SELECT literals below are all permanent and readable: no
+#: ``sync_state`` table, no ``repo`` / ``issues_since`` column, an unregistered
+#: collation, or a ``sync_state`` VIEW whose body evaluates ``json_extract`` on
+#: a truncated document. The whole code is preserved rather than a subset of
+#: it, because narrowing it would refuse readable destinations the base
+#: ``pull`` replaces (plan-critic R2-1). All three are permanent, readable
 #: conditions, so ``pull`` is still the documented recovery path for them
 #: (frozen AC3).
 #:

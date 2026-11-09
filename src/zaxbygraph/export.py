@@ -123,11 +123,11 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
     is silently broken, which is the contract being enforced here.
 
     The existence question is answered by ``stat`` and only
-    ``FileNotFoundError`` means "absent". ``os.path.exists`` is
-    ``genericpath.exists`` -- ``try: os.stat(path) except (OSError,
-    ValueError): return False`` -- and it swallows unconditionally on 3.11
-    through 3.14, so the hard-link half of this guard was skipped on every
-    interpreter for any per-file stat fault (issue #62)."""
+    ``FileNotFoundError`` means "absent". ``os.path.exists`` swallows every
+    ``OSError`` into ``False`` on 3.11 through 3.14 -- 3.11 through the
+    pure-Python ``genericpath.exists``, 3.12 and later through the C builtin
+    ``_path_exists`` -- so the hard-link half of this guard was skipped on
+    every interpreter for any per-file stat fault (issue #62)."""
     candidates = [
         db_path,
         db_path + "-wal",

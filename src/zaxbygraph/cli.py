@@ -1962,8 +1962,12 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
                                verify_sample=max(0, int(args.verify_sample)),
                                expected_repo=repo, expected_host=host)
     except SnapshotError as exc:
-        # The refusal's own exit code: 2 for a knowable guard rejection, 1 for
-        # one whose hint tells the user to retry (README's exit-code table).
+        # The refusal's own exit code. The default is 2; only the two inspection
+        # refusals pass 1, because what blocked them was a stat or open fault a
+        # retry can clear. A hint that says "re-pull" does NOT by itself mean 1
+        # -- git_timeout, dest_open, dest_sidecar_stale and corpus_mismatch all
+        # say that and stay 2, because what blocked them is a knowable fact
+        # retrying cannot change (README's exit-code table).
         return emit_failure(args, exc.exit_code, exc.message, slug=repo,
                             db_path=store_db, code_key=exc.code, hint=exc.hint)
     except (OSError, sqlite3.Error) as exc:

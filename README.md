@@ -850,18 +850,20 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
   request was malformed (bad flags, non-read SQL, multiple statements), or the
   resolved DB holds other repos but not this one. **`1`** — a runtime failure:
-  item not found, sync error, an authorizer denial at execution time, or a
-  guard rejection whose hint tells you to retry (`snapshot pull`'s
-  `dest_uninspectable` when the destination cannot be stat-ed or opened;
-  `export-corpus`'s `out_is_database` when `--out` cannot be inspected).
-  **`3`** — no corpus for the resolved repo (issue #2): the resolved DB is
-  missing or holds nothing for it; the message names the path and the exact
-  `sync` command. The distinction matters for retry logic: a `2` or `3` will
-  never succeed on retry unchanged (fix the request, or sync first), while a
-  `1` sometimes will. A guard rejection that names a *knowable* consequence —
-  a multi-repo or newer-local destination, a `--out` that resolves to the store
-  or a sidecar, a hard link of it — stays `2`, because retrying unchanged
-  cannot change what the destination is.
+  item not found, sync error, an authorizer denial at execution time, or one of
+  the two inspection refusals below. **`3`** — no corpus for the resolved repo
+  (issue #2): the resolved DB is missing or holds nothing for it; the message
+  names the path and the exact `sync` command. The distinction matters for
+  retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
+  request, or sync first), while a `1` sometimes will.
+  **The two inspection refusals that answer `1` are narrow, not a general
+  rule.** `snapshot pull`'s `dest_uninspectable` and `export-corpus`'s
+  `out_is_database`-on-an-uninspectable-path answer `1`, because what blocked
+  them was a stat or open fault that a retry can clear. Every other guard
+  rejection stays `2` — including the ones whose hint says to retry or re-pull
+  (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`) —
+  because what blocked them is a knowable fact about the request or the
+  destination that retrying unchanged cannot change.
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
