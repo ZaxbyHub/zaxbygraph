@@ -123,7 +123,11 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
     is silently broken, which is the contract being enforced here.
 
     The existence question is answered by ``stat`` and only
-    ``FileNotFoundError`` means "absent". ``os.path.exists`` swallows every
+    ``FileNotFoundError`` means "absent". ``ValueError`` is caught alongside
+    ``OSError`` in all three handlers: ``os.stat`` raises ``ValueError``, not
+    ``OSError``, for a path carrying an embedded null character, and this
+    guard's contract is a coded refusal rather than a traceback.
+    ``os.path.exists`` swallows every
     ``OSError`` into ``False`` on 3.11 through 3.14 -- 3.11 through the
     pure-Python ``genericpath.exists``, 3.12 and later through the C builtin
     ``_path_exists`` -- so the hard-link half of this guard was skipped on
@@ -145,7 +149,7 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
         os.stat(out_path)
     except FileNotFoundError:
         out_present = False            # --out does not exist yet: nothing to alias
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ExportError(
             "out_is_database",
             f"--out {out_path} could not be inspected, so whether it aliases"
@@ -169,7 +173,7 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
             os.stat(cand)
         except FileNotFoundError:
             continue
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise ExportError(
                 "out_is_database",
                 f"{cand} could not be inspected, so whether --out aliases it"
@@ -182,7 +186,7 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
             same = os.path.samefile(out_path, cand)
         except FileNotFoundError:
             continue                   # not an alias (a path vanished mid-check)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise ExportError(
                 "out_is_database",
                 f"--out {out_path} could not be compared with {cand}",

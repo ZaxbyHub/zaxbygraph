@@ -178,6 +178,19 @@ class AliasGuardFaultTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "out_is_database")
         self.assertEqual(ctx.exception.exit_code, 1)
 
+    def test_a_null_byte_in_the_path_is_a_coded_refusal_not_a_traceback(self):
+        # os.stat raises ValueError, not OSError, for a path carrying an
+        # embedded null character. The guard's contract is a coded refusal, so
+        # all three handlers catch ValueError alongside OSError.
+        db = _build_store(self.td)
+        for bad in ("a\x00b",
+                    str(self.td / "x") + "\x00" + "y"):
+            with self.subTest(path=bad):
+                with self.assertRaises(ExportError) as ctx:
+                    _reject_database_alias(str(bad), str(db))
+                self.assertEqual(ctx.exception.code, "out_is_database")
+                self.assertEqual(ctx.exception.exit_code, 1)
+
     def test_samefile_file_not_found_is_not_an_alias(self):
         # A path that vanished mid-check is not evidence of an alias.
         db = _build_store(self.td)
