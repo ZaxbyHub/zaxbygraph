@@ -317,8 +317,21 @@ class SqliteLegTests(unittest.TestCase):
         self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_open_time_busy_is_refused(self):
-        self._drive(sqlite3.SQLITE_BUSY, "database is locked",
-                    lambda d: _check_destination_shape(d, MANIFEST, False))
+        # The fault lands on the OPEN, not the SELECT: `_open_readonly` itself
+        # raises, so the classifier never sees a connection. Distinct from the
+        # query-time legs below, which reach a connection and fail on execute.
+        dest = _build_store(self.td)
+
+        def _faulting_open(_path):
+            exc = sqlite3.OperationalError("unable to open database file")
+            exc.sqlite_errorcode = sqlite3.SQLITE_BUSY
+            raise exc
+
+        with mock.patch("zaxbygraph.snapshot._open_readonly", _faulting_open):
+            with self.assertRaises(SnapshotError) as ctx:
+                _check_destination_shape(dest, MANIFEST, False)
+        self.assertEqual(ctx.exception.code, "dest_uninspectable")
+        self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_query_time_busy_is_refused(self):
         self._drive(sqlite3.SQLITE_BUSY, "database is locked",
@@ -359,8 +372,9 @@ class SqliteLegTests(unittest.TestCase):
         writer.execute("BEGIN EXCLUSIVE")
         self.addCleanup(writer.close)
         before = dest.read_bytes()
-        with self.assertRaises(SnapshotError):
+        with self.assertRaises(SnapshotError) as ctx:
             pull(dest, str(bare), force=False)
+        self.assertEqual(ctx.exception.code, "dest_uninspectable")
         self.assertEqual(dest.read_bytes(), before)
 
 
@@ -381,6 +395,8 @@ class NotAStoreTests(unittest.TestCase):
         ("sync_state with an unregistered collation",
          "CREATE TABLE sync_state(repo TEXT COLLATE app_collation,"
          " issues_since TEXT)"),
+        ("sync_state as a view over malformed JSON",
+         "CREATE TABLE raw(k TEXT, v TEXT)"),
     )
 
     def setUp(self):
@@ -398,6 +414,17 @@ class NotAStoreTests(unittest.TestCase):
                 lambda a, b: -1 if a < b else (1 if a > b else 0))
         if ddl:
             conn.execute(ddl)
+        if name == "sync_state as a view over malformed JSON":
+            # A readable `sync_state` VIEW whose body evaluates json_extract on
+            # a truncated document. The open succeeds and BOTH fixed literals
+            # fail with SQLITE_ERROR 1 `malformed JSON` during DATA evaluation,
+            # not schema resolution -- which is why the classifier preserves
+            # the whole code rather than a message match.
+            conn.execute("INSERT INTO raw VALUES ('a','{not-json')")
+            conn.execute(
+                "CREATE VIEW sync_state AS SELECT"
+                " json_extract(v, '$.repo') AS repo,"
+                " json_extract(v, '$.issues_since') AS issues_since FROM raw")
         conn.execute("CREATE TABLE valuable_payload(secret TEXT)")
         conn.execute("INSERT INTO valuable_payload VALUES ('do-not-lose')")
         conn.commit()
@@ -462,9 +489,36 @@ class NotAStoreTests(unittest.TestCase):
         check = sqlite3.connect(str(dest))
         try:
             (verdict,) = check.execute("PRAGMA quick_check").fetchone()
+            payload = check.execute(
+                "SELECT count(*) FROM sqlite_master WHERE type='table'"
+                " AND name='valuable_payload'").fetchone()[0]
         finally:
             check.close()
         self.assertEqual(verdict, "ok")
+        # Whole-file replacement, asserted rather than assumed: the payload the
+        # tool does not own is gone.
+        self.assertEqual(payload, 0, "valuable_payload survived the replace")
+
+    def test_the_malformed_json_view_fails_both_literals_with_code_one(self):
+        # The layout that disproved the "only schema errors, exactly three
+        # shapes" proof: the open succeeds and the failure happens during data
+        # evaluation, so the classifier's whole-code preservation is what keeps
+        # this layout replaceable rather than refused.
+        dest = self._make("sync_state as a view over malformed JSON",
+                          "CREATE TABLE raw(k TEXT, v TEXT)")
+        codes = []
+        for q in ("SELECT repo FROM sync_state",
+                  "SELECT issues_since FROM sync_state WHERE repo = ?"):
+            chk = sqlite3.connect(f"file:{dest}?mode=ro", uri=True)
+            try:
+                chk.execute(q, () if "?" not in q else ("x",)).fetchall()
+                codes.append("ok")
+            except sqlite3.Error as exc:
+                codes.append(_primary_code(exc))
+            finally:
+                chk.close()
+        self.assertEqual(codes, [sqlite3.SQLITE_ERROR, sqlite3.SQLITE_ERROR],
+                         f"unexpected codes {codes}")
 
 
 class CorruptDestinationTests(unittest.TestCase):

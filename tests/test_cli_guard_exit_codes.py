@@ -152,6 +152,31 @@ class SnapshotPullExitTests(_CliCase):
                              message_part="could not be inspected",
                              hint_part="re-pull")
 
+    def test_a_real_exclusive_writer_answers_exit_one(self):
+        # The plan's seventh matrix row: a REAL SQLITE_BUSY destination, driven
+        # through the CLI, answering exit 1 with dest_uninspectable. A
+        # rollback-journal store is required, because a WAL writer never blocks
+        # a reader and the BUSY leg is otherwise unreachable.
+        bare = self._published()
+        dest = _build_store(self.td)
+        conn = sqlite3.connect(str(dest))
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            conn.close()
+        writer = sqlite3.connect(str(dest), isolation_level=None, timeout=0)
+        writer.execute("BEGIN EXCLUSIVE")
+        self.addCleanup(writer.close)
+        before = dest.read_bytes()
+        code, out, _ = self.run_cmd(
+            ["snapshot", "pull", bare, "--db", str(dest),
+             "--repo", REPO, "--format", "json"])
+        self.assert_envelope(code, out, exit_code=1,
+                             error_code="dest_uninspectable",
+                             message_part="could not be inspected",
+                             hint_part="re-pull")
+        self.assertEqual(dest.read_bytes(), before)
+
     def test_multi_repo_answers_exit_two(self):
         bare = self._published()
         merged = self.td / "merged.db"
