@@ -23,8 +23,10 @@ two real destination schemas prove exact comparison is wrong: a `sync_state` wit
 a `COLLATE` column reopened without that collation answers
 `SQLITE_ERROR_MISSING_COLLSEQ` (257), and an FTS5 `sync_state` with a dropped
 shadow table answers `SQLITE_CORRUPT_VTAB` (267). Both are replaced successfully
-by the base `pull`, and 3.11 answers 267 where 3.14 answers 1 for the same FTS
-shape -- so exact matching both over-refuses and splits across the CI matrix.
+by the base `pull`. Masking with `& 0xFF` is what makes the classifier read 267
+as primary 11 (`SQLITE_CORRUPT`); an exact comparison to 11 or to 1 would
+misroute it, and which raw value a host reports is not something this suite
+should depend on.
 """
 from __future__ import annotations
 
@@ -482,8 +484,9 @@ class NotAStoreTests(unittest.TestCase):
             observed = _primary_code(exc)
         finally:
             chk.close()
-        # SQLITE_CORRUPT_VTAB (267) on 3.11, SQLITE_ERROR (1) on 3.14 -- both
-        # primaries are in the proceed set, so the layout is replaced either way.
+        # SQLITE_CORRUPT_VTAB (267) -> primary 11 (SQLITE_CORRUPT) on this host.
+        # Either raw value a host reports lands in the proceed set once the
+        # primary code is taken, so the layout is replaced either way.
         self.assertIn(observed, (1, 11), f"unexpected primary code {observed}")
         pull(dest, str(bare), force=False)
         check = sqlite3.connect(str(dest))

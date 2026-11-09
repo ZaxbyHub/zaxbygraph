@@ -117,9 +117,11 @@ class SnapshotError(Exception):
 #: ``COLLATE`` column reopened without that collation answers
 #: ``SQLITE_ERROR_MISSING_COLLSEQ`` (257), and an FTS5 ``sync_state`` with a
 #: dropped shadow table answers ``SQLITE_CORRUPT_VTAB`` (267) -- and both are
-#: replaced successfully by the base ``pull``. Masking with ``& 0xFF`` also
-#: removes an interpreter split: 3.11 answers 267 where 3.14 answers 1 for the
-#: same FTS shape.
+#: replaced successfully by the base ``pull``. Masking with ``& 0xFF`` is what
+#: makes the classifier read 267 as primary 11 (``SQLITE_CORRUPT``) rather than
+#: as an unknown code it would refuse; an exact comparison to 11 would misroute
+#: it, and a comparison to 1 would misroute it on any host that reports the
+#: extended form.
 _NOT_A_STORE_CODES = frozenset({
     getattr(sqlite3, "SQLITE_NOTADB", 26),
     getattr(sqlite3, "SQLITE_CORRUPT", 11),
@@ -149,11 +151,15 @@ def _is_not_a_store(exc: sqlite3.Error) -> bool:
 
 
 def _dest_uninspectable(db_path: Path) -> SnapshotError:
-    """The refusal for a destination whose contents cannot be determined."""
+    """The refusal for a destination whose contents cannot be determined.
+
+    Worded for both callers: `_check_destination_shape` asks whether the
+    destination holds other repos, `_local_watermark` asks what its watermark
+    is, and neither question is answerable when the file cannot be inspected."""
     return SnapshotError(
         "dest_uninspectable",
-        f"the destination store {db_path} could not be inspected, so whether"
-        " it holds other repos' corpora is unknown",
+        f"the destination store {db_path} could not be inspected, so its"
+        " contents cannot be determined",
         hint="close readers of the destination and re-pull, or check the"
              " path's permissions and the underlying storage",
         exit_code=1,

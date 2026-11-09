@@ -113,13 +113,16 @@ class AliasGuardFaultTests(unittest.TestCase):
 
     def test_out_faulted_is_refused(self):
         db, out = self._linked()
-        for p in _fault_patches(out):
+        patches = _fault_patches(out)
+        for p in patches:
             p.start()
         try:
             with self.assertRaises(ExportError) as ctx:
                 _reject_database_alias(str(out), str(db))
         finally:
-            for p in reversed(_fault_patches(out)):
+            # Stop the SAME patcher objects that were started: rebuilding the
+            # list leaves the first pair running for the rest of the process.
+            for p in reversed(patches):
                 p.stop()
         self.assertEqual(ctx.exception.code, "out_is_database")
         self.assertEqual(ctx.exception.exit_code, 1)
