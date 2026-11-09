@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import zlib
@@ -80,13 +81,96 @@ _WAL_HEADER_BYTES = 32
 
 
 class SnapshotError(Exception):
-    """Snapshot failure with an envelope-shaped payload."""
+    """Snapshot failure with an envelope-shaped payload.
 
-    def __init__(self, code: str, message: str, hint: str | None = None):
+    ``exit_code`` is the process exit the CLI answers with. It defaults to 2
+    (usage or guard rejection: ``README.md`` promises a 2 "will never succeed
+    on retry unchanged"), so every existing raise site keeps its current exit
+    code. A refusal whose hint tells the user to retry -- an uninspectable, busy
+    or I/O-faulted destination -- passes 1 instead, because that is the class
+    ``README.md`` says "sometimes will" succeed on retry.
+    """
+
+    def __init__(self, code: str, message: str, hint: str | None = None,
+                 exit_code: int = 2):
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
+        self.exit_code = exit_code
+
+
+#: Result codes that mean "this is a readable file that is not a usable
+#: zaxbygraph store", as opposed to "this file could not be inspected".
+#:
+#: ``SQLITE_NOTADB`` -- the bytes are not a database. ``SQLITE_CORRUPT`` -- a
+#: database whose pages are damaged. ``SQLITE_ERROR`` -- for the two fixed
+#: SELECT literals below, a schema outcome: no ``sync_state`` table, or no
+#: ``repo`` / ``issues_since`` column. All three are permanent, readable
+#: conditions, so ``pull`` is still the documented recovery path for them
+#: (frozen AC3).
+#:
+#: The comparison is on the PRIMARY code, never the raw ``sqlite_errorcode``:
+#: Python exposes SQLite's extended result codes through that attribute, and
+#: exact comparison to 1 and 11 does not implement those families. Two real
+#: destination schemas reproduce the wrong refusal -- a ``sync_state`` with a
+#: ``COLLATE`` column reopened without that collation answers
+#: ``SQLITE_ERROR_MISSING_COLLSEQ`` (257), and an FTS5 ``sync_state`` with a
+#: dropped shadow table answers ``SQLITE_CORRUPT_VTAB`` (267) -- and both are
+#: replaced successfully by the base ``pull``. Masking with ``& 0xFF`` also
+#: removes an interpreter split: 3.11 answers 267 where 3.14 answers 1 for the
+#: same FTS shape.
+_NOT_A_STORE_CODES = frozenset({
+    getattr(sqlite3, "SQLITE_NOTADB", 26),
+    getattr(sqlite3, "SQLITE_CORRUPT", 11),
+    getattr(sqlite3, "SQLITE_ERROR", 1),
+})
+
+
+def _primary_code(exc: sqlite3.Error) -> int | None:
+    """SQLite's primary result code for ``exc``, or None when unavailable."""
+    raw = getattr(exc, "sqlite_errorcode", None)
+    return None if raw is None else raw & 0xFF
+
+
+def _is_not_a_store(exc: sqlite3.Error) -> bool:
+    """True when ``exc`` means "a readable file that is not a usable store".
+
+    Every ``SQLITE_ERROR`` outcome is in this set, not only the ones whose
+    message names ``sync_state``. Narrowing it to a message match would refuse
+    readable destinations whose ``sync_state`` exists but lacks the ``repo``
+    or ``issues_since`` column -- a new refusal for a permanent, readable,
+    schema-incompatible store, which the base ``pull`` replaces (plan-critic
+    R2-1). Preserving the whole code keeps this change behaviour-preserving
+    for every ``SQLITE_ERROR`` outcome: whatever the base did, this does too.
+    """
+    code = _primary_code(exc)
+    return code is not None and code in _NOT_A_STORE_CODES
+
+
+def _dest_uninspectable(db_path: Path) -> SnapshotError:
+    """The refusal for a destination whose contents cannot be determined."""
+    return SnapshotError(
+        "dest_uninspectable",
+        f"the destination store {db_path} could not be inspected, so whether"
+        " it holds other repos' corpora is unknown",
+        hint="close readers of the destination and re-pull, or check the"
+             " path's permissions and the underlying storage",
+        exit_code=1,
+    )
+
+
+def _reject_unless_not_a_store(exc: sqlite3.Error, db_path: Path) -> None:
+    """Raise ``dest_uninspectable`` unless ``exc`` means "not a store".
+
+    The base code answered every ``sqlite3.Error`` from these legs with a bare
+    ``return``, which read a busy or I/O-faulted destination as "no local
+    corpus" and "no other repos". Those are inspection failures, not absences,
+    and they fail open on every interpreter -- so a stat-first fix alone would
+    leave them open (frozen AC7).
+    """
+    if not _is_not_a_store(exc):
+        raise _dest_uninspectable(db_path) from exc
 
 
 def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess:
@@ -759,16 +843,39 @@ def _check_destination_shape(db_path: Path, manifest: dict,
     """A whole-file replace destroys every other repo in the destination,
     so a multi-repo destination is refused unless --force is passed. The
     publish side already refuses a multi-repo SOURCE (multi_repo_store);
-    this is the symmetric destination guard (PRR-C)."""
-    if not db_path.is_file():
+    this is the symmetric destination guard (PRR-C).
+
+    The guard's own worst case is a destination it cannot inspect, so the
+    existence question is answered by ``stat`` and only ``FileNotFoundError``
+    means "absent". ``is_file()`` is not a stable oracle: on 3.14 it delegates
+    to ``os.path.isfile``, which swallows every ``OSError``, and on 3.11-3.13
+    it re-raises only outside pathlib's own swallow set. Either way an
+    uninspectable destination read as an absent one, and the early return that
+    exists for the absent case then skipped the guard immediately before
+    ``_install``'s whole-file ``os.replace`` (issue #61)."""
+    try:
+        st = db_path.stat()
+    except FileNotFoundError:
+        return                       # genuinely absent: nothing to refuse
+    except OSError as exc:
+        raise _dest_uninspectable(db_path) from exc
+    if not stat.S_ISREG(st.st_mode):
+        # Legacy behaviour preserved, NOT a safety claim: a directory fails
+        # later at `os.replace` (Windows -> PermissionError -> dest_open;
+        # POSIX rename -> EISDIR), and POSIX rename atomically replaces an
+        # existing non-directory node, including FIFO and device nodes.
+        # Recorded as a boundary in the PR body rather than given a new
+        # refusal here.
         return
     try:
         conn = _open_readonly(db_path)
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _reject_unless_not_a_store(exc, db_path)
         return
     try:
         repos = [r[0] for r in conn.execute("SELECT repo FROM sync_state")]
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _reject_unless_not_a_store(exc, db_path)
         return
     finally:
         conn.close()
@@ -784,11 +891,21 @@ def _check_destination_shape(db_path: Path, manifest: dict,
 
 
 def _local_watermark(db_path: Path, repo: str) -> str | None:
-    """The destination's watermark FOR THE SNAPSHOT'S REPO. An absent or
-    unreadable store reads as None (no local corpus) and must never be
-    created just to ask — connect() would leave a schema-less file that
-    resolve_db prefers over the real store (PRR-F3)."""
-    if not db_path.is_file():
+    """The destination's watermark FOR THE SNAPSHOT'S REPO.
+
+    An ABSENT store reads as None (no local corpus) and must never be created
+    just to ask -- connect() would leave a schema-less file that resolve_db
+    prefers over the real store (PRR-F3). An UNINSPECTABLE store is a
+    different thing and raises: reading it as None silently overwrote a newer
+    local store, because the `local_newer` refusal it feeds never fired
+    (issue #61, frozen AC4)."""
+    try:
+        st = db_path.stat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _dest_uninspectable(db_path) from exc
+    if not stat.S_ISREG(st.st_mode):
         return None
     try:
         conn = _open_readonly(db_path)
@@ -798,7 +915,8 @@ def _local_watermark(db_path: Path, repo: str) -> str | None:
                 (repo,)).fetchone()
         finally:
             conn.close()
-    except sqlite3.Error:
+    except sqlite3.Error as exc:
+        _reject_unless_not_a_store(exc, db_path)
         return None
     return row[0] if row else None
 def _write_provenance(staged: Path, manifest: dict) -> None:

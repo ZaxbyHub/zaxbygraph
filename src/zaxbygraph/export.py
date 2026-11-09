@@ -113,12 +113,21 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _reject_database_alias(out_path: str, db_path: str) -> None:
-    """--out must never name the database or its sidecars: the destination is
-    opened with a plain writable open after the read connection exists, and
-    ``open(path, "wb")`` would truncate an aliased store despite SQLite
-    running mode=ro. A stray ``-journal`` file is the worst case: SQLite
-    treats it as a hot journal and refuses every subsequent read-only open
-    until it is deleted by hand."""
+    """--out must never name the database or its sidecars.
+
+    A stray ``-journal`` file is the worst case: SQLite treats it as a hot
+    journal and refuses every subsequent read-only open until it is deleted by
+    hand. ``write_corpus`` reaches the destination through ``tempfile.mkstemp``
+    plus ``os.replace``, so the store's bytes survive an aliased ``--out`` --
+    but the corpus still lands on a path this guard forbids and the hard link
+    is silently broken, which is the contract being enforced here.
+
+    The existence question is answered by ``stat`` and only
+    ``FileNotFoundError`` means "absent". ``os.path.exists`` is
+    ``genericpath.exists`` -- ``try: os.stat(path) except (OSError,
+    ValueError): return False`` -- and it swallows unconditionally on 3.11
+    through 3.14, so the hard-link half of this guard was skipped on every
+    interpreter for any per-file stat fault (issue #62)."""
     candidates = [
         db_path,
         db_path + "-wal",
@@ -132,6 +141,21 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
             f"--out {out_path} resolves to a device, not a file;"
             " refusing to discard the corpus",
         )
+    try:
+        os.stat(out_path)
+    except FileNotFoundError:
+        out_present = False            # --out does not exist yet: nothing to alias
+    except OSError as exc:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} could not be inspected, so whether it aliases"
+            " the database is unknown",
+            hint="check the path's permissions and the underlying storage,"
+                 " then re-run the export",
+            exit_code=1,
+        ) from exc
+    else:
+        out_present = True
     for cand in candidates:
         if os.path.realpath(cand) == out_real:
             raise ExportError(
@@ -139,13 +163,39 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
                 f"--out {out_path} resolves to the database (or a sidecar);"
                 " refusing to overwrite the store",
             )
-        if os.path.exists(out_path) and os.path.exists(cand):
-            if os.path.samefile(out_path, cand):
-                raise ExportError(
-                    "out_is_database",
-                    f"--out {out_path} is a hard link (or alias) of the"
-                    " database; refusing to overwrite the store",
-                )
+        if not out_present:
+            continue
+        try:
+            os.stat(cand)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ExportError(
+                "out_is_database",
+                f"{cand} could not be inspected, so whether --out aliases it"
+                " is unknown",
+                hint="check the path's permissions and the underlying"
+                     " storage, then re-run the export",
+                exit_code=1,
+            ) from exc
+        try:
+            same = os.path.samefile(out_path, cand)
+        except FileNotFoundError:
+            continue                   # not an alias (a path vanished mid-check)
+        except OSError as exc:
+            raise ExportError(
+                "out_is_database",
+                f"--out {out_path} could not be compared with {cand}",
+                hint="check the path's permissions and the underlying"
+                     " storage, then re-run the export",
+                exit_code=1,
+            ) from exc
+        if same:
+            raise ExportError(
+                "out_is_database",
+                f"--out {out_path} is a hard link (or alias) of the"
+                " database; refusing to overwrite the store",
+            )
 
 
 def _check_completeness(

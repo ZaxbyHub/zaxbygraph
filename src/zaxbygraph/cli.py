@@ -1958,8 +1958,10 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
                                verify_sample=max(0, int(args.verify_sample)),
                                expected_repo=repo, expected_host=host)
     except SnapshotError as exc:
-        return emit_failure(args, 2, exc.message, slug=repo, db_path=store_db,
-                            code_key=exc.code, hint=exc.hint)
+        # The refusal's own exit code: 2 for a knowable guard rejection, 1 for
+        # one whose hint tells the user to retry (README's exit-code table).
+        return emit_failure(args, exc.exit_code, exc.message, slug=repo,
+                            db_path=store_db, code_key=exc.code, hint=exc.hint)
     except (OSError, sqlite3.Error) as exc:
         # a storage fault is a result object, never a traceback
         return emit_failure(args, 1, str(exc), slug=repo, db_path=store_db,

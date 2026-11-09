@@ -850,12 +850,18 @@ Machine-readable rules, worth knowing before scripting against this:
 - **Exit codes.** `0` success. **`2`** — usage or guard rejection, i.e. the
   request was malformed (bad flags, non-read SQL, multiple statements), or the
   resolved DB holds other repos but not this one. **`1`** — a runtime failure:
-  item not found, sync error, or an authorizer denial at execution time.
+  item not found, sync error, an authorizer denial at execution time, or a
+  guard rejection whose hint tells you to retry (`snapshot pull`'s
+  `dest_uninspectable` when the destination cannot be stat-ed or opened;
+  `export-corpus`'s `out_is_database` when `--out` cannot be inspected).
   **`3`** — no corpus for the resolved repo (issue #2): the resolved DB is
   missing or holds nothing for it; the message names the path and the exact
   `sync` command. The distinction matters for retry logic: a `2` or `3` will
   never succeed on retry unchanged (fix the request, or sync first), while a
-  `1` sometimes will.
+  `1` sometimes will. A guard rejection that names a *knowable* consequence —
+  a multi-repo or newer-local destination, a `--out` that resolves to the store
+  or a sidecar, a hard link of it — stays `2`, because retrying unchanged
+  cannot change what the destination is.
 - **Errors answer on stdout in JSON mode**: a failed command writes the
   envelope with `ok: false` and a coded `error` object (`no_such_column` with a
   `hint` naming the real columns, `no_such_table`, `not_found`, `no_corpus`,
