@@ -160,79 +160,110 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
             f"--out {out_path} resolves to a device, not a file;"
             " refusing to discard the corpus",
         )
-    # Pass 1 -- the alias comparison. It needs only the two realpaths, so it
-    # runs BEFORE out_path's own stat is known to work: a --out that provably
-    # resolves to the store (or a sidecar) is refused as an alias (exit 2, a
-    # knowable fact) rather than as "cannot inspect" (exit 1), which is what
-    # hoisting the stat ahead of this comparison used to answer. Hoisting the
-    # stat first made the guard claim the alias question was unknown on a path
-    # whose answer it had already computed.
+    # The guard PROVES what it can before it reports what it cannot. A
+    # determinable alias -- realpath equality, or a hard link proven by
+    # samefile -- answers 2, a knowable fact; a path that cannot be inspected
+    # answers 1. Reporting the fault first makes the guard say "whether it
+    # aliases the database is unknown" about a path whose answer it has already
+    # computed, which is both a false statement and the wrong exit class
+    # (PRR-007). So every inspection fault is remembered and raised only once
+    # nothing determinable turns up.
+    deferred = None
+
+    def note_fault(err: ExportError) -> None:
+        """Keep the FIRST inspection fault; raise it only at the end."""
+        nonlocal deferred
+        if deferred is None:
+            deferred = err
+
+    # Pass 1 -- realpath equality. It needs neither path to be stat-able, so a
+    # fault here is deferrable rather than decisive.
+    alias = None
     for cand in candidates:
         try:
             cand_real = os.path.realpath(cand)
         except (OSError, ValueError) as exc:
-            raise ExportError(
+            note_fault(ExportError(
                 "out_is_database",
                 f"{cand} could not be inspected, so whether --out aliases it"
                 " is unknown",
                 hint="check the path's permissions and the underlying"
                      " storage, then re-run the export",
                 exit_code=1,
-            ) from exc
+            ))
+            continue
         if cand_real == out_real:
-            raise ExportError(
-                "out_is_database",
-                f"--out {out_path} resolves to the database (or a sidecar);"
-                " refusing to overwrite the store",
-            )
+            alias = cand
+            break
+
     # Pass 2 -- the hard-link comparison, which needs out_path to exist. An
     # absent --out cannot hard-link anything, so this is where "absent" ends
     # the guard; everything above it has already run.
-    try:
-        os.stat(out_path)
-    except FileNotFoundError:
-        return                  # --out does not exist yet: nothing to alias
-    except (OSError, ValueError) as exc:
+    hard_link = None
+    if alias is None:
+        out_present = False
+        try:
+            os.stat(out_path)
+        except FileNotFoundError:
+            pass                          # absent: no hard link is possible
+        except (OSError, ValueError) as exc:
+            note_fault(ExportError(
+                "out_is_database",
+                f"--out {out_path} could not be inspected, so whether it"
+                " aliases the database is unknown",
+                hint="check the path's permissions and the underlying storage,"
+                     " then re-run the export",
+                exit_code=1,
+            ))
+        else:
+            out_present = True
+        if out_present:
+            for cand in candidates:
+                try:
+                    os.stat(cand)
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError) as exc:
+                    note_fault(ExportError(
+                        "out_is_database",
+                        f"{cand} could not be inspected, so whether --out"
+                        " aliases it is unknown",
+                        hint="check the path's permissions and the underlying"
+                             " storage, then re-run the export",
+                        exit_code=1,
+                    ))
+                    continue
+                try:
+                    same = os.path.samefile(out_path, cand)
+                except FileNotFoundError:
+                    continue          # not an alias (a path vanished mid-check)
+                except (OSError, ValueError) as exc:
+                    note_fault(ExportError(
+                        "out_is_database",
+                        f"--out {out_path} could not be compared with {cand}",
+                        hint="check the path's permissions and the underlying"
+                             " storage, then re-run the export",
+                        exit_code=1,
+                    ))
+                    continue
+                if same:
+                    hard_link = cand
+                    break
+
+    if alias is not None:
         raise ExportError(
             "out_is_database",
-            f"--out {out_path} could not be inspected, so whether it aliases"
-            " the database is unknown",
-            hint="check the path's permissions and the underlying storage,"
-                 " then re-run the export",
-            exit_code=1,
-        ) from exc
-    for cand in candidates:
-        try:
-            os.stat(cand)
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as exc:
-            raise ExportError(
-                "out_is_database",
-                f"{cand} could not be inspected, so whether --out aliases it"
-                " is unknown",
-                hint="check the path's permissions and the underlying"
-                     " storage, then re-run the export",
-                exit_code=1,
-            ) from exc
-        try:
-            same = os.path.samefile(out_path, cand)
-        except FileNotFoundError:
-            continue                   # not an alias (a path vanished mid-check)
-        except (OSError, ValueError) as exc:
-            raise ExportError(
-                "out_is_database",
-                f"--out {out_path} could not be compared with {cand}",
-                hint="check the path's permissions and the underlying"
-                     " storage, then re-run the export",
-                exit_code=1,
-            ) from exc
-        if same:
-            raise ExportError(
-                "out_is_database",
-                f"--out {out_path} is a hard link (or alias) of the"
-                " database; refusing to overwrite the store",
-            )
+            f"--out {out_path} resolves to the database (or a sidecar);"
+            " refusing to overwrite the store",
+        )
+    if hard_link is not None:
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} is a hard link (or alias) of the"
+            " database; refusing to overwrite the store",
+        )
+    if deferred is not None:
+        raise deferred
 
 
 def _check_completeness(

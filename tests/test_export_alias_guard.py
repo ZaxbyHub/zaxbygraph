@@ -148,6 +148,30 @@ class AliasGuardFaultTests(unittest.TestCase):
         self.assertEqual(ctx.exception.exit_code, 2)
         self.assertIn("resolves to the database", ctx.exception.message)
 
+    def test_a_provable_hard_link_outranks_a_later_candidate_fault(self):
+        """PRR-007 round 2: splitting the guard into a realpath pass and a
+        samefile pass reintroduced the same defect for HARD LINKS. `--out` is a
+        hard link of the store -- determinable by samefile -- and a LATER
+        candidate's realpath faults. The two-pass version raised the deferred
+        fault before the samefile could prove the alias, answering exit 1
+        "whether --out aliases it is unknown" on a path whose answer it had.
+
+        The guard now proves every determinable alias before raising any
+        inspection fault, so both orderings hold: realpath equality wins, and
+        so does a hard link proven after a sibling candidate faulted."""
+        db = _build_store(self.td)
+        out = self.td / "linked.jsonl"
+        if out.exists():
+            out.unlink()
+        os.link(db, out)
+        with mock.patch("os.path.realpath",
+                        _make_realpath_fault(str(db) + "-wal")):
+            with self.assertRaises(ExportError) as ctx:
+                _reject_database_alias(str(out), str(db))
+        self.assertEqual(ctx.exception.code, "out_is_database")
+        self.assertEqual(ctx.exception.exit_code, 2)
+        self.assertIn("hard link", ctx.exception.message)
+
     def test_out_faulted_is_refused(self):
         db, out = self._linked()
         patches = _fault_patches(out)
