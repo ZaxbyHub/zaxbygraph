@@ -156,3 +156,47 @@ commands are good.
 | Out-of-vocabulary literals, `no_such_table` hint, argparse errors as envelopes, several numbers in one `item` call, CLI output shapes described by the tool (§3, §4.1) | #72, new claims and ACs |
 | Skill shipped with the package and checked against installed copies (§4.3) | #73, new claim and ACs |
 | Coverage rows, fired triggers, priority note | #64 |
+
+## 8. Follow-up from the maintainer's machine (2026-11-10)
+
+The checks in §6 were run on the machine that holds the raw event files and
+the real stores. Results, and what they changed:
+
+- **Adoption (§1, §6).** The digest parser's `SUBCMDS` list omits `similar`,
+  `explain`, `coupling`, `eval`, `triage`, `bundle`, `brief` and `snapshot`.
+  In the raw event files no consumer-repository session ran `triage`,
+  `bundle`, `brief` or `similar`. `coupling` ran twice in one trainingapp
+  audit, which also probed `--help` for `triage`, `brief` and `similar`.
+  The count covers direct shell commands only.
+- **Skill copies (§4.3).** `~/.zcode/skills` and `~/.agents/skills` were
+  refreshed by hand on 2026-11-09: 350 lines, eight `triage` mentions,
+  identical to each other, hash different from `origin/main`. Their markers
+  still read 3d3aab0 and b47913e. `~/.claude/skills` is 141 lines at
+  e2ef892 with no mention of `triage`. No process writes the marker. The
+  window without the recipe (2026-10-30 → 2026-11-08) stands for the
+  `.zcode` copy.
+- **Claim convention (§4.2).** No definition of the claim comment, no
+  release marker and no lifetime exist in the installed skills. Recorded
+  sweeps looked back zero to nine days, most often three (18 sweeps with a
+  readable cutoff). #74 was amended: the window is a maintainer decision
+  and no release pattern is built in.
+- **Real-store timings.** opencode-swarm (3,629 items, 93 open issues):
+  `triage` 103.6 s, `bundle --count 3` 98.7 s, `brief` 100.6 s. ragappv3
+  (1,105 items, 100 open issues): 21.5 s, 16.1 s, 16.4 s. Worse than the
+  synthetic figures behind #70.
+- **Real-store output.** Default `bundle` pairs issues from two different
+  workstreams on ragappv3 and two unrelated CI issues on opencode-swarm,
+  each anchored on co-change; default `triage` has a signal in the demand
+  group only. Recorded on #69.
+- **Installed tool.** The `zaxbygraph` on PATH is an editable install of a
+  working tree with 24 modified tracked files (the in-progress Workstream A
+  change), reporting `0.4.0` at 6009c30. Recorded on #73.
+- **Test count.** The 928 figure came from that working tree, which has six
+  untracked test modules. Not a discrepancy in `main`.
+
+Not settled: whether `timeline truncated` notes (116 items on
+opencode-swarm, 62 on ragappv3) are false reports caused by comparing
+`totalCount` with an `itemTypes`-filtered page (`graphql.py:423-429`); the
+`sql` replay corpus; the `own/repo` stub store. The three false memory
+records of §4.1 have not been superseded: the attempt failed on a wrong
+flag.
