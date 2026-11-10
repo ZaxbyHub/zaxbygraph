@@ -152,7 +152,7 @@ commands are good.
 
 | Finding | Where |
 |---|---|
-| Claim gate for `triage` and `bundle` (§4.2) | New issue, Workstream B PR 4 |
+| Claim gate for `triage` and `bundle` (§4.2) | #74 (Workstream B, PR 4 of 4) |
 | Out-of-vocabulary literals, `no_such_table` hint, argparse errors as envelopes, several numbers in one `item` call, CLI output shapes described by the tool (§3, §4.1) | #72, new claims and ACs |
 | Skill shipped with the package and checked against installed copies (§4.3) | #73, new claim and ACs |
 | Coverage rows, fired triggers, priority note | #64 |
