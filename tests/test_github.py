@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 
 from fixtures import scrubbed_env
-from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
+from zaxbygraph.github import (
+    GitHubError,
+    GitHubTransportError,
+    GhApiSource,
+    _status_from_stderr,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -157,6 +162,46 @@ class StreamingListingTests(unittest.TestCase):
         self.assertIn("502", str(ctx.exception))
         self.assertEqual(len(pages), 1, f"pages delivered before the failure: {len(pages)}")
         self.assertEqual(len(pages[0]), 100)
+
+
+
+class TransportTypingTests(unittest.TestCase):
+    """Issue #65 AC3: a subprocess that could not be launched or did not
+    answer in time is a TYPED transport failure — the class (plus the named
+    HTTP statuses) that lets a GraphQL run degrade to REST. A plain
+    `GitHubError` here would leave a missing or hung `gh` fatal to a run
+    that could have finished over the per-item path."""
+
+    _MISSING = "zaxbygraph-definitely-not-a-real-gh-binary"
+
+    def test_launch_failure_is_typed_on_the_rest_path(self) -> None:
+        src = GhApiSource("acme", "forgegate", gh_bin=self._MISSING)
+        with self.assertRaises(GitHubTransportError):
+            src._api("repos/acme/forgegate")
+
+    def test_launch_failure_is_typed_on_the_graphql_path(self) -> None:
+        from zaxbygraph.graphql import GraphQLSource
+
+        src = GraphQLSource("acme", "forgegate", gh_bin=self._MISSING)
+        with self.assertRaises(GitHubTransportError):
+            src._graphql("query { viewer { login } }")
+
+    def test_only_the_typed_class_degrades(self) -> None:
+        from zaxbygraph.sync import _degradable_error
+
+        self.assertTrue(
+            _degradable_error(GitHubTransportError("gh api graphql timed out")),
+            "a typed transport failure is the degradable shape",
+        )
+        self.assertFalse(
+            _degradable_error(GitHubError("Field 'x' doesn't exist")),
+            "a statusless validation error must stay fatal so a schema"
+            " drift can never be mistaken for an unavailable endpoint",
+        )
+        self.assertFalse(
+            _degradable_error(GitHubError("rate limited", status=429)),
+            "a rate window is a retry, never a degradation",
+        )
 
 
 if __name__ == "__main__":

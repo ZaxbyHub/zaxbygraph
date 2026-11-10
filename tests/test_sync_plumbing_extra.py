@@ -63,8 +63,14 @@ class ProbeTrailTests(TempDBTest):
         host = _FakeGhHost()
         host.write_schema(_FULL_SCHEMA)
         host.write_graphql_responses([_page_payload([1])])
+        # One stable listing page, walked TWICE (the always-second-pass
+        # re-drain, issue #65 AC1), then releases once at the end of the run.
         host.write_rest_responses(
-            [[issue(1, title="one", comments=1, updated_at=ts(10))], [], []]
+            [
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [],
+            ]
         )
         with host:
             src = host.source()
@@ -96,8 +102,14 @@ class ProbeTrailTests(TempDBTest):
             {"Issue": ["databaseId", "comments"], "PullRequest": _FULL_SCHEMA["PullRequest"]}
         )
         host.write_graphql_responses([_page_payload([1])])
+        # One stable listing page, walked twice (the always-second-pass
+        # re-drain, issue #65 AC1), then releases once at the end of the run.
         host.write_rest_responses(
-            [[issue(1, title="one", comments=1, updated_at=ts(10))], [], []]
+            [
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [],
+            ]
         )
         with host:
             src = host.source()
@@ -152,10 +164,13 @@ class ProbeTrailTests(TempDBTest):
                 }
             ]
         )
+        # listing page, the per-item REST fallback for the dropped
+        # section, the verification pass's listing page, then releases.
         host.write_rest_responses(
             [
                 [issue(1, title="one", comments=1, updated_at=ts(10))],
                 [comment(50_001, "fallback")],
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
                 [],
             ]
         )
@@ -197,10 +212,13 @@ class NullSectionGuardTests(TempDBTest):
                 }
             ]
         )
+        # listing page, the per-item REST fallback for the null section,
+        # the verification pass's listing page, then releases.
         host.write_rest_responses(
             [
                 [issue(1, title="one", comments=1, updated_at=ts(10))],
                 [comment(50_001, "fallback comment")],
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
                 [],
             ]
         )
@@ -289,7 +307,11 @@ class CapabilityCacheTests(TempDBTest):
         host.write_graphql_responses([_page_payload([1]), _page_payload([1])])
         # per sync: (since-filtered listing, releases) — 2 REST calls each
         listing = [issue(1, title="one", comments=1, updated_at=ts(10))]
-        host.write_rest_responses([listing, [], listing, []])
+        # Per sync: the listing page, the verification pass's listing page
+        # (the second walk re-lists but does NOT re-fetch children), releases.
+        host.write_rest_responses(
+            [listing, listing, [], listing, listing, []]
+        )
         with host:
             first = sync_repo(self.conn, host.source(), REPO)
             probes_after_first = sum(1 for c in host.calls() if c["probe"])
@@ -300,10 +322,17 @@ class CapabilityCacheTests(TempDBTest):
         self.assertIsNone(second["last_error"])
         self.assertEqual(first["ingested"], 1)
         self.assertEqual(second["ingested"], 1, "the second sync must really re-ingest")
-        self.assertEqual(probes_after_first, 1)
+        # ONE logical probe, sent as the bounded introspection queries the
+        # split renders under GitHub's 2-use-per-field cap (issue #65 AC9),
+        # so the first sync's probe count is the split's width. What this
+        # test pins is the DELTA: the second source adds no introspection
+        # at all, because it hydrated the map from meta.
+        self.assertGreaterEqual(
+            probes_after_first, 1, "the first sync must probe once"
+        )
         self.assertEqual(
             probes_after_second,
-            1,
+            probes_after_first,
             "the second source must hydrate capabilities from the meta cache",
         )
         # BEHAVIORAL pin: the second sync's page query was built from the
@@ -327,8 +356,14 @@ class CapabilityCacheTests(TempDBTest):
         host = _FakeGhHost()
         host.write_schema({"Issue": ["databaseId", "comments"], "PullRequest": _FULL_SCHEMA["PullRequest"]})
         host.write_graphql_responses([_page_payload([1])])
+        # One stable listing page, walked twice (the always-second-pass
+        # re-drain, issue #65 AC1), then releases once.
         host.write_rest_responses(
-            [[issue(1, title="one", comments=1, updated_at=ts(10))], [], []]
+            [
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [issue(1, title="one", comments=1, updated_at=ts(10))],
+                [],
+            ]
         )
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -342,7 +377,11 @@ class CapabilityCacheTests(TempDBTest):
             result = sync_repo(self.conn, host.source(), REPO)
             probe_calls = sum(1 for c in host.calls() if c["probe"])
         self.assertIsNone(result["last_error"])
-        self.assertEqual(probe_calls, 1)
+        # The version mismatch must force a re-probe; the split renders one
+        # logical probe as several bounded introspection queries (issue #65
+        # AC9), so the assertion is "at least one introspection ran" — a
+        # mutant that hydrates the stale row probes zero times.
+        self.assertGreaterEqual(probe_calls, 1, "a stale-keyed cache must not be reused")
         self.assertIsNotNone(get_meta(self.conn, _capabilities_key()))
 
     def test_sources_without_probe_pair_skip_metadata(self) -> None:
@@ -363,7 +402,12 @@ class CapabilityCacheTests(TempDBTest):
 class _NumberedSource(FakeGitHubSource):
     """A numbers-capable fake: get_issues serves exactly the requested
     numbers as (payload, status) tuples; missing numbers carry the status
-    the caller states (404/410) or None when unknown."""
+    the caller states (404/410) or None when unknown.
+
+    The repository itself is READABLE here (probe_repository, issue #66
+    AC5), so an all-404 batch is a set of genuine per-item deletions
+    rather than an access failure — the disambiguator the production
+    source answers with one repository read."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -378,6 +422,9 @@ class _NumberedSource(FakeGitHubSource):
             else:
                 out[int(n)] = (None, self.missing_status.get(int(n), 404))
         return out
+
+    def probe_repository(self) -> bool:
+        return True
 
 
 class NumbersModeStateTests(TempDBTest):
@@ -731,13 +778,22 @@ class FeedbackRoundTests(TempDBTest):
 
         with patch.object(GraphQLSource, "_graphql", side_effect=fake_graphql):
             src.probe_capabilities()
-        self.assertEqual(len(captured), 1)
-        self.assertIn(
-            "fields(includeDeprecated: true) { name }",
-            captured[0],
-            "the probe must request deprecated-but-served fields by argument",
-        )
-        self.assertNotIn("name includeDeprecated", captured[0])
+        # The probe is ONE logical introspection, sent as the bounded
+        # field-budget queries the split renders under GitHub's 2-use-per-
+        # field cap (issue #65 AC9): every one of them must use the
+        # ARGUMENT form, and none may regress to the __Field subfield.
+        self.assertGreaterEqual(len(captured), 1, "the probe must introspect")
+        for query in captured:
+            if "fields(" not in query:
+                # The timeline-enum query introspects enumValues, not fields;
+                # the argument form applies to the type-field queries alone.
+                continue
+            self.assertIn(
+                "fields(includeDeprecated: true) { name }",
+                query,
+                "the probe must request deprecated-but-served fields by argument",
+            )
+            self.assertNotIn("name includeDeprecated", query)
 
     def test_rate_limited_section_error_surfaces(self) -> None:
         """A path-scoped RATE_LIMITED error must RAISE (engaging the sleep/
@@ -867,6 +923,60 @@ class FeedbackRoundTests(TempDBTest):
             "a no-op targeted run must not launder a failed sync's error",
         )
 
+    def test_targeted_ingest_keeps_open_deletion_error(self) -> None:
+        """A targeted run that DID ingest must not clear the error an OPEN
+        deletion pass recorded: the durable pending set — not the ingest
+        count — is what makes that error true (issue #66 AC4). Killed by:
+        reverting the targeted finalizer to `ingested > 0` alone, which let
+        `sync --numbers` erase the error a failed deletion pass wrote while
+        the pending row (and the incomplete verdict) stayed."""
+        from zaxbygraph.cli import cmd_sync
+
+        self.conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, full_sync_pending,"
+            " last_error) VALUES (?, ?, 1, ?)",
+            (REPO, "2026-01-01T00:00:00Z",
+             "deletion oracle unavailable HTTP 502"),
+        )
+        self.conn.execute(
+            "INSERT INTO sync_pending(repo, number, reason) VALUES (?, ?, 'deletion')",
+            (REPO, 7),
+        )
+        self.conn.commit()
+        src = _NumberedSource()
+        src.add_issue(issue(5, title="one", updated_at=ts(50)))
+        args = type(
+            "Args",
+            (),
+            {
+                "repo": REPO,
+                "db": str(self.db_path),
+                "force": False,
+                "include_patches": False,
+                "jsonl": None,
+                "jsonl_flag": False,
+                "format": "json",
+                "source": "graphql",
+                "wait": False,
+                "numbers": "5",
+            },
+        )()
+        with patch("zaxbygraph.cli.GhApiSource", return_value=src):
+            code = cmd_sync(args)
+        self.assertEqual(code, 0)
+        row = self.conn.execute(
+            "SELECT last_error, full_sync_pending FROM sync_state WHERE repo = ?",
+            (REPO,),
+        ).fetchone()
+        self.assertEqual(
+            row["last_error"],
+            "deletion oracle unavailable HTTP 502",
+            "an ingested targeted run must not launder an open deletion"
+            " pass's error",
+        )
+        self.assertEqual(row["full_sync_pending"], 1,
+                         "the incomplete verdict stands with the error")
+
     def test_gone_bundle_for_already_stored_deletion(self) -> None:
         """A deletion of an ALREADY-STORED item must reach the sidecar and
         replay to the same state/state_reason (the HIGH finding of the PR #37
@@ -993,6 +1103,63 @@ class FeedbackRoundTests(TempDBTest):
         finally:
             replay_conn.close()
 
+    def test_torn_pending_number_gone_resolves_the_obligation(self) -> None:
+        """A torn-pending number the source now answers 404/410 is a
+        DELETION, not a still-torn row: the item is marked gone through the
+        same path every other deletion takes (the repository-read gate
+        first, then the ingest-and-mark plus the sidecar bundle) and the
+        pending row CLEARS — otherwise the number costs an exact-number
+        fetch on every future run forever, and the plan's rule that a 404
+        during the refresh follows the existing per-item error path (the
+        item is not lost) never holds. Killed by: the retry's bare
+        `continue` for every answer that is not a payload."""
+        from zaxbygraph.store import ingest_item
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        ingest_item(
+            self.conn, REPO, issue(3, title="torn", updated_at=ts(5)),
+            pull_raw=None, issue_comments=[], review_comments=[],
+            reviews=[], files=[], include_patches=False,
+            advance_watermark=False,
+        )
+        self.conn.commit()
+        self.conn.execute(
+            "INSERT INTO sync_pending(repo, number, reason) VALUES (?, ?, 'torn')",
+            (REPO, 3),
+        )
+        self.conn.commit()
+        src = _NumberedSource()
+        src.missing_status = {3: 404}
+        sidecar = Path(self._td.name) / "sidecar"
+        result = sync_repo(self.conn, src, REPO, jsonl_path=sidecar)
+        self.assertIsNone(result["last_error"])
+        got = self.conn.execute(
+            "SELECT state, state_reason FROM items WHERE repo = ? AND number = 3",
+            (REPO,),
+        ).fetchone()
+        self.assertEqual(got["state"], "deleted",
+                        "a 404 on a pending number is a deletion verdict")
+        self.assertIn("404", got["state_reason"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM sync_pending WHERE repo = ?"
+                " AND number = 3", (REPO,)
+            ).fetchone()[0],
+            0, "the pending obligation ends with the item",
+        )
+        gone = [
+            json.loads(line)
+            for line in (sidecar / "events.jsonl").read_text(
+                encoding="utf-8"
+            ).splitlines()
+        ]
+        self.assertTrue(
+            any(r.get("resource") == "item_bundle"
+                and r["payload"].get("gone") and r["payload"]["number"] == 3
+                for r in gone),
+            "the deletion must reach the sidecar so replay reproduces it",
+        )
+
     def test_capability_cache_self_heals_after_fatal_error(self) -> None:
         """A fatal GitHubError while running on a CACHED capability map must
         delete the meta row so the next sync re-probes (no permanent
@@ -1010,10 +1177,19 @@ class FeedbackRoundTests(TempDBTest):
             "errors": [{"message": "Field 'comments' doesn't exist"}],
         }
         host.write_graphql_responses([_page_payload([1]), validation_error, _page_payload([1])])
-        host.write_rest_responses([listing, [], listing, listing, []])
+        # sync1: listing, verification listing, releases (3 REST calls).
+        # sync2: listing only - its page query is the validation error, so
+        # the run dies before releases. sync3: re-probe, then listing,
+        # verification listing, releases (3 more). 7 in total, and the
+        # verification walk's page must be a real listing: an empty one
+        # delivers nothing, so the pass sets never converge.
+        host.write_rest_responses(
+            [listing, listing, [], listing, listing, listing, []]
+        )
         with host:
             r1 = sync_repo(self.conn, host.source(), REPO)
             self.assertIsNone(r1["last_error"])
+            probes_after_first = sum(1 for c in host.calls() if c["probe"])
             from zaxbygraph.sync import SyncError
 
             with self.assertRaises(SyncError):
@@ -1028,10 +1204,19 @@ class FeedbackRoundTests(TempDBTest):
             )
             r3 = sync_repo(self.conn, host.source(), REPO)
             self.assertIsNone(r3["last_error"], "the next sync must re-probe and recover")
-            probes = sum(1 for c in host.calls() if c["probe"])
+            probes_after_third = sum(1 for c in host.calls() if c["probe"])
+        # TWO logical probes (the first sync's and the post-failure
+        # re-probe), each rendered as the bounded introspection queries the
+        # split sends under GitHub's 2-use-per-field cap (issue #65 AC9) —
+        # so the assertion is on the DELTA, which is exactly one more
+        # logical probe. A mutant that skips the invalidation hydrates the
+        # cached row and adds none.
+        self.assertGreaterEqual(
+            probes_after_first, 1, "the first sync must probe once"
+        )
         self.assertEqual(
-            probes,
-            2,
+            probes_after_third - probes_after_first,
+            probes_after_first,
             "the fatal error must invalidate the cached map (exactly one re-probe)",
         )
         self.assertIsNotNone(get_meta(self.conn, _capabilities_key()))

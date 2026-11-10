@@ -62,11 +62,29 @@ class MentionTests(unittest.TestCase):
         self.assertIn(("authored", "4"), {(e[2], e[4]) for e in edges_from_item(REPO, raw)})
 
     def test_closes_does_not_also_mention(self) -> None:
+        # An ISSUE body's closing keyword is a mention, never a closure
+        # (issue #67 AC1: GitHub honours closing keywords only in PR
+        # descriptions and commit messages).
         raw = {
             "number": 3,
             "user": {"login": "alice"},
             "body": "Closes #1. See also #2.",
             "labels": [],
+        }
+        rels = {(e[2], e[4]) for e in edges_from_item(REPO, raw)}
+        self.assertNotIn(("closes_keyword", "1"), rels)
+        self.assertIn(("mentions", "1"), rels)
+        self.assertIn(("mentions", "2"), rels)
+
+    def test_pr_body_closes_does_not_also_mention(self) -> None:
+        # A PR description's closing keyword keeps producing closes_keyword,
+        # and the per-payload suppression still holds on that surface.
+        raw = {
+            "number": 3,
+            "user": {"login": "alice"},
+            "body": "Closes #1. See also #2.",
+            "labels": [],
+            "pull_request": {"url": "https://api.github.com/repos/acme/forgegate/pulls/3"},
         }
         rels = {(e[2], e[4]) for e in edges_from_item(REPO, raw)}
         self.assertIn(("closes_keyword", "1"), rels)
@@ -75,12 +93,14 @@ class MentionTests(unittest.TestCase):
 
 
 class ReviewBodyTests(unittest.TestCase):
-    def test_review_body_closes(self) -> None:
+    def test_review_body_mentions_only(self) -> None:
+        # A review body's closing keyword is a mention, never a closure
+        # (issue #67 AC1).
         raw = {"id": 99, "user": {"login": "bob"}, "state": "APPROVED", "body": "closes #12"}
         edges = edges_from_review(REPO, 3, raw)
         rels = {(e[2], e[4]) for e in edges}
-        self.assertIn(("closes_keyword", "12"), rels)
-        self.assertNotIn(("mentions", "12"), rels)
+        self.assertNotIn(("closes_keyword", "12"), rels)
+        self.assertIn(("mentions", "12"), rels)
         self.assertIn(("reviewed", "3"), {(e[2], e[4]) for e in edges})
 
 

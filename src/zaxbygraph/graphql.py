@@ -17,7 +17,12 @@ from __future__ import annotations
 import json
 import subprocess
 
-from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
+from zaxbygraph.github import (
+    GitHubError,
+    GitHubTransportError,
+    GhApiSource,
+    _status_from_stderr,
+)
 
 #: Numbers per aliased children query (issue + pullRequest aliases each).
 GRAPHQL_CHILDREN_PAGE = 40
@@ -63,7 +68,7 @@ comments(first: 100) {
     updatedAt
     url
     authorAssociation
-    author { login url }
+    author { __typename login url }
   }
 }
 """
@@ -94,7 +99,7 @@ reviews(first: 50) {
     body
     submittedAt
     url
-    author { login }
+    author { __typename login }
     comments(first: 100) {
       totalCount
       pageInfo { hasNextPage }
@@ -106,7 +111,7 @@ reviews(first: 50) {
         url
         authorAssociation
         replyTo { databaseId }
-        author { login url }
+        author { __typename login url }
       }
     }
   }
@@ -250,6 +255,7 @@ _PULL_SCALAR_FRAGMENTS = (
     ("changedFiles", "changedFiles"),
     ("commits", _COMMITS_NODES),
     ("mergedAt", "mergedAt"),
+    ("updatedAt", "updatedAt"),
     ("mergeCommit", "mergeCommit { oid }"),
     ("baseRefName", "baseRefName"),
     ("headRefName", "headRefName"),
@@ -451,6 +457,10 @@ def _comment_payload(node: dict, *, in_reply_to_id=None) -> dict:
         "user": {
             "login": (node.get("author") or {}).get("login"),
             "html_url": (node.get("author") or {}).get("url"),
+            # GitHub's Actor interface has no `type` field; __typename is
+            # the discriminator (Bot/User), carried so ingest can set
+            # actors.is_bot (issue #67 AC4).
+            "type": "Bot" if (node.get("author") or {}).get("__typename") == "Bot" else None,
         },
         "created_at": node.get("createdAt"),
         "updated_at": node.get("updatedAt"),
@@ -566,17 +576,26 @@ class GraphQLSource(GhApiSource):
         caller, which fails open (sync proceeds with the full field set)."""
         if self._capabilities is not None:
             return self._capabilities
-        query = (
+        # GitHub caps each introspection field at TWO uses per query, so the
+        # probe splits across queries — at most two __type/fields selections
+        # and one enumValues per query — and the merged result is what gets
+        # cached (issue #65 AC9: the single stacked query was rejected on
+        # every sync, silently disabling the #23 schema-drift protection).
+        queries = (
             "query { rateLimit { remaining resetAt } "
             'i: __type(name: "Issue") { fields(includeDeprecated: true) { name } } '
-            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } '
-            'ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
+            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } }',
+            'query { ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
             'rc: __type(name: "PullRequestReviewComment") '
-            "{ fields(includeDeprecated: true) { name } } "
-            't: __type(name: "IssueTimelineItemsItemType") '
-            "{ enumValues { name } } }"
+            "{ fields(includeDeprecated: true) { name } } }",
+            'query { t: __type(name: "IssueTimelineItemsItemType") '
+            "{ enumValues { name } } }",
         )
-        payload = self._graphql(query)
+        payload: dict = {}
+        for query in queries:
+            part = self._graphql(query)
+            if isinstance(part, dict):
+                payload.update(part)
         caps: dict[str, set[str]] = {}
         for alias, type_name in (
             ("i", "Issue"),
@@ -738,11 +757,14 @@ class GraphQLSource(GhApiSource):
                 timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
-            raise GitHubError(
+            # Typed (issue #65 AC3): a subprocess that could not be launched
+            # or did not answer in time is a TRANSPORT failure, so a GraphQL
+            # children query over it degrades to the per-item REST path.
+            raise GitHubTransportError(
                 "gh CLI not found. Install GitHub CLI and authenticate with gh auth login."
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubError(
+            raise GitHubTransportError(
                 f"gh api graphql timed out after {GH_TIMEOUT_S}s"
             ) from exc
         if proc.returncode != 0:
@@ -1070,7 +1092,10 @@ class GraphQLSource(GhApiSource):
                     "id": r.get("databaseId"),
                     "state": r.get("state"),
                     "body": r.get("body"),
-                    "user": {"login": (r.get("author") or {}).get("login")},
+                    "user": {
+                        "login": (r.get("author") or {}).get("login"),
+                        "type": "Bot" if (r.get("author") or {}).get("__typename") == "Bot" else None,
+                    },
                     "submitted_at": r.get("submittedAt"),
                     "html_url": r.get("url"),
                 }
@@ -1146,6 +1171,7 @@ class GraphQLSource(GhApiSource):
                 "changed_files": node.get("changedFiles"),
                 "commits": (node.get("commits") or {}).get("totalCount"),
                 "merged_at": node.get("mergedAt"),
+                "updated_at": node.get("updatedAt"),
                 "merge_commit_sha": merge_commit.get("oid"),
                 "base": {"ref": node.get("baseRefName")},
                 "head": {"ref": node.get("headRefName")},
@@ -1166,6 +1192,7 @@ class GraphQLSource(GhApiSource):
             # "unknown" into explicit-null clearing of a stored value.
             for graphql_field, rest_key in (
                 ("mergedAt", "merged_at"),
+                ("updatedAt", "updated_at"),
                 ("mergeCommit", "merge_commit_sha"),
                 ("mergedBy", "merged_by"),
             ):

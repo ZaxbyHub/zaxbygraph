@@ -26,6 +26,22 @@ class GitHubError(RuntimeError):
         self.status = status
 
 
+class GitHubTransportError(GitHubError):
+    """A transport-level failure (the gh subprocess could not be run or did
+    not answer in time), as opposed to a hard GraphQL validation or
+    schema-drift error, which keeps the plain GitHubError shape. Only this
+    class (plus the named HTTP statuses) degrades a GraphQL run to REST
+    (issue #65 AC3): a statusless validation error must stay fatal so a
+    schema drift can never be mistaken for an unavailable endpoint."""
+
+
+class ListingShiftedError(RuntimeError):
+    """The issues listing's sort order shifted across a page boundary during
+    one walk (issue #65 AC1): the boundary verification re-read the page
+    just served and its item set changed. The sync layer answers with
+    another pass over the window; nothing about the run has failed."""
+
+
 def _status_from_stderr(stderr: str) -> int | None:
     text = stderr.lower()
     # Digit matches are word-boundary anchored: a bare "404"/"403"/"429"
@@ -79,11 +95,17 @@ class GhApiSource:
                 timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
-            raise GitHubError(
+            # Typed (issue #65 AC3): a subprocess that could not be launched
+            # is a TRANSPORT failure, so a GraphQL run over this transport
+            # degrades to REST instead of aborting — REST uses the same
+            # binary and will report its own honest failure if it is truly
+            # missing, but a gh that answers one call and hangs on another
+            # must not kill the run.
+            raise GitHubTransportError(
                 "gh CLI not found. Install GitHub CLI and authenticate with gh auth login."
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubError(
+            raise GitHubTransportError(
                 f"gh api timed out after {GH_TIMEOUT_S}s: {path}"
             ) from exc
         if proc.returncode != 0:
@@ -162,7 +184,17 @@ class GhApiSource:
         failure mid-listing keeps everything already delivered instead of
         discarding the whole buffered listing. Yields pages (lists of raw
         item dicts); the item-or-page yield contract is documented in the
-        GitHubSource protocol."""
+        GitHubSource protocol.
+
+        Boundary verification (issue #65 AC1): after each FULL page is
+        served, the same page is re-requested once and the item-number sets
+        are compared. A difference means the sort=updated&direction=asc
+        order shifted during the walk — an updated mover, a deleted mover,
+        or a same-timestamp reorder across the boundary — which is exactly
+        the shape that makes the next page's fixed offset skip a live item.
+        The mismatch raises ListingShiftedError, which the sync layer
+        answers with another pass over the window. A short page ends the
+        walk (nothing follows it, so no boundary can be crossed)."""
         qs = "state=all&per_page=100&sort=updated&direction=asc"
         if since:
             qs += f"&since={quote(str(since), safe=':-')}"
@@ -176,6 +208,18 @@ class GhApiSource:
                 yield items
             if len(data) < ISSUES_PAGE_SIZE:
                 return
+            # Verify this page against a fresh read before walking on: the
+            # page just served is the boundary the next page's offset is
+            # measured from.
+            check = self._api(f"repos/{self.slug}/issues?{qs}&page={page}")
+            if not isinstance(check, list):
+                raise GitHubError("unexpected issues payload")
+            if {item.get("number") for item in check if isinstance(item, dict)} != {
+                item.get("number") for item in items
+            }:
+                raise ListingShiftedError(
+                    f"listing order shifted across page {page} during the walk"
+                )
             page += 1
 
     def get_pull(self, number: int) -> dict:
@@ -183,6 +227,25 @@ class GhApiSource:
         if not isinstance(data, dict):
             raise GitHubError(f"unexpected pull payload for #{number}")
         return data
+
+    def probe_repository(self) -> bool:
+        """ONE repository-level read: is this repository readable at all?
+
+        The disambiguator between "every requested item is gone" and "the
+        repository is unreachable" (issue #66 AC5): a private, renamed or
+        deleted repository answers 404 for every item path exactly the way
+        genuinely-deleted items do, so a per-item verdict built from that
+        pattern alone would fabricate deletions out of an access failure.
+        A 200 means readable; 404/410 means it is not. Any other status
+        propagates — a transient or permission failure is neither verdict,
+        and the caller reports it instead of guessing."""
+        try:
+            data = self._api(f"repos/{self.slug}")
+        except GitHubError as exc:
+            if exc.status in (404, 410):
+                return False
+            raise
+        return isinstance(data, dict)
 
     def get_issues(self, numbers: list[int]) -> dict[int, tuple[dict | None, int | None]]:
         """Issue-list payloads for exact numbers (sync --numbers, issue #23).

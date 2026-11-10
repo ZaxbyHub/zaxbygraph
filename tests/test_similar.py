@@ -113,10 +113,13 @@ from zaxbygraph.evaluate import run_eval, _visible_candidates
 
 _EVAL_FIXTURE_DIR = Path(__file__).resolve().parent / "eval_fixture"
 #: corpus_sha256 of the REPLAYED real-corpus store (default include set).
-#: Re-pinned after the marker-scrub normalization of the recording (see
-#: tests/fixtures_eval.py `_MARKER_SCRUBS`); eval metrics unchanged.
+#: Re-pinned after the issue #67 keyword-scope change (a closing keyword in
+#: an issue body, comment, or review now records a mention, never
+#: closes_keyword), which re-derives the replay's keyword edges; eval
+#: metrics unchanged (acc_at_5 1.0, pair_recall 0.5). The fidelity
+#: manifest was re-recorded from the same events.jsonl in the same run.
 REPLAYED_CORPUS_SHA256 = (
-    "71a15ac9be1ffe6ffee9318f44b39b00def59e7f57c97588ce5e6dc2ae7ebbaf"
+    "15ff34d1eb71f1c57c424faefa9bf001830b69131030c4d8ef64730ae120444b"
 )
 
 _REAL_STORE: Path | None = None

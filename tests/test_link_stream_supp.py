@@ -666,6 +666,7 @@ class BodyCommitSimultaneityTests(unittest.TestCase):
             "title": "t",
             "body": "fixes #2",
             "user": {"login": "a"},
+            "pull_request": {"url": "https://api.github.com/repos/acme/forgegate/pulls/6"},
         }
         from zaxbygraph.extract import (
             collapse_edges,

@@ -5,6 +5,16 @@ from collections.abc import Callable, Iterable
 
 _CLOSE_KW = r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?):?"
 _SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+#: A same-repo reference longer than this many digits is not an issue number:
+#: it is noise (a comment id, a sha fragment, a paste). The bound is paired
+#: with the patterns' trailing \b so an over-long digit run matches NOTHING
+#: (skipping the token) instead of capturing a truncated prefix (issue #66
+#: AC1/AC10: CPython's int() digit limit would otherwise raise mid-ingest).
+_MAX_REF_DIGITS = 10
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_HUNK_HEADER_RE = re.compile(r"^@@ .* @@")
+_COMMENT_ID_RE = re.compile(r"(?i)\bcomment\s*$")
+_FOREIGN_SPACED_RE = re.compile(r"(?i)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s*$")
 
 
 def item_kind(raw: dict) -> str:
@@ -105,6 +115,63 @@ def _location(prefix: str, offset: int) -> str:
     return prefix if prefix == "title" else f"{prefix}@{offset}"
 
 
+def _noise_ranges(text: str) -> list[tuple[int, int]]:
+    """Character ranges whose #N tokens are quoting noise, not references
+    (issue #67 AC2): fenced code blocks, inline code spans, diff-hunk lines
+    (the +/- runs under an @@ header), and blockquoted lines. A markdown
+    list item ("- see #5") is NOT a diff hunk -- only lines inside an @@
+    hunk run are, so ordinary lists keep their references."""
+    ranges: list[tuple[int, int]] = []
+    pos = 0
+    fence: str | None = None
+    in_hunk = False
+    for line in text.splitlines(keepends=True):
+        end = pos + len(line)
+        stripped = line.lstrip()
+        first = stripped[:1]
+        if _FENCE_RE.match(stripped):
+            marker = stripped[:3]
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            ranges.append((pos, end))
+            in_hunk = False
+        elif fence is not None:
+            ranges.append((pos, end))
+        elif _HUNK_HEADER_RE.match(stripped):
+            in_hunk = True
+            ranges.append((pos, end))
+        elif in_hunk and first in ("+", "-", " "):
+            ranges.append((pos, end))
+        else:
+            in_hunk = False
+            if first == ">":
+                ranges.append((pos, end))
+        for m in re.finditer(r"`[^`\n]*`", line):
+            ranges.append((pos + m.start(), pos + m.end()))
+        pos = end
+    return ranges
+
+
+def _is_noise_reference(
+    masked: str, start: int, end: int, repo: str, noise: list[tuple[int, int]]
+) -> bool:
+    """True when the token at [start, end) is shape noise, not a reference:
+    inside a masked context (code/fence/hunk/quote), a 'comment #<id>' id,
+    or a SPACED foreign-repo reference ('owner/repo #N' -- the compact and
+    URL forms are already masked by _mask_foreign; the local repo's own
+    spaced form stays a reference, matching its compact form)."""
+    for lo, hi in noise:
+        if start < hi and end > lo:
+            return True
+    before = masked[:start].rstrip()
+    if _COMMENT_ID_RE.search(before):
+        return True
+    tail = _FOREIGN_SPACED_RE.search(before)
+    return bool(tail) and tail.group(1).lower() != repo.lower()
+
+
 def _iter_reference_locations(
     text: str | None, repo: str, prefix: str, patterns: list[str]
 ) -> list[tuple[int, str]]:
@@ -115,11 +182,15 @@ def _iter_reference_locations(
     offset indexes the text as stored. The reference token's offset is the
     '#' when the matched form carries one, else the digits' start (URL
     forms); the lowest offset wins per number so per-payload collapse is
-    deterministic.
-    """
+    deterministic. Tokens inside quoting noise (code, fences, diff hunks,
+    quotes), 'comment #<id>' ids, and spaced foreign-repo references are
+    skipped (issue #67 AC2/AC3); every pattern's digit capture is bounded
+    by _MAX_REF_DIGITS so an over-long run matches nothing rather than
+    raising inside int() (issue #66 AC1)."""
     if not text or not _SLUG_RE.match(repo):
         return []
     masked = _mask_foreign(text, repo)
+    noise = _noise_ranges(masked)
     best: dict[int, tuple[int, str]] = {}
     for pattern in patterns:
         for match in re.finditer(pattern, masked):
@@ -127,6 +198,8 @@ def _iter_reference_locations(
             digits_start = match.start(1)
             head = match.group(0)[: digits_start - match.start()]
             token_start = digits_start - 1 if head.endswith("#") else digits_start
+            if _is_noise_reference(masked, token_start, match.end(), repo, noise):
+                continue
             location = _location(prefix, token_start)
             prior = best.get(number)
             if prior is None or token_start < prior[0]:
@@ -136,17 +209,17 @@ def _iter_reference_locations(
 
 def _mention_patterns(repo: str) -> list[str]:
     return [
-        rf"(?i)https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d+)\b",
-        rf"(?i){re.escape(repo)}#(\d+)\b",
-        r"(?<![A-Za-z0-9._-])#(\d+)\b",
+        rf"(?i)https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i){re.escape(repo)}#(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?<![A-Za-z0-9._-])#(\d{{1,{_MAX_REF_DIGITS}}})\b",
     ]
 
 
 def _closing_patterns(repo: str) -> list[str]:
     return [
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?#(\d+)\b",
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?{re.escape(repo)}#(\d+)\b",
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d+)\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?#(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?{re.escape(repo)}#(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d{{1,{_MAX_REF_DIGITS}}})\b",
     ]
 
 
@@ -179,8 +252,8 @@ def iter_duplicate_locations(
     (masked), and these never produce duplicate_of edges — that relation is
     GitHub-reported only."""
     dup_patterns = [
-        rf"(?i)\b{_DUP_KW}\s+(?:of|by|for)?\s*#(\d+)\b",
-        rf"(?i)\b{_DUP_KW}\s+(?:of|by|for)?\s*{re.escape(repo)}#(\d+)\b",
+        rf"(?i)\b{_DUP_KW}\s+(?:of|by|for)?\s*#(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i)\b{_DUP_KW}\s+(?:of|by|for)?\s*{re.escape(repo)}#(\d{{1,{_MAX_REF_DIGITS}}})\b",
     ]
     return _iter_reference_locations(text, repo, prefix, dup_patterns)
 
@@ -191,9 +264,9 @@ def parse_closing_numbers(text: str | None, repo: str) -> set[int]:
     local = _strip_foreign(text, repo)
     nums: set[int] = set()
     patterns = [
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d+)\b",
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?{re.escape(repo)}#(\d+)\b",
-        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?#(\d+)\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?{re.escape(repo)}#(\d{{1,{_MAX_REF_DIGITS}}})\b",
+        rf"(?i)\b{_CLOSE_KW}\s+(?:this\s+)?#(\d{{1,{_MAX_REF_DIGITS}}})\b",
     ]
     for pat in patterns:
         for match in re.finditer(pat, local):
@@ -207,13 +280,13 @@ def parse_mentioned_numbers(text: str | None, repo: str) -> set[int]:
     local = _strip_foreign(text, repo)
     nums: set[int] = set()
     for match in re.finditer(
-        rf"(?i)https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d+)\b",
+        rf"(?i)https?://github\.com/{re.escape(repo)}/(?:issues|pull)/(\d{{1,{_MAX_REF_DIGITS}}})\b",
         local,
     ):
         nums.add(int(match.group(1)))
-    for match in re.finditer(rf"(?i){re.escape(repo)}#(\d+)\b", local):
+    for match in re.finditer(rf"(?i){re.escape(repo)}#(\d{{1,{_MAX_REF_DIGITS}}})\b", local):
         nums.add(int(match.group(1)))
-    for match in re.finditer(r"(?<![A-Za-z0-9._-])#(\d+)\b", local):
+    for match in re.finditer(rf"(?<![A-Za-z0-9._-])#(\d{{1,{_MAX_REF_DIGITS}}})\b", local):
         nums.add(int(match.group(1)))
     return nums
 
@@ -255,7 +328,13 @@ def edges_from_item(repo: str, raw: dict) -> list[tuple]:
             edges.append(("item", item_id, "has_label", "label", name, "labels[]", "payload"))
     body = raw.get("body") or ""
     title = raw.get("title") or ""
-    closed_locations = iter_closing_locations(body, repo)
+    # A closing keyword is honoured by GitHub only in a PR description (and a
+    # commit message, derived separately from retained pr_commits rows): an
+    # issue body, a comment, or a review records a MENTION, never a closure
+    # (issue #67 AC1 -- this narrows the AGENTS roll-up rule to mentions).
+    closed_locations = (
+        iter_closing_locations(body, repo) if item_kind(raw) == "pr" else []
+    )
     closed = {n for n, _ in closed_locations}
     for n, location in closed_locations:
         if n != number:
@@ -288,23 +367,11 @@ def edges_from_comment(repo: str, number: int, raw: dict) -> list[tuple]:
     if author:
         edges.append(("actor", author, "commented", "item", str(number), f"comment:{cid}", "payload"))
     body = raw.get("body") or ""
-    closed_locations = iter_closing_locations(body, repo, f"comment:{cid}")
-    closed = {n for n, _ in closed_locations}
-    for n, location in closed_locations:
-        if n != number:
-            edges.append(
-                (
-                    "item",
-                    str(number),
-                    "closes_keyword",
-                    "item",
-                    str(n),
-                    f"{location} closing keyword",
-                    "keyword",
-                )
-            )
+    # A closing keyword in a comment is a mention, never a closure (issue
+    # #67 AC1: GitHub honours closing keywords only in PR descriptions and
+    # commit messages).
     for n, location in iter_mention_locations(body, repo, f"comment:{cid}"):
-        if n != number and n not in closed:
+        if n != number:
             edges.append(("item", str(number), "mentions", "item", str(n), location, "keyword"))
     for n, location in iter_duplicate_locations(body, repo, f"comment:{cid}"):
         if n != number:
@@ -322,23 +389,10 @@ def edges_from_review(repo: str, number: int, raw: dict) -> list[tuple]:
             ("actor", author, "reviewed", "item", str(number), f"review:{rid}:{state}", "payload")
         )
     body = raw.get("body") or ""
-    closed_locations = iter_closing_locations(body, repo, f"review:{rid}")
-    closed = {n for n, _ in closed_locations}
-    for n, location in closed_locations:
-        if n != number:
-            edges.append(
-                (
-                    "item",
-                    str(number),
-                    "closes_keyword",
-                    "item",
-                    str(n),
-                    f"{location} closing keyword",
-                    "keyword",
-                )
-            )
+    # A closing keyword in a review is a mention, never a closure (issue
+    # #67 AC1).
     for n, location in iter_mention_locations(body, repo, f"review:{rid}"):
-        if n != number and n not in closed:
+        if n != number:
             edges.append(("item", str(number), "mentions", "item", str(n), location, "keyword"))
     for n, location in iter_duplicate_locations(body, repo, f"review:{rid}"):
         if n != number:
@@ -576,12 +630,17 @@ def branch_number_tokens(head_ref: str | None) -> list[int]:
     `python3-support`'s "3" or `v2`'s "2" — never an issue reference (PR #41
     review PRR-006). The branch_ref rule emits only for EXACTLY ONE token —
     a single token can never become ambiguous later (issue numbers are
-    unique per repo), so no retraction path is ever needed."""
+    unique per repo), so no retraction path is ever needed. The run is
+    bounded by _MAX_REF_DIGITS with digit boundaries on BOTH sides, so an
+    over-long run matches nothing (skipped) instead of capturing a
+    truncated prefix (issue #66 AC1/AC10: int() would otherwise raise)."""
     if not head_ref:
         return []
     return [
         int(token)
-        for token in re.findall(r"(?<![A-Za-z])\d+(?![A-Za-z])", head_ref)
+        for token in re.findall(
+            rf"(?<![A-Za-z0-9])\d{{1,{_MAX_REF_DIGITS}}}(?![A-Za-z0-9])", head_ref
+        )
     ]
 
 

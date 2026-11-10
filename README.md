@@ -59,7 +59,7 @@ zaxbygraph item 14                    # one item, with comments/files/edges
 
 `sync` prints the envelope with the run summary under `data` (keys `ingested`, `rate_limit_remaining`, `rate_limit_reset_at`,
 `last_number`, `full`, `finished_at`, `issues_since`, `item_count`,
-`comment_count`, `edge_count`, `last_error`; `repo` and `db` live on the
+`comment_count`, `edge_count`, `last_error`, `source`, `graphql_probe_failed`; `repo` and `db` live on the
 envelope root):
 
 ```json
@@ -70,7 +70,8 @@ envelope root):
     "ingested": 3, "last_number": 10, "full": true,
     "finished_at": "2026-09-12T19:23:04Z", "issues_since": "2026-01-03T05:40:10Z",
     "item_count": 3, "comment_count": 1, "edge_count": 10, "last_error": null,
-    "rate_limit_remaining": null, "rate_limit_reset_at": null
+    "rate_limit_remaining": null, "rate_limit_reset_at": null,
+    "source": "graphql", "graphql_probe_failed": false
   },
   "truncated": false
 }
@@ -78,6 +79,21 @@ envelope root):
 
 `ingested` counts items touched by *this* run — `0` on a second run with no
 upstream changes is the expected result, not a failure.
+
+`source` is the source this run actually used (`graphql` or `rest`),
+and `graphql_probe_failed` is `true` when the capability probe could
+not introspect the host (the run fails OPEN on the full field set and
+reports it — a later successful probe clears it). Every run walks its
+listing window at least twice to prove coverage (see
+[Listing completeness](#listing-completeness-the-pass-cap-and-the-recovery-floor-issue-65))
+and `ingested` counts DISTINCT item numbers, not deliveries.
+
+A `sync` that states no `--source` and no `--include-patches` inherits
+the store's recorded profile (`sync_state.fetch_source`), so a store
+deliberately kept on `--source rest` never profile-drifts; stating
+either flag re-stamps the profile it was given. The MCP `sync` tool
+takes the same `source` argument (`graphql`/`rest`) and follows the
+same rule.
 
 ### Where the database goes
 
@@ -101,6 +117,15 @@ overrides it. `<host>` comes from the origin URL host (`github.com` default —
 a bare `--repo OWNER/REPO` carries no host, so GitHub Enterprise users should
 sync from a checkout whose origin is the GHE URL rather than passing `--repo`
 by hand, or their store keys collide with github.com slugs).
+
+`ZAXBYGRAPH_BOT_LOGINS` (comma-separated logins, matched
+case-insensitively) adds actors to the `actors.is_bot` verdict the
+sync derives from payloads — a login ending in `[bot]`, a REST
+`type: "Bot"`, or a GraphQL `__typename: "Bot"` is already marked
+without it. Read at sync and at migration time only: adding a login
+later needs a re-sync of an item authored by it, because a stored
+`is_bot = 1` is never downgraded and the variable is not re-read on
+later runs.
 
 Reads never create anything: when no corpus exists for the resolved repo they
 exit **3** with the resolved path and the exact `zaxbygraph sync --repo <slug>`
@@ -327,7 +352,7 @@ zaxbygraph sync --repo OWNER/REPO [--force] [--numbers N,M] [--include-patches] 
 
 | Flag | Meaning |
 | --- | --- |
-| `--source` | `graphql` (default) or `rest`. Both stream the listing one page per call and commit each page as it arrives; `graphql` additionally fetches each page's comments, reviews, review comments, files and pull details in bulk GraphQL queries (one per up to 40 items, so a full 100-item page costs about three), with a per-item REST fallback for any connection that overflowed its page. The GraphQL query travels on stdin, and a cached capability probe (one introspection per host+gh version, persisted in the store's `meta` table) omits root fields the host's schema lacks — so drift on a field known at probe time cannot abort a sync. Caveats: drift on *nested* selections, or drift that appears *after* the probe was cached, can still produce a fatal validation error (a fatal error while running on a cached map clears the cache so the next sync re-probes); a probe that itself fails logs `probe failed:` to `fetch_log` and continues with the full field set. A runtime per-field error drops only that section for the affected items (rate-limit errors always surface to the retry ladder). Patches always come from REST (`pulls/{n}/files`), so `--include-patches` forces that fallback for files. |
+| `--source` | `graphql` (default) or `rest`. Both stream the listing one page per call and commit each page as it arrives; `graphql` additionally fetches each page's comments, reviews, review comments, files and pull details in bulk GraphQL queries (one per up to 40 items, so a full 100-item page costs about three), with a per-item REST fallback for any connection that overflowed its page. The GraphQL query travels on stdin, and a cached capability probe (one introspection per host+gh version, persisted in the store's `meta` table) omits root fields the host's schema lacks — so drift on a field known at probe time cannot abort a sync. Caveats: drift on *nested* selections, or drift that appears *after* the probe was cached, can still produce a fatal validation error (a fatal error while running on a cached map clears the cache so the next sync re-probes); a probe that itself fails logs `probe failed:` to `fetch_log` and continues with the full field set. A runtime per-field error drops only that section for the affected items (rate-limit errors always surface to the retry ladder). Patches always come from REST (`pulls/{n}/files`), so `--include-patches` forces that fallback for files.  A run that states no source inherits the store's recorded profile (`sync_state.fetch_source`), so a deliberately-rest store never profile-drifts; stating `--source` re-stamps the profile. |
 | `--wait` | Wait for the sync lock instead of returning `joined: true` when another sync holds it. |
 | `--force` | Ignore the watermark and do a full pull. Needed when you suspect updates that did not bump `updated_at` (review-only changes), and required to backfill patches after a no-patch sync. |
 | `--numbers N,M` | Refresh exactly these items (GraphQL source: through the bulk children path; `--source rest` fetches each item's children per item over REST). The watermark and freshness stamps are untouched, the deletion oracle never runs, and the run never completes a full sync: a store that has never had one stays marked pending, so a numbers-only corpus reads incomplete. A targeted run that ingests nothing leaves a previous `last_error` standing. A number that 404/410s marks that stored item `deleted` (recorded in the sidecar); a never-stored missing number only leaves a `fetch_log` note. Cannot be combined with `--force`. |
@@ -703,7 +728,7 @@ zaxbygraph mcp [--stale-seconds N]
   content}` — no structuredContent, by protocol design. The five work-selection/derived tools call the same query
   layer as their CLI commands, so data payloads match the CLI exactly on the
   same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
-  it returns a job id and `graph_status` reports progress.
+  it returns a job id and `graph_status` reports progress. The `sync` tool accepts the same `source` (`graphql`/`rest`) argument the CLI flag takes and honors the store's recorded profile when it is omitted.
 - **Protocol eras**: the server speaks legacy revisions (`2025-11-25`,
   `2025-06-18`, `2025-03-26`, `2024-11-05`, negotiated by `initialize`,
   latest answered 2025-11-25) and the stateless 2026-07-28 revision

@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from zaxbygraph.db import connect, init_schema
+from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
 
 REPO = "acme/forgegate"
 
@@ -362,7 +362,10 @@ class LegacyV10RefreshTests(_CliStore):
             version = int(vc.execute("PRAGMA user_version").fetchone()[0])
         finally:
             vc.close()
-        self.assertEqual(version, 11)
+        # v12 (issue #65/#66/#67) rides the same writable open, so the
+        # assertion is "the store is at the CURRENT version", not a pinned
+        # 11: a later schema addition must not break this refresh test.
+        self.assertEqual(version, CURRENT_USER_VERSION)
 
 
 class SyncStampingTests(unittest.TestCase):

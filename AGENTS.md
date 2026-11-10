@@ -52,6 +52,14 @@ shouldn't.
 - **A `closes_keyword` reference is not also a `mentions` reference.** The two
   are mutually exclusive within a single text payload; across payloads one
   pair can carry both (per-payload suppression only).
+- **A closing keyword is honoured only where GitHub honours it (issue #67).**
+  `closes_keyword` is derived from a PR description or a retained commit
+  message; the same words in an issue body, a comment, or a review record a
+  `mentions` reference and never a closure. Every `source='keyword'`
+  relation's derivation is bounded (reference digits are capped, so an
+  oversized token matches nothing instead of wedging `int()`) and is
+  offline-derivable from the stored payloads — migration v12 re-derives them
+  all under exactly these rules.
 - **Cross-repo keyword references are dropped, never localized; timeline
   cross-references are kept repo-qualified.** A `#5` in another repo's URL
   must not attach to local item 5, and a foreign cross-reference is stored as

@@ -50,6 +50,7 @@ from zaxbygraph.cli import (
 )
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.derive import ConfigError as DeriveConfigError
+from zaxbygraph.github import GhApiSource as GhRestSource
 from zaxbygraph.graphql import GraphQLSource as GhApiSource
 from zaxbygraph.paths import resolve_db
 from zaxbygraph.query import (
@@ -216,17 +217,34 @@ _JOB_SEQ = itertools.count(1)
 
 def _default_sync_runner(
     db_path, repo: str, *, force: bool = False, include_patches: bool = False,
-    numbers: list[int] | None = None,
+    numbers: list[int] | None = None, source: str | None = None,
 ) -> None:
     """The real background sync: the cmd_sync core without CLI output.
 
-    The GraphQL bulk source is the shipped default; the REST fallback
-    stays a CLI flag (the injected seam is pinned to (db_path, repo))."""
+    The source and patch profile come from the store's own recording
+    (issue #65 AC5): a rest-stamped store is refreshed over REST — the
+    hardcoded GraphQL construction used to flip it on every background
+    refresh — and a patch-enabled store keeps its patches instead of
+    silently losing them. An explicit argument overrides. The injected
+    seam is pinned to (db_path, repo)."""
     conn = connect(db_path)
     try:
         init_schema(conn)
-        source = GhApiSource(*repo.split("/", 1))
-        sync_repo(conn, source, repo, force=force, include_patches=include_patches,
+        row = conn.execute(
+            "SELECT include_patches, fetch_source FROM sync_state WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        stored_patches = bool(row["include_patches"]) if row else False
+        stored_source = (
+            row["fetch_source"] if row and row["fetch_source"] else None
+        ) or "graphql"
+        effective_patches = include_patches or stored_patches
+        effective_source = source or stored_source
+        if effective_source == "rest":
+            src = GhRestSource(*repo.split("/", 1))
+        else:
+            src = GhApiSource(*repo.split("/", 1))
+        sync_repo(conn, src, repo, force=force, include_patches=effective_patches,
                   numbers=numbers)
     finally:
         conn.close()
@@ -900,6 +918,13 @@ def _tool_sync(arguments: dict, ctx) -> dict:
     runner = ctx.sync_runner
     force = _bool_arg(arguments, "force")
     include_patches = _bool_arg(arguments, "include_patches")
+    source = arguments.get("source")
+    if source is not None and source not in ("graphql", "rest"):
+        raise ToolError(
+            "bad_request",
+            "source must be 'graphql' or 'rest'",
+            hint='e.g. "source": "rest"',
+        )
     numbers_raw = arguments.get("numbers")
     numbers: list[int] | None = None
     if numbers_raw is not None:
@@ -929,14 +954,16 @@ def _tool_sync(arguments: dict, ctx) -> dict:
                 hint=f"refresh at most {_MAX_NUMBERS} items per call",
             )
         numbers = numbers_raw
-    if runner is _default_sync_runner and (force or include_patches or numbers):
+    if runner is _default_sync_runner and (
+        force or include_patches or numbers or source
+    ):
         # Advertised arguments must actually reach sync_repo; the injected
         # test seam keeps its pinned (db_path, repo) signature.
         def runner(db_path_, repo_, _force=force, _patches=include_patches,
-                   _numbers=numbers):
+                   _numbers=numbers, _source=source):
             return _default_sync_runner(
                 db_path_, repo_, force=_force, include_patches=_patches,
-                numbers=_numbers,
+                numbers=_numbers, source=_source,
             )
     try:
         job_id, started = _start_job(db_path, slug, runner)
@@ -1231,6 +1258,11 @@ _TOOLS: list[dict] = [
                     "maxItems": _MAX_NUMBERS,
                 },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},
+                "source": {
+                    "type": "string",
+                    "enum": ["graphql", "rest"],
+                    "description": "Fetch source for this run; omitted inherits the store's recorded profile",
+                },
                 **_REPO_DB,
             }
         ),

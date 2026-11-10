@@ -150,10 +150,11 @@ class ProvenanceTests(EdgeIngestTest):
     def test_keyword_edges_are_labelled_weaker(self) -> None:
         self.ingest(issue(14, title="issue fourteen"))
         self.ingest(issue(3, title="issue three", body="Fixes #14"))
-        # keyword-derived closing reference: renamed rel, weaker source
+        # keyword-derived reference: an ISSUE body's closing keyword is a
+        # mention (issue #67 AC1) carrying the same weaker source
         self.assertEqual(
             self.source_of(
-                src_type="item", src_id="3", rel="closes_keyword",
+                src_type="item", src_id="3", rel="mentions",
                 dst_type="item", dst_id="14",
             ),
             "keyword",

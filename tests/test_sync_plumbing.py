@@ -251,7 +251,11 @@ class CapabilityProbeTests(unittest.TestCase):
         probe introspects the Issue/PullRequest types once (cached - a
         second probe costs no extra call) and the page query built afterwards
         omits a field the schema no longer has while still requesting the
-        fields it does."""
+        fields it does. The one logical introspection is sent as the bounded
+        field-budget queries the split renders (issue #65: GitHub caps each
+        introspection field at two uses), so the assertion is on the DELTA
+        the cached second probe adds — none — not on a transport-level query
+        count that the split legitimately raises."""
         host = _FakeGhHost()
         host.write_schema(
             {
@@ -263,20 +267,25 @@ class CapabilityProbeTests(unittest.TestCase):
         with host:
             src = host.source()
             src.probe_capabilities()
+            first = [c for c in host.calls() if c["probe"]]
             src.probe_capabilities()  # cached: no second introspection
             children = src.fetch_children([_listing_item(1)])
             calls = host.calls()
         self.assertIn(1, children)
         probes = [c for c in calls if c["probe"]]
+        self.assertGreaterEqual(
+            len(first), 1, "the probe must introspect at least once"
+        )
+        self.assertEqual(
+            len(probes),
+            len(first),
+            "the capability probe must be cached: the second probe adds no"
+            " introspection beyond the first one's",
+        )
         # Derive pages from the captured call list: the host's temp directory
         # is removed on __exit__, so a post-exit re-read observes nothing
         # (CHECK_WRONG amend, issue #23 trace).
         pages = [c for c in calls if c["argv"][:1] == ["graphql"] and not c["probe"]]
-        self.assertEqual(
-            len(probes),
-            1,
-            "the capability probe must be cached, one introspection per source",
-        )
         self.assertGreaterEqual(len(pages), 1, "a page query must still be sent")
         for page in pages:
             self.assertNotIn(
@@ -336,6 +345,13 @@ class FieldErrorToleranceTests(TempDBTest):
                 ],
                 # REST fallback for item 2's dropped comments section
                 [comment(50_002, "rest fallback note")],
+                # the verification pass's listing page (the always-second-
+                # pass re-drain, issue #65 AC1): the same window re-walked,
+                # every row already covered so no children are re-fetched
+                [
+                    issue(1, title="one", comments=1, updated_at=ts(10)),
+                    issue(2, title="two", comments=1, updated_at=ts(20)),
+                ],
                 # releases
                 [],
             ]

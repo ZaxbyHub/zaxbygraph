@@ -322,15 +322,19 @@ class LegacyTablePreservationTests(unittest.TestCase):
                 # v10 slot, so the three dropped tables are the preserved
                 # set; v5's stamp predates the v7/v8/v9 slots too, so the
                 # tables those migrations introduce are preserved as well —
-                # the version rule, not just the absent-table rule.
+                # the version rule, not just the absent-table rule. Both
+                # versions predate v12's `sync_pending` slot (and the v9
+                # candidate's schema never had it either), so its empty rows
+                # stand in both.
                 # `revisions` is excluded: it has its own per-item scoping
                 # (issue #40) and never enters the preserved list.
                 expected = {
-                    9: sorted(_V10_TABLES),
+                    9: sorted(set(_V10_TABLES) | {"sync_pending"}),
                     5: sorted((set(_V10_TABLES) | {"assignees",
                                                    "issue_field_values",
                                                    "item_path_refs",
-                                                   "item_signatures"})),
+                                                   "item_signatures",
+                                                   "sync_pending"})),
                 }[version]
                 self.assertEqual(
                     envelope.get("tables_preserved"), expected,
@@ -403,8 +407,12 @@ class LegacyTablePreservationTests(unittest.TestCase):
         # candidate's stamp) is NOT preserved: a genuine v9 candidate that
         # carries the table makes a claim about it, and replace-the-slug
         # honours that claim. Only the tables whose slot the stamp predates
-        # are preserved.
-        preserved = sorted(set(_V10_TABLES) - {"issue_field_values"})
+        # are preserved — which now includes v12's `sync_pending`, whose
+        # empty rows stand rather than being deleted for a repo the
+        # candidate never ran a v12 sync against.
+        preserved = sorted(
+            set(_V10_TABLES) - {"issue_field_values"} | {"sync_pending"}
+        )
         before = {t: _count(store, t) for t in preserved}
         cwd = _prep(root / "cwd")
         envelope = doctor_mod.doctor(cwd, REPO, store, extra_scans=[bad],
@@ -476,11 +484,13 @@ class LegacyTablePreservationTests(unittest.TestCase):
                 # are preserved; the bodies DO carry backticked paths, so the
                 # v8->v9 backfill populates item_path_refs and the
                 # candidate's own rows are adopted. item_events/pr_commits
-                # have no backfill at all.
+                # have no backfill at all, and a v1 schema never carried
+                # v12's sync_pending either.
                 self.assertEqual(
                     envelope.get("tables_preserved"),
                     sorted(("assignees", "issue_field_values",
-                            "item_signatures", "item_events", "pr_commits")),
+                            "item_signatures", "item_events", "pr_commits",
+                            "sync_pending")),
                     f"v{version}: the envelope does not name the preserved"
                     f" tables: {envelope.get('tables_preserved')}")
                 # The candidate's own derived rows landed — the invariant

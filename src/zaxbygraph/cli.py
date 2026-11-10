@@ -887,21 +887,37 @@ def cmd_sync(args: argparse.Namespace) -> int:
     elif args.jsonl_flag:
         jsonl = default_jsonl_dir(db_path)
     try:
-        # Default source is the GraphQL bulk source (issue #5); `--source rest`
-        # keeps the plain REST source (now page-streaming). The call goes
-        # through the shared quiet core (issue #31) so the --max-age refresh
-        # path issues exactly the same one sync_repo call. The CONSTRUCTION
-        # source defaults to graphql, but only an explicitly stated source is
-        # forwarded as the stamp (issue #48: an incidental default-source sync
-        # never rewrites the store's recorded profile).
+        # Profile inheritance (issue #65 AC4): a run WITHOUT --source or
+        # --include-patches uses the store's recorded profile, read UNDER
+        # the sync lock so a concurrent writer cannot flip it mid-run
+        # (the PR #47 review race). An explicit flag still wins, and only
+        # an explicitly stated source is forwarded as the stamp (issue
+        # #48: an incidental default-source sync never rewrites the
+        # store's recorded profile). The default CONSTRUCTION source is
+        # the GraphQL bulk source (issue #5); `--source rest` keeps the
+        # plain REST source (now page-streaming). The call goes through
+        # the shared quiet core (issue #31) so the --max-age refresh path
+        # issues exactly the same one sync_repo call.
+        stored = conn.execute(
+            "SELECT include_patches, fetch_source FROM sync_state WHERE repo = ?",
+            (slug,),
+        ).fetchone()
+        stored_patches = bool(stored["include_patches"]) if stored else False
+        stored_source = (
+            stored["fetch_source"] if stored and stored["fetch_source"] else None
+        ) or "graphql"
+        effective_patches = (
+            args.include_patches if args.include_patches else stored_patches
+        )
+        effective_source = getattr(args, "source", None) or stored_source
         result = _sync_core(
             conn,
             slug,
             force=args.force,
-            include_patches=args.include_patches,
+            include_patches=effective_patches,
             jsonl_path=jsonl,
             numbers=numbers,
-            source_name=getattr(args, "source", None) or "graphql",
+            source_name=effective_source,
             stamp_source=getattr(args, "source", None),
         )
     except SyncError as exc:
