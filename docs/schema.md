@@ -767,12 +767,16 @@ the durable retry set, keyed `(repo, number, reason)`.
 Written **before** the unresolved work is attempted, so any raise
 leaves every number pending for the next run; a clean run of *other*
 items never clears it, and the advancing per-item watermark can
-never seal it. The retry runs at the START of every full or
-targeted sync through the exact-number seam: a row that caught up
-ingests and leaves the set, one still skipped stays, and a number
-the source now answers 404/410 resolves as a deletion (through the
+never seal it. The retry runs at the START of every sync that
+DRAINS THE LISTING — full or incremental — through the exact-number
+seam (a targeted `--numbers` run fetches exactly the numbers named and
+never runs it, which is its documented contract): a row that caught up
+ingests and leaves the set, one still skipped stays, and a number the
+source now answers 404/410 resolves as a deletion (through the
 repository-read gate, with the sidecar bundle every other deletion
-writes). `sync_state.last_error` and `full_sync_pending` are held by
+writes). This narrows the plan's "every sync run (full, incremental,
+targeted)" — the shipped behaviour keeps targeted runs' one-job contract
+and is the defensible reading; recorded in 02-reproduction.md. `sync_state.last_error` and `full_sync_pending` are held by
 an open `deletion` row — neither the non-targeted nor the `--numbers`
 finalizer may launder it. `doctor --consolidate` copies the table
 (it leads with `(repo, number)`), so an adopted corpus keeps the

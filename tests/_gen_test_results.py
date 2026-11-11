@@ -109,6 +109,31 @@ for rel in _scan_files:
             deferred_hits.append(f"{rel}:{lineno}")
 assert not deferred_hits, f"deferred-work markers: {deferred_hits}"
 
+# The published anchor must verify against the CURRENT manifest: the
+# final critic caught a wave whose anchor half was never published, so the
+# receipt check is RUN here, not asserted in prose. The local copy in
+# repro/ is byte-identical to the comment published on #64.
+_receipt_lines = [
+    line for line in (TRACE / "repro" / "anchor-v9-body.md")
+    .read_text(encoding="utf-8").splitlines()
+    if line.startswith("issue-tracer-checkpoint-v1 ")
+]
+assert len(_receipt_lines) == 1, f"receipt lines: {len(_receipt_lines)}"
+# Git Bash by absolute path: a bare "bash" on native Windows Python
+# resolves to WSL's bash.exe, which cannot exec the script.
+_GIT_BASH = "C:/Program Files/Git/bin/bash.exe"
+_anchor = subprocess.run(
+    [_GIT_BASH,
+     "E:/ZCode/opencode-swarm/.opencode/skills/issue-tracer/scripts/"
+     "repro-check.sh", "verify-anchor", "--slug",
+     "65-66-67-workstream-a-sync-integrity", "--receipt", _receipt_lines[0]],
+    capture_output=True, text=True, cwd=str(ROOT),
+)
+assert _anchor.returncode == 0, (
+    "verify-anchor failed against the published receipt:\n"
+    + _anchor.stdout[-2000:] + "\n" + _anchor.stderr[-500:]
+)
+
 out: list[str] = []
 out.append("# Test results — 65-66-67-workstream-a-sync-integrity")
 out.append("")
@@ -198,9 +223,13 @@ out.append("  65-66-67-workstream-a-sync-integrity` → exit 0; the manifest hol
 out.append(f"  {manifest_rows} rows (22 CHECKPOINT + {amend_rows} AMEND across")
 out.append("  eight waves: the check-author strengthening, wave 7's")
 out.append("  implementation-driven re-freeze, and wave 8's C13 recovery leg).")
-out.append("- `repro-check.sh verify-anchor` against the published anchor v8")
-out.append("  (comment 6767718505 on #64) → OK; the superseded v7 receipt fails")
-out.append("  closed with `anchor manifest digest does not match`.")
+out.append("- `repro-check.sh verify-anchor` against the published anchor v9")
+out.append("  (comment 6789451960 on #64; local copy")
+out.append("  `repro/anchor-v9-body.md`) → OK — **and this generator runs")
+out.append("  that check**, so the claim cannot go stale again. The")
+out.append("  superseded v8 and v7 receipts fail closed with `anchor")
+out.append("  manifest digest does not match` (v8 predates wave 8; v7")
+out.append("  predates wave 7).")
 out.append("- Mutation probes: `python tests/test_mutation_sweep.py` → 15/15")
 out.append("  OK; `python tests/_probe_review_fixes.py` → 10/10 KILLED with a")
 out.append("  byte-identical restore and a green post-restore re-run.")
@@ -218,8 +247,9 @@ out.append("The deferred-work marker scan (run by this generator over the"
 out.append("`tests/`, excluding the generator itself, which necessarily")
 out.append("spells the markers) returns **no hits** — the assertion above")
 out.append("fails generation if one appears. The word `placeholder` was")
-out.append("checked separately: it appears only as descriptive prose about")
-out.append("SQL parameter lists (a value noun, not a deferred-work marker).")
+out.append("checked separately: every hit is a VALUE noun in prose (SQL")
+out.append("parameter lists, masked constants, placeholder nodes), never a")
+out.append("deferred-work marker.")
 out.append("The one disclosed non-hit is the mutation sweep's own comment")
 out.append("naming the deliberately-unprobed cost-only refinement (the batch")
 out.append("newest-duplicate stamp fold), a comment in a test tool, not")
@@ -234,9 +264,12 @@ out.append("  vacuous green. The two NEW-SURFACE checks are ERROR at base")
 out.append("  because the check file did not exist then; the four PRESERVING")
 out.append("  checks are green at both ends.")
 out.append("- The acceptance table's semantics digest (`AC/class/check/argv/`")
-out.append("  `expect`) is byte-identical across all eight amendment waves, so")
-out.append("  no check was redefined to pass — only per-path blobs moved, and")
-out.append("  each wave re-froze every pair on the touched path.")
+out.append("  `expect`) is `6bd191f0…`, unchanged since anchor v3 — stable")
+out.append("  across every amendment wave on this trace — so no check was")
+out.append("  redefined to pass; only per-path blobs moved, and each wave")
+out.append("  re-froze every pair on the touched path. (The digest did move")
+out.append("  once, between anchors v2 and v3, for a plan-phase CHECK_WRONG")
+out.append("  wave that predates the implementation.)")
 out.append("- The phase-4.5 review's HIGH finding was verified before it was")
 out.append("  fixed: `git show 6009c30:src/zaxbygraph/graphql.py` and the head")
 out.append("  copy of `check_deleted` were byte-identical, so C12 passed")

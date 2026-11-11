@@ -1160,6 +1160,69 @@ class FeedbackRoundTests(TempDBTest):
             "the deletion must reach the sidecar so replay reproduces it",
         )
 
+    def test_mid_refresh_degradation_never_stores_a_stale_row(self) -> None:
+        """AC6's invariant on the narrow race the final critic found in
+        `_resolve_torn_row`: refresh attempt 1 returns a STALE listing row,
+        attempt 2 degrades (a mid-refresh 404). Returning the last stale
+        row would hand the caller the stale half of the mixture to pair
+        with the newer pull payload — the exact combination AC6 forbids —
+        so the item must be SKIPPED into the durable pending set instead,
+        where the retry resolves the 404 as a deletion. Killed by:
+        `return current` on a non-dict refresh answer."""
+
+        class _DegradingTornSource(FakeGitHubSource):
+            """One stale refresh, then a 404: the tear cannot resolve."""
+
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def get_issues(self, numbers):
+                self.calls += 1
+                n = int(numbers[0])
+                if self.calls == 1:
+                    return {n: (deepcopy(self.issues[n]), 200)}
+                return {n: (None, 404)}
+
+        src = _DegradingTornSource()
+        pull_raw = pull(3, changed_files=0)
+        pull_raw.update(updated_at=ts(50), merged_at=ts(50),
+                        merge_commit_sha="abc")
+        src.add_pr(
+            issue(3, title="p3", kind="pr", state="open", updated_at=ts(30),
+                  comments=0),
+            pull_raw, files=[],
+        )
+        result = sync_repo(self.conn, src, REPO)
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(
+            src.calls, 2,
+            "the refresh is bounded at two attempts and both are spent",
+        )
+        self.assertIsNone(
+            self.conn.execute(
+                "SELECT state FROM items WHERE repo = ? AND number = 3",
+                (REPO,),
+            ).fetchone(),
+            "the stale row must never be stored beside the newer pull"
+            " payload — the refresh degraded instead of catching up",
+        )
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM sync_pending WHERE repo = ?"
+                " AND number = 3 AND reason = 'torn'", (REPO,)
+            ),
+            1, "the unresolved tear lands in the durable retry set",
+        )
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM fetch_log WHERE repo = ?"
+                " AND resource_id = '3' AND lower(note) LIKE"
+                " '%torn_row_unresolved%'", (REPO,)
+            ),
+            1, "the skip leaves its trail",
+        )
+
     def test_capability_cache_self_heals_after_fatal_error(self) -> None:
         """A fatal GitHubError while running on a CACHED capability map must
         delete the meta row so the next sync re-probes (no permanent

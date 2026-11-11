@@ -86,7 +86,12 @@ path mid-run (that string is the disclosed value — a consumer matching on
 `"rest"` exactly will not match a degraded run, which did use REST for the
 rest of its items). `graphql_probe_failed` is `true` when the capability
 probe could not introspect the host (the run fails OPEN on the full field
-set and reports it — a later successful probe clears it). Every run that
+set and reports it — a later successful probe clears it). A probe failure
+does NOT by itself switch the run to REST: the REST degradation fires on
+the first degradable GraphQL FETCH (a 401/403/404 or a typed transport
+error on the bulk children query), so a host that blocks introspection
+only keeps running on GraphQL — safely, on the full field set — while a
+host that blocks GraphQL entirely degrades on that first fetch. Every run that
 DRAINS THE LISTING walks its window at least twice to prove coverage (a
 targeted `--numbers` refresh never drains it: it fetches exactly the
 numbers named) (see

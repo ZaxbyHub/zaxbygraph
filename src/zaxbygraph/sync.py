@@ -914,13 +914,24 @@ def _resolve_torn_row(source: GitHubSource, list_raw: dict, pull_ts: str) -> dic
     """Re-fetch the listing row until it is at least as new as the pull
     payload's facts (issue #65 AC6): a stored row must never mix an older
     listing snapshot with a newer pull payload. Bounded at
-    _MAX_ITEM_REFRESHES attempts; None means the listing stayed stale and
-    the caller skips the item (recording it in the durable pending set)
-    rather than storing the forbidden mixture."""
+    _MAX_ITEM_REFRESHES attempts; None means the listing stayed stale — or
+    the refresh itself degraded mid-loop — and the caller skips the item
+    (recording it in the durable pending set) rather than storing the
+    forbidden mixture.
+
+    Every return of a row is a row PROVEN at least as new as `pull_ts`.
+    Nothing else may come back: the original row is stale by the caller's
+    own trigger, a row from an earlier attempt is stale by construction
+    (the loop continued past it), and a non-dict answer (a mid-refresh
+    404/410, a degraded payload) is not evidence of anything — so all three
+    resolve to None, and `_retry_torn_pending` discharges the number later
+    (a 404 there becomes a proper deletion)."""
     number = int(list_raw["number"])
     getter = getattr(source, "get_issues", None)
     if not callable(getter):
-        return list_raw
+        # No refresh seam: the tear cannot be resolved, so it must not be
+        # stored (the original row is the stale half of the mixture).
+        return None
     current: dict | None = None
     for _ in range(_MAX_ITEM_REFRESHES):
         results = _call_with_rate_retry(getter, [number]) or {}
@@ -929,7 +940,10 @@ def _resolve_torn_row(source: GitHubSource, list_raw: dict, pull_ts: str) -> dic
             entry if isinstance(entry, dict) else None
         )
         if not isinstance(row, dict):
-            return current
+            # A degraded answer is not a row: returning `current` here would
+            # hand the caller a provably stale row to pair with the newer
+            # pull payload — the exact mixture AC6 forbids. Skip instead.
+            return None
         row_ts = row.get("updated_at")
         if isinstance(row_ts, str) and row_ts >= pull_ts:
             return row
@@ -1264,14 +1278,14 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
     """Hydrate or run the capability probe for sources that support it
     (issue #23). Returns True when the latest probe FAILED (the run then
     fails open with the full field set and the failure is reported in the
-    sync result and status.coverage — issue #65 AC9), False otherwise."""
+    sync result and status.coverage — issue #65 AC9), False otherwise.
+
+    Duck-typed on BOTH members: every source without the probe pair (fakes,
+    REST-only, replay) skips the whole step — no meta I/O, no subprocess.
+    Meta reads/writes run OUTSIDE every per-item transaction. A probe
+    failure fails open: the sync proceeds with the full field set and the
+    failure is recorded in fetch_log."""
     probe_failed = False
-    """Hydrate or run the capability probe for sources that support it
-    (issue #23). Duck-typed on BOTH members: every source without the probe
-    pair (fakes, REST-only, replay) skips the whole step - no meta I/O, no
-    subprocess. Meta reads/writes run OUTSIDE every per-item transaction. A
-    probe failure fails open: the sync proceeds with the full field set and
-    the failure is recorded in fetch_log."""
     probe = getattr(source, "probe_capabilities", None)
     attach = getattr(source, "attach_capabilities", None)
     if not callable(probe) or not callable(attach):
