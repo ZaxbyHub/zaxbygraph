@@ -90,6 +90,25 @@ guardrail_tests = len(re.findall(
 ))
 assert guardrail_tests == 13, guardrail_tests
 
+# The deferred-work scan runs HERE so the claim is the scanner's output,
+# not a hand-assertion (the review caught a hand-asserted count). The
+# generator necessarily spells the markers, so it excludes itself — every
+# other file in the diff is scanned.
+ROOT = Path(__file__).resolve().parents[1]
+_MARKER = re.compile(r"TODO|FIXME|XXX|HACK")
+_scan_files = [
+    f for f in _git("diff", "--name-only", f"{BASE}..HEAD").splitlines()
+    if f.startswith(("src/", "tests/")) and f != "tests/_gen_test_results.py"
+]
+deferred_hits: list[str] = []
+for rel in _scan_files:
+    for lineno, line in enumerate(
+        (ROOT / rel).read_text(encoding="utf-8", errors="replace").splitlines(), 1
+    ):
+        if _MARKER.search(line):
+            deferred_hits.append(f"{rel}:{lineno}")
+assert not deferred_hits, f"deferred-work markers: {deferred_hits}"
+
 out: list[str] = []
 out.append("# Test results — 65-66-67-workstream-a-sync-integrity")
 out.append("")
@@ -194,8 +213,11 @@ out.append("## Deferred-Work Scan")
 out.append("")
 out.append("scan-deferred: clean")
 out.append("")
-out.append("`grep -rnE 'TODO|FIXME|XXX|HACK'` over the diff's `src/` and")
-out.append("`tests/` files returns **no hits**. The word `placeholder` was")
+out.append("The deferred-work marker scan (run by this generator over the"
+           f" {len(_scan_files)} files this diff touches in `src/` and")
+out.append("`tests/`, excluding the generator itself, which necessarily")
+out.append("spells the markers) returns **no hits** — the assertion above")
+out.append("fails generation if one appears. The word `placeholder` was")
 out.append("checked separately: it appears only as descriptive prose about")
 out.append("SQL parameter lists (a value noun, not a deferred-work marker).")
 out.append("The one disclosed non-hit is the mutation sweep's own comment")
