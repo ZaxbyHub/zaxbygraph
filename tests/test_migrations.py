@@ -1680,6 +1680,57 @@ class FoldCoverageCensusTests(unittest.TestCase):
         uncovered = number_scoped - folded - set(exempt)
         self.assertEqual(uncovered, set(), f"uncovered tables: {uncovered}")
 
+class IntermediateV12ShapeTests(unittest.TestCase):
+    def test_intermediate_v12_pending_table_converges(self) -> None:
+        """A store stamped 12 by the INTERMEDIATE build of this
+        unreleased slot created `sync_pending` WITHOUT `computed_at`:
+        `CREATE TABLE IF NOT EXISTS` is a no-op on the table it finds,
+        and the migration is skipped for an already-current version, so
+        without a guard the column would never arrive and every
+        `write_pending` would fail with "no column named computed_at".
+        `init_schema` must converge that shape on open. Killed by:
+        removing the guarded ALTER in init_schema."""
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / "history.db"
+        conn = connect(path)
+        init_schema(conn)
+        # Reshape to the intermediate build's table (no computed_at) and
+        # keep its version stamp, so the migration chain is skipped
+        # exactly as it would be for that store.
+        conn.execute("DROP TABLE sync_pending")
+        conn.execute(
+            "CREATE TABLE sync_pending (repo TEXT NOT NULL,"
+            " number INTEGER NOT NULL, reason TEXT NOT NULL,"
+            " PRIMARY KEY (repo, number, reason))"
+        )
+        conn.execute("PRAGMA user_version = 12")
+        conn.commit()
+        conn.close()
+
+        conn = connect(path)
+        self.addCleanup(conn.close)
+        init_schema(conn)  # the convergence runs here
+        cols = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(sync_pending)"
+            )
+        }
+        self.assertIn("computed_at", cols,
+                      "the intermediate v12 shape must converge on open")
+        from zaxbygraph.store import write_pending
+
+        write_pending(conn, "acme/forgegate", [3], "torn")
+        conn.commit()
+        row = conn.execute(
+            "SELECT number, reason, computed_at FROM sync_pending"
+        ).fetchone()
+        self.assertIsNotNone(
+            row["computed_at"],
+            "a converged row records when the obligation was written",
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

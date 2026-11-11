@@ -412,7 +412,9 @@ keyset cursor does not terminate when more than a page shares one
 timestamp, and intra-pass re-delivery detection cannot see a
 deletion. The mechanism that does close it:
 
-- **every run walks the window at least twice.** After a pass
+- **every run that drains the listing walks its window at least twice**
+  (a targeted `--numbers` refresh never drains it — it fetches exactly the
+  numbers named). After a pass
   completes, the loop runs again unless the pass delivered *exactly*
   the same set of item numbers as its predecessor (set equality, not
   subset membership — a subset rule stops on a pass that lost an item

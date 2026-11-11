@@ -80,11 +80,16 @@ envelope root):
 `ingested` counts items touched by *this* run — `0` on a second run with no
 upstream changes is the expected result, not a failure.
 
-`source` is the source this run actually used (`graphql` or `rest`),
-and `graphql_probe_failed` is `true` when the capability probe could
-not introspect the host (the run fails OPEN on the full field set and
-reports it — a later successful probe clears it). Every run walks its
-listing window at least twice to prove coverage (see
+`source` is the source this run actually used: `graphql`, `rest`, or
+`rest (graphql unavailable)` when a GraphQL run degraded to the per-item
+path mid-run (that string is the disclosed value — a consumer matching on
+`"rest"` exactly will not match a degraded run, which did use REST for the
+rest of its items). `graphql_probe_failed` is `true` when the capability
+probe could not introspect the host (the run fails OPEN on the full field
+set and reports it — a later successful probe clears it). Every run that
+DRAINS THE LISTING walks its window at least twice to prove coverage (a
+targeted `--numbers` refresh never drains it: it fetches exactly the
+numbers named) (see
 [Listing completeness](docs/schema.md#listing-completeness-the-pass-cap-and-the-recovery-floor-issue-65)
 in the schema reference — including the residual that bound cannot close)
 and `ingested` counts DISTINCT item numbers, not deliveries.

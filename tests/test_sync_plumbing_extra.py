@@ -1243,9 +1243,11 @@ class FeedbackRoundTests(TempDBTest):
 
     def test_source_name_reports_the_effective_source(self) -> None:
         """The result's `source` key names the source this run actually
-        used (issue #65's run summary): a REST-built run says `rest`, the
-        default says `graphql`, and a GraphQL run that degraded says so.
-        Killed by: dropping `source_name` from sync_repo's result."""
+        used (issue #65's run summary): a REST-built run says `rest` and
+        the default says `graphql`. (The degraded value
+        `rest (graphql unavailable)` is pinned separately by frozen C3;
+        this pin covers the source_name plumbing itself.) Killed by:
+        dropping `source_name` from sync_repo's result."""
         src = _NumberedSource()
         src.add_issue(issue(5, title="five", updated_at=ts(50)))
         rest = sync_repo(self.conn, src, REPO, source_name="rest")
@@ -1257,11 +1259,13 @@ class FeedbackRoundTests(TempDBTest):
                          "an unstated source keeps the historical answer")
 
     def test_explicit_mcp_source_stamps_the_profile(self) -> None:
-        """An explicit MCP `source` argument stamps the stored profile
-        exactly as the CLI's `--source` does; an omitted argument inherits
-        the recorded profile and never rewrites it (issue #48's rule, which
-        the MCP runner must honour too — README says the tool follows the
-        same rule)."""
+        """An explicit MCP `source` argument is reported as the effective
+        source AND stamps the stored profile, exactly as the CLI's
+        `--source` does; an omitted argument reports the inherited source
+        and passes no stamp, so the profile is never rewritten (issue #48's
+        rule, which the MCP runner must honour too — README says the tool
+        follows the same rule). The stored-profile inheritance itself is
+        pinned by frozen C4/C5; this pin covers the MCP wiring."""
         from zaxbygraph import mcp_server
 
         captured: dict = {}
