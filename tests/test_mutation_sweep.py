@@ -124,31 +124,19 @@ class MutationSweepTests(unittest.TestCase):
         )
         del real, real_loop, one_pass
 
-    def test_m3_subset_termination(self) -> None:
-        """M3: terminate the pass loop on a SUBSET instead of exact set
-        equality (the critic's 576-sequence counterexample class). Killed
-        by C1's complete-first-pass/destructive-second-pass case."""
-        # The subset rule is a one-character change in the termination
-        # comparison; express it by making the equality check always true
-        # once the delivered set is a subset of the predecessor's.
-        source = (
-            "import zaxbygraph.sync as _s\n"
-            "_orig = _s.sync_repo\n"
-        )
-        # Simpler and still faithful: patch the loop's comparison helper.
-        real = getattr(sync, "_already_covered", None)
-
-        def always_covered(*args, **kwargs):
-            return True
-
-        # A mutant that treats every re-delivery as covered skips the
-        # verification walk's re-fetch AND its re-ingest; C1's late-hazard
-        # case needs the walk to continue.
+    def test_m3_always_covered_redelivery(self) -> None:
+        """M3: treat EVERY re-delivery as already covered — the verification
+        walk then skips its re-fetch and re-ingest. Killed by C1's
+        complete-first-pass/destructive-second-pass case, which needs the
+        walk to continue. (The subset-termination mutant itself lives in
+        tests/_probe_review_fixes.py, "pass termination is exact set
+        equality", killed by the stored-set assertion in
+        PassTerminationTests; this entry pins the neighbouring
+        covered/ingest rule.)"""
         self._assert_killed(
-            _Mutant(sync, "_already_covered", always_covered),
+            _Mutant(sync, "_already_covered", lambda *a, **k: True),
             ["tests/test_sync_integrity.py::ListingIntegrityTests::test_listing_survives_mid_sync_update"],
         )
-        del real, source
 
     def test_m4_no_quiescence_failure(self) -> None:
         """M4: a cap trip launders the run as complete. Killed by the
