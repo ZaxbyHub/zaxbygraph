@@ -93,9 +93,10 @@ assert guardrail_tests == 13, guardrail_tests
 out: list[str] = []
 out.append("# Test results — 65-66-67-workstream-a-sync-integrity")
 out.append("")
-out.append(f"Head: `{HEAD}` (the phase-4.5 review-fix commit; the implementation")
-out.append(f"commit is `84df673152d76c63537311565e42d0702a56df28`). Base:")
-out.append(f"`{BASE}`.")
+out.append(f"Head: `{HEAD}` — the tip of a three-commit branch over base")
+out.append(f"`{BASE}` (the implementation commit, then the two phase-4.5")
+out.append("review-fix rounds; `git log --oneline` on the branch is the")
+out.append("authoritative sequence).")
 out.append("Every result below was produced by the command shown, at that head;")
 out.append("nothing is asserted from memory.")
 out.append("")
