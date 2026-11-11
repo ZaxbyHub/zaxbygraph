@@ -100,8 +100,13 @@ for cid, b in blocks.items():
     row = next(r for r in rows if r["check"] == cid)
     assert (b.get("argv") or "").strip() == row["argv"].strip(), (
         cid, b.get("argv"), row["argv"])
-    assert (b.get("expect") or "").strip() == row["expect"].strip(), (
-        cid, b.get("expect"), row["expect"])
+    # A replay that passes no --expect (the PRESERVING exit-code checks)
+    # records `-` in the block while the acceptance row carries the
+    # manifest's literal; only an EXPLICIT expect must match the row.
+    block_expect = (b.get("expect") or "").strip()
+    if block_expect != "-":
+        assert block_expect == row["expect"].strip(), (
+            cid, block_expect, row["expect"])
 
 manifest_head = (TRACE / "repro" / "checkpoint.manifest").read_text(
     encoding="utf-8"
@@ -250,13 +255,17 @@ if _probe.returncode != 0 or "ALL KILLED" not in _probe_out:
         f"review-fix probes did not report ALL KILLED "
         f"(exit={_probe.returncode}):\n{_probe_out[-3000:]}"
     )
-_probe_count = len(re.findall(r"^\s*\d+\.\s+.*KILLED", _probe_out, re.M))
+_probe_count = len(re.findall(r"^KILLED", _probe_out, re.M))
 if not _probe_count:
     # Fall back to the summary line's own number when the per-probe list
     # uses another shape.
     _pm = re.search(r"(\d+)/(\d+)\s+KILLED", _probe_out)
     _probe_count = int(_pm.group(2)) if _pm else 0
 assert _probe_count > 0, f"probe count undetermined from:\n{_probe_out[-800:]}"
+# Every probe must actually be KILLED: a SURVIVED/RESTORE-FAILED/PROBLEMS
+# line anywhere fails generation instead of being counted around.
+assert "SURVIVED" not in _probe_out and "RESTORE-FAILED" not in _probe_out, (
+    f"a probe did not die:\n{_probe_out[-800:]}")
 
 out: list[str] = []
 out.append("# Test results — 65-66-67-workstream-a-sync-integrity")
