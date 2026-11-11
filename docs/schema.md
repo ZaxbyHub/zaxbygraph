@@ -368,7 +368,7 @@ migrated store's column is `NULL`, which every reader treats as the
 documented graphql default. Fresh stores get the column at the same
 last position; the migration is a guarded `ALTER TABLE ... ADD COLUMN`.
 
-### Migration 12
+## Migration 12
 
 v12 (issues #65, #66, #67) is the largest single-slot migration:
 
@@ -378,9 +378,11 @@ v12 (issues #65, #66, #67) is the largest single-slot migration:
   `listing_floor_active`, and the new `sync_pending` table (also
   declared in `schema.sql`, so a fresh store is born with it);
 - **`actors.is_bot` backfill** — every stored payload (items,
-  comments, reviews, releases `raw_json`) is re-read for the four
-  bot signals (the `[bot]` suffix, a REST `type: "Bot"`, a GraphQL
-  `__typename: "Bot"`). The configured list is deliberately NOT read
+  comments, reviews, releases `raw_json`) is re-read for the payload bot
+  signals: the `[bot]` suffix on the login, and `type: "Bot"` on the
+  payload's user — REST carries that key natively, GraphQL's
+  `__typename: "Bot"` is mapped into it at ingest. The configured list
+  is deliberately NOT read
   here: `ZAXBYGRAPH_BOT_LOGINS` is not reconstructible from stored JSON,
   so its entries are applied at sync time only (an exact, literal match —
   no case folding) and a login added to it later needs a re-sync of an
@@ -587,8 +589,8 @@ One row per repo. What `zaxbygraph status` reads.
 | `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
-| `listing_floor` | TEXT | v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean finish, and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
-| `listing_floor_active` | INTEGER | v12. `1` while an unresolved listing floor stands. The next run raises a stale watermark to the floor; a `NULL` watermark is never narrowed by it (from-the-beginning already covers the floor's window), so `--force` still re-reads everything. |
+| `listing_floor` | TEXT | v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean **non-targeted** finish (`sync --numbers` never re-drains the listing, so it never clears the floor), and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
+| `listing_floor_active` | INTEGER | v12. `1` while an unresolved listing floor stands. The next non-targeted run raises a stale watermark to the floor (a targeted refresh never moves the watermark at all); a `NULL` watermark is never narrowed by it (from-the-beginning already covers the floor's window), so `--force` still re-reads everything. |
 
 The three counts are recomputed when a sync run finishes (and by
 `doctor --consolidate` and the schema migrations), not per ingested item:
@@ -601,7 +603,7 @@ can disagree with its live `counts[]` for the same reason.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `11`). The
+`PRAGMA user_version` is the authoritative schema state (currently `12`). The
 `meta.schema_version` row is informational only. `init_schema` (which runs
 the migration chain) executes only on a WRITABLE open: a `sync`, an
 MCP-triggered sync, or `doctor --consolidate` (adoption migrates its temp
@@ -777,9 +779,12 @@ repository-read gate, with the sidecar bundle every other deletion
 writes). This narrows the plan's "every sync run (full, incremental,
 targeted)" — the shipped behaviour keeps targeted runs' one-job contract
 and is the defensible reading; recorded in 02-reproduction.md. `sync_state.last_error` and `full_sync_pending` are held by
-an open `deletion` row — neither the non-targeted nor the `--numbers`
-finalizer may launder it. `doctor --consolidate` copies the table
-(it leads with `(repo, number)`), so an adopted corpus keeps the
+an open `sync_pending` row of ANY reason (`torn` or `deletion`) — neither
+the non-targeted nor the `--numbers`
+finalizer may launder it, and a torn debt that used to finish clean now
+keeps the incomplete marker too (PR #76 review). `doctor --consolidate`
+keeps the store's open rows (unioning the candidate's in) and re-imposes
+the marker, so an adopted corpus keeps the
 debts it owes.
 
 ## fetch_log

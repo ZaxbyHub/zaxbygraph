@@ -70,8 +70,10 @@ CREATE TABLE IF NOT EXISTS items (
     comment_count                 INTEGER NOT NULL DEFAULT 0,
     paths_text                    TEXT NOT NULL DEFAULT '',
     raw_json      TEXT NOT NULL,
-    -- v12 (issue #67): the single numeric token a PR head_ref names, when
-    -- exactly one stored issue matches it. Declared LAST so a fresh store's
+    -- v12 (issue #67): the single numeric token a PR head_ref carries,
+    -- stored whenever the head_ref has exactly one such token - the token
+    -- matching a stored issue is what gates the branch_ref EDGE, not this
+    -- column. Declared LAST so a fresh store's
     -- column order matches a pre-v12 store's after the v11->v12 migration's
     -- guarded ALTER appends it; idx_items_repo_branch (migration-owned, see
     -- db.py) reads it.

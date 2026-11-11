@@ -11,10 +11,23 @@ _SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 #: (skipping the token) instead of capturing a truncated prefix (issue #66
 #: AC1/AC10: CPython's int() digit limit would otherwise raise mid-ingest).
 _MAX_REF_DIGITS = 10
-_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+#: A fence line's FULL delimiter run (PR #76 review PRR-008): capturing the
+#: whole run lets a four-backtick block refuse to close on an inner
+#: three-backtick line, which the old three-character truncation could not
+#: distinguish — the inner line's code then leaked out as references.
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _HUNK_HEADER_RE = re.compile(r"^@@ .* @@")
 _COMMENT_ID_RE = re.compile(r"(?i)\bcomment\s*$")
 _FOREIGN_SPACED_RE = re.compile(r"(?i)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s*$")
+#: Both noise probes above are END-anchored (\\bcomment\\s*$ and a
+#: trailing owner/repo), so they can only match at the very end of the
+#: prefix given to them: a bounded tail is the entire match surface.
+#: GitHub's owner (39) + repo (100) name caps keep any real foreign-spaced
+#: match far under this bound, 'comment' is seven letters, and a longer
+#: tail could only re-scan text the anchors can never reach (PR #76 review
+#: PRR-007: an unbounded per-reference copy + scan of the whole prefix
+#: made extraction quadratic in body length).
+_NOISE_TAIL_PROBE = 256
 
 
 def item_kind(raw: dict) -> str:
@@ -115,6 +128,45 @@ def _location(prefix: str, offset: int) -> str:
     return prefix if prefix == "title" else f"{prefix}@{offset}"
 
 
+def _code_span_ranges(line: str) -> list[tuple[int, int]]:
+    """Inline code-span ranges on one line: an opener run of N backticks
+    closed by the next run of at least N (PR #76 review PRR-009: the old
+    single-backtick regex could not see ``fixes #5`` as one span, so a
+    double-backtick span's reference leaked out as an edge). A linear scan
+    with no backtracking — a long run that never finds its closer is
+    literal text and costs one pass, not a blowup."""
+    ranges: list[tuple[int, int]] = []
+    i = 0
+    n = len(line)
+    while i < n:
+        if line[i] != "`":
+            i += 1
+            continue
+        j = i
+        while j < n and line[j] == "`":
+            j += 1
+        opener = j - i
+        k = j
+        close_start = -1
+        while k < n:
+            if line[k] == "`":
+                s = k
+                while k < n and line[k] == "`":
+                    k += 1
+                if k - s >= opener:
+                    close_start = s
+                    break
+            else:
+                k += 1
+        if close_start < 0:
+            # No closer of sufficient length: literal backticks.
+            i = j
+            continue
+        ranges.append((i, k))
+        i = k
+    return ranges
+
+
 def _noise_ranges(text: str) -> list[tuple[int, int]]:
     """Character ranges whose #N tokens are quoting noise, not references
     (issue #67 AC2): fenced code blocks, inline code spans, diff-hunk lines
@@ -129,11 +181,16 @@ def _noise_ranges(text: str) -> list[tuple[int, int]]:
         end = pos + len(line)
         stripped = line.lstrip()
         first = stripped[:1]
-        if _FENCE_RE.match(stripped):
-            marker = stripped[:3]
+        fence_match = _FENCE_RE.match(stripped)
+        if fence_match:
+            run = fence_match.group(1)
             if fence is None:
-                fence = marker
-            elif marker == fence:
+                fence = run
+            elif run[0] == fence[0] and len(run) >= len(fence):
+                # Same delimiter character, at least as long as the opener
+                # (PR #76 review PRR-008): a shorter inner run stays
+                # content, so a four-backtick block cannot close on an
+                # inner three-backtick line.
                 fence = None
             ranges.append((pos, end))
             in_hunk = False
@@ -148,27 +205,32 @@ def _noise_ranges(text: str) -> list[tuple[int, int]]:
             in_hunk = False
             if first == ">":
                 ranges.append((pos, end))
-        for m in re.finditer(r"`[^`\n]*`", line):
-            ranges.append((pos + m.start(), pos + m.end()))
+        for span_start, span_end in _code_span_ranges(line):
+            ranges.append((pos + span_start, pos + span_end))
         pos = end
     return ranges
 
 
 def _is_noise_reference(
-    masked: str, start: int, end: int, repo: str, noise: list[tuple[int, int]]
+    masked: str, start: int, end: int, repo: str, noise_mask: bytearray
 ) -> bool:
     """True when the token at [start, end) is shape noise, not a reference:
     inside a masked context (code/fence/hunk/quote), a 'comment #<id>' id,
     or a SPACED foreign-repo reference ('owner/repo #N' -- the compact and
     URL forms are already masked by _mask_foreign; the local repo's own
-    spaced form stays a reference, matching its compact form)."""
-    for lo, hi in noise:
-        if start < hi and end > lo:
+    spaced form stays a reference, matching its compact form).
+
+    `noise_mask` is the byte-per-character membership of the noise ranges
+    (built once per payload), and the two end-anchored probes read only a
+    bounded tail of the prefix — both are the PR #76 review PRR-007 fix
+    that keeps extraction linear in body length."""
+    for i in range(start, end):
+        if noise_mask[i]:
             return True
-    before = masked[:start].rstrip()
-    if _COMMENT_ID_RE.search(before):
+    probe = masked[max(0, start - _NOISE_TAIL_PROBE):start].rstrip()
+    if _COMMENT_ID_RE.search(probe):
         return True
-    tail = _FOREIGN_SPACED_RE.search(before)
+    tail = _FOREIGN_SPACED_RE.search(probe)
     return bool(tail) and tail.group(1).lower() != repo.lower()
 
 
@@ -191,6 +253,12 @@ def _iter_reference_locations(
         return []
     masked = _mask_foreign(text, repo)
     noise = _noise_ranges(masked)
+    # Byte-per-character membership of the noise ranges, built once per
+    # payload so each reference's check is O(token) instead of O(ranges x
+    # text) (PR #76 review PRR-007).
+    noise_mask = bytearray(len(masked))
+    for lo, hi in noise:
+        noise_mask[lo:hi] = b"\x01" * (hi - lo)
     best: dict[int, tuple[int, str]] = {}
     for pattern in patterns:
         for match in re.finditer(pattern, masked):
@@ -198,7 +266,7 @@ def _iter_reference_locations(
             digits_start = match.start(1)
             head = match.group(0)[: digits_start - match.start()]
             token_start = digits_start - 1 if head.endswith("#") else digits_start
-            if _is_noise_reference(masked, token_start, match.end(), repo, noise):
+            if _is_noise_reference(masked, token_start, match.end(), repo, noise_mask):
                 continue
             location = _location(prefix, token_start)
             prior = best.get(number)

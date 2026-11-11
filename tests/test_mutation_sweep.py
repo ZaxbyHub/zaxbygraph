@@ -49,8 +49,22 @@ class _Mutant:
 
 
 def _run_checks(selectors: list[str]) -> str:
-    """Run the named pytest selectors in-process, returning their output."""
-    import pytest
+    """Run the named pytest selectors in-process, returning their output.
+
+    pytest is EVIDENCE tooling, not a runtime dependency: CI installs it
+    and runs this sweep, but the documented offline command
+    (`python -m unittest discover -s tests -b`) must stay runnable on a
+    stdlib-only checkout, so a missing pytest SKIPS these probes with a
+    named reason instead of erroring 15 times (PR #76 review PRR-002)."""
+    try:
+        import pytest
+    except ImportError as exc:
+        raise unittest.SkipTest(
+            "pytest is not installed: the mutation sweep is evidence "
+            "tooling — CI installs it and runs every probe; the documented "
+            "offline suite command runs without it (pip install pytest to "
+            "run the sweep locally)"
+        ) from exc
 
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -105,24 +119,18 @@ class MutationSweepTests(unittest.TestCase):
         del real
 
     def test_m2_single_pass(self) -> None:
-        """M2: the pass loop runs ONCE (no verification walk). Killed by the
-        stable-walk accounting (exactly two walks) and by C1's mid-sync
-        update recovery."""
-        real = sync._MAX_LISTING_PASSES
-
-        def one_pass(*args, **kwargs):
-            return 1
-
-        # A cap of 1 makes the loop fail on the second pass, so instead
-        # simulate the single-pass shape by making the quiescence test see
-        # only one walk: patch the loop's termination to always break.
-        real_loop = sync.sync_repo
-
+        """M2: cap the pass loop at one pass. The kill comes from the
+        honest cap-failure path — the second iteration raises
+        listing_not_quiescent — which discriminates the loop's existence
+        (a run that never re-walks cannot raise it), NOT the single-pass
+        walk shape this entry once claimed: capping is what the mutant
+        actually does, so the expected signature names it (PR #76 review
+        PRR-023)."""
         self._assert_killed(
             _Mutant(sync, "_MAX_LISTING_PASSES", 1),
             ["tests/test_listing_guardrails.py::ListingGuardrailTests::test_stable_run_walks_exactly_twice"],
+            expect="listing_not_quiescent",
         )
-        del real, real_loop, one_pass
 
     def test_m3_always_covered_redelivery(self) -> None:
         """M3: treat EVERY re-delivery as already covered — the verification
@@ -322,12 +330,14 @@ class MutationSweepTests(unittest.TestCase):
     # -- branch token lookup (#67) ---------------------------------------
 
     def test_m15_branch_lookup_scans(self) -> None:
-        """M15: the per-issue branch lookup degenerates into a whole-table
-        scan. Killed by C20's VDBE step-count ratio."""
+        """M15: drop the index the per-issue branch lookup rides. The kill
+        is the production plan hint itself — the lookup pins
+        `INDEXED BY idx_items_repo_branch`, so a missing index raises
+        OperationalError instead of degrading to a scan (the C20 ratio
+        never gets to measure one). That is the real dependency this
+        mutant proves: production REQUIRES the migration-created index
+        (PR #76 review PRR-022 renamed the claim to match the kill)."""
         real = store.rebuild_edges
-        # The mutant is expressed at the SQL level by dropping the index the
-        # lookup rides; C20 measures VDBE steps and the ratio moves.
-        conn_path = Path(":memory:")
 
         def unindexed(conn, *args, **kwargs):
             try:
@@ -339,8 +349,8 @@ class MutationSweepTests(unittest.TestCase):
         self._assert_killed(
             _Mutant(store, "rebuild_edges", unindexed),
             ["tests/test_extract_noise.py::BranchLookupCostTests::test_branch_lookup_is_indexed"],
+            expect="no such index",
         )
-        del conn_path
 
 
 if __name__ == "__main__":

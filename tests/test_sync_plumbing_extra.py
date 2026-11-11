@@ -783,11 +783,17 @@ class FeedbackRoundTests(TempDBTest):
         # field cap (issue #65 AC9): every one of them must use the
         # ARGUMENT form, and none may regress to the __Field subfield.
         self.assertGreaterEqual(len(captured), 1, "the probe must introspect")
-        for query in captured:
-            if "fields(" not in query:
-                # The timeline-enum query introspects enumValues, not fields;
-                # the argument form applies to the type-field queries alone.
-                continue
+        # At least one captured query must introspect type fields: the old
+        # loop skipped every query without `fields(`, so an enum-only probe
+        # satisfied this test without ever evaluating its own assertion
+        # (PR #76 review PRR-027).
+        field_queries = [q for q in captured if "fields(" in q]
+        self.assertGreaterEqual(
+            len(field_queries), 1,
+            "at least one probe query must introspect type fields by "
+            "argument — the argument-form assertion below must actually run",
+        )
+        for query in field_queries:
             self.assertIn(
                 "fields(includeDeprecated: true) { name }",
                 query,

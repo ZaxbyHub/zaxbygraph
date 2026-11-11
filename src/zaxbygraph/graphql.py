@@ -767,6 +767,16 @@ class GraphQLSource(GhApiSource):
             raise GitHubTransportError(
                 f"gh api graphql timed out after {GH_TIMEOUT_S}s"
             ) from exc
+        except OSError as exc:
+            # Every OTHER launch failure (PermissionError, WinError 193 on
+            # a non-executable file, ENOEXEC) is still a TRANSPORT failure
+            # (PR #76 review PRR-021): the typed class is what carries it
+            # into the REST degradation ladder; a raw OSError bypasses
+            # GitHubError entirely. FileNotFoundError above keeps its
+            # specific message.
+            raise GitHubTransportError(
+                f"gh CLI could not be launched: {exc}"
+            ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
             raise self._with_rate_budget(

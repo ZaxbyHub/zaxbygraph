@@ -99,12 +99,12 @@ numbers named) (see
 in the schema reference — including the residual that bound cannot close)
 and `ingested` counts DISTINCT item numbers, not deliveries.
 
-A `sync` that states no `--source` and no `--include-patches` inherits
-the store's recorded profile (`sync_state.fetch_source`), so a store
-deliberately kept on `--source rest` never profile-drifts; stating
-either flag re-stamps the profile it was given. The MCP `sync` tool
-takes the same `source` argument (`graphql`/`rest`) and follows the
-same rule.
+A `sync` that states no `--source` inherits the store's recorded profile
+(`sync_state.fetch_source`), so a store deliberately kept on
+`--source rest` never profile-drifts; stating `--source` re-stamps the
+profile (`--include-patches` does not touch it — only the source flag
+carries a profile to re-stamp). The MCP `sync` tool takes the same
+`source` argument (`graphql`/`rest`) and follows the same rule.
 
 ### Where the database goes
 
@@ -368,7 +368,7 @@ zaxbygraph sync --repo OWNER/REPO [--force] [--numbers N,M] [--include-patches] 
 | `--wait` | Wait for the sync lock instead of returning `joined: true` when another sync holds it. |
 | `--force` | Ignore the watermark and do a full pull. Needed when you suspect updates that did not bump `updated_at` (review-only changes), and required to backfill patches after a no-patch sync. |
 | `--numbers N,M` | Refresh exactly these items (GraphQL source: through the bulk children path; `--source rest` fetches each item's children per item over REST). The watermark and freshness stamps are untouched, the deletion oracle never runs, and the run never completes a full sync: a store that has never had one stays marked pending, so a numbers-only corpus reads incomplete. A targeted run that ingests nothing leaves a previous `last_error` standing. A number that 404/410s marks that stored item `deleted` (recorded in the sidecar); a never-stored missing number only leaves a `fetch_log` note. Cannot be combined with `--force`. |
-| `--include-patches` | Store unified diffs in `pr_files.patch`. Off by default — patches dominate the database size. |
+| `--include-patches` | Store unified diffs in `pr_files.patch`. A fresh store starts without patches — they dominate the database size — but a store that has stored patches keeps storing them on later runs (the recorded flag is inherited, and there is no `--no-patches`; disclosed in the PR body). |
 | `--jsonl [DIR]` | Also append one `item_bundle` record per ingested item to `DIR/events.jsonl` (default: a `jsonl/` directory beside the database). Each record is an envelope `{"resource": "item_bundle", "payload": {...}}` whose payload carries `number`, `item`, `pull`, every child section, the timeline, `children_complete` (the exact per-section completeness map the ingest saw, since schema v8), and `gone`/`gone_status` (present on every bundle; `gone: true` marks a recorded deletion, with `gone_note` carrying the exact deletion reason). Every deletion shape is recorded — first-sighting 404/410, an already-stored item that later disappears, the deletion oracle, and targeted refreshes. **Do not deduplicate bundles by `(number, item.updated_at)`**: that pair is not unique — a resumed sync may duplicate lines (collapse only *adjacent* byte-identical records for a number), and distinct same-timestamp observations are real history that LAST-WINS would silently discard. Replay (`JsonlReplaySource`, in the repository's `tests/replay.py`, not part of the installed package) treats bundles as ordered observations, keeps nonconsecutive repeats, serves each version with its own children, applies `children_complete` verbatim, and fails pre-v8 bundles (no `children_complete` key) closed so replay never fabricates deletion evidence the original run did not observe. Replay does not support `--include-patches` replays. The format replaced the pre-0.4.x per-resource records — pre-upgrade `events.jsonl` files contain no bundles and cannot be replayed (start a fresh sidecar file). Releases are appended as separate `release` records. |
 
 Sync is sequential and resumable. With the default `graphql` source, cost is
@@ -383,8 +383,12 @@ resumes rather than restarting.
 Rate limits are budgeted, not fatal: a core rate-limit failure with an
 exhausted budget is slept out until the reported reset (reported afterwards
 as `rate_limit_remaining` / `rate_limit_reset_at` in the sync result and in
-`status`), then the listing resumes — after five slept windows (`graphql`
-also sleeps proactively when its budget is already at the floor) the run
+`status`), then the listing resumes — after five slept windows *per
+listing pass* (`graphql`
+also sleeps proactively when its budget is already at the floor; each
+pass boundary and detected shift resets the budget, so a run that keeps
+quiescing into new passes can sleep up to five windows per pass while
+holding the whole-run lock) the run
 gives up and reports the error. Secondary limits that carry no resolvable
 reset fail fast as before. A full sync that starts without a watermark and
 drains its listing also consults the source's deletion oracle (the shipped

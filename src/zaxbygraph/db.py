@@ -1892,8 +1892,40 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                 (repo, item_number),
             ).fetchall()
 
+        def _text(payload: dict, *keys: str) -> dict:
+            """Non-string text fields are EMPTY text, never str()-coerced —
+            a list's repr can carry backticked paths and `closes #N`, and
+            extracting from it would let a malformed payload write edges
+            (the v9 backfill rule, PR #76 review PRR-006: the extractors
+            take str only, so an uncoerced {"title": 5} raises TypeError
+            and aborts the migration — one stored row blocking every open
+            of the store)."""
+            for key in keys:
+                if key in payload and not isinstance(payload[key], str):
+                    payload = {**payload, key: ""}
+            return payload
+
+        # Per-item belt for extractor shapes the sanitizer does not know
+        # (a wrong-typed nested field, a column holding a non-string): a
+        # non-SQLite fault marks the row un-derivable and contributes
+        # nothing, and the guard below keeps the row's prior keyword edges
+        # instead of replacing them with a partial set or aborting the
+        # migration (PR #76 review PRR-006). A sqlite3 storage fault still
+        # propagates: the report-don't-swallow invariant is unchanged.
+        extract_faults: list[bool] = []
+
+        def _safe(fn, *args):
+            try:
+                return fn(*args)
+            except sqlite3.Error:
+                raise
+            except Exception:
+                extract_faults.append(True)
+                return ()
+
         for item in items:
             number = int(item["number"])
+            extract_faults.clear()
             raw, malformed = _payload(
                 item["raw_json"],
                 {
@@ -1912,8 +1944,9 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
             # shape) may not carry it.
             if item["head_ref"] and not raw.get("head_ref"):
                 raw = {**raw, "head_ref": item["head_ref"]}
+            raw = _text(raw, "title", "body")
             collected: list[tuple] = []
-            collected.extend(_extract.edges_from_item(repo, raw))
+            collected.extend(_safe(_extract.edges_from_item, repo, raw))
             for crow in _children(
                 "comments", "number, kind, github_id, author, body, raw_json",
                 "kind, github_id", number,
@@ -1928,7 +1961,8 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                     ("id", "github_id"),
                 )
                 collected.extend(
-                    _extract.edges_from_comment(repo, number, craw)
+                    _safe(_extract.edges_from_comment, repo, number,
+                          _text(craw, "body"))
                 )
             for rrow in _children(
                 "reviews", "number, id, author, state, body, raw_json",
@@ -1944,19 +1978,24 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                     },
                     ("id",),
                 )
-                collected.extend(_extract.edges_from_review(repo, number, rraw))
+                collected.extend(
+                    _safe(_extract.edges_from_review, repo, number,
+                          _text(rraw, "body"))
+                )
             commit_rows = _children("pr_commits", "sha, message", "sha", number)
             if commit_rows:
                 collected.extend(
-                    _extract.edges_from_commit_messages(
+                    _safe(
+                        _extract.edges_from_commit_messages,
                         repo, number,
                         [{"sha": r["sha"], "message": r["message"]}
                          for r in commit_rows],
                     )
                 )
             collected.extend(
-                _extract.edges_from_pr_state(
-                    repo, raw, title_lookup, number_lookup
+                _safe(
+                    _extract.edges_from_pr_state,
+                    repo, raw, title_lookup, number_lookup,
                 )
             )
             # branch_ref derives from the head_ref COLUMN — the same source
@@ -1983,9 +2022,13 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
             keyword = [
                 e for e in _extract.collapse_edges(collected) if e[6] == "keyword"
             ]
-            if malformed and not keyword:
-                # Nothing derivable from this row: its prior keyword edges
-                # are evidence a parse failure must not discard.
+            if extract_faults or (malformed and not keyword):
+                # Nothing SAFELY derivable from this row — a parse failure,
+                # or an extractor that could not take its stored shape: its
+                # prior keyword edges are evidence a failure must not
+                # discard, and a partial replacement would retract the
+                # faulted stream's evidence under a silent migration
+                # (PR #76 review PRR-006).
                 continue
             conn.execute(
                 "DELETE FROM edges WHERE repo = ? AND src_type = 'item'"

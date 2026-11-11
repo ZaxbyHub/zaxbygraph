@@ -81,8 +81,12 @@ class SchemaV11MigrationTests(unittest.TestCase):
         # the parity assertion below does not.
         self.assertGreater(
             _columns(self.db).index("fetch_source"),
-            10,
-            "fetch_source must follow the v10 shape, never precede it",
+            # The v10 shape ends at rate_limit_reset_at (index 11 of the
+            # 12-column list), so fetch_source must sit strictly AFTER it —
+            # `> 10` would admit index 11, before the last v10 column
+            # (PR #76 review PRR-029).
+            11,
+            "fetch_source must follow every v10 column, never precede it",
         )
         self.assertEqual(_version(self.db), CURRENT_USER_VERSION)
 
@@ -106,8 +110,12 @@ class SchemaV11MigrationTests(unittest.TestCase):
         self.assertEqual(_columns(self.db), _columns(fresh))
         self.assertGreater(
             _columns(self.db).index("fetch_source"),
-            10,
-            "fetch_source must follow the v10 shape, never precede it",
+            # The v10 shape ends at rate_limit_reset_at (index 11 of the
+            # 12-column list), so fetch_source must sit strictly AFTER it —
+            # `> 10` would admit index 11, before the last v10 column
+            # (PR #76 review PRR-029).
+            11,
+            "fetch_source must follow every v10 column, never precede it",
         )
 
     def test_migration_is_idempotent(self):

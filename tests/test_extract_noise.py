@@ -157,6 +157,17 @@ class ActorIsBotTests(TempDBTest):
         self.assertEqual(got.get("dave"), 0, "a human author")
         if configured:
             self.assertEqual(got.get("zed"), 1, f"a login named in the configured comma-separated bot list ({_BOT_LIST_ENV})")
+        else:
+            # The payload-only contract, asserted WHILE the env var is set
+            # (the migration leg runs inside patch.dict): a backfill that
+            # consulted the configured list would mark zed as a bot and
+            # this assertion is the only thing that notices (PR #76 review
+            # PRR-024).
+            self.assertEqual(
+                got.get("zed"), 0,
+                "the v12 backfill must IGNORE the configured bot list even "
+                f"while {_BOT_LIST_ENV} is set — payload signals only",
+            )
 
     def test_actors_carry_is_bot(self) -> None:
         """RED at base (missing surface: the real GraphQL author selection

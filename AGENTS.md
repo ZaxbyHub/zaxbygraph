@@ -59,7 +59,10 @@ shouldn't.
   relation's derivation is bounded (reference digits are capped, so an
   oversized token matches nothing instead of wedging `int()`) and is
   offline-derivable from the stored payloads — migration v12 re-derives them
-  all under exactly these rules.
+  all under exactly these rules (a row the extractors cannot take — an
+  unparseable payload, or a wrong-typed field after its sanitizer — keeps
+  its prior keyword edges instead: a failure never discards evidence, and
+  the migration reports nothing it could not derive).
 - **Cross-repo keyword references are dropped, never localized; timeline
   cross-references are kept repo-qualified.** A `#5` in another repo's URL
   must not attach to local item 5, and a foreign cross-reference is stored as

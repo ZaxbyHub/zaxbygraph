@@ -106,6 +106,15 @@ class ExtractionFaultTests(TempDBTest):
             1, "the contained fault must be logged to fetch_log for the item")
         self.assertEqual(result["issues_since"], ts(30),
                          "the watermark must advance past the faulted item")
+        self.assertEqual(
+            [tuple(r) for r in self.conn.execute(
+                "SELECT rel, dst_id FROM edges WHERE repo = ?"
+                " AND rel = 'authored' AND dst_id = '2'", (REPO,))],
+            [],
+            "the faulted item's own extraction must contribute NO edges — "
+            "containment must be visible at the edge level, not only in "
+            "the fetch_log note (PR #76 review PRR-039)",
+        )
 
         # Case 2: COMMENT extraction fault for one comment; everything else lands.
         self.src.add_issue(issue(6, title="six", author="alice", updated_at=ts(60)))

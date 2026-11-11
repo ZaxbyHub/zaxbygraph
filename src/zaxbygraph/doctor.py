@@ -707,6 +707,8 @@ def _copy_table(
     table: str,
     autoinc_pk: str | None,
     repo_l: str,
+    *,
+    or_ignore: bool = False,
 ) -> None:
     """Copy one repo-keyed table from the candidate into the store.
 
@@ -743,7 +745,8 @@ def _copy_table(
         (repo_l,) if "repo" in cols else (),
     ).fetchall()
     insert_sql = (
-        f"INSERT INTO {_quote_ident(table)} ({', '.join(quoted)}) "
+        f"INSERT{' OR IGNORE' if or_ignore else ''} INTO"
+        f" {_quote_ident(table)} ({', '.join(quoted)}) "
         f"VALUES ({placeholders})"
     )
     dst.executemany(insert_sql, [tuple(r) for r in rows])
@@ -869,10 +872,27 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         else:
                             preserved_tables.append(table)
                             continue
+                    if table == "sync_pending":
+                        # Open retry obligations the STORE owes are never
+                        # dropped (PR #76 review PRR-019): the copy below
+                        # unions the candidate's rows in with OR IGNORE
+                        # instead of replace-the-slug, so an adopted corpus
+                        # keeps every number the next sync still owes a
+                        # retry — and reports the debt instead of silently
+                        # forgetting it.
+                        continue
                     dst.execute(
                         f"DELETE FROM {_quote_ident(table)} WHERE repo = ?",
                         (repo_l,)
                     )
+                # Capture the store's markers BEFORE its sync_state row is
+                # replaced: open obligations below re-impose them on top of
+                # the candidate's state (PR #76 review PRR-019).
+                prior_state = dst.execute(
+                    "SELECT full_sync_pending, last_error FROM sync_state"
+                    " WHERE repo = ?",
+                    (repo_l,),
+                ).fetchone()
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
                 # Snapshot provenance (issue #34) drops on consolidation:
@@ -990,7 +1010,14 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         # set and is adopted here (swarm-pr-review N-02).
                         continue
                     try:
-                        _copy_table(src, dst, table, autoinc_pk, repo_l)
+                        _copy_table(
+                            src, dst, table, autoinc_pk, repo_l,
+                            # The store's rows were kept above (PR #76
+                            # review PRR-019): union the candidate's in,
+                            # never conflicting with an obligation the
+                            # store already owes.
+                            or_ignore=(table == "sync_pending"),
+                        )
                     except sqlite3.DatabaseError as exc:
                         # A candidate whose schema diverges from the tool's
                         # can defeat the copy as well as the fold (an extra
@@ -1106,6 +1133,36 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         " listing_floor_active = excluded.listing_floor_active",
                         (repo_l, floor, 1 if active else 0),
                     )
+                # Open retry obligations survive WITH their markers
+                # (PR #76 review PRR-019): the candidate's clean sync_state
+                # must not launder debts the store still owes. The obligation
+                # rows were unioned above; status reads the marker, so an
+                # adopted corpus that still owes a retry reads incomplete
+                # (and keeps the store's error text when the candidate
+                # carries none) until a clean sync discharges it.
+                pending_cols = {
+                    r[1] for r in dst.execute("PRAGMA table_info(sync_pending)")
+                }
+                if "number" in pending_cols:
+                    open_n = dst.execute(
+                        "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
+                        (repo_l,),
+                    ).fetchone()[0]
+                    if open_n:
+                        prior_error = (
+                            prior_state["last_error"]
+                            if prior_state is not None else None
+                        )
+                        dst.execute(
+                            "INSERT OR IGNORE INTO sync_state(repo) VALUES (?)",
+                            (repo_l,),
+                        )
+                        dst.execute(
+                            "UPDATE sync_state SET full_sync_pending = 1,"
+                            " last_error = COALESCE(last_error, ?)"
+                            " WHERE repo = ?",
+                            (prior_error, repo_l),
+                        )
                 # actors is a global login->url table (no repo column), so it
                 # is copied wholesale despite the slug-scoped delete above.
                 # is_bot (schema v12, issue #67) rides along and NEVER

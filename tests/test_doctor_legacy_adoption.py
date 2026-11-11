@@ -323,9 +323,11 @@ class LegacyTablePreservationTests(unittest.TestCase):
                 # set; v5's stamp predates the v7/v8/v9 slots too, so the
                 # tables those migrations introduce are preserved as well —
                 # the version rule, not just the absent-table rule. Both
-                # versions predate v12's `sync_pending` slot (and the v9
-                # candidate's schema never had it either), so its empty rows
-                # stand in both.
+                # versions predate v12's `sync_pending` slot — the fixture's
+                # candidate physically carries the current schema's table
+                # (_pair stamps the version, it does not drop v12 DDL), but
+                # the VERSION is what makes it "never had", so its empty
+                # rows stand in both (PR #76 review PRR-042).
                 # `revisions` is excluded: it has its own per-item scoping
                 # (issue #40) and never enters the preserved list.
                 expected = {

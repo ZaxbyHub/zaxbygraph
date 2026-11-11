@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
 from fixtures import REPO, FakeGitHubSource, TempDBTest, comment, issue, ts
+from zaxbygraph import github as github_mod
 from zaxbygraph.github import GhApiSource
 from zaxbygraph.sync import SyncError, sync_repo
 
@@ -179,8 +181,27 @@ class ListingGuardrailTests(TempDBTest):
 
         transport = _WindowTransport(count=250, on_request=new_item_lands_on_page_one,
                                      repo=repo)
-        result = self._run(transport, repo)
+        # The escalation itself must be observable: the store-level
+        # assertions below pass even with the `raise ListingShiftedError`
+        # removed (the ordinary re-walk still delivers everything), so only
+        # counting constructions of the exception discriminates the
+        # early-exit mechanism AC1 names (PR #76 review PRR-001).
+        escalated: list[object] = []
+
+        class _CountingShift(github_mod.ListingShiftedError):
+            def __init__(self, *args, **kwargs):
+                escalated.append(args)
+                super().__init__(*args, **kwargs)
+
+        with patch.object(github_mod, "ListingShiftedError", _CountingShift):
+            result = self._run(transport, repo)
         self.assertIsNone(result["last_error"])
+        self.assertGreaterEqual(
+            len(escalated), 1,
+            "a shift the boundary verification sees must ESCALATE through "
+            "ListingShiftedError — removing the raise leaves every other "
+            "assertion here green while the early exit is gone (PR #76 "
+            "review PRR-001)")
         self.assertGreaterEqual(transport.boundary_mismatches, 1,
                                 "the boundary re-read must observe the shift")
         self.assertGreaterEqual(

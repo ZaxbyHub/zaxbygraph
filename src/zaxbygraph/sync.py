@@ -64,6 +64,11 @@ def _log_graphql_unavailable(
         log_fetch(
             conn, repo, "graphql", None,
             note=f"graphql unavailable; degraded to REST: {exc}",
+            # The row records a FAILURE: carry the HTTP status the failure
+            # reported (NULL when the failure had none) instead of the
+            # log_fetch default of 200, which would file it as a success
+            # (PR #76 review PRR-030).
+            status=getattr(exc, "status", None),
         )
         conn.commit()
     except Exception:
@@ -225,9 +230,13 @@ def _already_covered(
 
 
 #: Rate-limit windows slept through per fetch-layer call before giving up
-#: (issue #5). Five is the ceiling; each sleep is additionally clamped so a
-#: hostile or far-future reset can never park the sync (and its whole-run
-#: lock) indefinitely.
+#: (issue #5). Five is the ceiling PER ATTEMPT — the listing pass loop
+#: resets this budget at each pass boundary and after a detected boundary
+#: shift, so a run that keeps quiescing into new passes can sleep up to
+#: five windows per pass (PR #76 review PRR-012; the whole-run worst case
+#: is five times _MAX_LISTING_PASSES windows, and the whole-run lock is
+#: held the entire time). Each sleep is additionally clamped so a hostile
+#: or far-future reset can never park the sync indefinitely.
 _MAX_RATE_WINDOWS = 5
 
 #: Listing-completeness passes (issue #65 AC1): the window is walked at least
@@ -769,8 +778,8 @@ def _assert_repository_readable(source: GitHubSource, repo: str) -> None:
     if readable is not True:
         raise SyncError(
             f"repository {repo} is not readable: every requested item"
-            " answered HTTP 404 (the repository may be private, renamed,"
-            " or unreachable)"
+            " answered HTTP 404/410 (the repository may be private,"
+            " renamed, or unreachable)"
         )
 
 
@@ -1022,7 +1031,30 @@ def _retry_torn_pending(
              links, links_incomplete, pr_commits) = _resolve_children(
                 source, row, item_kind(row), include_patches,
             )
-        except GitHubError:
+        except GitHubError as exc:
+            # The debt stays pending for the next run, but the failure is
+            # never silent (PR #76 review PRR-004): one fetch_log row with
+            # the real status names the fault, and last_error keeps the
+            # readiness verdict from reading clean while every retry of the
+            # owed number is failing (transport, permission, rate-limit and
+            # schema faults alike — a credential loss must not look like a
+            # healthy sync).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                log_fetch(
+                    conn, repo, "item", str(n),
+                    note=f"torn retry failed: {exc}",
+                    status=getattr(exc, "status", None),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            set_last_error(conn, repo, _error_text(exc))
+            # set_last_error's upsert opens an implicit transaction; commit
+            # it here or the next write_pending (BEGIN IMMEDIATE) fails
+            # with "cannot start a transaction within a transaction".
+            conn.commit()
             continue
         pull_ts = (
             pull_raw.get("updated_at") if isinstance(pull_raw, dict) else None
@@ -1054,6 +1086,15 @@ def _retry_torn_pending(
         except Exception:
             conn.rollback()
             raise
+        # A resolved torn item is as stored as any listing-ingested item,
+        # so it records the same replayable bundle (PR #76 review PRR-011:
+        # without it events.jsonl omits a row the store contains and replay
+        # cannot reproduce the corpus).
+        _write_item_bundle(
+            jsonl_handle, n, row, pull_raw,
+            issue_comments, review_comments, reviews, files, timeline,
+            links, links_incomplete, pr_commits, children_complete,
+        )
         clear_pending(conn, repo, [n], "torn")
         seen_numbers.add(n)
         ingested += 1
@@ -1147,7 +1188,15 @@ def _deletion_pass(
         checker, candidates, _deletion_corroborator(seen_numbers, candidates)
     )
     if not isinstance(verdicts, dict):
-        return
+        # A non-dict answer is a FAILED probe, not a pass (PR #76 review
+        # PRR-015): the durable candidates written above stay pending for
+        # the next run, and the run records the failure exactly like any
+        # other probe fault instead of finishing exit-0 with no verdict
+        # while last_full_sync_at keeps moving on a later incremental run.
+        raise SyncError(
+            f"deletion oracle for {repo} returned a non-dict answer"
+            f" ({len(candidates)} candidates remain pending)"
+        )
     allowed = set(candidates)
     clean: dict[int, str] = {}
     for n, v in verdicts.items():
@@ -1187,6 +1236,61 @@ def _write_jsonl(handle: TextIO | None, resource: str, payload: object) -> None:
     handle.write(json.dumps({"resource": resource, "payload": payload}, ensure_ascii=False))
     handle.write("\n")
     handle.flush()
+
+
+def _write_item_bundle(
+    handle: TextIO | None,
+    number: int,
+    list_raw: dict,
+    pull_raw: object,
+    issue_comments: object,
+    review_comments: object,
+    reviews: object,
+    files: object,
+    timeline: object,
+    links: object,
+    links_incomplete: object,
+    pr_commits: object,
+    children_complete: object,
+) -> None:
+    """One replayable item_bundle for an ingested item — the exact payloads
+    ingest saw, written by BOTH the listing loop and the torn-pending retry
+    so replay reproduces every stored row (issue #23/#25; PR #76 review
+    PRR-011: a resolved torn item missing from events.jsonl would make the
+    replay corpus disagree with the store). A pull payload without its own
+    number (GraphQL-shaped) is stamped on the bundle copy only — the raw
+    dicts stay untouched so raw_json reproduces byte-identically.
+    """
+    pull_for_bundle = pull_raw
+    if isinstance(pull_for_bundle, dict) and "number" not in pull_for_bundle:
+        pull_for_bundle = {**pull_for_bundle, "number": number}
+    _write_jsonl(
+        handle,
+        "item_bundle",
+        {
+            "number": number,
+            "item": list_raw,
+            "pull": pull_for_bundle,
+            "issue_comments": issue_comments,
+            "review_comments": review_comments,
+            "reviews": reviews,
+            "files": files,
+            "timeline": timeline,
+            # v10 sections (issue #27): the exact link and commit payloads
+            # ingest saw, with the same presence semantics (None = never
+            # carried) so replay reproduces the store.
+            "links": links,
+            "links_incomplete": links_incomplete,
+            "pr_commits": pr_commits,
+            # The exact completeness map ingest saw (issue #25): replay
+            # applies it verbatim so it can never fabricate tombstones the
+            # original run suppressed. Pre-#25 bundles lack the key; the
+            # reader fails them closed.
+            "children_complete": children_complete,
+            "gone": False,
+            "gone_status": None,
+        },
+    )
 
 
 def _ensure_state_row(
@@ -1274,6 +1378,18 @@ def _probe_failed_key(source: GitHubSource) -> str:
     )
 
 
+def _clear_probe_failures(conn: sqlite3.Connection) -> None:
+    """Drop EVERY capability-probe failure marker on a successful probe.
+
+    status.coverage counts every non-empty `capability_probe_failed:%` row,
+    so clearing only this host+version's key would leave a superseded
+    gh-version key reporting failure forever after an upgrade — the count
+    the code comment promises is "never cumulative" (PR #76 review
+    PRR-033). The store is local to one machine, so one success proves the
+    host recovered for every key it ever wrote."""
+    conn.execute("DELETE FROM meta WHERE key LIKE 'capability_probe_failed:%'")
+
+
 def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: str) -> bool:
     """Hydrate or run the capability probe for sources that support it
     (issue #23). Returns True when the latest probe FAILED (the run then
@@ -1314,7 +1430,7 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
             # hand the per-item loop a connection already in a transaction,
             # and its BEGIN IMMEDIATE would fail with "cannot start a
             # transaction within a transaction".
-            set_meta(conn, _probe_failed_key(source), "")
+            _clear_probe_failures(conn)
             conn.commit()
             return probe_failed
         except ValueError:
@@ -1327,8 +1443,10 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
             log_fetch(conn, repo, "graphql_probe", None, note=f"probe failed: {exc}")
             # The LATEST probe state, so status.coverage reads recovery-safe
             # (a later successful probe clears it) — issue #65 AC9: the
-            # failure is reported, not only logged.
-            set_meta(conn, _probe_failed_key(source), str(exc))
+            # failure is reported, not only logged. The TEXT is bounded
+            # through _error_text like last_error (PR #76 review PRR-046):
+            # raw gh stderr must not land unbounded in the meta table.
+            set_meta(conn, _probe_failed_key(source), _error_text(exc))
             conn.commit()
         except Exception:
             conn.rollback()
@@ -1336,7 +1454,7 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
         return True
     attach(caps)
     # A successful probe clears the latest-failure state (recovery-safe).
-    set_meta(conn, _probe_failed_key(source), "")
+    _clear_probe_failures(conn)
     set_meta(
         conn,
         key,
@@ -1441,6 +1559,17 @@ def sync_repo(
                     # silently skip everything older than it.
                     since = floor
         pending_at_start = bool(row is not None and row["full_sync_pending"])
+        if numbers is None and pending_at_start and since is not None:
+            # An unfinished full sync completes as a FULL sync (issue #66
+            # AC12/AC13 on the resumed path; PR #76 review PRR-013): the
+            # run re-walks from the beginning instead of the watermark
+            # tail, so the deletion oracle's absence derivation sees the
+            # whole corpus. A tail walk's `seen` set cannot distinguish
+            # "not yet listed this run" from "gone upstream", so finishing
+            # on the tail would either skip the oracle (certifying a full
+            # sync that never derived deletions) or fabricate candidates.
+            # The from-the-beginning walk subsumes any recovery floor.
+            since = None
         if numbers is not None:
             # Targeted refresh (issue #23): never starts or completes a full
             # sync, and the deletion oracle never runs. A corpus that has
@@ -1690,6 +1819,27 @@ def sync_repo(
                                 # mark applies to every live 404/410
                                 # observation, the distinct-item count moves
                                 # once per number.
+                                #
+                                # Repository reachability decides whether
+                                # this per-item verdict is real (issue #66
+                                # AC5 extended to the listing walk, PR #76
+                                # review PRR-010): a repository that became
+                                # unreadable between the served listing page
+                                # and this fetch would otherwise fabricate
+                                # a deletion for every remaining item while
+                                # the run reports success. ONE probe per
+                                # 404/410 decides it — a probe passed now
+                                # keeps the mark, an unreadable repository
+                                # fails the run before anything is marked.
+                                # A source with no probe read keeps the
+                                # per-item verdict (test fakes; every
+                                # shipped source has the probe —
+                                # GraphQLSource inherits it from
+                                # GhApiSource).
+                                if callable(
+                                    getattr(source, "probe_repository", None)
+                                ):
+                                    _assert_repository_readable(source, repo)
                                 marked = _ingest_and_mark_gone(
                                     conn, repo, list_raw, number, exc.status,
                                     include_patches=include_patches,
@@ -1724,6 +1874,28 @@ def sync_repo(
                             isinstance(pull_ts, str) and isinstance(list_ts, str)
                             and pull_ts > list_ts
                         ):
+                            # The store may already hold state at least as
+                            # new as the pull payload — this run's pending
+                            # retry resolved it, or an earlier run did — and
+                            # the listing row in hand is simply stale. The
+                            # stale row must not regress the stored row, and
+                            # there is no obligation left to record: the
+                            # pending set exists to bring the STORE to
+                            # pull-freshness, which it already is (PR #76
+                            # review PRR-013's resumed-full re-walk makes
+                            # a resolved item re-encounter its own stale
+                            # listing row inside one run).
+                            stored_row = conn.execute(
+                                "SELECT updated_at FROM items"
+                                " WHERE repo = ? AND number = ?",
+                                (repo, number),
+                            ).fetchone()
+                            stored_ts = (
+                                stored_row["updated_at"] if stored_row else None
+                            )
+                            if isinstance(stored_ts, str) and stored_ts >= pull_ts:
+                                last_number = number
+                                continue
                             refreshed = _resolve_torn_row(source, list_raw, pull_ts)
                             if refreshed is None:
                                 # The listing never caught up: skip the item,
@@ -1882,41 +2054,14 @@ def sync_repo(
                         # One replayable item_bundle per ingested item
                         # (issue #23): the bundle carries the owning number
                         # and the exact section lists ingest saw, so a replay
-                        # reproduces the store row for row. A pull payload
-                        # without its own number (GraphQL-shaped) is stamped
-                        # on the bundle copy only - the raw dicts stay
-                        # untouched so raw_json reproduces byte-identically.
-                        pull_for_bundle = pull_raw
-                        if isinstance(pull_for_bundle, dict) and "number" not in pull_for_bundle:
-                            pull_for_bundle = {**pull_for_bundle, "number": number}
-                        _write_jsonl(
-                            jsonl_handle,
-                            "item_bundle",
-                            {
-                                "number": number,
-                                "item": list_raw,
-                                "pull": pull_for_bundle,
-                                "issue_comments": issue_comments,
-                                "review_comments": review_comments,
-                                "reviews": reviews,
-                                "files": files,
-                                "timeline": timeline,
-                                # v10 sections (issue #27): the exact link
-                                # and commit payloads ingest saw, with the
-                                # same presence semantics (None = never
-                                # carried) so replay reproduces the store.
-                                "links": links,
-                                "links_incomplete": links_incomplete,
-                                "pr_commits": pr_commits,
-                                # The exact completeness map ingest saw
-                                # (issue #25): replay applies it verbatim so
-                                # it can never fabricate tombstones the
-                                # original run suppressed. Pre-#25 bundles
-                                # lack the key; the reader fails them closed.
-                                "children_complete": children_complete,
-                                "gone": False,
-                                "gone_status": None,
-                            },
+                        # reproduces the store row for row — the shared
+                        # writer both ingest paths use (PR #76 review
+                        # PRR-011 keeps the torn-pending path on it too).
+                        _write_item_bundle(
+                            jsonl_handle, number, list_raw, pull_raw,
+                            issue_comments, review_comments, reviews, files,
+                            timeline, links, links_incomplete, pr_commits,
+                            children_complete,
                         )
                 # Pass-loop control (issue #65 AC1): this pass is done. A
                 # targeted refresh is one walk and never re-drains; otherwise

@@ -108,6 +108,17 @@ class GhApiSource:
             raise GitHubTransportError(
                 f"gh api timed out after {GH_TIMEOUT_S}s: {path}"
             ) from exc
+        except OSError as exc:
+            # Every OTHER launch failure — a non-executable file
+            # (PermissionError / EACCES on POSIX, WinError 193 on
+            # Windows), ENOEXEC, a vanished binary between check and exec —
+            # is still a TRANSPORT failure (PR #76 review PRR-021): the
+            # typed class is what carries it into the degradation ladder,
+            # and a raw OSError bypasses GitHubError entirely. FileNotFoundError
+            # above keeps its specific message.
+            raise GitHubTransportError(
+                f"gh CLI could not be launched: {exc}"
+            ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api failed").strip()
             exc = GitHubError(err, status=_status_from_stderr(err))

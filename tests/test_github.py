@@ -203,6 +203,46 @@ class TransportTypingTests(unittest.TestCase):
             "a rate window is a retry, never a degradation",
         )
 
+    def test_401_and_404_are_degradable_statuses(self) -> None:
+        """The documented degradable set is 401/403/404 (issue #65 AC3,
+        README): only 403 had a positive test, so removing 401 or 404 from
+        `_degradable_error` passed the whole suite (PR #76 review PRR-025).
+        A bad credential (401) or a moved endpoint (404) must degrade to
+        REST, not abort the run."""
+        from zaxbygraph.sync import _degradable_error
+
+        for status in (401, 404):
+            self.assertTrue(
+                _degradable_error(GitHubError(f"gh: HTTP {status}", status=status)),
+                f"HTTP {status} is a documented degradable status",
+            )
+
+    def test_timeout_is_typed_on_both_paths(self) -> None:
+        """A hung `gh` (TimeoutExpired) must be GitHubTransportError on BOTH
+        the REST and GraphQL paths — the launch-failure tests never reach
+        the timeout handler, so re-typing it to a plain GitHubError passed
+        the suite (PR #76 review PRR-026)."""
+        import subprocess as _sp
+        from unittest.mock import patch as _patch
+
+        src = GhApiSource("acme", "forgegate")
+        with _patch(
+            "zaxbygraph.github.subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["gh"], timeout=1),
+        ):
+            with self.assertRaises(GitHubTransportError):
+                src._api("repos/acme/forgegate")
+
+        from zaxbygraph.graphql import GraphQLSource
+
+        gql = GraphQLSource("acme", "forgegate")
+        with _patch(
+            "zaxbygraph.graphql.subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["gh"], timeout=1),
+        ):
+            with self.assertRaises(GitHubTransportError):
+                gql._graphql("query { viewer { login } }")
+
 
 if __name__ == "__main__":
     unittest.main()

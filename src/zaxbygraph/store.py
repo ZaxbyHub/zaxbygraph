@@ -1015,9 +1015,13 @@ def rebuild_edges(
     # the item's rows (written by the caller before this function) survive
     # and no owned edge has been deleted yet, so the item's edges can never
     # be left half-deleted — records ONE fetch_log row naming the fault, and
-    # returns None so the caller continues with the surviving edges. A
-    # sqlite3 storage fault is NOT contained: it propagates and fails the
-    # run, per the report-don't-swallow invariant.
+    # returns None so the caller can skip the replacement entirely: a
+    # partial extraction is not authoritative, and replacing with it would
+    # retract the faulted stream's stored evidence under a clean verdict
+    # (PR #76 review PRR-005). A sqlite3 storage fault is NOT contained: it
+    # propagates and fails the run, per the report-don't-swallow invariant.
+    faulted: list[str] = []
+
     def contained(label: str, fn, *args):
         conn.execute("SAVEPOINT extract")
         try:
@@ -1033,6 +1037,7 @@ def rebuild_edges(
                 conn, repo, "item", str(number),
                 note=f"contained extraction fault in {label}: {exc}",
             )
+            faulted.append(label)
             return None
 
     collected: list[tuple] = []
@@ -1159,6 +1164,26 @@ def rebuild_edges(
     # Every extraction is contained above; only now, with the full edge set
     # in hand, are the owned edges replaced (issue #66 AC2): a contained
     # fault can never leave this item's edges half-deleted.
+    if faulted:
+        prior_owned = conn.execute(
+            "SELECT 1 FROM edges WHERE repo = ? AND src_type = 'item'"
+            " AND src_id = ? AND source NOT IN ('timeline','closing_ref','link')"
+            " LIMIT 1",
+            (repo, str(number)),
+        ).fetchone()
+        if prior_owned:
+            # A faulted re-ingest of an item that ALREADY holds owned edges
+            # changes nothing (PR #76 review PRR-005): delete-and-insert a
+            # partial set would retract the faulted stream's stored evidence
+            # under a clean verdict, and the healthy streams' new edges
+            # arrive on the next fault-free re-ingest. The fetch_log row
+            # recorded above names the fault.
+            return
+        # No prior owned edges: nothing to lose, so the healthy streams
+        # land and the faulted stream's part stays absent — the containment
+        # contract the extraction-fault tests pin (issue #66 AC2: the
+        # faulted comment's edges never appear, the item's own and the
+        # healthy sibling's do).
     delete_owned_edges(conn, repo, number)
     # GitHub-reported links replace/union per connection BEFORE the keyword
     # edges insert (issue #27): the link stream's own exemption keeps a
@@ -1176,11 +1201,12 @@ def bump_watermark(conn: sqlite3.Connection, repo: str, updated_at: str | None) 
     nxt = current
     if updated_at and (current is None or updated_at > current):
         nxt = updated_at
-    # An unresolved deletion pass keeps its recorded error (issue #66 AC4):
-    # the per-item bump runs on every committed item, so clearing
-    # unconditionally would launder a failed full sync into a clean verdict
-    # before any finalizer could see it. The durable sync_pending set is the
-    # evidence; the EXISTS is an index seek on its primary key.
+    # An unresolved DURABLE OBLIGATION keeps its recorded error (issue #66
+    # AC4 for the deletion pass; PR #76 review PRR-003/PRR-004 for the torn
+    # retry): the per-item bump runs on every committed item, so clearing
+    # unconditionally would launder a failed pass or retry into a clean
+    # verdict before any finalizer could see it. ANY open sync_pending row
+    # is the evidence; the EXISTS is an index seek on its primary key.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")}
     if "number" in cols:
         conn.execute(
@@ -1190,8 +1216,7 @@ def bump_watermark(conn: sqlite3.Connection, repo: str, updated_at: str | None) 
             ON CONFLICT(repo) DO UPDATE SET
                 issues_since = excluded.issues_since,
                 last_error = CASE WHEN EXISTS (
-                    SELECT 1 FROM sync_pending
-                    WHERE repo = ? AND reason = 'deletion'
+                    SELECT 1 FROM sync_pending WHERE repo = ?
                 ) THEN last_error ELSE NULL END
             """,
             (repo, nxt, repo),
@@ -1356,34 +1381,36 @@ def mark_sync_finished(
     ingested NOTHING (ingested_count == 0) leaves a previous `last_error`
     standing: a no-op refresh must not launder a failed sync's error into a
     clean readiness verdict (PR #37 review). Nor does a targeted run that
-    DID ingest, while a deletion pass is still open — the pending set, not
-    the ingest count, is what makes the previous error true (issue #66 AC4).
+    DID ingest, while a durable obligation (a torn or deletion pending row)
+    is still open — the pending set, not the ingest count, is what makes
+    the previous error true (issue #66 AC4; PR #76 review PRR-003).
 
     The rate-limit columns carry the window this run slept through (NULL when
     it saw none), verbatim as the source reported it (issue #5 AC4).
     """
     now = utcnow()
     conn.execute("INSERT OR IGNORE INTO sync_state(repo) VALUES (?)", (repo,))
-    # An unresolved deletion pass keeps its marker AND its error (issue #66
-    # AC4): a run that did not complete the pass — a plain incremental run
-    # never runs it, and a targeted refresh never runs it either — must not
-    # launder a failed full sync into a clean readiness verdict. The durable
-    # sync_pending set is the evidence, consulted by BOTH finish paths so a
-    # `sync --numbers` run that ingests one item cannot erase the error a
-    # failed deletion pass recorded. A pre-v12 store has no table and reads
-    # as nothing pending.
+    # An unresolved DURABLE OBLIGATION — any sync_pending row, torn or
+    # deletion — keeps the incomplete marker AND the error (issue #66 AC4
+    # for the deletion pass; PR #76 review PRR-003 for the torn retry): a
+    # run that leaves an owed number behind must not certify a clean
+    # readiness verdict, or a listed item the store never ingested would
+    # read as complete. The pending set is the evidence, consulted by BOTH
+    # finish paths so a `sync --numbers` run that ingests one item cannot
+    # erase the error either obligation recorded. A pre-v12 store has no
+    # table and reads as nothing pending.
     cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")}
-    deletion_open = 0
+    pending_open = 0
     if "number" in cols:
-        deletion_open = conn.execute(
-            "SELECT COUNT(*) FROM sync_pending WHERE repo = ? AND reason = 'deletion'",
+        pending_open = conn.execute(
+            "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
             (repo,),
         ).fetchone()[0]
     if targeted:
         conn.execute(
             """
             UPDATE sync_state SET
-                last_error = CASE WHEN :ingested > 0 AND :deletion_open = 0
+                last_error = CASE WHEN :ingested > 0 AND :pending_open = 0
                             THEN NULL ELSE last_error END,
                 rate_limit_remaining = :rate_remaining,
                 rate_limit_reset_at = :rate_reset_at
@@ -1391,24 +1418,31 @@ def mark_sync_finished(
             """,
             {
                 "ingested": ingested_count,
-                "deletion_open": deletion_open,
+                "pending_open": pending_open,
                 "repo": repo,
                 "rate_remaining": rate_limit_remaining,
                 "rate_reset_at": rate_limit_reset_at,
             },
         )
         return
-    # (the non-targeted UPDATE below carries :deletion_open)
+    # (the non-targeted UPDATE below carries :pending_open)
+    #
+    # The freshness stamps and the incomplete marker move TOGETHER (PR #76
+    # review PRR-014): the completion stamp may only advance on a finish
+    # that actually discharges every open obligation, never from the
+    # pre-update flag while the same statement withholds that flag.
     conn.execute(
         """
         UPDATE sync_state SET
-            last_full_sync_at = CASE WHEN full_sync_pending = 1
+            last_full_sync_at = CASE WHEN :pending_open = 0
+                                AND full_sync_pending = 1
                                 THEN :now ELSE last_full_sync_at END,
-            last_incr_sync_at = CASE WHEN full_sync_pending = 0
+            last_incr_sync_at = CASE WHEN :pending_open = 0
+                                AND full_sync_pending = 0
                                 THEN :now ELSE last_incr_sync_at END,
-            full_sync_pending = CASE WHEN :deletion_open > 0
-                                THEN full_sync_pending ELSE 0 END,
-            last_error = CASE WHEN :deletion_open > 0
+            full_sync_pending = CASE WHEN :pending_open > 0
+                                THEN 1 ELSE 0 END,
+            last_error = CASE WHEN :pending_open > 0
                         THEN last_error ELSE NULL END,
             rate_limit_remaining = :rate_remaining,
             rate_limit_reset_at = :rate_reset_at
@@ -1417,7 +1451,7 @@ def mark_sync_finished(
         {
             "now": now,
             "repo": repo,
-            "deletion_open": deletion_open,
+            "pending_open": pending_open,
             "rate_remaining": rate_limit_remaining,
             "rate_reset_at": rate_limit_reset_at,
         },

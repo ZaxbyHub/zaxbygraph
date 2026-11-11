@@ -40,7 +40,7 @@ PROBES = [
     (
         "targeted finalizer consults the pending set",
         "src/zaxbygraph/store.py",
-        "last_error = CASE WHEN :ingested > 0 AND :deletion_open = 0\n"
+        "last_error = CASE WHEN :ingested > 0 AND :pending_open = 0\n"
         "                            THEN NULL ELSE last_error END,",
         "last_error = CASE WHEN :ingested > 0 THEN NULL ELSE last_error END,",
         1,
@@ -54,7 +54,7 @@ PROBES = [
         "src/zaxbygraph/github.py",
         "raise GitHubTransportError(",
         "raise GitHubError(",
-        2,  # the launch site and the timeout site
+        3,  # the launch site, the timeout site, and the OSError catch-all
         [
             "tests/test_github.py::TransportTypingTests::"
             "test_launch_failure_is_typed_on_the_rest_path",
@@ -65,7 +65,7 @@ PROBES = [
         "src/zaxbygraph/graphql.py",
         "raise GitHubTransportError(",
         "raise GitHubError(",
-        2,  # the launch site and the timeout site
+        3,  # the launch site, the timeout site, and the OSError catch-all
         [
             "tests/test_github.py::TransportTypingTests::"
             "test_launch_failure_is_typed_on_the_graphql_path",
@@ -141,6 +141,18 @@ def run(selectors: list[str]) -> int:
 
 
 def main() -> int:
+    # These probes shell out to pytest: without it every revert would
+    # "kill" on a missing-module exit, which is how a no-pytest run once
+    # reported false KILLs (PR #76 review PRR-002). Fail closed with a
+    # named reason instead.
+    import importlib.util
+
+    if importlib.util.find_spec("pytest") is None:
+        print(
+            "RESULT: BLOCKED — pytest is not installed; the probes need it "
+            "to run the pinned tests (pip install pytest)"
+        )
+        return 2
     problems: list[str] = []
     for label, rel, shipped, reverted, occurrences, selectors in PROBES:
         path = ROOT / rel

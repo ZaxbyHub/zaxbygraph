@@ -49,10 +49,23 @@ class _MovingOrderTransport:
     served): ``update`` bumps a delivered item's updated_at (it moves to the
     tail); ``delete`` removes a delivered item; ``tie-swap`` flips the
     relative order of two items sharing an updated_at across the page
-    boundary. All three shift the asc order so the next page's window skips
-    a live item -- the update at the opening boundary (fire_after=2), the
-    delete and the tie-swap after page 2 (fire_after=3). Children/releases
-    answer empty; anything else is unexpected."""
+    boundary. All three shift the asc order so a later page's fixed-offset
+    window can drop a live item.
+
+    ``fire_after`` is a 1-based LISTING-REQUEST index, and which request
+    that is depends on the revision (PR #76 review PRR-028: the old text
+    claimed "after page 2 (fire_after=3)" while the test passes 4):
+    at base there is one request per page, so request 2 is page 2's fetch
+    and a 3-page walk has no request 4 at all; at head every full page is
+    re-read once for boundary verification, so request 2 is page 1's
+    re-read and request 4 is page 2's re-read -- between page 2's fetch
+    and page 3's. The update therefore uses fire_after=2 (the opening
+    boundary under both layouts: base skips it on the next page's window,
+    head sees it on the re-read and escalates) and the delete and
+    tie-swap use fire_after=4, which exists only under the head layout;
+    each leg asserts ``transport.mutated`` so a hazard that never fired
+    cannot pass. Children/releases answer empty; anything else is
+    unexpected."""
 
     def __init__(self, count: int = 250, hazard: str = "update",
                  fire_after: int = 2, move_number: int = 50,
