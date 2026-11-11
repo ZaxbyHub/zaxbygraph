@@ -787,7 +787,11 @@ def upsert_item_row(
             v7_values["author_association"],
             v7_values["merged_by"],
             _dumps(raw),
-            branch_token if has_branch else None,
+            # The bind list must agree with the statement: branch_ph is
+            # empty when the store predates the column, so the VALUE is
+            # dropped here too (supplying it unconditionally is a
+            # ProgrammingError on a pre-v12 items table).
+            *((branch_token,) if has_branch else ()),
         ),
     )
 

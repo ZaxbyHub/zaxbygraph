@@ -1731,6 +1731,49 @@ class IntermediateV12ShapeTests(unittest.TestCase):
         )
 
 
+class PreBranchTokenFallbackTests(unittest.TestCase):
+    def test_upsert_item_row_without_the_branch_token_column(self) -> None:
+        """A store whose items table predates `branch_token` is the
+        shape `upsert_item_row`'s `has_branch=False` path claims to
+        support ("a store opened before it keeps working without the
+        token"): the statement drops the placeholder, so the value must
+        be dropped from the bind tuple too. Supplying it
+        unconditionally is a ProgrammingError — 39 binds for 38
+        placeholders. Killed by: reverting to `branch_token if
+        has_branch else None`."""
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / "history.db"
+        conn = connect(path)
+        self.addCleanup(conn.close)
+        init_schema(conn)
+        # Reshape to the pre-v12 items table: the partial index on the
+        # column must go first (SQLite refuses to drop an indexed
+        # column), then the column itself.
+        conn.execute("DROP INDEX IF EXISTS idx_items_repo_branch")
+        conn.execute("ALTER TABLE items DROP COLUMN branch_token")
+        conn.commit()
+        from zaxbygraph.store import upsert_item_row
+
+        raw = {
+            "id": 10_001,
+            "number": 1, "title": "t", "body": "b", "state": "open",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:01:00Z",
+            "user": {"login": "alice"},
+        }
+        upsert_item_row(conn, "acme/forgegate", raw, "issue")
+        conn.commit()
+        row = conn.execute(
+            "SELECT number, title FROM items WHERE repo = ? AND number = 1",
+            ("acme/forgegate",),
+        ).fetchone()
+        self.assertIsNotNone(
+            row,
+            "a pre-v12 items table must still accept an upsert",
+        )
+
+
 
 if __name__ == "__main__":
     unittest.main()

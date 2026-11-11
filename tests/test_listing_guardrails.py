@@ -472,6 +472,11 @@ class ListingGuardrailTests(TempDBTest):
         result = sync_repo(self.conn, src, repo)
         self.assertIsNone(result["last_error"],
                           "a transport failure must degrade, not abort")
+        self.assertEqual(
+            result["source"], "rest (graphql unavailable)",
+            "the envelope names the degraded value exactly as README"
+            " documents it",
+        )
         self.assertEqual(len(_stored(self.conn, repo)), 3)
         self.assertEqual(src.bulk_calls, 1,
                          "the bulk call is tried once, then REST takes over")

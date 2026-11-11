@@ -1244,10 +1244,12 @@ class FeedbackRoundTests(TempDBTest):
     def test_source_name_reports_the_effective_source(self) -> None:
         """The result's `source` key names the source this run actually
         used (issue #65's run summary): a REST-built run says `rest` and
-        the default says `graphql`. (The degraded value
-        `rest (graphql unavailable)` is pinned separately by frozen C3;
-        this pin covers the source_name plumbing itself.) Killed by:
-        dropping `source_name` from sync_repo's result."""
+        the default says `graphql` — the exact strings, not just their
+        presence. (The third value, `rest (graphql unavailable)`, is pinned
+        by the transport-degradation guardrail in
+        tests/test_listing_guardrails.py; frozen C3 only matches
+        substrings.) Killed by: dropping `source_name` from sync_repo's
+        result."""
         src = _NumberedSource()
         src.add_issue(issue(5, title="five", updated_at=ts(50)))
         rest = sync_repo(self.conn, src, REPO, source_name="rest")
