@@ -1334,8 +1334,11 @@ class GraphQLSource(GhApiSource):
           as the base refusal — deleted since the listing, or a degraded
           response — so it raises rather than mass-marking.
         * **no witness available** (the all-gone window, where every listed
-          item is a candidate): ONE independent ``probe_repository()``
-          read decides — readable marks, unreadable raises.
+          item is a candidate): ONE independent ``probe_repository()`` read
+          per all-gone CHUNK decides — readable marks, unreadable raises.
+          The chunk is the evidentiary unit (the same 50 candidates are
+          being marked together), so a >50-item window costs ceil(n/50)
+          reads, never one read for the whole pass.
 
         The caller (sync) buffers every verdict and marks only after this
         returns, so any raise here marks nothing."""

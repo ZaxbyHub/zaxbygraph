@@ -80,6 +80,7 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
     "sync_pending": {
         "number": "v12. One row per number a run could NOT resolve, keyed (repo, number, reason): 'torn' for an unresolved listing/pull tear, 'deletion' for a deletion pass that did not complete. Written BEFORE the unresolved work is attempted, so any raise leaves it pending; a clean run of other items never clears it, and the advancing watermark can never seal it. Cleared when the retry resolves the number - including a 404/410, which resolves it as a deletion through the repository-read gate",
         "reason": "v12. 'torn' or 'deletion' - the two durable retry obligations. doctor --consolidate copies the table (it leads with (repo, number)), so an adopted corpus keeps the debts it owes",
+        "computed_at": "v12. When this obligation was FIRST recorded; it never moves (ON CONFLICT DO NOTHING), so a row pending for weeks says so",
     },
     "sync_state": {
         "fetch_source": "v11. The fetch source this store's profile deliberately uses (graphql/rest), stamped at listing-sync start; NULL = unset, the documented graphql default. The --max-age refresh re-reads it under the sync lock; consolidation adopts a post-v11 candidate's value, a pre-v11 candidate leaves it NULL",

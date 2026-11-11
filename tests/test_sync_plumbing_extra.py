@@ -1241,6 +1241,62 @@ class FeedbackRoundTests(TempDBTest):
             )
         self.assertEqual(captured.get("numbers"), [2, 3])
 
+    def test_source_name_reports_the_effective_source(self) -> None:
+        """The result's `source` key names the source this run actually
+        used (issue #65's run summary): a REST-built run says `rest`, the
+        default says `graphql`, and a GraphQL run that degraded says so.
+        Killed by: dropping `source_name` from sync_repo's result."""
+        src = _NumberedSource()
+        src.add_issue(issue(5, title="five", updated_at=ts(50)))
+        rest = sync_repo(self.conn, src, REPO, source_name="rest")
+        self.assertEqual(rest["source"], "rest")
+        graphql = sync_repo(self.conn, src, REPO, source_name="graphql")
+        self.assertEqual(graphql["source"], "graphql")
+        default = sync_repo(self.conn, src, REPO)
+        self.assertEqual(default["source"], "graphql",
+                         "an unstated source keeps the historical answer")
+
+    def test_explicit_mcp_source_stamps_the_profile(self) -> None:
+        """An explicit MCP `source` argument stamps the stored profile
+        exactly as the CLI's `--source` does; an omitted argument inherits
+        the recorded profile and never rewrites it (issue #48's rule, which
+        the MCP runner must honour too — README says the tool follows the
+        same rule)."""
+        from zaxbygraph import mcp_server
+
+        captured: dict = {}
+
+        def fake_sync_repo(conn, source, repo, **kw):
+            captured.update(kw)
+
+        fake_conn = unittest.mock.MagicMock()
+        fake_conn.execute.return_value.fetchone.return_value = {
+            "include_patches": 0, "fetch_source": None,
+        }
+        patches = (
+            patch.object(mcp_server, "sync_repo", side_effect=fake_sync_repo),
+            patch.object(mcp_server, "init_schema"),
+            patch.object(mcp_server, "connect", return_value=fake_conn),
+        )
+        with patches[0], patches[1], patches[2]:
+            mcp_server._default_sync_runner(
+                Path(self._td.name) / "x.db", REPO, source="rest"
+            )
+        self.assertEqual(captured.get("source_name"), "rest",
+                         "the run reports the source it used")
+        self.assertEqual(captured.get("fetch_source"), "rest",
+                         "an explicit source re-stamps the profile")
+
+        captured.clear()
+        with patches[0], patches[1], patches[2]:
+            mcp_server._default_sync_runner(
+                Path(self._td.name) / "x.db", REPO
+            )
+        self.assertEqual(captured.get("source_name"), "graphql",
+                         "an omitted source inherits the recorded profile")
+        self.assertIsNone(captured.get("fetch_source"),
+                          "an omitted source must never rewrite the stamp")
+
 
 if __name__ == "__main__":
     unittest.main()

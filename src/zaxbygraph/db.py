@@ -2108,6 +2108,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
         version = target
+    # v12 shape convergence for a store stamped 12 by an INTERMEDIATE build
+    # of this same unreleased slot: that build's CREATE TABLE IF NOT EXISTS
+    # created sync_pending WITHOUT computed_at, CREATE IF NOT EXISTS is a
+    # no-op on the table it finds, and the migration is skipped for an
+    # already-current version — so the column would never arrive and every
+    # write_pending would fail with "no column named computed_at". One
+    # guarded ALTER closes that. A released store never has this shape (v12
+    # ships with the column in both DDLs), so this is branch-local
+    # convergence rather than a schema slot, and it costs one PRAGMA per
+    # write-open.
+    pending_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")
+    }
+    if pending_cols and "computed_at" not in pending_cols:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE sync_pending ADD COLUMN computed_at TEXT")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

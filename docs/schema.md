@@ -330,7 +330,7 @@ Two boundaries:
 | --- | --- | --- |
 | `login` | TEXT | Primary key. |
 | `html_url` | TEXT | |
-| `is_bot` | INTEGER | v12. `1` when the actor is a bot: a login ending in `[bot]`, a REST payload `type: "Bot"`, a GraphQL `__typename: "Bot"`, or a login listed in the `ZAXBYGRAPH_BOT_LOGINS` environment variable (comma-separated, matched case-insensitively). **Never downgrades**: a later payload carrying no bot signal keeps the stored `1`, and `doctor --consolidate` takes `MAX` so adoption cannot un-mark a known bot. |
+| `is_bot` | INTEGER | v12. `1` when the actor is a bot: a login ending in `[bot]`, a REST payload `type: "Bot"`, a GraphQL `__typename: "Bot"`, or a login listed in the `ZAXBYGRAPH_BOT_LOGINS` environment variable (comma-separated, **exact literal match** — no patterns, no case folding; applied at sync time only, never by the v12 backfill). **Never downgrades**: a later payload carrying no bot signal keeps the stored `1`, and `doctor --consolidate` takes `MAX` so adoption cannot un-mark a known bot. |
 
 ## releases
 
@@ -757,6 +757,10 @@ the durable retry set, keyed `(repo, number, reason)`.
 | `reason` | TEXT | `torn` — the listing row stayed older than the
  pull payload after the bounded refresh; `deletion` — a deletion
  pass that did not complete. |
+| `computed_at` | TEXT | When this obligation was FIRST recorded
+ (issue #66); it never moves (`ON CONFLICT DO NOTHING`), so a row pending
+ for weeks says so. NULL only on a row written by an intermediate build of
+ this unreleased slot — `init_schema` converges that shape on open. |
 
 Written **before** the unresolved work is attempted, so any raise
 leaves every number pending for the next run; a clean run of *other*
