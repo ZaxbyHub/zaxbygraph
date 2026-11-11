@@ -88,7 +88,7 @@ guardrail_tests = len(re.findall(
         encoding="utf-8"
     )
 ))
-assert guardrail_tests == 13, guardrail_tests
+assert guardrail_tests == 14, guardrail_tests
 
 # The deferred-work scan runs HERE so the claim is the scanner's output,
 # not a hand-assertion (the review caught a hand-asserted count). The

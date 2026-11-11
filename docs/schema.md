@@ -428,8 +428,8 @@ deletion. The mechanism that does close it:
   is 4 passes; reaching it with unequal sets raises
   `listing_not_quiescent`, persists the recovery floor
   (`listing_floor`/`listing_floor_active`), keeps
-  `full_sync_pending`, and suppresses the clean finish — the run
-  never claims coverage it did not achieve.
+  `full_sync_pending`, and suppresses the clean finish — so, when the
+  cap trips, the run never claims coverage it did not achieve.
 - **the next run re-drains from the earlier of the floor and the
   watermark**, and a clean finish clears the floor. A `NULL` floor
   with the flag set is a full run's floor (re-drain from the

@@ -524,17 +524,20 @@ class PassTerminationTests(TempDBTest):
     def test_subset_termination_would_lose_a_live_item(self) -> None:
         """The walk ends on EXACT set equality, not on subset membership.
 
-        Scripted windows: pass 1 delivers {1..8}; pass 2 delivers {1..7} —
-        a strict subset, because live item 8 is skipped at a page
-        boundary; pass 3 re-walks cleanly and delivers {1..8} again.
+        Scripted windows: pass 1 delivers {1..7} — live item 8 was skipped
+        at a page boundary. Pass 2 delivers {1..6}, a STRICT subset of
+        pass 1 (item 7 is skipped too). Item 8 first appears in pass 3,
+        and pass 4 reproduces pass 3.
 
-        Under subset termination the run would stop after pass 2
-        ({1..7} is a subset of {1..8}) with live item 8 never stored and a
-        clean success reported. Exact equality sees the sets differ, walks
-        on, and stores it; pass 4 reproduces pass 3 and ends the run."""
+        Under subset termination the run stops after pass 2 ({1..6} is a
+        subset of {1..7}), the store holds {1..7}, and live item 8 — which
+        no earlier pass ever delivered — is missing while the run reports
+        success. That is the stored-set assertion below failing. Exact
+        equality sees the sets differ, walks on through pass 3, and stores
+        it; pass 4 reproduces pass 3 and ends the run with four walks."""
         repo = "acme/gw-subset"
         transport = _ScriptedWindowsTransport(
-            [list(range(1, 9)), list(range(1, 8)),
+            [list(range(1, 8)), list(range(1, 7)),
              list(range(1, 9)), list(range(1, 9))],
             repo,
         )
@@ -542,13 +545,42 @@ class PassTerminationTests(TempDBTest):
         self.assertIsNone(result["last_error"])
         self.assertEqual(
             _stored(self.conn, repo), set(range(1, 9)),
-            "the live item the second pass skipped must be stored — subset"
-            " termination would have stopped before it was delivered",
+            "the live item no earlier pass delivered must be stored —"
+            " subset termination stops at pass 2 with it missing",
         )
         self.assertEqual(
             transport.calls, 4,
-            "pass1, pass2 (a strict subset), pass3, pass4 (equals pass3):"
-            f" {transport.calls} walks",
+            "pass1, pass2 (a strict subset), pass3 (delivers 8), pass4"
+            f" (equals pass3): {transport.calls} walks",
+        )
+
+    def test_single_post_verification_recovery(self) -> None:
+        """The critic's requirement-5 case: an item skipped AFTER its
+        page's boundary verification (so no mismatch signal exists) is
+        NEW in the next pass, which forces another pass, and the union of
+        the passes is complete — the exact shape recorded as
+        `single-post-verification: new-in-pass2 ... another-pass-required
+        True union-missing []` in 06-critic-review.md's round-8 analysis.
+
+        Scripted windows: pass 1 delivers {1..7} (item 8 is the
+        post-verification skip), pass 2 delivers {1..8} — item 8 is new,
+        so the sets differ and the walk continues — pass 3 reproduces
+        pass 2 and ends the run."""
+        repo = "acme/gw-postver"
+        transport = _ScriptedWindowsTransport(
+            [list(range(1, 8)), list(range(1, 9)), list(range(1, 9))],
+            repo,
+        )
+        result = sync_repo(self.conn, _source(transport, repo), repo)
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(
+            _stored(self.conn, repo), set(range(1, 9)),
+            "the post-verification skip must be recovered by a later pass",
+        )
+        self.assertEqual(
+            transport.calls, 3,
+            "pass1 (skips 8), pass2 (delivers 8 — new, so another pass),"
+            f" pass3 (equals pass2): {transport.calls} walks",
         )
 
 
