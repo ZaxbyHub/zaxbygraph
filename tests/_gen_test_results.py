@@ -141,7 +141,7 @@ assert not deferred_hits, f"deferred-work markers: {deferred_hits}"
 # receipt check is RUN here, not asserted in prose. The local copy in
 # repro/ is byte-identical to the comment published on #64.
 _receipt_lines = [
-    line for line in (TRACE / "repro" / "anchor-v9-body.md")
+    line for line in (TRACE / "repro" / "anchor-v10-body.md")
     .read_text(encoding="utf-8").splitlines()
     if line.startswith("issue-tracer-checkpoint-v1 ")
 ]
@@ -348,15 +348,16 @@ out.append("- `PYTHONPATH=src bash repro/replay-all.sh` → 22/22 PASS (above)."
 out.append("- `repro-check.sh verify-checkpoint --slug")
 out.append("  65-66-67-workstream-a-sync-integrity` → exit 0; the manifest holds")
 out.append(f"  {manifest_rows} rows (22 CHECKPOINT + {amend_rows} AMEND across")
-out.append("  eight waves: the check-author strengthening, wave 7's")
-out.append("  implementation-driven re-freeze, and wave 8's C13 recovery leg).")
-out.append("- `repro-check.sh verify-anchor` against the published anchor v9")
-out.append("  (comment 6789451960 on #64; local copy")
-out.append("  `repro/anchor-v9-body.md`) → OK — **and this generator runs")
+out.append("  nine waves: the check-author strengthening, wave 7's")
+out.append("  implementation-driven re-freeze, wave 8's C13 recovery leg, and")
+out.append("  the swarm-pr-feedback round's three-file re-freeze).")
+out.append("- `repro-check.sh verify-anchor` against the published anchor v10")
+out.append("  (comment 6809481434 on #64; local copy")
+out.append("  `repro/anchor-v10-body.md`) → OK — **and this generator runs")
 out.append("  that check**, so the claim cannot go stale again. The")
-out.append("  superseded v8 and v7 receipts fail closed with `anchor")
-out.append("  manifest digest does not match` (v8 predates wave 8; v7")
-out.append("  predates wave 7).")
+out.append("  superseded v9, v8 and v7 receipts fail closed with `anchor")
+out.append("  manifest digest does not match` (v9 predates the feedback")
+out.append("  wave; v8 predates wave 8; v7 predates wave 7).")
 out.append(f"- Mutation probes: `python tests/test_mutation_sweep.py` → "
            f"{_sweep_passed}/{_sweep_mutants} OK (run by this generator);"
            f" `python tests/_probe_review_fixes.py` → {_probe_count}/{_probe_count}"
