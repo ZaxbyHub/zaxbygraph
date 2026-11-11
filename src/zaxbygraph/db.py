@@ -12,7 +12,7 @@ from zaxbygraph.extract import (
 )
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
@@ -1867,34 +1867,30 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                 return parsed, False
             return structured, True
 
+        # The payload reads STREAM (the plan's migration contract: "all
+        # reads stream"). The item cursor walks one row at a time, and each
+        # item's children come from an indexed per-number lookup, so the
+        # memory bound is one item's text rather than the whole corpus —
+        # the migration runs inside the write transaction and must not hold
+        # a large store's bodies in RAM while it does. Writes here touch
+        # only `edges`, never the table the cursor is scanning. The two
+        # CROSS-ITEM indexes (titles for the revert lookup, issue numbers
+        # for branch_ref) stay materialized: they are structured columns
+        # with no payloads, and the lookups they serve are random-access by
+        # design.
         items = conn.execute(
             "SELECT number, kind, title, body, head_ref, raw_json FROM items"
             " WHERE repo = ? ORDER BY number",
             (repo,),
-        ).fetchall()
-        comments = {}
-        for row in conn.execute(
-            "SELECT number, kind, github_id, author, body, raw_json FROM comments"
-            " WHERE repo = ? ORDER BY number, kind, github_id",
-            (repo,),
-        ):
-            comments.setdefault(int(row["number"]), []).append(row)
-        reviews = {}
-        for row in conn.execute(
-            "SELECT number, id, author, state, body, raw_json FROM reviews"
-            " WHERE repo = ? ORDER BY number, id",
-            (repo,),
-        ):
-            reviews.setdefault(int(row["number"]), []).append(row)
-        commits = {}
-        for row in conn.execute(
-            "SELECT number, sha, message FROM pr_commits WHERE repo = ?"
-            " ORDER BY number, sha",
-            (repo,),
-        ):
-            commits.setdefault(int(row["number"]), []).append(
-                {"sha": row["sha"], "message": row["message"]}
-            )
+        )
+
+        def _children(table: str, cols: str, order: str, item_number: int):
+            """That item's child rows, from the table's own item index."""
+            return conn.execute(
+                f"SELECT {cols} FROM {table} WHERE repo = ? AND number = ?"
+                f" ORDER BY {order}",
+                (repo, item_number),
+            ).fetchall()
 
         for item in items:
             number = int(item["number"])
@@ -1918,7 +1914,10 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                 raw = {**raw, "head_ref": item["head_ref"]}
             collected: list[tuple] = []
             collected.extend(_extract.edges_from_item(repo, raw))
-            for crow in comments.get(number, []):
+            for crow in _children(
+                "comments", "number, kind, github_id, author, body, raw_json",
+                "kind, github_id", number,
+            ):
                 craw, cmal = _payload(
                     crow["raw_json"],
                     {
@@ -1931,7 +1930,10 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                 collected.extend(
                     _extract.edges_from_comment(repo, number, craw)
                 )
-            for rrow in reviews.get(number, []):
+            for rrow in _children(
+                "reviews", "number, id, author, state, body, raw_json",
+                "id", number,
+            ):
                 rraw, rmal = _payload(
                     rrow["raw_json"],
                     {
@@ -1943,10 +1945,13 @@ def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
                     ("id",),
                 )
                 collected.extend(_extract.edges_from_review(repo, number, rraw))
-            if commits.get(number):
+            commit_rows = _children("pr_commits", "sha, message", "sha", number)
+            if commit_rows:
                 collected.extend(
                     _extract.edges_from_commit_messages(
-                        repo, number, commits[number]
+                        repo, number,
+                        [{"sha": r["sha"], "message": r["message"]}
+                         for r in commit_rows],
                     )
                 )
             collected.extend(
@@ -2026,6 +2031,7 @@ def migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
         " repo TEXT NOT NULL,"
         " number INTEGER NOT NULL,"
         " reason TEXT NOT NULL,"
+        " computed_at TEXT,"
         " PRIMARY KEY (repo, number, reason))"
     )
     state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}

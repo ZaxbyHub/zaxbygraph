@@ -85,7 +85,8 @@ and `graphql_probe_failed` is `true` when the capability probe could
 not introspect the host (the run fails OPEN on the full field set and
 reports it — a later successful probe clears it). Every run walks its
 listing window at least twice to prove coverage (see
-[Listing completeness](#listing-completeness-the-pass-cap-and-the-recovery-floor-issue-65))
+[Listing completeness](docs/schema.md#listing-completeness-the-pass-cap-and-the-recovery-floor-issue-65)
+in the schema reference — including the residual that bound cannot close)
 and `ingested` counts DISTINCT item numbers, not deliveries.
 
 A `sync` that states no `--source` and no `--include-patches` inherits
@@ -118,14 +119,15 @@ a bare `--repo OWNER/REPO` carries no host, so GitHub Enterprise users should
 sync from a checkout whose origin is the GHE URL rather than passing `--repo`
 by hand, or their store keys collide with github.com slugs).
 
-`ZAXBYGRAPH_BOT_LOGINS` (comma-separated logins, matched
-case-insensitively) adds actors to the `actors.is_bot` verdict the
-sync derives from payloads — a login ending in `[bot]`, a REST
-`type: "Bot"`, or a GraphQL `__typename: "Bot"` is already marked
-without it. Read at sync and at migration time only: adding a login
-later needs a re-sync of an item authored by it, because a stored
-`is_bot = 1` is never downgraded and the variable is not re-read on
-later runs.
+`ZAXBYGRAPH_BOT_LOGINS` (comma-separated **exact** logins, matched
+literally — no patterns, no case folding) adds actors to the
+`actors.is_bot` verdict the sync derives from payloads: a login ending
+in `[bot]`, a REST `type: "Bot"`, or a GraphQL `__typename: "Bot"` is
+already marked without it. Read at **sync time only**: the schema-v12
+backfill covers the payload signals alone, because the configured list is
+not reconstructible from stored JSON — a login added to the variable
+later needs a re-sync of an item authored by it, and a stored
+`is_bot = 1` is never downgraded.
 
 Reads never create anything: when no corpus exists for the resolved repo they
 exit **3** with the resolved path and the exact `zaxbygraph sync --repo <slug>`

@@ -20,7 +20,7 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced/reopened events), 'closing_ref' (PR closingIssuesReferences), 'link' (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections; replaced per connection when fetched complete AND faithfully reported - a node that fails to parse, a carried plural null, or a list on a singular connection is malformed, not a removal, so it is union-only like an overflow), 'payload' (structured fields). Part of the unique key except for rel='closes', where GitHub-reported streams merge into one row (closing_ref preferred when present, each reporting stream's evidence kept)",
     },
     "actors": {
-        "is_bot": "v12. 1 when the actor is a bot: a login ending in [bot], a REST payload type 'Bot', a GraphQL __typename 'Bot', or a login listed in the ZAXBYGRAPH_BOT_LOGINS environment variable (comma-separated, matched case-insensitively). NEVER downgrades - a later payload that carries no bot signal keeps the stored 1, and doctor --consolidate takes MAX so adoption cannot un-mark a known bot",
+        "is_bot": "v12. 1 when the actor is a bot: a login ending in [bot], a REST payload type 'Bot', a GraphQL __typename 'Bot', or a login listed in the ZAXBYGRAPH_BOT_LOGINS environment variable (comma-separated, EXACT literal match - no patterns, no case folding; applied at sync time only, never by the v12 backfill). NEVER downgrades - a later payload that carries no bot signal keeps the stored 1, and doctor --consolidate takes MAX so adoption cannot un-mark a known bot",
     },
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",

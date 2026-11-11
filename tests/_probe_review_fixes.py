@@ -109,6 +109,25 @@ PROBES = [
             "test_torn_pending_number_gone_resolves_the_obligation",
         ],
     ),
+    (
+        "the PRODUCTION oracle consults the corroborator",
+        "src/zaxbygraph/graphql.py",
+        "if callable(corroborator):",
+        "if False and callable(corroborator):  # PROBE: base behaviour",
+        1,
+        ["tests/test_deletion_oracle.py::RealOracleTruthTableTests"],
+    ),
+    (
+        "a later run retries only the pending set",
+        "src/zaxbygraph/sync.py",
+        "                    derive_new=started_full,",
+        "                    derive_new=True,  # PROBE: re-derive from absence",
+        1,
+        [
+            "tests/test_deletion_oracle.py::PlainRunRetryShapeTests::"
+            "test_plain_run_never_derives_candidates_from_window_absence",
+        ],
+    ),
 ]
 
 

@@ -1308,22 +1308,59 @@ class GraphQLSource(GhApiSource):
 
     # -- deletion oracle ----------------------------------------------------
 
-    def check_deleted(self, numbers: list[int]) -> dict[int, str]:
-        """Existence probe over stored numbers (issue #5 AC5).
+    def check_deleted(
+        self, numbers: list[int], corroborator=None
+    ) -> dict[int, str]:
+        """Existence probe over stored numbers — the ONE owner of chunking
+        and of the corroboration truth table (issue #5 AC5, issue #66 AC2).
 
         A number is reported deleted only when neither its issue nor its
         pullRequest node resolves. GraphQL cannot distinguish a transferred
         issue from a deleted one in this repo, so the verdict is always
         'deleted' here; sources with richer signals may report
-        'transferred'."""
+        'transferred'.
+
+        The truth table, per chunk:
+
+        * **no corroborator offered** (a one-argument call, or a caller
+          that passes None) — EXACTLY the base contract: a chunk that
+          resolves nothing raises, because an all-null answer cannot be
+          told apart from a repo-wide visibility change or a silently
+          degraded response.
+        * **a witness that resolves** corroborates a chunk that resolves
+          nothing: those candidates are genuinely gone, and the witness
+          itself never becomes a verdict.
+        * **a witness that resolves nothing** is the same evidentiary class
+          as the base refusal — deleted since the listing, or a degraded
+          response — so it raises rather than mass-marking.
+        * **no witness available** (the all-gone window, where every listed
+          item is a candidate): ONE independent ``probe_repository()``
+          read decides — readable marks, unreadable raises.
+
+        The caller (sync) buffers every verdict and marks only after this
+        returns, so any raise here marks nothing."""
         gone: dict[int, str] = {}
         unique = sorted({int(n) for n in numbers})
         for start in range(0, len(unique), GRAPHQL_DELETED_PAGE):
             chunk = unique[start:start + GRAPHQL_DELETED_PAGE]
+            witness: int | None = None
+            if callable(corroborator):
+                offered = corroborator()
+                witness = int(offered) if offered is not None else None
             aliases: list[str] = []
             for n in chunk:
                 aliases.append(f"i{n}: issue(number: {n}) {{ number }}")
                 aliases.append(f"p{n}: pullRequest(number: {n}) {{ number }}")
+            if witness is not None and witness not in chunk:
+                # The witness rides the SAME query, so a degraded response
+                # cannot be mistaken for a dead witness (both would fail the
+                # same read, and the raise is the safe direction either way).
+                aliases.append(
+                    f"iw{witness}: issue(number: {witness}) {{ number }}"
+                )
+                aliases.append(
+                    f"pw{witness}: pullRequest(number: {witness}) {{ number }}"
+                )
             query = (
                 "query { rateLimit { remaining resetAt } "
                 f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
@@ -1333,18 +1370,51 @@ class GraphQLSource(GhApiSource):
             repo = payload.get("repository")
             if not isinstance(repo, dict):
                 raise GitHubError("unexpected graphql repository payload")
-            resolved = 0
-            for n in chunk:
-                if repo.get(f"i{n}") is not None or repo.get(f"p{n}") is not None:
-                    resolved += 1
-                else:
-                    gone[n] = "deleted"
-            if resolved == 0:
-                # A chunk where NOTHING resolves is indistinguishable from a
-                # repo-wide visibility change or a silently degraded
-                # response; refusing to mass-mark is the safe direction.
-                raise GitHubError(
-                    "deletion probe resolved no nodes for a whole chunk; "
-                    "refusing to mark items gone without corroboration"
+
+            def _resolves(n: int, _repo=repo) -> bool:
+                # Both alias shapes: a chunk member is queried as i{n}/p{n},
+                # a witness riding alongside as iw{n}/pw{n}.
+                return (
+                    _repo.get(f"i{n}") is not None
+                    or _repo.get(f"p{n}") is not None
+                    or _repo.get(f"iw{n}") is not None
+                    or _repo.get(f"pw{n}") is not None
                 )
+
+            resolved = sum(1 for n in chunk if _resolves(n))
+            if resolved == 0:
+                if not callable(corroborator):
+                    # Legacy/no-witness shape: the base all-null refusal.
+                    raise GitHubError(
+                        "deletion probe resolved no nodes for a whole chunk; "
+                        "refusing to mark items gone without corroboration"
+                    )
+                if witness is None:
+                    # The all-gone window: no listed item is left to vouch
+                    # for the candidates, so ONE independent read of the
+                    # repository decides (issue #66 AC2).
+                    if not self.probe_repository():
+                        raise GitHubError(
+                            "deletion probe found no live nodes and the"
+                            " repository is not readable; refusing to mark"
+                            " items gone without corroboration",
+                            status=404,
+                        )
+                elif not _resolves(witness):
+                    # A dead witness: deleted since the listing, or a
+                    # response that cannot be trusted. Same evidentiary
+                    # class as the base refusal — refuse to mass-mark.
+                    raise GitHubError(
+                        "deletion probe witness resolved no nodes; "
+                        "refusing to mark items gone without corroboration"
+                    )
+                # Corroborated (or repository-read readable): every
+                # candidate in this chunk is genuinely gone.
+                for n in chunk:
+                    if n != witness:
+                        gone[n] = "deleted"
+                continue
+            for n in chunk:
+                if not _resolves(n):
+                    gone[n] = "deleted"
         return gone

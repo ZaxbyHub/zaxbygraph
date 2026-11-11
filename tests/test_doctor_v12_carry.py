@@ -296,5 +296,55 @@ class ActorBotCarryTests(_CarryCase):
         self.assertEqual(got.get("alice"), 0)
 
 
+class PendingSetCarryTests(_CarryCase):
+    def test_consolidation_carries_the_pending_retry_set(self) -> None:
+        """`sync_pending` rows are OBLIGATIONS, not evidence: consolidation
+        must copy them, or an adopted corpus forgets that the next sync
+        still owes those numbers a retry (the drift guard's rule — a table
+        keyed `(repo, number)` is item-scoped and is copied — plus the
+        plan's Cluster 7 "copied by doctor with its repo scope"). Both
+        reasons and the recorded `computed_at` survive."""
+        store = self._store()
+        cand = self._db("cand")
+        conn = connect(cand)
+        self._seed_item(conn, 100)
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since, last_full_sync_at)"
+            " VALUES (?, ?, ?)",
+            (REPO, STAMP, STAMP),
+        )
+        conn.execute(
+            "INSERT INTO sync_pending(repo, number, reason, computed_at)"
+            " VALUES (?, ?, ?, ?)",
+            (REPO, 3, "deletion", STAMP),
+        )
+        conn.execute(
+            "INSERT INTO sync_pending(repo, number, reason, computed_at)"
+            " VALUES (?, ?, ?, ?)",
+            (REPO, 4, "torn", STAMP),
+        )
+        conn.commit()
+        conn.close()
+        self._consolidate(store, cand)
+        conn = connect(store)
+        try:
+            rows = sorted(
+                (int(r[0]), str(r[1]), str(r[2]))
+                for r in conn.execute(
+                    "SELECT number, reason, computed_at FROM sync_pending"
+                    " WHERE repo = ?",
+                    (REPO,),
+                )
+            )
+        finally:
+            conn.close()
+        self.assertEqual(
+            rows,
+            [(3, "deletion", STAMP), (4, "torn", STAMP)],
+            "an adopted corpus keeps the retry debts it owes, with their"
+            " reasons and the time they were recorded",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -245,7 +245,13 @@ def _default_sync_runner(
         else:
             src = GhApiSource(*repo.split("/", 1))
         sync_repo(conn, src, repo, force=force, include_patches=effective_patches,
-                  numbers=numbers)
+                  numbers=numbers,
+                  # The envelope reports the source this run actually used;
+                  # an EXPLICIT source argument re-stamps the stored profile
+                  # exactly as the CLI's --source does (an omitted argument
+                  # inherits and never rewrites — issue #48).
+                  source_name=effective_source,
+                  fetch_source=source)
     finally:
         conn.close()
 

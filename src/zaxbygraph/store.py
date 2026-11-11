@@ -1235,11 +1235,16 @@ def write_pending(
     never seal an item the run did not actually resolve. Idempotent."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        stamp = utcnow()
         for n in sorted({int(x) for x in numbers}):
+            # computed_at records WHEN the obligation was first recorded and
+            # never moves (ON CONFLICT DO NOTHING): a row pending for weeks
+            # says so (issue #66).
             conn.execute(
-                "INSERT INTO sync_pending(repo, number, reason) VALUES (?, ?, ?)"
+                "INSERT INTO sync_pending(repo, number, reason, computed_at)"
+                " VALUES (?, ?, ?, ?)"
                 " ON CONFLICT(repo, number, reason) DO NOTHING",
-                (repo, n, reason),
+                (repo, n, reason, stamp),
             )
         conn.commit()
     except Exception:

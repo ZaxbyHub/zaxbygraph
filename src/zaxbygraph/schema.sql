@@ -1,4 +1,4 @@
--- zaxbygraph schema v11 (`PRAGMA user_version` = 11; see db.py MIGRATIONS)
+-- zaxbygraph schema v12 (`PRAGMA user_version` = 12; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- All table rows are mechanically derived from fetched GitHub data:
 -- the fetcher replaces item-scoped child tables on re-ingest (v10's
@@ -399,6 +399,9 @@ CREATE TABLE IF NOT EXISTS sync_pending (
     repo TEXT NOT NULL,
     number INTEGER NOT NULL,
     reason TEXT NOT NULL,
+    -- When this obligation was first recorded (issue #66): a pending row's
+    -- age is the diagnostic for "how long has this retry been owed".
+    computed_at TEXT,
     PRIMARY KEY (repo, number, reason)
 );
 

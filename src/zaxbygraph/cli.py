@@ -440,6 +440,7 @@ def _sync_core(
         jsonl_path=jsonl_path,
         numbers=numbers,
         fetch_source=stamp_source,
+        source_name=source_name,
     )
 
 

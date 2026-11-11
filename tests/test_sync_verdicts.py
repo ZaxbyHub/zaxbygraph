@@ -441,10 +441,22 @@ class DeletionPassHonestyTests(TempDBTest):
     def test_failed_deletion_pass_is_not_laundered(self) -> None:
         """RED at base, GREEN after the fix: when the deletion pass of a
         full sync fails, full_sync_pending stays set (and last_error stays
-        recorded) until a later run actually completes the pass -- a plain
-        incremental sync must not clear the marker or launder the error,
-        because it never re-runs the pass. At base the following plain sync
-        stamps a full sync and clears both."""
+        recorded) until a later run actually COMPLETES the pass.
+
+        Three legs, because the recovery and the non-laundering rule are the
+        same rule seen from both sides:
+
+        1. the failed pass leaves the marker, the error and the pending row;
+        2. a plain incremental sync whose retry FAILS again clears none of
+           them — it re-runs the pass over the pending set and the pass
+           fails, so nothing completed;
+        3. a plain incremental sync whose retry SUCCEEDS clears the pending
+           rows, the marker and the error together. That is the pass
+           completing (the plan's later-run recovery), not laundering:
+           nothing clears until the pass has actually run to success.
+
+        At base no retry exists at all: the first plain sync stamps a full
+        sync and clears both, which is the laundering this check pins."""
         self.src = _FlakyOracleSource()
         self.src.add_issue(issue(1, updated_at=ts(10)))
         self.src.add_issue(issue(2, updated_at=ts(20)))
@@ -460,8 +472,9 @@ class DeletionPassHonestyTests(TempDBTest):
         self.assertEqual(row["full_sync_pending"], 1, "the failed pass must stay pending")
         self.assertIsNotNone(row["last_error"])
 
-        # A plain incremental sync must not launder the failed pass.
-        self.src.fail = False
+        # Leg 2: the oracle is STILL broken. The plain sync re-runs the pass
+        # over the pending set, the pass fails again, and nothing clears.
+        self.src.fail = True
         self.src.comment_on(1, "bump")
         try:
             self.sync()
@@ -478,6 +491,30 @@ class DeletionPassHonestyTests(TempDBTest):
         self.assertIsNotNone(row["last_error"],
                              "the recorded deletion-pass failure must survive "
                              "the plain sync")
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM sync_pending WHERE repo = ?"
+                       " AND reason = 'deletion'", (REPO,)),
+            1, "an unfinished retry keeps its pending row for the next run",
+        )
+
+        # Leg 3: the oracle recovers. The next plain sync re-runs the pass
+        # over the SAME pending set, completes it, and clears everything —
+        # the pass finishing is what makes the clear honest.
+        self.src.fail = False
+        self.sync()
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM sync_pending WHERE repo = ?"
+                       " AND reason = 'deletion'", (REPO,)),
+            0, "a completed retry discharges the pending obligation",
+        )
+        row = self.conn.execute(
+            "SELECT full_sync_pending, last_error FROM sync_state WHERE repo = ?",
+            (REPO,),
+        ).fetchone()
+        self.assertEqual(row["full_sync_pending"], 0,
+                         "a completed retry must clear the marker")
+        self.assertIsNone(row["last_error"],
+                          "a completed retry must clear the recorded error")
 
 
 class _Repo404Source(FakeGitHubSource):

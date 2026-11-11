@@ -1083,15 +1083,24 @@ def _deletion_pass(
     repo: str,
     seen_numbers: set[int],
     jsonl_handle: TextIO | None = None,
+    *,
+    derive_new: bool = True,
 ) -> None:
     """Consult the source's deletion oracle after a drained full listing.
 
-    Only a run that started at since=None may mark: absence from an
-    incremental listing means "not updated", never "gone". The candidate set
-    is stored, unmarked items minus everything seen across the whole run
-    (including rate-limit restarts), unioned with any numbers a previous
-    run left pending (issue #66 AC4: a pass that did not complete retries
-    from the durable set, never from a laundered clean state).
+    Only a run that started at since=None may derive NEW candidates: absence
+    from an incremental listing means "not updated", never "gone". The
+    candidate set is stored, unmarked items minus everything seen across the
+    whole run (including rate-limit restarts), unioned with any numbers a
+    previous run left pending (issue #66 AC4: a pass that did not complete
+    retries from the durable set, never from a laundered clean state).
+
+    `derive_new=False` is the RETRY shape the plan promises for a later run:
+    a failed pass leaves its candidate set in `sync_pending(reason=
+    'deletion')`, and a later non-full run re-runs the oracle over exactly
+    those numbers — never re-deriving absence from an incremental window —
+    then clears the rows, the pending marker and the error on success. A
+    plain re-run therefore recovers this failure class without `--force`.
 
     Atomicity (issue #66 AC3): the pending set is written BEFORE the probe,
     the verdicts are buffered, and items are marked ONLY after every chunk
@@ -1101,14 +1110,19 @@ def _deletion_pass(
     checker = getattr(source, "check_deleted", None)
     if not callable(checker):
         return
-    rows = conn.execute(
-        "SELECT number FROM items WHERE repo = ? AND state NOT IN ('deleted','transferred')",
-        (repo,),
-    ).fetchall()
     pending = set(pending_numbers(conn, repo, "deletion")["deletion"])
-    candidates = sorted(
-        ({int(r["number"]) for r in rows} - set(seen_numbers)) | pending
-    )
+    if derive_new:
+        rows = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND state NOT IN ('deleted','transferred')",
+            (repo,),
+        ).fetchall()
+        candidates = sorted(
+            ({int(r["number"]) for r in rows} - set(seen_numbers)) | pending
+        )
+    else:
+        # Retry shape: only the durable set, so an incremental window's
+        # silence can never fabricate a deletion.
+        candidates = sorted(pending)
     if not candidates:
         clear_pending(conn, repo, reason="deletion")
         return
@@ -1334,6 +1348,7 @@ def sync_repo(
     jsonl_path: Path | None = None,
     numbers: list[int] | None = None,
     fetch_source: str | None = None,
+    source_name: str | None = None,
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction.
 
@@ -1347,7 +1362,10 @@ def sync_repo(
     nothing: callers that construct the source directly (the MCP surface)
     or run on the CLI default leave the recorded profile exactly as the
     operator set it, so a deliberately-rest store never silently flips
-    (cubic re-review)."""
+    (cubic re-review). `source_name` is the EFFECTIVE source this run was
+    built from (`graphql`/`rest`) and is what the result's `source` key
+    reports; None (the default) keeps the historical answer, which reports
+    `graphql` unless the run itself degraded to REST."""
     # Everything that touches the database lives inside the try: the recorder
     # must see prologue failures too (force reset, state-row ensure, pending
     # marker) — a lock or disk fault landing there is still a failed sync and
@@ -1939,13 +1957,23 @@ def sync_repo(
                     ):
                         walk_since = committed_since
 
-        # Deletion oracle: only a drained full listing may mark items gone
-        # (issue #5 AC5). Incremental absence marks nothing. Runs under the
-        # bounded retry so a window cannot fail an otherwise-complete run.
-        # A targeted refresh never runs it (issue #23): absence from its
-        # filtered view is meaningless for every other item.
-        if started_full:
-            _deletion_pass(conn, source, repo, seen_numbers, jsonl_handle)
+        # Deletion oracle: a drained FULL listing may derive new candidates
+        # (issue #5 AC5) — absence from an incremental listing means "not
+        # updated", never "gone". A run that finds an OPEN deletion pass
+        # re-runs it over exactly the pending set (the plan's later-run
+        # recovery), so a failed pass is retried by a plain re-run instead
+        # of requiring --force and instead of sitting on the error forever.
+        # Runs under the bounded retry so a window cannot fail an
+        # otherwise-complete run. A targeted refresh never runs it (issue
+        # #23): absence from its filtered view is meaningless for every
+        # other item, and its own retry seam is the torn set.
+        if numbers is None:
+            pending_deletion = pending_numbers(conn, repo, "deletion")["deletion"]
+            if started_full or pending_deletion:
+                _deletion_pass(
+                    conn, source, repo, seen_numbers, jsonl_handle,
+                    derive_new=started_full,
+                )
 
         # Fields the capability probe dropped from the page queries
         # (issue #23): one fetch_log row per distinct omitted field.
@@ -2081,7 +2109,11 @@ def sync_repo(
         "last_error": None if state is None else state["last_error"],
         "rate_limit_remaining": None if rate_window is None else rate_window[0],
         "rate_limit_reset_at": None if rate_window is None else rate_window[1],
-        "source": "rest (graphql unavailable)" if rest_degraded else "graphql",
+        "source": (
+            "rest (graphql unavailable)"
+            if rest_degraded
+            else (source_name if source_name in ("graphql", "rest") else "graphql")
+        ),
         "graphql_probe_failed": bool(probe_failed),
     }
 

@@ -297,7 +297,11 @@ than attached to a same-numbered local item; foreign
 `closingIssuesReferences` entries are discarded outright — never stored,
 never repo-qualified — unlike timeline cross-references from other repos,
 which are kept as repo-qualified ids (`owner/repo#N`) that never attach to a
-same-numbered local item.
+same-numbered local item. A two-segment `word/word #N` after a space is
+dropped **even when it might be a same-repo path** (`src/app #5`): the shape
+is textually indistinguishable from a foreign slug, and never fabricating an
+edge is the conservative direction (AC18 only requires the foreign shape to
+be dropped; this is that rule applied to the whole shape).
 
 Two boundaries:
 
@@ -375,10 +379,12 @@ v12 (issues #65, #66, #67) is the largest single-slot migration:
   declared in `schema.sql`, so a fresh store is born with it);
 - **`actors.is_bot` backfill** — every stored payload (items,
   comments, reviews, releases `raw_json`) is re-read for the four
-  bot signals; a login listed in `ZAXBYGRAPH_BOT_LOGINS` at
-  migration time is marked too (the environment variable is a
-  one-shot boundary: it is NOT re-read on later syncs, so a login
-  added later needs a re-sync of an item authored by it);
+  bot signals (the `[bot]` suffix, a REST `type: "Bot"`, a GraphQL
+  `__typename: "Bot"`). The configured list is deliberately NOT read
+  here: `ZAXBYGRAPH_BOT_LOGINS` is not reconstructible from stored JSON,
+  so its entries are applied at sync time only (an exact, literal match —
+  no case folding) and a login added to it later needs a re-sync of an
+  item authored by it;
 - **`items.branch_token` backfill** — from each stored PR's
   `head_ref` under the exactly-one-token rule;
 - **keyword-edge re-derivation** — every `source='keyword'`
