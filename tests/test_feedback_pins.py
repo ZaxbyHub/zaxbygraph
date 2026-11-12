@@ -17,6 +17,7 @@ Offline: no network, no live `gh`.
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -153,11 +154,13 @@ class InterruptedFullMarkerTests(unittest.TestCase):
     candidate's consolidation independently of sync_pending."""
 
     def test_marker_and_error_survive_a_clean_candidate(self) -> None:
-        store = _prep(Path(tempfile.mkdtemp()) / "store" / "history.db")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        store = _prep(tmp / "store" / "history.db")
         _seed_store(store, (1, 2), "2027-05-01T00:00:00Z")
-        cand = _prep(Path(tempfile.mkdtemp()) / "cand" / "history.db")
+        cand = _prep(tmp / "cand" / "history.db")
         _seed_store(cand, (1, 2), "2027-06-01T00:00:00Z")
-        cwd = _prep(Path(tempfile.mkdtemp()) / "cwd")
+        cwd = _prep(tmp / "cwd")
 
         conn = connect(store)
         conn.execute(
@@ -597,11 +600,13 @@ class DoctorObligationUnionTests(unittest.TestCase):
     retry obligations AND their markers."""
 
     def test_v12_candidate_union_keeps_store_obligations(self) -> None:
-        store = _prep(Path(tempfile.mkdtemp()) / "store" / "history.db")
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        store = _prep(tmp / "store" / "history.db")
         _seed_store(store, (1, 2), "2027-05-01T00:00:00Z")
-        cand = _prep(Path(tempfile.mkdtemp()) / "cand" / "history.db")
+        cand = _prep(tmp / "cand" / "history.db")
         _seed_store(cand, (1, 2), "2027-06-01T00:00:00Z")
-        cwd = _prep(Path(tempfile.mkdtemp()) / "cwd")
+        cwd = _prep(tmp / "cwd")
 
         conn = connect(store)
         write_pending(conn, REPO, [2], "torn")
@@ -785,7 +790,9 @@ class ProbeFailureCounterTests(TempDBTest):
         from zaxbygraph.db import set_meta
 
         host = sync_mod._gh_host()
-        other = "some-other-host.example"
+        # Derived, never a fixed literal: a fixed value could equal
+        # GH_HOST in some environment (cubic run-3 P3).
+        other = f"other.{host}"
         assert other != host
         set_meta(self.conn,
                  f"capability_probe_failed:v3:{host}:gh-0.0-old",
