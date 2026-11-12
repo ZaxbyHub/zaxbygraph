@@ -424,7 +424,8 @@ The payload below is what you get under `data` (the envelope adds
 
 Each `repos` row carries `complete`: true only when no full sync is pending
 and the last sync recorded no error — the readiness signal to gate on. Check
-`last_error` first. Non-null means the last sync stopped early.
+`last_error` first. Non-null means the last sync did not fully discharge its
+obligations (it stopped early, or a pending retry it attempted failed).
 
 ### `search` — full-text
 

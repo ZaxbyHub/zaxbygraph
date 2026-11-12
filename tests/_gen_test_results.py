@@ -125,8 +125,8 @@ assert guardrail_tests >= 14, guardrail_tests
 # The deferred-work scan runs HERE so the claim is the scanner's output,
 # not a hand-assertion (the review caught a hand-asserted count). The
 # generator necessarily spells the markers, so it excludes itself — every
-# other file in the diff is scanned.
-ROOT = Path(__file__).resolve().parents[1]
+# other file in the diff is scanned. (ROOT is defined at the top of the
+# file; the duplicate assignment the review found is gone.)
 _MARKER = re.compile(r"TODO|FIXME|XXX|HACK")
 _scan_files = [
     f for f in _git("diff", "--name-only", f"{BASE}..HEAD").splitlines()

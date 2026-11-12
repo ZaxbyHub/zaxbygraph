@@ -1443,9 +1443,13 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
             log_fetch(conn, repo, "graphql_probe", None, note=f"probe failed: {exc}")
             # The LATEST probe state, so status.coverage reads recovery-safe
             # (a later successful probe clears it) — issue #65 AC9: the
-            # failure is reported, not only logged. The TEXT is bounded
-            # through _error_text like last_error (PR #76 review PRR-046):
-            # raw gh stderr must not land unbounded in the meta table.
+            # failure is reported, not only logged. Superseded keys are
+            # dropped FIRST so the coverage count stays at the documented
+            # one-per-latest-failure (PR #76 review PRR-033 body-claim
+            # audit). The TEXT is bounded through _error_text like
+            # last_error (PR #76 review PRR-046): raw gh stderr must not
+            # land unbounded in the meta table.
+            _clear_probe_failures(conn)
             set_meta(conn, _probe_failed_key(source), _error_text(exc))
             conn.commit()
         except Exception:

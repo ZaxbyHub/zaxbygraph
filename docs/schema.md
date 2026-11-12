@@ -580,13 +580,13 @@ One row per repo. What `zaxbygraph status` reads.
 | `issues_since` | TEXT | The watermark. Passed back to GitHub verbatim. |
 | `last_full_sync_at` | TEXT | |
 | `last_incr_sync_at` | TEXT | |
-| `last_error` | TEXT | Last failure message, or `NULL`. Non-null means the sync stopped early and re-running will resume. |
+| `last_error` | TEXT | Last failure message, or `NULL`. Non-null means the last sync did not fully discharge its obligations — it stopped early, or a pending retry it attempted failed — and re-running will resume. |
 | `item_count` | INTEGER | |
 | `comment_count` | INTEGER | |
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
 | `fetch_source` | TEXT | v11. The fetch source this store's profile deliberately uses — `graphql` or `rest` — stamped at listing-sync start whenever a run EXPLICITLY stated a source (`--source`, or the `--max-age` refresh honoring the stored value); a run that did not state one (a plain `sync`, a targeted `--numbers` run without `--source`, the MCP surface) never rewrites the stamp, so a store deliberately kept on `--source rest` stays rest until the operator says otherwise. `NULL` on pre-v11 stores or where never recorded, which every reader treats as the documented graphql default. The `--max-age` refresh re-reads it under the sync lock and re-stamps the concrete value it honored; a mid-run GraphQL→REST degradation is a transient fact of one run and never rewrites the stamp. Consolidation adopts a post-v11 candidate's value with its sync_state row; a pre-v11 candidate leaves the column NULL. |
-| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run, AND whenever any `sync_pending` obligation (torn or deletion) is open — including a torn debt from an incremental run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
 | `listing_floor` | TEXT | v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean **non-targeted** finish (`sync --numbers` never re-drains the listing, so it never clears the floor), and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
@@ -774,9 +774,11 @@ DRAINS THE LISTING — full or incremental — through the exact-number
 seam (a targeted `--numbers` run fetches exactly the numbers named and
 never runs it, which is its documented contract): a row that caught up
 ingests and leaves the set, one still skipped stays, and a number the
-source now answers 404/410 resolves as a deletion (through the
-repository-read gate, with the sidecar bundle every other deletion
-writes). This narrows the plan's "every sync run (full, incremental,
+source now answers 404/410 goes through the repository-read gate first —
+a STORED item is marked `deleted` (404) or `transferred` (410) with the
+sidecar bundle every other deletion writes, while an UNSTORED number
+only clears the obligation and records a fetch_log note (there is
+nothing to mark). This narrows the plan's "every sync run (full, incremental,
 targeted)" — the shipped behaviour keeps targeted runs' one-job contract
 and is the defensible reading; recorded in 02-reproduction.md. `sync_state.last_error` and `full_sync_pending` are held by
 an open `sync_pending` row of ANY reason (`torn` or `deletion`) — neither

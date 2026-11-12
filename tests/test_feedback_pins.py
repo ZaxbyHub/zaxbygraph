@@ -65,8 +65,8 @@ class TornObligationReportingTests(TempDBTest):
         self.sync()
 
         state = self.conn.execute(
-            "SELECT last_error, full_sync_pending FROM sync_state"
-            " WHERE repo = ?", (REPO,),
+            "SELECT last_error, full_sync_pending, last_full_sync_at"
+            " FROM sync_state WHERE repo = ?", (REPO,),
         ).fetchone()
         self.assertEqual(
             self.count(
@@ -82,6 +82,12 @@ class TornObligationReportingTests(TempDBTest):
             "item was absent (PR #76 review PRR-003)")
         self.assertIsNone(state["last_error"],
                           "run 1 itself did not fail; only the retry does")
+        self.assertIsNone(
+            state["last_full_sync_at"],
+            "a finish that still owes a torn obligation must not advance "
+            "the completion stamp — the CASE used to key on the PRE-update "
+            "flag, stamping while the same UPDATE withheld that flag "
+            "(PR #76 review PRR-014)")
 
         # Run 2: the refresh now serves a row (so the retry reaches the
         # children fetch), but that FIRST fetch fails with a 403. Only the
@@ -552,6 +558,31 @@ class ProbeFailureCounterTests(TempDBTest):
             "one success must clear every probe-failure key: the old"
             " version-scoped key used to survive and status.coverage kept"
             " counting it (PR #76 review PRR-033)")
+
+    def test_probe_failure_marker_is_bounded(self) -> None:
+        """The failure marker stores _error_text (bounded), not raw gh
+        stderr (PR #76 review PRR-046)."""
+        from zaxbygraph import sync as sync_mod
+        from zaxbygraph.db import get_meta
+
+        class _FailingProbeSource:
+            gh_bin = "gh"
+
+            def probe_capabilities(self):
+                raise GitHubError("boom: " + "x" * 5000, status=500)
+
+            def attach_capabilities(self, caps):  # pragma: no cover
+                raise AssertionError("the probe must fail first")
+
+        src = _FailingProbeSource()
+        with patch.dict(sync_mod._GH_VERSION_CACHE, {"gh": "offline"}):
+            failed = sync_mod._attach_capabilities(self.conn, src, REPO)
+        self.assertTrue(failed, "the probe failure must be reported")
+        value = get_meta(self.conn, sync_mod._probe_failed_key(src)) or ""
+        self.assertLessEqual(
+            len(value), 2000,
+            "the persisted marker must be bounded by _error_text, not raw "
+            "exception text (PR #76 review PRR-046)")
 
 
 if __name__ == "__main__":

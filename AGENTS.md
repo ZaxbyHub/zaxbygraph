@@ -111,7 +111,9 @@ shouldn't.
   fails to parse, a carried plural null, or a list on a singular connection
   is malformed, not a removal, so it is union-only like an overflow
   (issue #53) — while a complete, well-formed re-fetch retracts removed
-  links and a degraded one never does
+  links and a degraded one never does; a re-ingest whose EXTRACTION
+  faulted keeps every prior owned edge (including the links) until a
+  fault-free re-ingest replaces them (PR #76 review PRR-005)
   (docs/schema.md). Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.
