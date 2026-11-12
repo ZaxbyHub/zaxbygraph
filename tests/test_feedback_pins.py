@@ -176,6 +176,49 @@ class FaultedReingestPreservesEdgesTests(TempDBTest):
                 (REPO,)),
             1, "the fault must still be logged")
 
+    def test_faulted_reingest_keeps_a_link_only_item_intact(self) -> None:
+        """The round-2 reviewer's link-only case, pinned: an item whose
+        only ITEM-SRC prior edge is a GitHub-reported link must keep it on
+        a faulted re-ingest. The guard widened from non-link owned rows to
+        ANY prior row because the replacement also runs rebuild_links
+        (AGENTS.md's faulted-reingest clause, PR #76 review PRR-005)."""
+        payload = issue(1, title="one", body="plain prose", updated_at=ts(10))
+        common = dict(
+            pull_raw=None, issue_comments=[], review_comments=[],
+            reviews=[], files=[], include_patches=False,
+        )
+        ingest_item(
+            self.conn, REPO, payload,
+            links={"blocked_by": [{"number": 2, "repo": REPO}]},
+            links_incomplete=False, **common,
+        )
+        self.conn.commit()
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND src_id = '1'"
+                " AND rel = 'blocked_by' AND source = 'link'", (REPO,)),
+            1, "the fixture must hold exactly one outbound link edge")
+
+        def boom(repo, raw):
+            raise ValueError("deterministic extraction fault marker")
+
+        with patch("zaxbygraph.store.edges_from_item", side_effect=boom):
+            ingest_item(
+                self.conn, REPO, payload,
+                links={"blocked_by": []},
+                links_incomplete=False, **common,
+            )
+        self.conn.commit()
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND src_id = '1'"
+                " AND rel = 'blocked_by' AND source = 'link'", (REPO,)),
+            1,
+            "a faulted re-ingest must not run the link replacement either: "
+            "the carried-complete empty connection would retract the only "
+            "prior edge this item holds (PR #76 review PRR-005, round-2 "
+            "link-only probe)")
+
 
 class MigrationWrongTypedPayloadTests(unittest.TestCase):
     """PRR-006: a stored wrong-typed title must not abort the v12
@@ -577,8 +620,14 @@ class ProbeFailureCounterTests(TempDBTest):
         src = _FailingProbeSource()
         with patch.dict(sync_mod._GH_VERSION_CACHE, {"gh": "offline"}):
             failed = sync_mod._attach_capabilities(self.conn, src, REPO)
+            # Resolve the key WHILE the patched cache is active: outside
+            # the block _gh_version re-reads the real version and the
+            # lookup lands on a different row (the round-2 review caught
+            # exactly that vacuity).
+            key = sync_mod._probe_failed_key(src)
+            value = get_meta(self.conn, key) or ""
         self.assertTrue(failed, "the probe failure must be reported")
-        value = get_meta(self.conn, sync_mod._probe_failed_key(src)) or ""
+        self.assertTrue(value, f"no marker written under {key}")
         self.assertLessEqual(
             len(value), 2000,
             "the persisted marker must be bounded by _error_text, not raw "
