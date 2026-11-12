@@ -74,7 +74,20 @@ class SchemaV11MigrationTests(unittest.TestCase):
         self.assertIsNotNone(row)
         self.assertIsNone(row[0], "a fresh stamp must leave fetch_source NULL")
         c.close()
-        self.assertEqual(_columns(self.db)[-1], "fetch_source")
+        # fetch_source is an APPENDED migration column: it arrives after
+        # every v10 column. It is not asserted to be the last column —
+        # v12 appends listing_floor/listing_floor_active after it, and
+        # "last" would break on every later addition while saying nothing
+        # the parity assertion below does not.
+        self.assertGreater(
+            _columns(self.db).index("fetch_source"),
+            # The v10 shape ends at rate_limit_reset_at (index 11 of the
+            # 12-column list), so fetch_source must sit strictly AFTER it —
+            # `> 10` would admit index 11, before the last v10 column
+            # (PR #76 review PRR-029).
+            11,
+            "fetch_source must follow every v10 column, never precede it",
+        )
         self.assertEqual(_version(self.db), CURRENT_USER_VERSION)
 
     def test_v10_store_migrates_to_identical_shape(self):
@@ -95,7 +108,15 @@ class SchemaV11MigrationTests(unittest.TestCase):
         init_schema(c2)
         c2.close()
         self.assertEqual(_columns(self.db), _columns(fresh))
-        self.assertEqual(_columns(self.db)[-1], "fetch_source")
+        self.assertGreater(
+            _columns(self.db).index("fetch_source"),
+            # The v10 shape ends at rate_limit_reset_at (index 11 of the
+            # 12-column list), so fetch_source must sit strictly AFTER it —
+            # `> 10` would admit index 11, before the last v10 column
+            # (PR #76 review PRR-029).
+            11,
+            "fetch_source must follow every v10 column, never precede it",
+        )
 
     def test_migration_is_idempotent(self):
         c = connect(self.db)

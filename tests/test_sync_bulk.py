@@ -52,9 +52,14 @@ class BulkWiringTests(TempDBTest):
         result = sync_repo(self.conn, src, REPO)
         self.assertEqual(result["ingested"], 50)
         self.assertEqual(src.fallback_calls, 0)
-        # One listing page (50 items) -> one fetch_children call for the page.
+        # One listing page (50 items) -> ONE fetch_children call for that
+        # page. The always-second-pass re-drain (issue #65 AC1) then walks
+        # the stable listing a second time to prove quiescence, and that
+        # verification page is NOT re-fetched: every row it delivers is one
+        # this run already covered, so the bulk children call is skipped and
+        # the pass costs one listing page and nothing else.
         self.assertEqual(len(src.fetch_children_calls), 1)
-        self.assertEqual(src.fetch_children_calls[0], 50)
+        self.assertEqual(src.fetch_children_calls, [50])
         self.assertEqual(self.count("SELECT COUNT(*) FROM items WHERE kind = 'pr'"), 50)
         self.assertEqual(
             self.count("SELECT COUNT(*) FROM comments WHERE kind = 'issue_comment'"), 100
@@ -158,7 +163,12 @@ class MalformedListingTests(TempDBTest):
             "SELECT COUNT(*) FROM fetch_log WHERE repo = ? AND note LIKE 'skipped malformed%'",
             (REPO,),
         )
-        self.assertEqual(trail, 1)
+        # One observation per listing pass: the always-second-pass re-drain
+        # (issue #65 AC1) sees the same malformed row again and logs its own
+        # skip. The invariant is that the row is NEVER ingested and EVERY
+        # sighting leaves a trail, not that the log holds exactly one row.
+        self.assertEqual(trail, 2)
+        self.assertGreaterEqual(trail, 1, "a skipped row must leave a trail")
 
 
 class SourceSwitchTests(TempDBTest):

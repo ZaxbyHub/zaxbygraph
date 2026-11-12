@@ -9,7 +9,12 @@ import unittest
 from pathlib import Path
 
 from fixtures import scrubbed_env
-from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
+from zaxbygraph.github import (
+    GitHubError,
+    GitHubTransportError,
+    GhApiSource,
+    _status_from_stderr,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -157,6 +162,86 @@ class StreamingListingTests(unittest.TestCase):
         self.assertIn("502", str(ctx.exception))
         self.assertEqual(len(pages), 1, f"pages delivered before the failure: {len(pages)}")
         self.assertEqual(len(pages[0]), 100)
+
+
+
+class TransportTypingTests(unittest.TestCase):
+    """Issue #65 AC3: a subprocess that could not be launched or did not
+    answer in time is a TYPED transport failure — the class (plus the named
+    HTTP statuses) that lets a GraphQL run degrade to REST. A plain
+    `GitHubError` here would leave a missing or hung `gh` fatal to a run
+    that could have finished over the per-item path."""
+
+    _MISSING = "zaxbygraph-definitely-not-a-real-gh-binary"
+
+    def test_launch_failure_is_typed_on_the_rest_path(self) -> None:
+        src = GhApiSource("acme", "forgegate", gh_bin=self._MISSING)
+        with self.assertRaises(GitHubTransportError):
+            src._api("repos/acme/forgegate")
+
+    def test_launch_failure_is_typed_on_the_graphql_path(self) -> None:
+        from zaxbygraph.graphql import GraphQLSource
+
+        src = GraphQLSource("acme", "forgegate", gh_bin=self._MISSING)
+        with self.assertRaises(GitHubTransportError):
+            src._graphql("query { viewer { login } }")
+
+    def test_only_the_typed_class_degrades(self) -> None:
+        from zaxbygraph.sync import _degradable_error
+
+        self.assertTrue(
+            _degradable_error(GitHubTransportError("gh api graphql timed out")),
+            "a typed transport failure is the degradable shape",
+        )
+        self.assertFalse(
+            _degradable_error(GitHubError("Field 'x' doesn't exist")),
+            "a statusless validation error must stay fatal so a schema"
+            " drift can never be mistaken for an unavailable endpoint",
+        )
+        self.assertFalse(
+            _degradable_error(GitHubError("rate limited", status=429)),
+            "a rate window is a retry, never a degradation",
+        )
+
+    def test_401_and_404_are_degradable_statuses(self) -> None:
+        """The documented degradable set is 401/403/404 (issue #65 AC3,
+        README): only 403 had a positive test, so removing 401 or 404 from
+        `_degradable_error` passed the whole suite (PR #76 review PRR-025).
+        A bad credential (401) or a moved endpoint (404) must degrade to
+        REST, not abort the run."""
+        from zaxbygraph.sync import _degradable_error
+
+        for status in (401, 404):
+            self.assertTrue(
+                _degradable_error(GitHubError(f"gh: HTTP {status}", status=status)),
+                f"HTTP {status} is a documented degradable status",
+            )
+
+    def test_timeout_is_typed_on_both_paths(self) -> None:
+        """A hung `gh` (TimeoutExpired) must be GitHubTransportError on BOTH
+        the REST and GraphQL paths — the launch-failure tests never reach
+        the timeout handler, so re-typing it to a plain GitHubError passed
+        the suite (PR #76 review PRR-026)."""
+        import subprocess as _sp
+        from unittest.mock import patch as _patch
+
+        src = GhApiSource("acme", "forgegate")
+        with _patch(
+            "zaxbygraph.github.subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["gh"], timeout=1),
+        ):
+            with self.assertRaises(GitHubTransportError):
+                src._api("repos/acme/forgegate")
+
+        from zaxbygraph.graphql import GraphQLSource
+
+        gql = GraphQLSource("acme", "forgegate")
+        with _patch(
+            "zaxbygraph.graphql.subprocess.run",
+            side_effect=_sp.TimeoutExpired(cmd=["gh"], timeout=1),
+        ):
+            with self.assertRaises(GitHubTransportError):
+                gql._graphql("query { viewer { login } }")
 
 
 if __name__ == "__main__":

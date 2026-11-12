@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import socket
@@ -11,20 +12,28 @@ from pathlib import Path
 from typing import TextIO
 
 from zaxbygraph.extract import item_kind
-from zaxbygraph.github import GitHubError, GitHubSource
+from zaxbygraph.github import (
+    GitHubError,
+    GitHubSource,
+    GitHubTransportError,
+    ListingShiftedError,
+)
 from zaxbygraph.graphql import GH_TIMEOUT_S
 from zaxbygraph.repo import validate_slug
 from zaxbygraph.db import get_meta, set_meta
 from zaxbygraph.store import (
     ISO_Z,
     bump_watermark,
+    clear_pending,
     ingest_item,
     log_fetch,
     mark_sync_finished,
+    pending_numbers,
     recount,
     replace_releases,
     set_last_error,
     utcnow,
+    write_pending,
 )
 
 
@@ -32,11 +41,218 @@ class SyncError(RuntimeError):
     pass
 
 
-#: Rate-limit windows slept through per fetch-layer call before giving up
-#: (issue #5). Five is the ceiling; each sleep is additionally clamped so a
-#: hostile or far-future reset can never park the sync (and its whole-run
-#: lock) indefinitely.
+def _degradable_error(exc: BaseException) -> bool:
+    """True when a GraphQL failure means the ENDPOINT is unavailable rather
+    than the request being wrong (issue #65 AC3): a typed transport failure
+    (the gh subprocess could not run or answer), or a non-rate-limit
+    401/403/404. A statusless GraphQL validation or schema-drift error keeps
+    the plain GitHubError shape and is deliberately NOT degradable — it must
+    stay fatal so a schema drift can never be mistaken for an unavailable
+    endpoint."""
+    if isinstance(exc, GitHubTransportError):
+        return True
+    status = getattr(exc, "status", None)
+    return status in (401, 403, 404)
+
+
+def _log_graphql_unavailable(
+    conn: sqlite3.Connection, repo: str, exc: BaseException
+) -> None:
+    """The ONE fetch_log row recording a GraphQL-to-REST degradation."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        log_fetch(
+            conn, repo, "graphql", None,
+            note=f"graphql unavailable; degraded to REST: {exc}",
+            # The row records a FAILURE: carry the HTTP status the failure
+            # reported (NULL when the failure had none) instead of the
+            # log_fetch default of 200, which would file it as a success
+            # (PR #76 review PRR-030).
+            status=getattr(exc, "status", None),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _fail_not_quiescent(
+    conn: sqlite3.Connection, repo: str, since: str | None, passes: int
+) -> SyncError:
+    """Persist the recovery floor and build the honest-failure error for a
+    listing that never quiesced within the pass cap (issue #65 AC1): the run
+    is incomplete, the next run re-drains this window from the floor, and a
+    clean finish is suppressed so the sync never claims coverage the union of
+    these passes did not achieve.
+
+    The floor columns arrive with migration v12; the read and clear paths
+    guard on them, so this write does too — on a pre-v12 connection the run
+    still fails honestly, it just cannot promise a persisted floor (and the
+    error says so rather than claiming one)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        floor_cols = "listing_floor_active" in {
+            r[1] for r in conn.execute("PRAGMA table_info(sync_state)")
+        }
+        if floor_cols:
+            conn.execute(
+                "UPDATE sync_state SET listing_floor = ?, listing_floor_active = 1"
+                " WHERE repo = ?",
+                (since, repo),
+            )
+        set_last_error(
+            conn,
+            repo,
+            "listing_not_quiescent: the listing order kept shifting across"
+            f" {passes} passes; the run is incomplete and will retry from the"
+            + (" persisted recovery floor"
+               if floor_cols else " window it re-drains (no floor column on"
+                                  " this pre-v12 store)"),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return SyncError(
+        f"listing_not_quiescent after {passes} passes; the run is incomplete"
+        + (" (recovery floor persisted)" if floor_cols else
+           " (recovery floor not persisted: pre-v12 store)")
+    )
+
+
+def _batch_fully_covered(
+    batch: list,
+    ingested_versions: dict[int, str],
+    ingested_numbers: set[int],
+    prev_pass_counts: dict[int, int],
+) -> bool:
+    """True when EVERY row of this listing page is one this run already
+    covered, so the page's bulk children call can be skipped entirely.
+
+    Conservative in the safe direction: a row that is malformed, or whose
+    `updated_at` is absent, or that this run skipped makes the whole page
+    uncovered — the fetch then happens and the per-item loop decides each
+    row on its own (a row it finds covered is skipped there). The per-number
+    count within the page plays the same role it plays per row: a source
+    that serves several versions of one number in a single walk is never
+    treated as a re-delivery. When a page DOES carry the same number twice,
+    the binding stamp is the NEWEST of them — the batch is covered only
+    when the version this run stored is at least as new as every duplicate,
+    and a non-comparable stamp keeps the batch uncovered rather than being
+    folded away."""
+    counts: dict[int, int] = {}
+    stamps: dict[int, object] = {}
+    for raw in batch:
+        if not isinstance(raw, dict) or "number" not in raw:
+            return False
+        try:
+            number = int(raw["number"])
+        except (TypeError, ValueError):
+            return False
+        counts[number] = counts.get(number, 0) + 1
+        stamp = raw.get("updated_at")
+        if number not in stamps:
+            stamps[number] = stamp
+            continue
+        prior = stamps[number]
+        if not isinstance(prior, str) or not isinstance(stamp, str):
+            stamps[number] = prior  # a non-comparable stamp stays uncovered
+        elif stamp > prior:
+            stamps[number] = stamp
+    if not counts:
+        return False
+    return all(
+        _already_covered(
+            number, ingested_versions.get(number), stamps.get(number),
+            ingested_numbers, count, prev_pass_counts,
+        )
+        for number, count in counts.items()
+    )
+
+
+def _committed_watermark(
+    conn: sqlite3.Connection, repo: str
+) -> str | None:
+    """The watermark the items committed so far have already advanced to.
+
+    Read AFTER a rate window is slept out, so an interrupted walk resumes
+    from it rather than from the run-start binding (issue #65 AC2): the
+    run-start binding would re-list everything the pass already delivered,
+    which is exactly the re-work the per-item watermark bumps exist to
+    avoid. None (no state row, or a NULL watermark) means the walk keeps
+    its current floor."""
+    row = conn.execute(
+        "SELECT issues_since FROM sync_state WHERE repo = ?", (repo,)
+    ).fetchone()
+    return None if row is None else row["issues_since"]
+
+
+def _already_covered(
+    number: int,
+    prior_ts: object,
+    row_ts: object,
+    ingested_numbers: set[int],
+    seen_this_pass: int,
+    prev_pass_counts: dict[int, int],
+) -> bool:
+    """True when this run has ALREADY covered the row the listing just
+    delivered, so a verification pass can move on without re-fetching its
+    children or recording a second observation (issue #65 AC1).
+
+    Two conditions must both hold:
+
+    * the number was ingested this run and the version stored for it is at
+      least as new as the row just served (a newer row is a real
+      observation and is always ingested), and
+    * the previous pass served at least as many rows for that number.
+
+    The second condition is what keeps a source that legitimately delivers
+    several versions of ONE number in a single walk correct: within one
+    pass every delivery is its own observation — a recorded replay serves
+    the same item bytes with different children on successive pages, and
+    each of those must ingest and leave its own tombstones. Across passes,
+    the k-th re-delivery of a number the previous pass already served k or
+    more times is the verification walk proving coverage, not a new
+    observation.
+
+    A row whose `updated_at` cannot be compared (absent, or not a string)
+    is never treated as covered: the run cannot prove it is the same
+    observation, so it re-ingests. A number this run SKIPPED (a torn row,
+    say) is never in `ingested_numbers`, so it is retried rather than
+    assumed covered."""
+    if number not in ingested_numbers:
+        return False
+    if not isinstance(prior_ts, str) or not isinstance(row_ts, str):
+        return False
+    if prior_ts < row_ts:
+        return False
+    return seen_this_pass <= prev_pass_counts.get(number, 0)
+
+
+#: Rate-limit windows slept through before giving up (issue #5). The
+#: constant is TWO budgets (PR #76 review PRR-012 / N9): each
+#: fetch-layer call's ladder in `_call_with_rate_retry` may sleep up to
+#: five windows before re-raising, AND the listing walk keeps its own
+#: five-window restart budget that the pass loop resets at every pass
+#: boundary and detected shift. A single pass therefore sleeps far more
+#: than five windows in total (per-call ladders inside each walk), a run
+#: that keeps quiescing into new passes multiplies that by
+#: _MAX_LISTING_PASSES, and the whole-run lock is held the entire time.
+#: Each sleep is additionally clamped so a hostile or far-future reset
+#: can never park the sync indefinitely.
 _MAX_RATE_WINDOWS = 5
+
+#: Listing-completeness passes (issue #65 AC1): the window is walked at least
+#: twice and again whenever a pass delivers a set different from its
+#: predecessor's. The cap bounds a churning repository: reaching it with
+#: unequal sets FAILS the run incomplete (listing_not_quiescent) and persists
+#: the recovery floor, so a clean sync never claims coverage it did not get.
+_MAX_LISTING_PASSES = 4
+#: Listing-row refresh attempts for one torn row (issue #65 AC6): the pull
+#: payload postdates the listing snapshot, so the row is re-fetched until
+#: the listing catches up — bounded, because a persistently skewed listing
+#: must skip the item rather than store the mixture.
+_MAX_ITEM_REFRESHES = 2
 
 #: Upper bound on a single sleep-until-reset, in seconds: one hour, the
 #: longest real GitHub window. A hostile or far-future reset can therefore
@@ -542,6 +758,34 @@ def _ingest_and_mark_gone(
     return ingested_here
 
 
+def _assert_repository_readable(source: GitHubSource, repo: str) -> None:
+    """Refuse per-item 404 verdicts when the REPOSITORY cannot be read.
+
+    Every requested number answering 404/410 is ambiguous: the repository
+    itself is unreachable (private, renamed, deleted) or every requested
+    item is genuinely gone. Per-item verdicts built from an access failure
+    would fabricate deletions, so ONE repository-level read decides it when
+    the source can answer (issue #66 AC5). A source with no such read is
+    treated as unreachable — fail-safe: change nothing and name the
+    repository-access failure. A probe error that is not a plain 404/410 is
+    neither verdict and is reported as its own failure."""
+    probe = getattr(source, "probe_repository", None)
+    readable: bool | None = None
+    if callable(probe):
+        try:
+            readable = bool(_call_with_rate_retry(probe))
+        except GitHubError as exc:
+            raise SyncError(
+                f"repository {repo} could not be read: {exc}"
+            ) from exc
+    if readable is not True:
+        raise SyncError(
+            f"repository {repo} is not readable: every requested item"
+            " answered HTTP 404/410 (the repository may be private,"
+            " renamed, or unreachable)"
+        )
+
+
 def _number_of(raw: object) -> int | None:
     if isinstance(raw, dict) and "number" in raw:
         try:
@@ -571,6 +815,21 @@ def _numbered_payloads(
     getter = getattr(source, "get_issues", None)
     if callable(getter):
         results = _call_with_rate_retry(getter, sorted(wanted)) or {}
+        # Repository reachability (issue #66 AC5): when EVERY requested
+        # number answers 404/410, either the repository itself is
+        # unreadable (private, renamed, deleted) or every requested item is
+        # genuinely gone — the two are indistinguishable from the item
+        # paths alone, and per-item verdicts built from an access failure
+        # would fabricate deletions. ONE repository-level read decides it
+        # when the source can answer; a source that cannot is treated as
+        # unreachable, which changes nothing and fails loudly.
+        if results and all(
+            isinstance(entry, tuple)
+            and len(entry) > 1
+            and entry[1] in (404, 410)
+            for entry in results.values()
+        ):
+            _assert_repository_readable(source, repo)
         shells: list[dict] = []
         for n in sorted(wanted):
             entry = results.get(n)
@@ -663,35 +922,284 @@ def _numbered_payloads(
                 raise
 
 
+def _resolve_torn_row(source: GitHubSource, list_raw: dict, pull_ts: str) -> dict | None:
+    """Re-fetch the listing row until it is at least as new as the pull
+    payload's facts (issue #65 AC6): a stored row must never mix an older
+    listing snapshot with a newer pull payload. Bounded at
+    _MAX_ITEM_REFRESHES attempts; None means the listing stayed stale — or
+    the refresh itself degraded mid-loop — and the caller skips the item
+    (recording it in the durable pending set) rather than storing the
+    forbidden mixture.
+
+    Every return of a row is a row PROVEN at least as new as `pull_ts`.
+    Nothing else may come back: the original row is stale by the caller's
+    own trigger, a row from an earlier attempt is stale by construction
+    (the loop continued past it), and a non-dict answer (a mid-refresh
+    404/410, a degraded payload) is not evidence of anything — so all three
+    resolve to None, and `_retry_torn_pending` discharges the number later
+    (a 404 there becomes a proper deletion)."""
+    number = int(list_raw["number"])
+    getter = getattr(source, "get_issues", None)
+    if not callable(getter):
+        # No refresh seam: the tear cannot be resolved, so it must not be
+        # stored (the original row is the stale half of the mixture).
+        return None
+    current: dict | None = None
+    for _ in range(_MAX_ITEM_REFRESHES):
+        results = _call_with_rate_retry(getter, [number]) or {}
+        entry = results.get(number)
+        row = entry[0] if isinstance(entry, tuple) and len(entry) > 1 else (
+            entry if isinstance(entry, dict) else None
+        )
+        if not isinstance(row, dict):
+            # A degraded answer is not a row: returning `current` here would
+            # hand the caller a provably stale row to pair with the newer
+            # pull payload — the exact mixture AC6 forbids. Skip instead.
+            return None
+        row_ts = row.get("updated_at")
+        if isinstance(row_ts, str) and row_ts >= pull_ts:
+            return row
+        current = row
+    return None
+
+
+def _retry_torn_pending(
+    conn: sqlite3.Connection,
+    source: GitHubSource,
+    repo: str,
+    numbers: list[int],
+    include_patches: bool,
+    seen_numbers: set[int],
+    jsonl_handle: TextIO | None,
+) -> int:
+    """Refresh the torn-pending numbers through the exact-number seam
+    (issue #66 AC5): a listing row that has caught up ingests normally and
+    leaves the pending set; one still skewed against its pull payload
+    stays pending for the next run. A later healthy item's watermark
+    advance can therefore never seal a skipped item.
+
+    A number the source now answers 404/410 is NOT still torn — the item
+    is gone, and the plan's rule is that a 404 during the refresh follows
+    the existing per-item error path (the item is not lost): the
+    repository-read gate first (an unreadable repository must never
+    fabricate a deletion), then the same ingest-and-mark + sidecar bundle
+    every other deletion shape writes, then the pending row clears so the
+    number stops costing an exact-number fetch on every future run."""
+    getter = getattr(source, "get_issues", None)
+    if not callable(getter):
+        return 0
+    ingested = 0
+    for n in numbers:
+        results = _call_with_rate_retry(getter, [n]) or {}
+        entry = results.get(n)
+        row = entry[0] if isinstance(entry, tuple) and len(entry) > 1 else (
+            entry if isinstance(entry, dict) else None
+        )
+        status = entry[1] if isinstance(entry, tuple) and len(entry) > 1 else None
+        if not isinstance(row, dict):
+            if status in (404, 410):
+                _assert_repository_readable(source, repo)
+                gone_note = (
+                    f"GitHub returned HTTP {status} while fetching item data"
+                )
+                stored = _stored_list_raw(conn, repo, n)
+                if stored is not None:
+                    _write_gone_bundle(
+                        jsonl_handle, n, stored, gone_note,
+                        "deleted" if status == 404 else "transferred",
+                    )
+                    _mark_gone(conn, repo, n,
+                               "deleted" if status == 404 else "transferred",
+                               gone_note)
+                else:
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        log_fetch(
+                            conn, repo, "item", str(n),
+                            note=(
+                                f"skipped pending number: HTTP {status} and"
+                                " the item was never stored"
+                            ),
+                            status=status,
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        raise
+                clear_pending(conn, repo, [n], "torn")
+            continue  # unresolved (or gone, now resolved): nothing else to do
+        try:
+            (pull_raw, issue_comments, review_comments, reviews,
+             files, timeline, flags, children_complete,
+             links, links_incomplete, pr_commits) = _resolve_children(
+                source, row, item_kind(row), include_patches,
+            )
+        except GitHubError as exc:
+            # The debt stays pending for the next run, but the failure is
+            # never silent (PR #76 review PRR-004): one fetch_log row with
+            # the real status names the fault, and last_error keeps the
+            # readiness verdict from reading clean while every retry of the
+            # owed number is failing (transport, permission, rate-limit and
+            # schema faults alike — a credential loss must not look like a
+            # healthy sync).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                log_fetch(
+                    conn, repo, "item", str(n),
+                    note=f"torn retry failed: {exc}",
+                    status=getattr(exc, "status", None),
+                )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            set_last_error(conn, repo, _error_text(exc))
+            # set_last_error's upsert opens an implicit transaction; commit
+            # it here or the next write_pending (BEGIN IMMEDIATE) fails
+            # with "cannot start a transaction within a transaction".
+            conn.commit()
+            continue
+        pull_ts = (
+            pull_raw.get("updated_at") if isinstance(pull_raw, dict) else None
+        )
+        list_ts = row.get("updated_at")
+        if (
+            isinstance(pull_ts, str) and isinstance(list_ts, str)
+            and pull_ts > list_ts
+        ):
+            continue  # still torn: stays pending
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            ingest_item(
+                conn, repo, row,
+                pull_raw=pull_raw,
+                issue_comments=issue_comments,
+                review_comments=review_comments,
+                reviews=reviews,
+                files=files,
+                include_patches=include_patches,
+                timeline=timeline,
+                children_complete=children_complete,
+                links=links,
+                links_incomplete=links_incomplete,
+                pr_commits=pr_commits,
+                advance_watermark=True,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        # A resolved torn item is as stored as any listing-ingested item,
+        # so it records the same replayable bundle (PR #76 review PRR-011:
+        # without it events.jsonl omits a row the store contains and replay
+        # cannot reproduce the corpus).
+        _write_item_bundle(
+            jsonl_handle, n, row, pull_raw,
+            issue_comments, review_comments, reviews, files, timeline,
+            links, links_incomplete, pr_commits, children_complete,
+        )
+        clear_pending(conn, repo, [n], "torn")
+        seen_numbers.add(n)
+        ingested += 1
+    return ingested
+
+
+def _deletion_corroborator(seen_numbers: set[int], candidates: list[int]):
+    """The known-live witness factory for the deletion probe (issue #66
+    AC3/AC12): a number this run's listing delivered that is not itself a
+    candidate, or None when every listed item is a candidate (the all-gone
+    window — the probe then falls back to repository reachability)."""
+
+    def corroborator() -> int | None:
+        live = sorted(set(seen_numbers) - set(candidates))
+        return live[0] if live else None
+
+    return corroborator
+
+
+def _call_deletion_checker(checker, candidates, corroborator):
+    """Invoke the source's deletion oracle, passing the witness ONLY to
+    oracles whose signature accepts one (issue #66 AC3): a legacy
+    one-argument oracle keeps its exact contract — being handed a second
+    argument it never declared would raise TypeError and lose the verdicts.
+    Runs under the bounded rate-limit retry so a window cannot fail an
+    otherwise-complete run."""
+    try:
+        takes_witness = (
+            len(inspect.signature(checker).parameters) >= 2
+        )
+    except (TypeError, ValueError):
+        takes_witness = False
+    if takes_witness:
+        return _call_with_rate_retry(checker, candidates, corroborator)
+    return _call_with_rate_retry(checker, candidates)
+
+
 def _deletion_pass(
     conn: sqlite3.Connection,
     source: GitHubSource,
     repo: str,
     seen_numbers: set[int],
     jsonl_handle: TextIO | None = None,
+    *,
+    derive_new: bool = True,
 ) -> None:
     """Consult the source's deletion oracle after a drained full listing.
 
-    Only a run that started at since=None may mark: absence from an
-    incremental listing means "not updated", never "gone". The candidate set
-    is stored, unmarked items minus everything seen across the whole run
-    (including rate-limit restarts). The probe runs under the bounded
-    rate-limit retry so a window cannot fail an otherwise-complete run."""
+    Only a run that started at since=None may derive NEW candidates: absence
+    from an incremental listing means "not updated", never "gone". The
+    candidate set is stored, unmarked items minus everything seen across the
+    whole run (including rate-limit restarts), unioned with any numbers a
+    previous run left pending (issue #66 AC4: a pass that did not complete
+    retries from the durable set, never from a laundered clean state).
+
+    `derive_new=False` is the RETRY shape the plan promises for a later run:
+    a failed pass leaves its candidate set in `sync_pending(reason=
+    'deletion')`, and a later non-full run re-runs the oracle over exactly
+    those numbers — never re-deriving absence from an incremental window —
+    then clears the rows, the pending marker and the error on success. A
+    plain re-run therefore recovers this failure class without `--force`.
+
+    Atomicity (issue #66 AC3): the pending set is written BEFORE the probe,
+    the verdicts are buffered, and items are marked ONLY after every chunk
+    succeeded. A raise from the probe marks NOTHING — no item is fabricated
+    deleted and no corroborated verdict is half-applied — and the pending
+    set guarantees every candidate is retried on the next run."""
     checker = getattr(source, "check_deleted", None)
     if not callable(checker):
         return
-    rows = conn.execute(
-        "SELECT number FROM items WHERE repo = ? AND state NOT IN ('deleted','transferred')",
-        (repo,),
-    ).fetchall()
-    candidates = sorted(
-        {int(r["number"]) for r in rows} - set(seen_numbers)
-    )
+    pending = set(pending_numbers(conn, repo, "deletion")["deletion"])
+    if derive_new:
+        rows = conn.execute(
+            "SELECT number FROM items WHERE repo = ? AND state NOT IN ('deleted','transferred')",
+            (repo,),
+        ).fetchall()
+        candidates = sorted(
+            ({int(r["number"]) for r in rows} - set(seen_numbers)) | pending
+        )
+    else:
+        # Retry shape: only the durable set, so an incremental window's
+        # silence can never fabricate a deletion.
+        candidates = sorted(pending)
     if not candidates:
+        clear_pending(conn, repo, reason="deletion")
         return
-    verdicts = _call_with_rate_retry(checker, candidates) or {}
+    # The durable retry set comes first: any raise below leaves every
+    # candidate pending for the next run.
+    write_pending(conn, repo, candidates, "deletion")
+    verdicts = _call_deletion_checker(
+        checker, candidates, _deletion_corroborator(seen_numbers, candidates)
+    )
     if not isinstance(verdicts, dict):
-        return
+        # A non-dict answer is a FAILED probe, not a pass (PR #76 review
+        # PRR-015): the durable candidates written above stay pending for
+        # the next run, and the run records the failure exactly like any
+        # other probe fault instead of finishing exit-0 with no verdict
+        # while last_full_sync_at keeps moving on a later incremental run.
+        raise SyncError(
+            f"deletion oracle for {repo} returned a non-dict answer"
+            f" ({len(candidates)} candidates remain pending)"
+        )
     allowed = set(candidates)
     clean: dict[int, str] = {}
     for n, v in verdicts.items():
@@ -705,6 +1213,7 @@ def _deletion_pass(
             continue
         if number in allowed and text in ("deleted", "transferred"):
             clean[number] = text
+    # Every chunk succeeded: apply the buffered verdicts and clear the set.
     for number, verdict in sorted(clean.items()):
         gone_note = "reported by source deletion check after a completed full listing"
         # Oracle deletions must reach the sidecar too, or replay resurrects
@@ -716,6 +1225,7 @@ def _deletion_pass(
             verdict=verdict,
         )
         _mark_gone(conn, repo, number, verdict, gone_note)
+    clear_pending(conn, repo, reason="deletion")
 
 
 def _error_text(exc: BaseException) -> str:
@@ -729,6 +1239,61 @@ def _write_jsonl(handle: TextIO | None, resource: str, payload: object) -> None:
     handle.write(json.dumps({"resource": resource, "payload": payload}, ensure_ascii=False))
     handle.write("\n")
     handle.flush()
+
+
+def _write_item_bundle(
+    handle: TextIO | None,
+    number: int,
+    list_raw: dict,
+    pull_raw: object,
+    issue_comments: object,
+    review_comments: object,
+    reviews: object,
+    files: object,
+    timeline: object,
+    links: object,
+    links_incomplete: object,
+    pr_commits: object,
+    children_complete: object,
+) -> None:
+    """One replayable item_bundle for an ingested item — the exact payloads
+    ingest saw, written by BOTH the listing loop and the torn-pending retry
+    so replay reproduces every stored row (issue #23/#25; PR #76 review
+    PRR-011: a resolved torn item missing from events.jsonl would make the
+    replay corpus disagree with the store). A pull payload without its own
+    number (GraphQL-shaped) is stamped on the bundle copy only — the raw
+    dicts stay untouched so raw_json reproduces byte-identically.
+    """
+    pull_for_bundle = pull_raw
+    if isinstance(pull_for_bundle, dict) and "number" not in pull_for_bundle:
+        pull_for_bundle = {**pull_for_bundle, "number": number}
+    _write_jsonl(
+        handle,
+        "item_bundle",
+        {
+            "number": number,
+            "item": list_raw,
+            "pull": pull_for_bundle,
+            "issue_comments": issue_comments,
+            "review_comments": review_comments,
+            "reviews": reviews,
+            "files": files,
+            "timeline": timeline,
+            # v10 sections (issue #27): the exact link and commit payloads
+            # ingest saw, with the same presence semantics (None = never
+            # carried) so replay reproduces the store.
+            "links": links,
+            "links_incomplete": links_incomplete,
+            "pr_commits": pr_commits,
+            # The exact completeness map ingest saw (issue #25): replay
+            # applies it verbatim so it can never fabricate tombstones the
+            # original run suppressed. Pre-#25 bundles lack the key; the
+            # reader fails them closed.
+            "children_complete": children_complete,
+            "gone": False,
+            "gone_status": None,
+        },
+    )
 
 
 def _ensure_state_row(
@@ -807,13 +1372,44 @@ def _gh_host() -> str:
     return os.environ.get("GH_HOST") or "github.com"
 
 
-def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: str) -> None:
+def _probe_failed_key(source: GitHubSource) -> str:
+    """The meta key holding the LATEST capability-probe failure (empty when
+    the last probe succeeded), keyed like the capability cache itself."""
+    return (
+        f"capability_probe_failed:v3:{_gh_host()}:"
+        f"{_gh_version(getattr(source, 'gh_bin', 'gh'))}"
+    )
+
+
+def _clear_probe_failures(conn: sqlite3.Connection) -> None:
+    """Drop THIS HOST's capability-probe failure markers on a successful
+    probe.
+
+    status.coverage counts every non-empty `capability_probe_failed:%` row,
+    so clearing only this host+version's key would leave a superseded
+    gh-version key reporting failure forever after an upgrade — the count
+    the code comment promises is "never cumulative" (PR #76 review
+    PRR-033). The delete is scoped to the CURRENT host's keys: probe
+    markers are host-specific, and a success against one host must not
+    erase another host's active failure (PR #76 review N8)."""
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE ?",
+        (f"capability_probe_failed:%:{_gh_host()}:%",),
+    )
+
+
+def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: str) -> bool:
     """Hydrate or run the capability probe for sources that support it
-    (issue #23). Duck-typed on BOTH members: every source without the probe
-    pair (fakes, REST-only, replay) skips the whole step - no meta I/O, no
-    subprocess. Meta reads/writes run OUTSIDE every per-item transaction. A
-    probe failure fails open: the sync proceeds with the full field set and
-    the failure is recorded in fetch_log."""
+    (issue #23). Returns True when the latest probe FAILED (the run then
+    fails open with the full field set and the failure is reported in the
+    sync result and status.coverage — issue #65 AC9), False otherwise.
+
+    Duck-typed on BOTH members: every source without the probe pair (fakes,
+    REST-only, replay) skips the whole step — no meta I/O, no subprocess.
+    Meta reads/writes run OUTSIDE every per-item transaction. A probe
+    failure fails open: the sync proceeds with the full field set and the
+    failure is recorded in fetch_log."""
+    probe_failed = False
     probe = getattr(source, "probe_capabilities", None)
     attach = getattr(source, "attach_capabilities", None)
     if not callable(probe) or not callable(attach):
@@ -837,7 +1433,14 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
             # failure-triggered re-probe otherwise exists).
             source._capabilities_from_cache = True
             source._capabilities_meta_key = key
-            return
+            # Clearing the latest-failure state is a write, so it commits
+            # here like the fresh-probe path does: leaving it open would
+            # hand the per-item loop a connection already in a transaction,
+            # and its BEGIN IMMEDIATE would fail with "cannot start a
+            # transaction within a transaction".
+            _clear_probe_failures(conn)
+            conn.commit()
+            return probe_failed
         except ValueError:
             pass  # corrupt meta row: fall through to a fresh probe
     try:
@@ -846,12 +1449,24 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
         conn.execute("BEGIN IMMEDIATE")
         try:
             log_fetch(conn, repo, "graphql_probe", None, note=f"probe failed: {exc}")
+            # The LATEST probe state, so status.coverage reads recovery-safe
+            # (a later successful probe clears it) — issue #65 AC9: the
+            # failure is reported, not only logged. Superseded keys are
+            # dropped FIRST so the coverage count stays at the documented
+            # one-per-latest-failure (PR #76 review PRR-033 body-claim
+            # audit). The TEXT is bounded through _error_text like
+            # last_error (PR #76 review PRR-046): raw gh stderr must not
+            # land unbounded in the meta table.
+            _clear_probe_failures(conn)
+            set_meta(conn, _probe_failed_key(source), _error_text(exc))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-        return
+        return True
     attach(caps)
+    # A successful probe clears the latest-failure state (recovery-safe).
+    _clear_probe_failures(conn)
     set_meta(
         conn,
         key,
@@ -864,6 +1479,7 @@ def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: s
         ),
     )
     conn.commit()
+    return probe_failed
 
 
 def sync_repo(
@@ -876,6 +1492,7 @@ def sync_repo(
     jsonl_path: Path | None = None,
     numbers: list[int] | None = None,
     fetch_source: str | None = None,
+    source_name: str | None = None,
 ) -> dict:
     """Incremental sync. Each item is one IMMEDIATE transaction.
 
@@ -889,7 +1506,10 @@ def sync_repo(
     nothing: callers that construct the source directly (the MCP surface)
     or run on the CLI default leave the recorded profile exactly as the
     operator set it, so a deliberately-rest store never silently flips
-    (cubic re-review)."""
+    (cubic re-review). `source_name` is the EFFECTIVE source this run was
+    built from (`graphql`/`rest`) and is what the result's `source` key
+    reports; None (the default) keeps the historical answer, which reports
+    `graphql` unless the run itself degraded to REST."""
     # Everything that touches the database lives inside the try: the recorder
     # must see prologue failures too (force reset, state-row ensure, pending
     # marker) — a lock or disk fault landing there is still a failed sync and
@@ -898,12 +1518,19 @@ def sync_repo(
     # the row was never created.
     repo = validate_slug(repo)  # canonical lowercase identity for every key
     ingested = 0
+    ingested_numbers: set[int] = set()
     last_number: int | None = None
     jsonl_handle: TextIO | None = None
     try:
         if force and numbers is None:
             # The force reset runs first so the pending marker below is
             # computed from the watermark this run will actually use.
+            # An active recovery floor is NOT cleared here: a forced run
+            # drains from the beginning (a NULL watermark subsumes the
+            # floor's window — the floor read below only ever RAISES a
+            # non-NULL watermark to the floor), and if this run then fails
+            # for an unrelated reason the floor must still be there for the
+            # next one. It clears on a clean finish like any other run's.
             conn.execute(
                 "UPDATE sync_state SET issues_since = NULL, last_error = NULL WHERE repo = ?",
                 (repo,),
@@ -916,7 +1543,45 @@ def sync_repo(
             (repo,),
         ).fetchone()
         since = None if row is None else row["issues_since"]
+        # Recovery floor (issue #65 AC1): a previous run that could not
+        # quiesce the listing persisted this floor; the run re-drains from
+        # the earliest of it and the watermark, so an item the churn skipped
+        # can never be sealed by the advancing per-item watermark bumps. A
+        # NULL floor with the flag active is a full run's floor: from the
+        # beginning. The columns arrive with migration v12; a pre-v12 store
+        # simply has no floor.
+        floor_cols = "listing_floor_active" in {
+            r[1] for r in conn.execute("PRAGMA table_info(sync_state)")
+        }
+        if floor_cols:
+            frow = conn.execute(
+                "SELECT listing_floor, listing_floor_active FROM sync_state WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+            if frow is not None and frow["listing_floor_active"]:
+                floor = frow["listing_floor"]
+                if floor is None:
+                    since = None
+                elif since is not None and floor < since:
+                    # Raise a stale watermark to the floor so the window the
+                    # last run could not quiesce is re-drained. A NULL
+                    # watermark already means "from the beginning", which
+                    # SUBSUMES the floor's window (the plan's min() rule) —
+                    # narrowing a from-the-beginning run to the floor would
+                    # silently skip everything older than it.
+                    since = floor
         pending_at_start = bool(row is not None and row["full_sync_pending"])
+        if numbers is None and pending_at_start and since is not None:
+            # An unfinished full sync completes as a FULL sync (issue #66
+            # AC12/AC13 on the resumed path; PR #76 review PRR-013): the
+            # run re-walks from the beginning instead of the watermark
+            # tail, so the deletion oracle's absence derivation sees the
+            # whole corpus. A tail walk's `seen` set cannot distinguish
+            # "not yet listed this run" from "gone upstream", so finishing
+            # on the tail would either skip the oracle (certifying a full
+            # sync that never derived deletions) or fabricate candidates.
+            # The from-the-beginning walk subsumes any recovery floor.
+            since = None
         if numbers is not None:
             # Targeted refresh (issue #23): never starts or completes a full
             # sync, and the deletion oracle never runs. A corpus that has
@@ -946,18 +1611,34 @@ def sync_repo(
             started_full = since is None
         seen_numbers: set[int] = set()
         rate_window: tuple[int, str] | None = None
-
         # Sidecar setup is a failure path too (e.g. the target path is a
         # regular file). The finally guard tolerates a half-failed setup
-        # because jsonl_handle is None until it opens.
+        # because jsonl_handle is None until it opens. It opens BEFORE the
+        # pending retry below: a torn number that turns out to be deleted
+        # records its gone bundle through the same seam every other
+        # deletion uses, and that needs the handle.
         if jsonl_path is not None:
             jsonl_path.mkdir(parents=True, exist_ok=True)
             jsonl_handle = (jsonl_path / "events.jsonl").open("a", encoding="utf-8")
+        # Pending retry (issue #66 AC5): numbers an earlier run could not
+        # resolve are refreshed first, through the exact-number seam, so
+        # the advancing watermark can never seal them.
+        if numbers is None:
+            pending_torn = pending_numbers(conn, repo, "torn")["torn"]
+            if pending_torn:
+                ingested += _retry_torn_pending(
+                    conn, source, repo, pending_torn, include_patches,
+                    seen_numbers, jsonl_handle,
+                )
+                for n in pending_torn:
+                    if n in seen_numbers and n not in ingested_numbers:
+                        ingested_numbers.add(n)
+
         # Capability probe (issue #23): hydrate the cached field map or run
         # the introspection once per host+gh-version, so a schema drift never
         # reaches the page query. Duck-typed: sources without the probe pair
         # skip the whole step. Outside every per-item transaction.
-        _attach_capabilities(conn, source, repo)
+        probe_failed = _attach_capabilities(conn, source, repo)
         # The listing is consumed in pages and each item commits with its
         # own watermark bump, so everything delivered before a failure is
         # durable (issue #5 AC1). A rate-limit window is slept out on the
@@ -968,7 +1649,46 @@ def sync_repo(
         # (GraphQLSource) is also checked proactively at the top of each
         # attempt, so a budget already at the floor sleeps BEFORE burning
         # the attempt (issue #5 AC4's "reaches the floor" clause).
+        #
+        # Pass loop (issue #65 AC1): the attempt loop below is ONE pass over
+        # the window. After a pass completes, the loop runs again unless the
+        # pass delivered exactly the same item set as its predecessor (the
+        # quiescence condition); a boundary shift detected inside the source
+        # (ListingShiftedError) ends the pass early and forces another. The
+        # run's coverage is the union of every pass's deliveries, and the
+        # cap (_MAX_LISTING_PASSES) fails the run incomplete rather than
+        # letting a churning listing look complete.
         attempts = 0
+        listing_passes = 0
+        prev_pass_numbers: set[int] | None = None
+        pass_numbers: set[int] = set()
+        # How many rows each pass delivered per number (issue #65 AC1). A
+        # source may legitimately serve several versions of one number in a
+        # single walk — a recorded replay does exactly that — so "already
+        # ingested" cannot be decided by the row alone: a re-delivery is a
+        # verification only when the PREVIOUS pass served at least as many
+        # rows for that number (see _already_covered).
+        pass_counts: dict[int, int] = {}
+        prev_pass_counts: dict[int, int] = {}
+        # REST degradation (issue #65 AC3): set once, when a qualifying
+        # GraphQL failure proves the endpoint unavailable; the run then
+        # finishes over the per-item REST path and reports it.
+        rest_degraded = False
+        # Items this run already skipped as torn (issue #65 AC6): a later
+        # pass re-delivers them from the listing, but re-attempting the
+        # resolution would burn the refresh budget twice and re-log the
+        # same fault — the durable pending set already holds them.
+        torn_skipped: set[int] = set()
+        # The updated_at each number was ingested with this run, so a
+        # verification pass can skip an unchanged re-delivery (no children
+        # re-fetch, no re-ingest) while still re-ingesting a NEWER row and
+        # ingesting anything the first pass skipped.
+        ingested_versions: dict[int, str] = {}
+        # walk_since is the floor the CURRENT walk uses; a rate-window restart
+        # advances it to the committed watermark (issue #65 AC2), while every
+        # new pass resets it to the run's floor so the pass loop's
+        # completeness argument (re-walk the whole window) still holds.
+        walk_since = since
         while True:
             try:
                 # Proactive floor check (issue #5 AC4 "reaches the floor"):
@@ -988,16 +1708,39 @@ def sync_repo(
                         jsonl_handle,
                     )
                 else:
-                    payloads = source.list_issues(since)
+                    payloads = source.list_issues(walk_since)
                 for payload in payloads:
                     batch = _batch(payload)
                     # One bulk children call per listing page when the source
                     # offers it (issue #5 AC2); items the source did not
-                    # answer fall through to the per-item REST path.
+                    # answer fall through to the per-item REST path. A page
+                    # every row of which this run already covered (the
+                    # verification pass re-listing a stable window) is NOT
+                    # re-fetched: the coverage proof needs the listing page
+                    # again, never its children a second time.
                     provided_map: dict[int, dict] = {}
                     fetch = getattr(source, "fetch_children", None)
-                    if callable(fetch) and batch:
-                        provided_map = fetch(batch) or {}
+                    if (
+                        callable(fetch)
+                        and batch
+                        and not rest_degraded
+                        and not _batch_fully_covered(
+                            batch, ingested_versions, ingested_numbers,
+                            prev_pass_counts,
+                        )
+                    ):
+                        try:
+                            provided_map = fetch(batch) or {}
+                        except GitHubError as exc:
+                            if _rate_attrs(exc) is not None:
+                                raise  # a window: the attempt loop sleeps it out
+                            if not _degradable_error(exc):
+                                raise
+                            # GraphQL is unavailable: degrade ONCE, log the
+                            # one row, and let this and every later item take
+                            # the per-item REST path.
+                            rest_degraded = True
+                            _log_graphql_unavailable(conn, repo, exc)
                     for list_raw in batch:
                         if not isinstance(list_raw, dict) or "number" not in list_raw:
                             continue
@@ -1017,6 +1760,22 @@ def sync_repo(
                                 raise
                             continue
                         seen_numbers.add(number)
+                        pass_numbers.add(number)
+                        pass_counts[number] = pass_counts.get(number, 0) + 1
+                        if _already_covered(
+                            number,
+                            ingested_versions.get(number),
+                            list_raw.get("updated_at"),
+                            ingested_numbers,
+                            pass_counts[number],
+                            prev_pass_counts,
+                        ):
+                            # A verification pass re-delivered a row this
+                            # run already covered: coverage is proven, so
+                            # nothing is re-fetched and no second
+                            # observation is recorded.
+                            last_number = number
+                            continue
                         kind = item_kind(list_raw)
                         provided = provided_map.get(number)
                         if isinstance(provided, dict) and provided.get("gone"):
@@ -1031,7 +1790,13 @@ def sync_repo(
                             carried_note = provided.get("gone_note")
                             carried_verdict = provided.get("gone_verdict")
                             status = provided.get("gone_status")
-                            ingested += _ingest_and_mark_gone(
+                            # EVERY gone observation is applied — the mark
+                            # records that observation's verdict, so a later
+                            # bundle (410/transferred after 404/deleted) must
+                            # still land — while the run's `ingested` count
+                            # stays DISTINCT per number (C2's restarted-pass
+                            # contract). Only the counting is once per number.
+                            marked = _ingest_and_mark_gone(
                                 conn, repo, list_raw, number,
                                 status if isinstance(status, int) else 404,
                                 include_patches=include_patches,
@@ -1045,6 +1810,10 @@ def sync_repo(
                                     else "deleted"
                                 ),
                             )
+                            if number not in ingested_numbers:
+                                ingested_numbers.add(number)
+                                ingested += marked
+                            ingested_versions[number] = list_raw.get("updated_at")
                             last_number = number
                             continue
                         try:
@@ -1058,15 +1827,124 @@ def sync_repo(
                             )
                         except GitHubError as exc:
                             if exc.status in (404, 410):
-                                ingested += _ingest_and_mark_gone(
+                                # Same rule as the replayed-gone branch: the
+                                # mark applies to every live 404/410
+                                # observation, the distinct-item count moves
+                                # once per number.
+                                #
+                                # Repository reachability decides whether
+                                # this per-item verdict is real (issue #66
+                                # AC5 extended to the listing walk, PR #76
+                                # review PRR-010): a repository that became
+                                # unreadable between the served listing page
+                                # and this fetch would otherwise fabricate
+                                # a deletion for every remaining item while
+                                # the run reports success. ONE probe per
+                                # 404/410 decides it — a probe passed now
+                                # keeps the mark, an unreadable repository
+                                # fails the run before anything is marked.
+                                # A source with no probe read keeps the
+                                # per-item verdict (test fakes; every
+                                # shipped source has the probe —
+                                # GraphQLSource inherits it from
+                                # GhApiSource).
+                                if callable(
+                                    getattr(source, "probe_repository", None)
+                                ):
+                                    _assert_repository_readable(source, repo)
+                                marked = _ingest_and_mark_gone(
                                     conn, repo, list_raw, number, exc.status,
                                     include_patches=include_patches,
                                     jsonl_handle=jsonl_handle,
                                     advance_watermark=numbers is None,
                                 )
+                                if number not in ingested_numbers:
+                                    ingested_numbers.add(number)
+                                    ingested += marked
+                                ingested_versions[number] = list_raw.get("updated_at")
                                 last_number = number
                                 continue
                             raise
+
+                        # Torn-row resolution (issue #65 AC6): the pull
+                        # payload's updated_at strictly newer than the
+                        # listing row's means the two snapshots disagree —
+                        # re-fetch the listing row until it catches up. A
+                        # listing that stays skewed skips the item into the
+                        # durable pending set (never the forbidden mixture,
+                        # and never the ABSENT-preservation path that would
+                        # keep a stored row's old pull-owned trio).
+                        pull_ts = (
+                            pull_raw.get("updated_at")
+                            if isinstance(pull_raw, dict) else None
+                        )
+                        list_ts = list_raw.get("updated_at")
+                        if number in torn_skipped:
+                            last_number = number
+                            continue
+                        if (
+                            isinstance(pull_ts, str) and isinstance(list_ts, str)
+                            and pull_ts > list_ts
+                        ):
+                            # The store may already hold state at least as
+                            # new as the pull payload — this run's pending
+                            # retry resolved it, or an earlier run did — and
+                            # the listing row in hand is simply stale. The
+                            # stale row must not regress the stored row, and
+                            # there is no obligation left to record: the
+                            # pending set exists to bring the STORE to
+                            # pull-freshness, which it already is (PR #76
+                            # review PRR-013's resumed-full re-walk makes
+                            # a resolved item re-encounter its own stale
+                            # listing row inside one run).
+                            stored_row = conn.execute(
+                                "SELECT updated_at, state FROM items"
+                                " WHERE repo = ? AND number = ?",
+                                (repo, number),
+                            ).fetchone()
+                            stored_ts = (
+                                stored_row["updated_at"] if stored_row else None
+                            )
+                            stored_state = (
+                                stored_row["state"] if stored_row else None
+                            )
+                            # Terminal rows are excluded: a deleted or
+                            # transferred row whose listing is served live
+                            # again must fall through and re-ingest, never
+                            # be preserved by the freshness shortcut (PR #76
+                            # review N4).
+                            if (
+                                isinstance(stored_ts, str)
+                                and stored_ts >= pull_ts
+                                and stored_state not in ("deleted", "transferred")
+                            ):
+                                last_number = number
+                                continue
+                            refreshed = _resolve_torn_row(source, list_raw, pull_ts)
+                            if refreshed is None:
+                                # The listing never caught up: skip the item,
+                                # leave its stored row byte-unchanged, and
+                                # record the durable retry.
+                                torn_skipped.add(number)
+                                write_pending(conn, repo, [number], "torn")
+                                conn.execute("BEGIN IMMEDIATE")
+                                try:
+                                    log_fetch(
+                                        conn, repo, "item", str(number),
+                                        note=(
+                                            "torn_row_unresolved: the listing row"
+                                            " stayed older than the pull payload"
+                                            f" (listing {list_ts}, pull {pull_ts});"
+                                            " the item is pending retry"
+                                        ),
+                                    )
+                                    conn.commit()
+                                except Exception:
+                                    conn.rollback()
+                                    raise
+                                last_number = number
+                                continue
+                            list_raw = refreshed
 
                         conn.execute("BEGIN IMMEDIATE")
                         try:
@@ -1192,48 +2070,57 @@ def sync_repo(
                         except Exception:
                             conn.rollback()
                             raise
-                        ingested += 1
+                        if number not in ingested_numbers:
+                            ingested_numbers.add(number)
+                            ingested += 1
+                        ingested_versions[number] = list_raw.get("updated_at")
                         last_number = number
                         # One replayable item_bundle per ingested item
                         # (issue #23): the bundle carries the owning number
                         # and the exact section lists ingest saw, so a replay
-                        # reproduces the store row for row. A pull payload
-                        # without its own number (GraphQL-shaped) is stamped
-                        # on the bundle copy only - the raw dicts stay
-                        # untouched so raw_json reproduces byte-identically.
-                        pull_for_bundle = pull_raw
-                        if isinstance(pull_for_bundle, dict) and "number" not in pull_for_bundle:
-                            pull_for_bundle = {**pull_for_bundle, "number": number}
-                        _write_jsonl(
-                            jsonl_handle,
-                            "item_bundle",
-                            {
-                                "number": number,
-                                "item": list_raw,
-                                "pull": pull_for_bundle,
-                                "issue_comments": issue_comments,
-                                "review_comments": review_comments,
-                                "reviews": reviews,
-                                "files": files,
-                                "timeline": timeline,
-                                # v10 sections (issue #27): the exact link
-                                # and commit payloads ingest saw, with the
-                                # same presence semantics (None = never
-                                # carried) so replay reproduces the store.
-                                "links": links,
-                                "links_incomplete": links_incomplete,
-                                "pr_commits": pr_commits,
-                                # The exact completeness map ingest saw
-                                # (issue #25): replay applies it verbatim so
-                                # it can never fabricate tombstones the
-                                # original run suppressed. Pre-#25 bundles
-                                # lack the key; the reader fails them closed.
-                                "children_complete": children_complete,
-                                "gone": False,
-                                "gone_status": None,
-                            },
+                        # reproduces the store row for row — the shared
+                        # writer both ingest paths use (PR #76 review
+                        # PRR-011 keeps the torn-pending path on it too).
+                        _write_item_bundle(
+                            jsonl_handle, number, list_raw, pull_raw,
+                            issue_comments, review_comments, reviews, files,
+                            timeline, links, links_incomplete, pr_commits,
+                            children_complete,
                         )
-                break
+                # Pass-loop control (issue #65 AC1): this pass is done. A
+                # targeted refresh is one walk and never re-drains; otherwise
+                # the loop runs again unless this pass delivered exactly the
+                # same item set as its predecessor (quiescence), and the cap
+                # fails the run incomplete with the recovery floor persisted.
+                if numbers is not None:
+                    break
+                listing_passes += 1
+                if pass_numbers == prev_pass_numbers:
+                    break
+                if listing_passes >= _MAX_LISTING_PASSES:
+                    raise _fail_not_quiescent(conn, repo, since, listing_passes)
+                prev_pass_numbers = pass_numbers
+                pass_numbers = set()
+                prev_pass_counts = pass_counts
+                pass_counts = {}
+                attempts = 0  # a fresh pass gets its own rate-window budget
+                walk_since = since  # ...and re-walks from the run's floor
+                continue
+            except ListingShiftedError:
+                # The source's boundary verification saw the order shift
+                # mid-walk: this pass ends early (its delivered items are
+                # durable) and the next pass re-walks the window.
+                if numbers is not None:
+                    raise
+                listing_passes += 1
+                if listing_passes >= _MAX_LISTING_PASSES:
+                    raise _fail_not_quiescent(conn, repo, since, listing_passes)
+                pass_numbers = set()
+                prev_pass_counts = pass_counts
+                pass_counts = {}
+                attempts = 0
+                walk_since = since
+                continue
             except GitHubError as exc:
                 window = _rate_attrs(exc)
                 if window is None or attempts >= _MAX_RATE_WINDOWS:
@@ -1241,14 +2128,35 @@ def sync_repo(
                 rate_window = window
                 attempts += 1
                 _rate_sleep(exc)
+                # Resume the interrupted walk from the watermark the items
+                # committed so far have already advanced to (issue #65 AC2) —
+                # never from the run-start binding, which would re-list
+                # everything the pass already delivered. The pass loop resets
+                # walk_since to the run floor on the next pass.
+                if numbers is None:
+                    committed_since = _committed_watermark(conn, repo)
+                    if committed_since is not None and (
+                        walk_since is None or committed_since > walk_since
+                    ):
+                        walk_since = committed_since
 
-        # Deletion oracle: only a drained full listing may mark items gone
-        # (issue #5 AC5). Incremental absence marks nothing. Runs under the
-        # bounded retry so a window cannot fail an otherwise-complete run.
-        # A targeted refresh never runs it (issue #23): absence from its
-        # filtered view is meaningless for every other item.
-        if started_full:
-            _deletion_pass(conn, source, repo, seen_numbers, jsonl_handle)
+        # Deletion oracle: a drained FULL listing may derive new candidates
+        # (issue #5 AC5) — absence from an incremental listing means "not
+        # updated", never "gone". A run that finds an OPEN deletion pass
+        # re-runs it over exactly the pending set (the plan's later-run
+        # recovery), so a failed pass is retried by a plain re-run instead
+        # of requiring --force and instead of sitting on the error forever.
+        # Runs under the bounded retry so a window cannot fail an
+        # otherwise-complete run. A targeted refresh never runs it (issue
+        # #23): absence from its filtered view is meaningless for every
+        # other item, and its own retry seam is the torn set.
+        if numbers is None:
+            pending_deletion = pending_numbers(conn, repo, "deletion")["deletion"]
+            if started_full or pending_deletion:
+                _deletion_pass(
+                    conn, source, repo, seen_numbers, jsonl_handle,
+                    derive_new=started_full,
+                )
 
         # Fields the capability probe dropped from the page queries
         # (issue #23): one fetch_log row per distinct omitted field.
@@ -1293,6 +2201,15 @@ def sync_repo(
                 targeted=numbers is not None,
                 ingested_count=ingested,
             )
+            if numbers is None and floor_cols:
+                # The listing quiesced and the run finished clean: the
+                # recovery floor is resolved and cleared (a targeted refresh
+                # never re-drains the listing, so it never clears it).
+                conn.execute(
+                    "UPDATE sync_state SET listing_floor = NULL,"
+                    " listing_floor_active = 0 WHERE repo = ?",
+                    (repo,),
+                )
             recount(conn, repo)
             conn.commit()
         except Exception:
@@ -1375,6 +2292,12 @@ def sync_repo(
         "last_error": None if state is None else state["last_error"],
         "rate_limit_remaining": None if rate_window is None else rate_window[0],
         "rate_limit_reset_at": None if rate_window is None else rate_window[1],
+        "source": (
+            "rest (graphql unavailable)"
+            if rest_degraded
+            else (source_name if source_name in ("graphql", "rest") else "graphql")
+        ),
+        "graphql_probe_failed": bool(probe_failed),
     }
 
 

@@ -13,10 +13,14 @@ import sqlite3
 # are the caveats a caller must know before writing SQL against this DB.
 COLUMN_NOTES: dict[str, dict[str, str]] = {
     "edges": {
+        "rel": "closes_keyword is keyword-derived AND only from a PR description or a retained commit message (issue #67): the same words in an issue body, comment or review record 'mentions', never a closure. 'closes' is the GitHub-reported relation (timeline events + closingIssuesReferences) and keyword regexes must never write it; duplicate_keyword and branch_ref are keyword-derived and offline-re-derivable (migration v12)",
         "src_id": "TEXT-typed even for item numbers - filter with src_id = '10', not 10; a foreign cross-referenced source is a repo-qualified id (`owner/repo#N`), never a bare number",
         "dst_id": "TEXT-typed even for item numbers - use dst_id = '10' in SQL filters; a commit endpoint carries the sha so the graph joins to `git log`",
         "evidence": "Provenance payload; never part of an edge's identity - `source` is part of the key because the same pair reported by two streams is two facts, with the closes exception: rel='closes' holds one row per pair whose evidence carries each stream that reported it - both when both streams did (schema v6)",
         "source": "Provenance stream: 'keyword' (text patterns), 'timeline' (closed/cross-referenced/reopened events), 'closing_ref' (PR closingIssuesReferences), 'link' (v10 GitHub-reported blockedBy/parent/duplicateOf/open-linked-PR connections; replaced per connection when fetched complete AND faithfully reported - a node that fails to parse, a carried plural null, or a list on a singular connection is malformed, not a removal, so it is union-only like an overflow), 'payload' (structured fields). Part of the unique key except for rel='closes', where GitHub-reported streams merge into one row (closing_ref preferred when present, each reporting stream's evidence kept)",
+    },
+    "actors": {
+        "is_bot": "v12. 1 when the actor is a bot: a login ending in [bot], a REST payload type 'Bot', a GraphQL __typename 'Bot', or a login listed in the ZAXBYGRAPH_BOT_LOGINS environment variable (comma-separated, EXACT literal match - no patterns, no case folding; applied at sync time only, never by the v12 backfill). NEVER downgrades - a later payload that carries no bot signal keeps the stored 1, and doctor --consolidate takes MAX so adoption cannot un-mark a known bot",
     },
     "pr_files": {
         "patch": "NULL unless the sync used --include-patches",
@@ -43,6 +47,7 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "merged_by": "v7, pull-owned (/pulls merged_by login). A listing-only re-ingest preserves it - the AC3 COALESCE-on-absent rule reproduced on merge_commit before v7",
         "comment_count": "v7, DERIVED: the stored-row count of comments for the item, recomputed on every ingest and by the migration - not a payload field",
         "paths_text": "v7, DERIVED: space-joined pr_files paths (ORDER BY path), recomputed on every ingest - the search surface for touched paths, weighted below title/body",
+        "branch_token": "v12, DERIVED from head_ref: the single numeric token a PR head_ref carries (a multi-token head_ref stores NULL). The indexed equality lookup on (repo, branch_token) is what keeps the per-issue branch_ref derivation flat in corpus size; the EDGE additionally requires the token to name a stored ISSUE other than the PR itself, and the column is authoritative over a payload that predates it",
     },
     "comments": {
         "author_association": "v7. REST supplies it natively; GraphQL maps authorAssociation when the capability probe reports the field. A probe-degraded re-ingest preserves the stored value via the pre-replacement snapshot",
@@ -72,10 +77,17 @@ COLUMN_NOTES: dict[str, dict[str, str]] = {
         "sha": "v10. The commit oid; one row per commit of a PR. Replaced only when the commits section was fetched complete",
         "message": "v10. messageHeadline and messageBody composed; closes_keyword edges with 'commit <sha>' provenance derive from these RETAINED rows on every ingest, so a REST or overflowed re-ingest never retracts them",
     },
+    "sync_pending": {
+        "number": "v12. One row per number a run could NOT resolve, keyed (repo, number, reason): 'torn' for an unresolved listing/pull tear, 'deletion' for a deletion pass that did not complete. Written BEFORE the unresolved work is attempted, so any raise leaves it pending; a clean run of other items never clears it, and the advancing watermark can never seal it. Cleared when the retry resolves the number - a stored item answering 404 is marked deleted and 410 transferred, an unstored number only clears the obligation (nothing to mark), and both go through the repository-read gate first",
+        "reason": "v12. 'torn' or 'deletion' - the two durable retry obligations. doctor --consolidate copies the table (it leads with (repo, number)), so an adopted corpus keeps the debts it owes",
+        "computed_at": "v12. When this obligation was FIRST recorded; it never moves (ON CONFLICT DO NOTHING), so a row pending for weeks says so",
+    },
     "sync_state": {
         "fetch_source": "v11. The fetch source this store's profile deliberately uses (graphql/rest), stamped at listing-sync start; NULL = unset, the documented graphql default. The --max-age refresh re-reads it under the sync lock; consolidation adopts a post-v11 candidate's value, a pre-v11 candidate leaves it NULL",
+        "listing_floor": "v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and issues_since. NULL with listing_floor_active=1 is a FULL run's floor - re-drain from the beginning, which subsumes any timestamp. Resolved (cleared) by the next clean non-targeted FINISH - sync --numbers never re-drains the listing, so it never clears the floor. The floor tracks LISTING quiescence only: an item-level sync_pending obligation that outlives the same finish is retried through its own seam and does not keep the floor standing",
+        "listing_floor_active": "v12. 1 while an unresolved listing floor stands. The next non-targeted run raises a stale watermark to the floor (a targeted refresh never moves the watermark at all); a NULL watermark is never narrowed by it (from-the-beginning already covers the floor's window), so --force still re-reads everything",
         "issues_since": "Watermark passed back verbatim and inclusive; never adjusted",
-        "last_error": "Non-null means the last sync stopped early - re-run sync",
+        "last_error": "Non-null means the last sync did not fully discharge its obligations - it stopped early, or a pending retry it attempted failed. Re-run sync",
         "item_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",
         "comment_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",
         "edge_count": "Finish-time snapshot: recomputed at sync finish (and by doctor --consolidate / migrations), so it can lag committed rows after an interrupted run",

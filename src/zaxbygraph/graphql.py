@@ -17,7 +17,12 @@ from __future__ import annotations
 import json
 import subprocess
 
-from zaxbygraph.github import GitHubError, GhApiSource, _status_from_stderr
+from zaxbygraph.github import (
+    GitHubError,
+    GitHubTransportError,
+    GhApiSource,
+    _status_from_stderr,
+)
 
 #: Numbers per aliased children query (issue + pullRequest aliases each).
 GRAPHQL_CHILDREN_PAGE = 40
@@ -63,7 +68,7 @@ comments(first: 100) {
     updatedAt
     url
     authorAssociation
-    author { login url }
+    author { __typename login url }
   }
 }
 """
@@ -94,7 +99,7 @@ reviews(first: 50) {
     body
     submittedAt
     url
-    author { login }
+    author { __typename login }
     comments(first: 100) {
       totalCount
       pageInfo { hasNextPage }
@@ -106,7 +111,7 @@ reviews(first: 50) {
         url
         authorAssociation
         replyTo { databaseId }
-        author { login url }
+        author { __typename login url }
       }
     }
   }
@@ -250,6 +255,7 @@ _PULL_SCALAR_FRAGMENTS = (
     ("changedFiles", "changedFiles"),
     ("commits", _COMMITS_NODES),
     ("mergedAt", "mergedAt"),
+    ("updatedAt", "updatedAt"),
     ("mergeCommit", "mergeCommit { oid }"),
     ("baseRefName", "baseRefName"),
     ("headRefName", "headRefName"),
@@ -451,6 +457,10 @@ def _comment_payload(node: dict, *, in_reply_to_id=None) -> dict:
         "user": {
             "login": (node.get("author") or {}).get("login"),
             "html_url": (node.get("author") or {}).get("url"),
+            # GitHub's Actor interface has no `type` field; __typename is
+            # the discriminator (Bot/User), carried so ingest can set
+            # actors.is_bot (issue #67 AC4).
+            "type": "Bot" if (node.get("author") or {}).get("__typename") == "Bot" else None,
         },
         "created_at": node.get("createdAt"),
         "updated_at": node.get("updatedAt"),
@@ -566,17 +576,26 @@ class GraphQLSource(GhApiSource):
         caller, which fails open (sync proceeds with the full field set)."""
         if self._capabilities is not None:
             return self._capabilities
-        query = (
+        # GitHub caps each introspection field at TWO uses per query, so the
+        # probe splits across queries — at most two __type/fields selections
+        # and one enumValues per query — and the merged result is what gets
+        # cached (issue #65 AC9: the single stacked query was rejected on
+        # every sync, silently disabling the #23 schema-drift protection).
+        queries = (
             "query { rateLimit { remaining resetAt } "
             'i: __type(name: "Issue") { fields(includeDeprecated: true) { name } } '
-            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } '
-            'ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
+            'p: __type(name: "PullRequest") { fields(includeDeprecated: true) { name } } }',
+            'query { ic: __type(name: "IssueComment") { fields(includeDeprecated: true) { name } } '
             'rc: __type(name: "PullRequestReviewComment") '
-            "{ fields(includeDeprecated: true) { name } } "
-            't: __type(name: "IssueTimelineItemsItemType") '
-            "{ enumValues { name } } }"
+            "{ fields(includeDeprecated: true) { name } } }",
+            'query { t: __type(name: "IssueTimelineItemsItemType") '
+            "{ enumValues { name } } }",
         )
-        payload = self._graphql(query)
+        payload: dict = {}
+        for query in queries:
+            part = self._graphql(query)
+            if isinstance(part, dict):
+                payload.update(part)
         caps: dict[str, set[str]] = {}
         for alias, type_name in (
             ("i", "Issue"),
@@ -738,12 +757,25 @@ class GraphQLSource(GhApiSource):
                 timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
-            raise GitHubError(
+            # Typed (issue #65 AC3): a subprocess that could not be launched
+            # or did not answer in time is a TRANSPORT failure, so a GraphQL
+            # children query over it degrades to the per-item REST path.
+            raise GitHubTransportError(
                 "gh CLI not found. Install GitHub CLI and authenticate with gh auth login."
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubError(
+            raise GitHubTransportError(
                 f"gh api graphql timed out after {GH_TIMEOUT_S}s"
+            ) from exc
+        except OSError as exc:
+            # Every OTHER launch failure (PermissionError, WinError 193 on
+            # a non-executable file, ENOEXEC) is still a TRANSPORT failure
+            # (PR #76 review PRR-021): the typed class is what carries it
+            # into the REST degradation ladder; a raw OSError bypasses
+            # GitHubError entirely. FileNotFoundError above keeps its
+            # specific message.
+            raise GitHubTransportError(
+                f"gh CLI could not be launched: {exc}"
             ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
@@ -1070,7 +1102,10 @@ class GraphQLSource(GhApiSource):
                     "id": r.get("databaseId"),
                     "state": r.get("state"),
                     "body": r.get("body"),
-                    "user": {"login": (r.get("author") or {}).get("login")},
+                    "user": {
+                        "login": (r.get("author") or {}).get("login"),
+                        "type": "Bot" if (r.get("author") or {}).get("__typename") == "Bot" else None,
+                    },
                     "submitted_at": r.get("submittedAt"),
                     "html_url": r.get("url"),
                 }
@@ -1146,6 +1181,7 @@ class GraphQLSource(GhApiSource):
                 "changed_files": node.get("changedFiles"),
                 "commits": (node.get("commits") or {}).get("totalCount"),
                 "merged_at": node.get("mergedAt"),
+                "updated_at": node.get("updatedAt"),
                 "merge_commit_sha": merge_commit.get("oid"),
                 "base": {"ref": node.get("baseRefName")},
                 "head": {"ref": node.get("headRefName")},
@@ -1166,6 +1202,7 @@ class GraphQLSource(GhApiSource):
             # "unknown" into explicit-null clearing of a stored value.
             for graphql_field, rest_key in (
                 ("mergedAt", "merged_at"),
+                ("updatedAt", "updated_at"),
                 ("mergeCommit", "merge_commit_sha"),
                 ("mergedBy", "merged_by"),
             ):
@@ -1281,22 +1318,62 @@ class GraphQLSource(GhApiSource):
 
     # -- deletion oracle ----------------------------------------------------
 
-    def check_deleted(self, numbers: list[int]) -> dict[int, str]:
-        """Existence probe over stored numbers (issue #5 AC5).
+    def check_deleted(
+        self, numbers: list[int], corroborator=None
+    ) -> dict[int, str]:
+        """Existence probe over stored numbers — the ONE owner of chunking
+        and of the corroboration truth table (issue #5 AC5, issue #66 AC2).
 
         A number is reported deleted only when neither its issue nor its
         pullRequest node resolves. GraphQL cannot distinguish a transferred
         issue from a deleted one in this repo, so the verdict is always
         'deleted' here; sources with richer signals may report
-        'transferred'."""
+        'transferred'.
+
+        The truth table, per chunk:
+
+        * **no corroborator offered** (a one-argument call, or a caller
+          that passes None) — EXACTLY the base contract: a chunk that
+          resolves nothing raises, because an all-null answer cannot be
+          told apart from a repo-wide visibility change or a silently
+          degraded response.
+        * **a witness that resolves** corroborates a chunk that resolves
+          nothing: those candidates are genuinely gone, and the witness
+          itself never becomes a verdict.
+        * **a witness that resolves nothing** is the same evidentiary class
+          as the base refusal — deleted since the listing, or a degraded
+          response — so it raises rather than mass-marking.
+        * **no witness available** (the all-gone window, where every listed
+          item is a candidate): ONE independent ``probe_repository()`` read
+          per all-gone CHUNK decides — readable marks, unreadable raises.
+          The chunk is the evidentiary unit (the same 50 candidates are
+          being marked together), so a >50-item window costs ceil(n/50)
+          reads, never one read for the whole pass.
+
+        The caller (sync) buffers every verdict and marks only after this
+        returns, so any raise here marks nothing."""
         gone: dict[int, str] = {}
         unique = sorted({int(n) for n in numbers})
         for start in range(0, len(unique), GRAPHQL_DELETED_PAGE):
             chunk = unique[start:start + GRAPHQL_DELETED_PAGE]
+            witness: int | None = None
+            if callable(corroborator):
+                offered = corroborator()
+                witness = int(offered) if offered is not None else None
             aliases: list[str] = []
             for n in chunk:
                 aliases.append(f"i{n}: issue(number: {n}) {{ number }}")
                 aliases.append(f"p{n}: pullRequest(number: {n}) {{ number }}")
+            if witness is not None and witness not in chunk:
+                # The witness rides the SAME query, so a degraded response
+                # cannot be mistaken for a dead witness (both would fail the
+                # same read, and the raise is the safe direction either way).
+                aliases.append(
+                    f"iw{witness}: issue(number: {witness}) {{ number }}"
+                )
+                aliases.append(
+                    f"pw{witness}: pullRequest(number: {witness}) {{ number }}"
+                )
             query = (
                 "query { rateLimit { remaining resetAt } "
                 f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
@@ -1306,18 +1383,51 @@ class GraphQLSource(GhApiSource):
             repo = payload.get("repository")
             if not isinstance(repo, dict):
                 raise GitHubError("unexpected graphql repository payload")
-            resolved = 0
-            for n in chunk:
-                if repo.get(f"i{n}") is not None or repo.get(f"p{n}") is not None:
-                    resolved += 1
-                else:
-                    gone[n] = "deleted"
-            if resolved == 0:
-                # A chunk where NOTHING resolves is indistinguishable from a
-                # repo-wide visibility change or a silently degraded
-                # response; refusing to mass-mark is the safe direction.
-                raise GitHubError(
-                    "deletion probe resolved no nodes for a whole chunk; "
-                    "refusing to mark items gone without corroboration"
+
+            def _resolves(n: int, _repo=repo) -> bool:
+                # Both alias shapes: a chunk member is queried as i{n}/p{n},
+                # a witness riding alongside as iw{n}/pw{n}.
+                return (
+                    _repo.get(f"i{n}") is not None
+                    or _repo.get(f"p{n}") is not None
+                    or _repo.get(f"iw{n}") is not None
+                    or _repo.get(f"pw{n}") is not None
                 )
+
+            resolved = sum(1 for n in chunk if _resolves(n))
+            if resolved == 0:
+                if not callable(corroborator):
+                    # Legacy/no-witness shape: the base all-null refusal.
+                    raise GitHubError(
+                        "deletion probe resolved no nodes for a whole chunk; "
+                        "refusing to mark items gone without corroboration"
+                    )
+                if witness is None:
+                    # The all-gone window: no listed item is left to vouch
+                    # for the candidates, so ONE independent read of the
+                    # repository decides (issue #66 AC2).
+                    if not self.probe_repository():
+                        raise GitHubError(
+                            "deletion probe found no live nodes and the"
+                            " repository is not readable; refusing to mark"
+                            " items gone without corroboration",
+                            status=404,
+                        )
+                elif not _resolves(witness):
+                    # A dead witness: deleted since the listing, or a
+                    # response that cannot be trusted. Same evidentiary
+                    # class as the base refusal — refuse to mass-mark.
+                    raise GitHubError(
+                        "deletion probe witness resolved no nodes; "
+                        "refusing to mark items gone without corroboration"
+                    )
+                # Corroborated (or repository-read readable): every
+                # candidate in this chunk is genuinely gone.
+                for n in chunk:
+                    if n != witness:
+                        gone[n] = "deleted"
+                continue
+            for n in chunk:
+                if not _resolves(n):
+                    gone[n] = "deleted"
         return gone

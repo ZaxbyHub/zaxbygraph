@@ -47,6 +47,7 @@
     "merged_by": null,
     "comment_count": 1,
     "paths_text": "",
+    "branch_token": null,
     "labels": [
       {
         "name": "bug",

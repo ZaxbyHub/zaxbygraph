@@ -12,13 +12,13 @@ from zaxbygraph.extract import (
 )
 
 SCHEMA_NAME = "schema.sql"
-SCHEMA_VERSION = "11"
+SCHEMA_VERSION = "12"
 
 #: `PRAGMA user_version` is the authoritative schema state. Databases created
 #: before this framework (v1) carry 0 with the tables already present and are
 #: migrated in place; fresh databases are created at the current shape. The
 #: `meta.schema_version` row is informational only.
-CURRENT_USER_VERSION = 11
+CURRENT_USER_VERSION = 12
 
 #: Feature gates compare against the slot that INTRODUCED a capability, never
 #: against CURRENT_USER_VERSION: a read-only store several slots behind must
@@ -322,6 +322,10 @@ _LOSER_CHILD_TABLES = (
     "item_signatures",
     "item_events",
     "pr_commits",
+    # v12's durable retry set (issue #65/#66): a loser's pending numbers are
+    # the loser's obligation, so they go with it — leaving them would attach
+    # another item's retry debt to the winner's number.
+    "sync_pending",
 )
 
 
@@ -646,6 +650,12 @@ _FOLD_TABLES = (
      "rowid"),
     ("pr_commits",
      "ON CONFLICT(repo, number, sha) DO NOTHING",
+     "rowid"),
+    # v12's durable retry set (issue #65/#66): the same (repo, number,
+    # reason) obligation recorded under two casings of one repo is ONE debt,
+    # so the fold collapses it like every other number-scoped child.
+    ("sync_pending",
+     "ON CONFLICT(repo, number, reason) DO NOTHING",
      "rowid"),
 )
 
@@ -1736,6 +1746,350 @@ def migrate_v10_to_v11(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sync_state ADD COLUMN fetch_source TEXT")
 
 
+def _backfill_is_bot_v12(conn: sqlite3.Connection) -> None:
+    """Backfill actors.is_bot from the stored payloads (issue #67 AC4): a
+    login ending in `[bot]`, or a payload user whose `type` is `Bot`. An
+    externally configured bot list is NOT reconstructible from stored
+    payloads — that boundary is disclosed in docs/schema.md. An existing
+    flag is never downgraded (upsert is max-semantics for the flag)."""
+    import json as _json
+
+    from zaxbygraph import extract as _extract
+
+    bot_logins: set[str] = set()
+    typed: dict[str, bool] = {}
+    queries = (
+        ("SELECT raw_json FROM items", None),
+        ("SELECT raw_json FROM comments", None),
+        ("SELECT raw_json FROM reviews", None),
+        ("SELECT raw_json FROM releases", None),
+    )
+    for sql, _ in queries:
+        for row in conn.execute(sql):
+            raw = row[0]
+            if not raw:
+                continue
+            try:
+                payload = _json.loads(raw)
+            except (TypeError, ValueError, RecursionError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            login = _extract._login(payload)
+            if not login:
+                continue
+            if login.endswith("[bot]"):
+                bot_logins.add(login)
+            user = payload.get("user") or payload.get("author")
+            if isinstance(user, dict) and user.get("type") == "Bot":
+                typed[login] = True
+    for login in sorted(bot_logins | set(typed)):
+        conn.execute(
+            "UPDATE actors SET is_bot = 1 WHERE login = ?"
+            " AND (is_bot IS NULL OR is_bot = 0)",
+            (login,),
+        )
+
+
+def _backfill_branch_tokens_v12(conn: sqlite3.Connection) -> None:
+    """Backfill items.branch_token from the stored head_ref (issue #67
+    AC4/AC5): the exactly-one-numeric-token rule, multi-token branches
+    stay NULL."""
+    from zaxbygraph import extract as _extract
+
+    for row in conn.execute(
+        "SELECT repo, number, head_ref FROM items"
+        " WHERE kind = 'pr' AND head_ref IS NOT NULL"
+    ):
+        tokens = _extract.branch_number_tokens(row["head_ref"])
+        if len(tokens) == 1:
+            conn.execute(
+                "UPDATE items SET branch_token = ? WHERE repo = ? AND number = ?",
+                (str(tokens[0]), row["repo"], row["number"]),
+            )
+
+
+#: The keyword relations v12 re-derives (issue #67): every source='keyword'
+#: relation, each deleted only after its new set is computed in full.
+_V12_KEYWORD_RELS = ("mentions", "closes_keyword", "duplicate_keyword",
+                     "branch_ref", "reverts")
+
+
+def _rederive_keyword_edges_v12(conn: sqlite3.Connection) -> None:
+    """Re-derive every source='keyword' edge offline under the issue #67
+    rules, per repo, from the stored payloads: closing keywords come only
+    from PR descriptions and retained commit messages (an issue body, a
+    comment, or a review records a mention), the noise shapes (code spans,
+    fences, diff hunks, quotes, comment ids, spaced foreign refs) emit
+    nothing, and branch_ref/reverts re-derive from the stored head_ref and
+    titles. Every timeline, closing_ref and link edge is untouched.
+
+    The malformed-row policy: a row whose raw_json cannot be parsed still
+    derives from its structured columns; a row with nothing derivable KEEPS
+    its prior keyword edges (a parse failure never discards evidence)."""
+    import json as _json
+
+    from zaxbygraph import extract as _extract
+
+    repos = [r["repo"] for r in conn.execute(
+        "SELECT DISTINCT repo FROM items ORDER BY repo"
+    )]
+    for repo in repos:
+        titles: dict[str, list[int]] = {}
+        issue_numbers: set[int] = set()
+        for row in conn.execute(
+            "SELECT number, kind, title FROM items WHERE repo = ?", (repo,)
+        ):
+            if row["kind"] == "issue":
+                issue_numbers.add(int(row["number"]))
+            title = row["title"]
+            if title:
+                titles.setdefault(title, []).append(int(row["number"]))
+
+        def title_lookup(title: str, _t=titles) -> list[int]:
+            return _t.get(title, [])
+
+        def number_lookup(numbers, _n=issue_numbers) -> set[int]:
+            return _n & set(numbers)
+
+        def _payload(raw, structured: dict, identity: tuple[str, ...]):
+            """The parsed payload, or a structured-column fallback flagged
+            by the returned tuple's second member. A parsed payload that
+            does not carry its own identity key is malformed, exactly like
+            a parse failure: the extractors index that key (edges_from_item
+            reads raw['number']), so handing it a shape it cannot read
+            would abort the whole migration instead of falling back."""
+            try:
+                parsed = _json.loads(raw) if raw else None
+            except (TypeError, ValueError, RecursionError):
+                parsed = None
+            if isinstance(parsed, dict) and any(k in parsed for k in identity):
+                return parsed, False
+            return structured, True
+
+        # The payload reads STREAM (the plan's migration contract: "all
+        # reads stream"). The item cursor walks one row at a time, and each
+        # item's children come from an indexed per-number lookup, so the
+        # memory bound is one item's text rather than the whole corpus —
+        # the migration runs inside the write transaction and must not hold
+        # a large store's bodies in RAM while it does. Writes here touch
+        # only `edges`, never the table the cursor is scanning. The two
+        # CROSS-ITEM indexes (titles for the revert lookup, issue numbers
+        # for branch_ref) stay materialized: they are structured columns
+        # with no payloads, and the lookups they serve are random-access by
+        # design.
+        items = conn.execute(
+            "SELECT number, kind, title, body, head_ref, raw_json FROM items"
+            " WHERE repo = ? ORDER BY number",
+            (repo,),
+        )
+
+        def _children(table: str, cols: str, order: str, item_number: int):
+            """That item's child rows, from the table's own item index."""
+            return conn.execute(
+                f"SELECT {cols} FROM {table} WHERE repo = ? AND number = ?"
+                f" ORDER BY {order}",
+                (repo, item_number),
+            ).fetchall()
+
+        def _text(payload: dict, *keys: str) -> dict:
+            """Non-string text fields are EMPTY text, never str()-coerced —
+            a list's repr can carry backticked paths and `closes #N`, and
+            extracting from it would let a malformed payload write edges
+            (the v9 backfill rule, PR #76 review PRR-006: the extractors
+            take str only, so an uncoerced {"title": 5} raises TypeError
+            and aborts the migration — one stored row blocking every open
+            of the store)."""
+            for key in keys:
+                if key in payload and not isinstance(payload[key], str):
+                    payload = {**payload, key: ""}
+            return payload
+
+        # Per-item belt for extractor shapes the sanitizer does not know
+        # (a wrong-typed nested field, a column holding a non-string): a
+        # non-SQLite fault marks the row un-derivable and contributes
+        # nothing, and the guard below keeps the row's prior keyword edges
+        # instead of replacing them with a partial set or aborting the
+        # migration (PR #76 review PRR-006). A sqlite3 storage fault still
+        # propagates: the report-don't-swallow invariant is unchanged.
+        extract_faults: list[bool] = []
+
+        def _safe(fn, *args):
+            try:
+                return fn(*args)
+            except sqlite3.Error:
+                raise
+            except Exception:
+                extract_faults.append(True)
+                return ()
+
+        for item in items:
+            number = int(item["number"])
+            extract_faults.clear()
+            raw, malformed = _payload(
+                item["raw_json"],
+                {
+                    "number": number,
+                    "title": item["title"] or "",
+                    "body": item["body"] or "",
+                    "state": "open",
+                    "labels": [],
+                    **({"pull_request": {"url": ""}}
+                       if item["kind"] == "pr" else {}),
+                },
+                ("number",),
+            )
+            # The head_ref COLUMN is authoritative for the branch token: a
+            # payload recorded before the column existed (or the fixture
+            # shape) may not carry it.
+            if item["head_ref"] and not raw.get("head_ref"):
+                raw = {**raw, "head_ref": item["head_ref"]}
+            raw = _text(raw, "title", "body")
+            collected: list[tuple] = []
+            collected.extend(_safe(_extract.edges_from_item, repo, raw))
+            for crow in _children(
+                "comments", "number, kind, github_id, author, body, raw_json",
+                "kind, github_id", number,
+            ):
+                craw, cmal = _payload(
+                    crow["raw_json"],
+                    {
+                        "id": crow["github_id"],
+                        "body": crow["body"] or "",
+                        "user": {"login": crow["author"]},
+                    },
+                    ("id", "github_id"),
+                )
+                collected.extend(
+                    _safe(_extract.edges_from_comment, repo, number,
+                          _text(craw, "body"))
+                )
+            for rrow in _children(
+                "reviews", "number, id, author, state, body, raw_json",
+                "id", number,
+            ):
+                rraw, rmal = _payload(
+                    rrow["raw_json"],
+                    {
+                        "id": rrow["id"],
+                        "body": rrow["body"] or "",
+                        "state": rrow["state"] or "",
+                        "user": {"login": rrow["author"]},
+                    },
+                    ("id",),
+                )
+                collected.extend(
+                    _safe(_extract.edges_from_review, repo, number,
+                          _text(rraw, "body"))
+                )
+            commit_rows = _children("pr_commits", "sha, message", "sha", number)
+            if commit_rows:
+                collected.extend(
+                    _safe(
+                        _extract.edges_from_commit_messages,
+                        repo, number,
+                        [{"sha": r["sha"], "message": r["message"]}
+                         for r in commit_rows],
+                    )
+                )
+            collected.extend(
+                _safe(
+                    _extract.edges_from_pr_state,
+                    repo, raw, title_lookup, number_lookup,
+                )
+            )
+            # branch_ref derives from the head_ref COLUMN — the same source
+            # the store's own ingest loop reads (edges_from_pr_state reads
+            # the payload's nested head.ref, which a listing payload may
+            # not carry in that shape).
+            head_ref = item["head_ref"]
+            if head_ref:
+                tokens = _extract.branch_number_tokens(head_ref)
+                if len(tokens) == 1:
+                    stored = number_lookup(tokens)
+                    if len(stored) == 1 and next(iter(stored)) != number:
+                        collected.append(
+                            (
+                                "item",
+                                str(number),
+                                "branch_ref",
+                                "item",
+                                str(next(iter(stored))),
+                                f"head_ref {head_ref}",
+                                "keyword",
+                            )
+                        )
+            keyword = [
+                e for e in _extract.collapse_edges(collected) if e[6] == "keyword"
+            ]
+            if extract_faults or (malformed and not keyword):
+                # Nothing SAFELY derivable from this row — a parse failure,
+                # or an extractor that could not take its stored shape: its
+                # prior keyword edges are evidence a failure must not
+                # discard, and a partial replacement would retract the
+                # faulted stream's evidence under a silent migration
+                # (PR #76 review PRR-006).
+                continue
+            conn.execute(
+                "DELETE FROM edges WHERE repo = ? AND src_type = 'item'"
+                " AND src_id = ? AND source = 'keyword'"
+                " AND rel IN (%s)" % ",".join("?" * len(_V12_KEYWORD_RELS)),
+                (repo, str(number), *_V12_KEYWORD_RELS),
+            )
+            conn.executemany(
+                "INSERT INTO edges(repo, src_type, src_id, rel, dst_type, dst_id,"
+                " confidence, evidence, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, 'EXTRACTED', ?, 'keyword')",
+                [
+                    (repo, e[0], e[1], e[2], e[3], e[4], e[5])
+                    for e in keyword
+                ],
+            )
+
+
+def migrate_v11_to_v12(conn: sqlite3.Connection) -> None:
+    """v11 -> v12: bot identity, branch tokens, the durable retry set, the
+    listing recovery floor, and the keyword-edge re-derivation under the
+    issue #67 rules.
+
+    The branch-token INDEX is created HERE, never in schema.sql:
+    init_schema executes the current DDL before the migration chain, so an
+    index on a column a v11 store does not have yet would fail the open.
+    Fresh stores receive the columns from schema.sql and the index from
+    this chain, so both paths converge on the same shape."""
+    item_cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "branch_token" not in item_cols:
+        conn.execute("ALTER TABLE items ADD COLUMN branch_token TEXT")
+    actor_cols = {row[1] for row in conn.execute("PRAGMA table_info(actors)")}
+    if "is_bot" not in actor_cols:
+        conn.execute(
+            "ALTER TABLE actors ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_repo_branch"
+        " ON items(repo, branch_token) WHERE branch_token IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_pending ("
+        " repo TEXT NOT NULL,"
+        " number INTEGER NOT NULL,"
+        " reason TEXT NOT NULL,"
+        " computed_at TEXT,"
+        " PRIMARY KEY (repo, number, reason))"
+    )
+    state_cols = {row[1] for row in conn.execute("PRAGMA table_info(sync_state)")}
+    if "listing_floor" not in state_cols:
+        conn.execute("ALTER TABLE sync_state ADD COLUMN listing_floor TEXT")
+    if "listing_floor_active" not in state_cols:
+        conn.execute(
+            "ALTER TABLE sync_state ADD COLUMN listing_floor_active"
+            " INTEGER NOT NULL DEFAULT 0"
+        )
+    _backfill_is_bot_v12(conn)
+    _backfill_branch_tokens_v12(conn)
+    _rederive_keyword_edges_v12(conn)
+
+
 #: Forward-only, ordered. Each entry runs in its own transaction that ends by
 #: stamping `PRAGMA user_version` (the pragma is transactional).
 MIGRATIONS = [
@@ -1749,6 +2103,7 @@ MIGRATIONS = [
     (9, migrate_v8_to_v9),
     (10, migrate_v9_to_v10),
     (11, migrate_v10_to_v11),
+    (12, migrate_v11_to_v12),
 ]
 
 
@@ -1770,6 +2125,7 @@ _TABLE_INTRODUCED_VERSION = {
     "item_signatures": 9,
     "item_events": 10,
     "pr_commits": 10,
+    "sync_pending": 12,
 }
 
 
@@ -1795,6 +2151,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
             conn.rollback()
             raise
         version = target
+    # v12 shape convergence for a store stamped 12 by an INTERMEDIATE build
+    # of this same unreleased slot: that build's CREATE TABLE IF NOT EXISTS
+    # created sync_pending WITHOUT computed_at, CREATE IF NOT EXISTS is a
+    # no-op on the table it finds, and the migration is skipped for an
+    # already-current version — so the column would never arrive and every
+    # write_pending would fail with "no column named computed_at". One
+    # guarded ALTER closes that. A released store never has this shape (v12
+    # ships with the column in both DDLs), so this is branch-local
+    # convergence rather than a schema slot, and it costs one PRAGMA per
+    # write-open.
+    pending_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")
+    }
+    if pending_cols and "computed_at" not in pending_cols:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE sync_pending ADD COLUMN computed_at TEXT")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     conn.execute(
         "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -200,11 +200,20 @@ def _coverage(conn: sqlite3.Connection, repo: str | None, user_version: int) -> 
     else:
         revision_rows = None
         revision_bytes = None
+    # The LATEST capability-probe failure state (issue #65 AC9): one when
+    # the last probe failed, zero once a later probe succeeds — never a
+    # cumulative count, so a recovered host does not keep reporting.
+    probe_failures = conn.execute(
+        "SELECT COUNT(*) FROM meta"
+        " WHERE key LIKE 'capability_probe_failed:%'"
+        " AND value IS NOT NULL AND value != ''"
+    ).fetchone()[0]
     page_size = conn.execute("PRAGMA page_size").fetchone()[0]
     page_count = conn.execute("PRAGMA page_count").fetchone()[0]
     return {
         "truncation_notes": truncation_notes,
         "dropped_fields": dropped_fields,
+        "probe_failures": probe_failures,
         "null_v7_rows": null_v7_rows,
         "revision_rows": revision_rows,
         "revision_bytes": revision_bytes,

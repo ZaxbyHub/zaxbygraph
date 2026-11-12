@@ -1,4 +1,4 @@
-# Schema reference (schema version 11, `PRAGMA user_version` = 11)
+# Schema reference (schema version 12, `PRAGMA user_version` = 12)
 
 Canonical column reference for `zaxbygraph sql`. Everything here was read from a
 live database with `PRAGMA table_info`; if you change `src/zaxbygraph/schema.sql`,
@@ -56,6 +56,7 @@ One row per issue or pull request. The central table.
 | `locked` | INTEGER | `0`/`1`. |
 | `base_ref` | TEXT | PRs only, e.g. `main`. |
 | `head_ref` | TEXT | PRs only. |
+| `branch_token` | TEXT | v12, derived from `head_ref`: the single numeric token a PR head_ref carries (`fix/12-thing` → `12`); a multi-token head_ref (`fix/12-34`) stores `NULL`. The indexed equality lookup on `(repo, branch_token)` is what keeps the `branch_ref` derivation flat in corpus size, and the edge itself additionally requires the token to name a stored **issue** other than the PR. Authoritative over a payload that predates it. |
 | `additions` | INTEGER | PRs only. From `/pulls/{n}`. |
 | `deletions` | INTEGER | PRs only. |
 | `changed_files` | INTEGER | PRs only. `0` means the files GET was skipped. |
@@ -236,8 +237,8 @@ keeps two-rows-are-two-facts.
 | `reviewed` | actor → item | Reviewed at least once. Also collapsed. |
 | `has_label` | item → label | |
 | `touches` | item → file | A PR changed this path. The join key to a code graph. |
-| `closes_keyword` | item → item | A closing keyword plus a same-repo reference in a title, body, comment, review body, or PR commit message (`commit <sha>` evidence). Keyword-derived only — see the caveat below. |
-| `mentions` | item → item | A same-repo reference **without** a closing keyword, in a title, body, comment, or review body. |
+| `closes_keyword` | item → item | A closing keyword plus a same-repo reference in a **PR description** or a **retained commit message** (`commit <sha>` evidence) — the two surfaces GitHub actually honours (issue #67). The same words in an issue body, a comment, or a review body record a `mentions` edge instead, never a closure. Keyword-derived only — see the caveat below. |
+| `mentions` | item → item | A same-repo reference in a title, body, comment, or review body — including a *closing* keyword in one of those non-PR surfaces, which records a mention and never a closure (issue #67). |
 | `closes` | item → item | GitHub-reported closing link: a `closed` timeline event (closer is a PR or a known merge commit) or a PR's `closingIssuesReferences`. Never written by keyword regexes. |
 | `cross_referenced` | item → item | Stored as carried on each item's timeline: source → owner. GitHub reports every reference on **both** items' timelines, so a linkage can appear in either direction (`related`/`path` are direction-agnostic). Foreign sources are repo-qualified (`owner/repo#N`). |
 | `closed_by_commit` | item → commit | The item's `closed` timeline event carries this commit sha. |
@@ -262,10 +263,17 @@ distinguished by `items.kind`. A commit endpoint's id is the sha.
 
 ### What `closes_keyword` and `closes` do and do not mean
 
-`closes_keyword` (source='keyword') is derived from **closing keywords in
-bodies, comments, and review bodies** — `close`/`closes`/`closed`,
-`fix`/`fixes`/`fixed`, `resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
-same-repo GitHub URL. It means *a keyword said so*; nothing more is claimed.
+`closes_keyword` (source='keyword') is derived from **closing keywords
+in a PR's description and in retained commit messages** (issue #67
+narrowed the surface: GitHub honours a closing keyword only there) —
+`close`/`closes`/`closed`, `fix`/`fixes`/`fixed`,
+`resolve`/`resolves`/`resolved` — followed by `#N`, `owner/repo#N`, or a
+same-repo GitHub URL. The same words in an issue body, a comment, or a
+review body record `mentions` instead. It means *a keyword said so*;
+nothing more is claimed. Every `source='keyword'` relation's derivation
+is bounded (reference digits are capped, so an oversized token matches
+nothing rather than wedging `int()`) and is offline-derivable:
+migration v12 re-derives them all from the stored payloads.
 
 `closes` (source='timeline' or 'closing_ref') is what **GitHub reported**:
 `closed` timeline events — including auto-close from merge-commit messages,
@@ -289,7 +297,11 @@ than attached to a same-numbered local item; foreign
 `closingIssuesReferences` entries are discarded outright — never stored,
 never repo-qualified — unlike timeline cross-references from other repos,
 which are kept as repo-qualified ids (`owner/repo#N`) that never attach to a
-same-numbered local item.
+same-numbered local item. A two-segment `word/word #N` after a space is
+dropped **even when it might be a same-repo path** (`src/app #5`): the shape
+is textually indistinguishable from a foreign slug, and never fabricating an
+edge is the conservative direction (AC18 only requires the foreign shape to
+be dropped; this is that rule applied to the whole shape).
 
 Two boundaries:
 
@@ -318,6 +330,7 @@ Two boundaries:
 | --- | --- | --- |
 | `login` | TEXT | Primary key. |
 | `html_url` | TEXT | |
+| `is_bot` | INTEGER | v12. `1` when the actor is a bot: a login ending in `[bot]`, a REST payload `type: "Bot"`, a GraphQL `__typename: "Bot"`, or a login listed in the `ZAXBYGRAPH_BOT_LOGINS` environment variable (comma-separated, **exact literal match** — no patterns, no case folding; applied at sync time only, never by the v12 backfill). **Never downgrades**: a later payload carrying no bot signal keeps the stored `1`, and `doctor --consolidate` takes `MAX` so adoption cannot un-mark a known bot. |
 
 ## releases
 
@@ -354,6 +367,95 @@ possible (the requested source was never recorded before this slot), so a
 migrated store's column is `NULL`, which every reader treats as the
 documented graphql default. Fresh stores get the column at the same
 last position; the migration is a guarded `ALTER TABLE ... ADD COLUMN`.
+
+## Migration 12
+
+v12 (issues #65, #66, #67) is the largest single-slot migration:
+
+- **columns** — `items.branch_token`, `actors.is_bot` (both `ALTER`
+  guarded, so a fresh store and a migrated one converge on the same
+  column order), `sync_state.listing_floor`/
+  `listing_floor_active`, and the new `sync_pending` table (also
+  declared in `schema.sql`, so a fresh store is born with it);
+- **`actors.is_bot` backfill** — every stored payload (items,
+  comments, reviews, releases `raw_json`) is re-read for the payload bot
+  signals: the `[bot]` suffix on the login, and `type: "Bot"` on the
+  payload's user — REST carries that key natively, GraphQL's
+  `__typename: "Bot"` is mapped into it at ingest. The configured list
+  is deliberately NOT read
+  here: `ZAXBYGRAPH_BOT_LOGINS` is not reconstructible from stored JSON,
+  so its entries are applied at sync time only (an exact, literal match —
+  no case folding) and a login added to it later needs a re-sync of an
+  item authored by it;
+- **`items.branch_token` backfill** — from each stored PR's
+  `head_ref` under the exactly-one-token rule;
+- **keyword-edge re-derivation** — every `source='keyword'`
+  relation is recomputed from the stored payloads under the issue
+  #67 rules: closing keywords only from PR descriptions and
+  retained commit messages (`pr_commits.messages`, both revert
+  shapes included), the noise shapes (code spans, fenced blocks,
+  diff hunks, quotes, `comment #id`, spaced foreign-repo
+  references) emitting nothing, reference digits capped, and
+  `branch_ref` re-derived from the head_ref column. The
+  **malformed-row policy**: a row whose `raw_json` cannot be parsed
+  (or carries no identity key) derives from its structured
+  columns, and a row with nothing derivable **keeps** its prior
+  keyword edges — a parse failure never discards evidence.
+  Timeline, `closing_ref` and `link` edges are untouched.
+
+## Listing completeness, the pass cap and the recovery floor (issue #65)
+
+GitHub's issues listing is served `sort=updated&direction=asc` by
+fixed page offsets over a **mutable** order: an already-delivered
+item that is updated (it moves to the tail) or deleted shifts every
+later item up one, so the next page's window silently skips a live
+item at the boundary. No per-boundary probe closes that class — a
+keyset cursor does not terminate when more than a page shares one
+timestamp, and intra-pass re-delivery detection cannot see a
+deletion. The mechanism that does close it:
+
+- **every run that drains the listing walks its window at least twice**
+  (a targeted `--numbers` refresh never drains it — it fetches exactly the
+  numbers named). After a pass
+  completes, the loop runs again unless the pass delivered *exactly*
+  the same set of item numbers as its predecessor (set equality, not
+  subset membership — a subset rule stops on a pass that lost an item
+  the store still lacks).
+- **each full page is re-read once** for boundary verification: the
+  page just served is the offset the next page is measured from, so
+  it is requested again and its number set compared. A mismatch ends
+  the pass early (`ListingShiftedError`) and the next pass
+  re-walks. A short page ends the walk and is never re-read.
+- **a churn that never quiesces fails the run honestly.** The cap
+  is 4 passes; reaching it with unequal sets raises
+  `listing_not_quiescent`, persists the recovery floor
+  (`listing_floor`/`listing_floor_active`), keeps
+  `full_sync_pending`, and suppresses the clean finish — so, when the
+  cap trips, the run never claims coverage it did not achieve.
+- **the next run re-drains from the earlier of the floor and the
+  watermark**, and a clean finish clears the floor. A `NULL` floor
+  with the flag set is a full run's floor (re-drain from the
+  beginning), and a `NULL` watermark is never raised to a non-NULL
+  floor — from-the-beginning already subsumes it, which is what
+  keeps `--force` a real from-scratch read.
+- **a per-item skip is retried from `sync_pending`, never from the
+  watermark**: a torn row is skipped (never stored as a mixture),
+  and a later healthy item's watermark advance cannot seal it,
+  because the durable pending set is refreshed first on every
+  following run.
+
+**Disclosed residual (a condition of this completeness claim).**
+The guarantee is *coverage of the window this run walked*,
+established by the re-walk, and it is bounded by the pass cap: a
+listing that keeps shifting for four consecutive passes fails
+rather than guessing. What no bounded-pass rule can close is the
+**double-churn residual** — the same live item skipped by boundary
+churn in two consecutive passes in a row, which then terminate
+equal. The store never *loses* an item it already holds (every
+pass's deliveries accumulate), but such an item can be absent from
+a run that reports complete until a later run re-lists it. The
+cost of the guarantee is one extra full listing walk per sync;
+children fetches, not listing pages, dominate a full sync.
 
 ## revisions
 
@@ -478,15 +580,17 @@ One row per repo. What `zaxbygraph status` reads.
 | `issues_since` | TEXT | The watermark. Passed back to GitHub verbatim. |
 | `last_full_sync_at` | TEXT | |
 | `last_incr_sync_at` | TEXT | |
-| `last_error` | TEXT | Last failure message, or `NULL`. Non-null means the sync stopped early and re-running will resume. |
+| `last_error` | TEXT | Last failure message, or `NULL`. Non-null means the last sync did not fully discharge its obligations — it stopped early, or a pending retry it attempted failed — and re-running will resume. |
 | `item_count` | INTEGER | |
 | `comment_count` | INTEGER | |
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
 | `fetch_source` | TEXT | v11. The fetch source this store's profile deliberately uses — `graphql` or `rest` — stamped at listing-sync start whenever a run EXPLICITLY stated a source (`--source`, or the `--max-age` refresh honoring the stored value); a run that did not state one (a plain `sync`, a targeted `--numbers` run without `--source`, the MCP surface) never rewrites the stamp, so a store deliberately kept on `--source rest` stays rest until the operator says otherwise. `NULL` on pre-v11 stores or where never recorded, which every reader treats as the documented graphql default. The `--max-age` refresh re-reads it under the sync lock and re-stamps the concrete value it honored; a mid-run GraphQL→REST degradation is a transient fact of one run and never rewrites the stamp. Consolidation adopts a post-v11 candidate's value with its sync_state row; a pre-v11 candidate leaves the column NULL. |
-| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run, AND whenever any `sync_pending` obligation (torn or deletion) is open — including a torn debt from an incremental run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
+| `listing_floor` | TEXT | v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean **non-targeted** finish (`sync --numbers` never re-drains the listing, so it never clears the floor) — the floor tracks LISTING quiescence only, so an item-level `sync_pending` obligation that outlives the same finish is retried through its own seam and does not keep the floor standing — and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
+| `listing_floor_active` | INTEGER | v12. `1` while an unresolved listing floor stands. The next non-targeted run raises a stale watermark to the floor (a targeted refresh never moves the watermark at all); a `NULL` watermark is never narrowed by it (from-the-beginning already covers the floor's window), so `--force` still re-reads everything. |
 
 The three counts are recomputed when a sync run finishes (and by
 `doctor --consolidate` and the schema migrations), not per ingested item:
@@ -499,7 +603,7 @@ can disagree with its live `counts[]` for the same reason.
 
 ### Schema versions and migrations
 
-`PRAGMA user_version` is the authoritative schema state (currently `11`). The
+`PRAGMA user_version` is the authoritative schema state (currently `12`). The
 `meta.schema_version` row is informational only. `init_schema` (which runs
 the migration chain) executes only on a WRITABLE open: a `sync`, an
 MCP-triggered sync, or `doctor --consolidate` (adoption migrates its temp
@@ -645,6 +749,46 @@ Each item is ingested in a single `BEGIN IMMEDIATE` transaction that includes
 its own watermark bump, so an interrupted sync leaves the watermark at the last
 **fully committed** item and is resumable.
 
+## sync_pending
+
+One row per number a run could **not** resolve (v12, issue #65/#66):
+the durable retry set, keyed `(repo, number, reason)`.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `repo` | TEXT | Folded slug, like every other table. |
+| `number` | INTEGER | The unresolved item. |
+| `reason` | TEXT | `torn` — the listing row stayed older than the
+ pull payload after the bounded refresh; `deletion` — a deletion
+ pass that did not complete. |
+| `computed_at` | TEXT | When this obligation was FIRST recorded
+ (issue #66); it never moves (`ON CONFLICT DO NOTHING`), so a row pending
+ for weeks says so. NULL only on a row written by an intermediate build of
+ this unreleased slot — `init_schema` converges that shape on open. |
+
+Written **before** the unresolved work is attempted, so any raise
+leaves every number pending for the next run; a clean run of *other*
+items never clears it, and the advancing per-item watermark can
+never seal it. The retry runs at the START of every sync that
+DRAINS THE LISTING — full or incremental — through the exact-number
+seam (a targeted `--numbers` run fetches exactly the numbers named and
+never runs it, which is its documented contract): a row that caught up
+ingests and leaves the set, one still skipped stays, and a number the
+source now answers 404/410 goes through the repository-read gate first —
+a STORED item is marked `deleted` (404) or `transferred` (410) with the
+sidecar bundle every other deletion writes, while an UNSTORED number
+only clears the obligation and records a fetch_log note (there is
+nothing to mark). This narrows the plan's "every sync run (full, incremental,
+targeted)" — the shipped behaviour keeps targeted runs' one-job contract
+and is the defensible reading; recorded in 02-reproduction.md. `sync_state.last_error` and `full_sync_pending` are held by
+an open `sync_pending` row of ANY reason (`torn` or `deletion`) — neither
+the non-targeted nor the `--numbers`
+finalizer may launder it, and a torn debt that used to finish clean now
+keeps the incomplete marker too (PR #76 review). `doctor --consolidate`
+keeps the store's open rows (unioning the candidate's in) and re-imposes
+the marker, so an adopted corpus keeps the
+debts it owes.
+
 ## fetch_log
 
 Audit trail of HTTP fetches.
@@ -708,7 +852,15 @@ the same reason.
 `status`'s `coverage` block (v7) distinguishes "absent upstream" from "not
 fetched": `truncation_notes` maps `fetch_log.resource` to the count of that
 resource's notes containing `truncated`; `dropped_fields` counts
-capability-probe `omitted <field>` notes; `null_v7_rows` counts items rows
+capability-probe `omitted <field>` notes; `probe_failures` (v12) counts
+`meta` keys of the form `capability_probe_failed:<host>:<gh-version>`
+holding a non-empty value — the latest failure PER HOST (a successful
+probe clears that host's keys only, so a run that recovered by
+re-probing reads `0` for its host while another host's active failure,
+or a still-failing probe, reads `1` and a multi-host store reads the
+sum of its hosts' active failures) (issue #65 AC9: the failure is
+reported, not only logged);
+`null_v7_rows` counts items rows
 where `reactions_total` or `author_association` is `NULL` — the two listing
 keys GitHub always carries with a non-null value, so their `NULL`
 unambiguously marks a payload that predated v7 or one the v6→v7 backfill

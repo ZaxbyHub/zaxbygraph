@@ -170,14 +170,14 @@ class DegradedReingestSurvivalTests(ExtraEdgeIngestTest):
             timeline=None,
         )
         self.assertEqual(
-            self.edge_count("rel = 'closes_keyword' AND src_id = '3'"), 1
+            self.edge_count("rel = 'mentions' AND src_id = '3'"), 1
         )
         self.ingest(
             issue(3, title="issue three", body="no keyword anymore"),
             timeline=None,
         )
         self.assertEqual(
-            self.edge_count("rel = 'closes_keyword' AND src_id = '3'"), 0,
+            self.edge_count("rel = 'mentions' AND src_id = '3'"), 0,
             "a retracted closing keyword must retract the edge on rebuild",
         )
 

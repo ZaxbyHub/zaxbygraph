@@ -1,4 +1,4 @@
--- zaxbygraph schema v11 (`PRAGMA user_version` = 11; see db.py MIGRATIONS)
+-- zaxbygraph schema v12 (`PRAGMA user_version` = 12; see db.py MIGRATIONS)
 -- Raw GitHub issue/PR corpus + EXTRACTED graph edges.
 -- All table rows are mechanically derived from fetched GitHub data:
 -- the fetcher replaces item-scoped child tables on re-ingest (v10's
@@ -10,9 +10,16 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 
+-- v12 (issue #67): the bot verdict for an actor, derived from the payload
+-- (a [bot] suffix, a REST type, a GraphQL __typename) or the configured
+-- ZAXBYGRAPH_BOT_LOGINS list. Declared LAST so a fresh store's column
+-- order matches a pre-v12 store's after the v11->v12 migration's guarded
+-- ALTER appends it (the fresh/migrated shape parity the schema tests
+-- assert).
 CREATE TABLE IF NOT EXISTS actors (
     login    TEXT PRIMARY KEY,
-    html_url TEXT
+    html_url TEXT,
+    is_bot   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS items (
@@ -63,6 +70,14 @@ CREATE TABLE IF NOT EXISTS items (
     comment_count                 INTEGER NOT NULL DEFAULT 0,
     paths_text                    TEXT NOT NULL DEFAULT '',
     raw_json      TEXT NOT NULL,
+    -- v12 (issue #67): the single numeric token a PR head_ref carries,
+    -- stored whenever the head_ref has exactly one such token - the token
+    -- matching a stored issue is what gates the branch_ref EDGE, not this
+    -- column. Declared LAST so a fresh store's
+    -- column order matches a pre-v12 store's after the v11->v12 migration's
+    -- guarded ALTER appends it; idx_items_repo_branch (migration-owned, see
+    -- db.py) reads it.
+    branch_token TEXT,
     UNIQUE (repo, number)
 );
 
@@ -218,7 +233,15 @@ CREATE TABLE IF NOT EXISTS sync_state (
     -- uses, stamped at listing-sync start. NULL (pre-v11 stores, unset)
     -- means the documented graphql default; the --max-age refresh reads it
     -- under the sync lock so a deliberately REST store never profile-drifts.
-    fetch_source         TEXT
+    fetch_source         TEXT,
+    -- v12 (issue #65 AC1): the recovery floor of a listing that never
+    -- quiesced — the window the next run re-drains (the earlier of this
+    -- and the watermark). Declared LAST, in the order the v11->v12
+    -- migration's guarded ALTERs append them, so a fresh store's column
+    -- order matches a migrated one's. A NULL floor with the flag set is a
+    -- full run's floor: re-drain from the beginning.
+    listing_floor        TEXT,
+    listing_floor_active INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
@@ -365,3 +388,22 @@ CREATE TABLE IF NOT EXISTS pr_commits (
 
 CREATE INDEX IF NOT EXISTS idx_items_repo_head ON items(repo, head_ref)
     WHERE kind = 'pr' AND head_ref IS NOT NULL;
+
+-- The durable per-item retry set (migration v12, issue #65/#66): the numbers
+-- a run could not resolve this time, keyed by reason ('torn' for an
+-- unresolved listing/pull tear, 'deletion' for a deletion pass that did not
+-- complete). Written BEFORE the unresolved work is attempted, so any raise
+-- leaves every number pending for the next run — the advancing watermark can
+-- never seal an item the run did not actually resolve. Keyed (repo, number,
+-- reason), so doctor's consolidation copies it like the other item-scoped
+-- children: dropping it would let an adopted corpus forget the retry it owes.
+CREATE TABLE IF NOT EXISTS sync_pending (
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    -- When this obligation was first recorded (issue #66): a pending row's
+    -- age is the diagnostic for "how long has this retry been owed".
+    computed_at TEXT,
+    PRIMARY KEY (repo, number, reason)
+);
+

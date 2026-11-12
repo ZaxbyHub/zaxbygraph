@@ -62,14 +62,51 @@ def _labels_text(raw: dict) -> str:
     return " ".join(names)
 
 
-def upsert_actor(conn: sqlite3.Connection, login: str | None, html_url: str | None = None) -> None:
+#: The comma-separated environment list of exact bot logins (issue #67 AC4).
+#: Read lazily at actor upsert so a process-wide configuration applies to
+#: every ingest path; an externally configured login is NOT reconstructible
+#: from stored payloads, so migration v12's backfill covers only the suffix
+#: and payload-type signals (disclosed in docs/schema.md).
+BOT_LOGINS_ENV = "ZAXBYGRAPH_BOT_LOGINS"
+
+
+def configured_bot_logins() -> set[str]:
+    import os
+
+    raw = os.environ.get(BOT_LOGINS_ENV) or ""
+    return {part.strip() for part in raw.split(",") if part.strip()}
+
+
+def actor_is_bot(login: str | None, user: object = None) -> bool:
+    """True when this actor is a bot (issue #67 AC4): the login ends in
+    `[bot]`, the payload user's type is `Bot` (REST `type`, or the GraphQL
+    `__typename` mapped into it), or the login is in the configured list."""
+    if not login:
+        return False
+    if login.endswith("[bot]"):
+        return True
+    if isinstance(user, dict) and user.get("type") == "Bot":
+        return True
+    return login in configured_bot_logins()
+
+
+def upsert_actor(
+    conn: sqlite3.Connection,
+    login: str | None,
+    html_url: str | None = None,
+    is_bot: bool = False,
+) -> None:
     if not login:
         return
     url = html_url or f"https://github.com/{login}"
+    # is_bot is max-semantics: a later payload without bot signals never
+    # downgrades a stored flag (issue #67 AC4).
     conn.execute(
-        "INSERT INTO actors(login, html_url) VALUES (?, ?) "
-        "ON CONFLICT(login) DO UPDATE SET html_url = COALESCE(excluded.html_url, actors.html_url)",
-        (login, url),
+        "INSERT INTO actors(login, html_url, is_bot) VALUES (?, ?, ?) "
+        "ON CONFLICT(login) DO UPDATE SET"
+        " html_url = COALESCE(excluded.html_url, actors.html_url),"
+        " is_bot = MAX(COALESCE(actors.is_bot, 0), excluded.is_bot)",
+        (login, url, 1 if is_bot else 0),
     )
 
 
@@ -597,7 +634,10 @@ def upsert_item_row(
 ) -> None:
     user = raw.get("user") if isinstance(raw.get("user"), dict) else {}
     author = user.get("login") if user else None
-    upsert_actor(conn, author, user.get("html_url") if user else None)
+    upsert_actor(
+        conn, author, user.get("html_url") if user else None,
+        is_bot=actor_is_bot(author, user),
+    )
     base = raw.get("base") if isinstance(raw.get("base"), dict) else {}
     head = raw.get("head") if isinstance(raw.get("head"), dict) else {}
     # Source-owned extraction (issue #24): listing signals come from the
@@ -632,7 +672,25 @@ def upsert_item_row(
     v7_values = merge_absent(
         extracted, dict(zip(_V7_MERGEABLE_COLUMNS, tuple(existing))) if existing else {}
     )
-    conn.execute(
+    # The branch token (issue #67 AC5): the exactly-one-numeric-token rule
+    # over the PR's head_ref, stored so the issue-ingest branch lookup is an
+    # indexed equality seek instead of a whole-corpus scan. The column
+    # arrives with migration v12; a store opened before it keeps working
+    # without the token.
+    item_cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+    has_branch = "branch_token" in item_cols
+    branch_token: str | None = None
+    if has_branch and kind == "pr":
+        head_ref = raw.get("head_ref") or head.get("ref")
+        if isinstance(head_ref, str) and head_ref:
+            tokens = branch_number_tokens(head_ref)
+            if len(tokens) == 1:
+                branch_token = str(tokens[0])
+    branch_col = ", branch_token" if has_branch else ""
+    branch_ph = ", ?" if has_branch else ""
+    branch_upd_id = ", branch_token=excluded.branch_token" if has_branch else ""
+    branch_upd_key = ", branch_token=excluded.branch_token" if has_branch else ""
+    item_sql = (
         """
         INSERT INTO items(
             id, repo, number, kind, node_id, title, body, labels_text, state, state_reason,
@@ -641,7 +699,8 @@ def upsert_item_row(
             reactions_total, milestone, item_type, sub_issues_total, sub_issues_completed,
             dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by,
             dependencies_total_blocking, author_association, merged_by, raw_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            {branch_col}
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?{branch_ph})
         ON CONFLICT(id) DO UPDATE SET
             repo=excluded.repo, number=excluded.number, kind=excluded.kind, node_id=excluded.node_id,
             title=excluded.title, body=excluded.body, labels_text=excluded.labels_text,
@@ -660,7 +719,7 @@ def upsert_item_row(
             dependencies_total_blocked_by=excluded.dependencies_total_blocked_by,
             dependencies_total_blocking=excluded.dependencies_total_blocking,
             author_association=excluded.author_association, merged_by=excluded.merged_by,
-            raw_json=excluded.raw_json
+            raw_json=excluded.raw_json{branch_upd_id}
         ON CONFLICT(repo, number) DO UPDATE SET
             id=excluded.id, kind=excluded.kind, node_id=excluded.node_id,
             title=excluded.title, body=excluded.body, labels_text=excluded.labels_text,
@@ -679,8 +738,16 @@ def upsert_item_row(
             dependencies_total_blocked_by=excluded.dependencies_total_blocked_by,
             dependencies_total_blocking=excluded.dependencies_total_blocking,
             author_association=excluded.author_association, merged_by=excluded.merged_by,
-            raw_json=excluded.raw_json
-        """,
+            raw_json=excluded.raw_json{branch_upd_key}
+        """
+    ).format(
+        branch_col=branch_col,
+        branch_ph=branch_ph,
+        branch_upd_id=branch_upd_id,
+        branch_upd_key=branch_upd_key,
+    )
+    conn.execute(
+        item_sql,
         (
             int(raw["id"]),
             repo,
@@ -720,6 +787,11 @@ def upsert_item_row(
             v7_values["author_association"],
             v7_values["merged_by"],
             _dumps(raw),
+            # The bind list must agree with the statement: branch_ph is
+            # empty when the store predates the column, so the VALUE is
+            # dropped here too (supplying it unconditionally is a
+            # ProgrammingError on a pre-v12 items table).
+            *((branch_token,) if has_branch else ()),
         ),
     )
 
@@ -763,6 +835,7 @@ def insert_comments(
             conn,
             author,
             (rec.get("user") or {}).get("html_url") if isinstance(rec.get("user"), dict) else None,
+            is_bot=actor_is_bot(author, rec.get("user")),
         )
         if "author_association" in rec:
             association = rec.get("author_association")
@@ -843,6 +916,7 @@ def insert_reviews(conn: sqlite3.Connection, repo: str, number: int, reviews: It
             conn,
             author,
             (rec.get("user") or {}).get("html_url") if isinstance(rec.get("user"), dict) else None,
+            is_bot=actor_is_bot(author, rec.get("user")),
         )
         conn.execute(
             """
@@ -914,12 +988,6 @@ def rebuild_edges(
     links: dict | None = None,
     links_incomplete: object = None,
 ) -> None:
-    delete_owned_edges(conn, repo, number)
-    # GitHub-reported links replace/union per connection BEFORE the keyword
-    # edges insert (issue #27): the link stream's own exemption keeps a
-    # degraded re-ingest from retracting them.
-    rebuild_links(conn, repo, number, links, links_incomplete)
-
     def merge_commit_lookup(sha: str) -> int | None:
         row = conn.execute(
             "SELECT number FROM items WHERE repo = ? AND merge_commit = ?", (repo, sha)
@@ -942,17 +1010,59 @@ def rebuild_edges(
         ).fetchall()
         return {int(r[0]) for r in rows}
 
+    # Contained extraction (issue #66 AC2): every deterministic extraction
+    # call runs inside its own savepoint. A fault rolls the savepoint back —
+    # the item's rows (written by the caller before this function) survive
+    # and no owned edge has been deleted yet, so the item's edges can never
+    # be left half-deleted — records ONE fetch_log row naming the fault, and
+    # returns None so the caller can skip the replacement entirely: a
+    # partial extraction is not authoritative, and replacing with it would
+    # retract the faulted stream's stored evidence under a clean verdict
+    # (PR #76 review PRR-005). A sqlite3 storage fault is NOT contained: it
+    # propagates and fails the run, per the report-don't-swallow invariant.
+    faulted: list[str] = []
+
+    def contained(label: str, fn, *args):
+        conn.execute("SAVEPOINT extract")
+        try:
+            return fn(*args)
+        except sqlite3.Error:
+            conn.execute("ROLLBACK TO SAVEPOINT extract")
+            conn.execute("RELEASE SAVEPOINT extract")
+            raise
+        except Exception as exc:
+            conn.execute("ROLLBACK TO SAVEPOINT extract")
+            conn.execute("RELEASE SAVEPOINT extract")
+            log_fetch(
+                conn, repo, "item", str(number),
+                note=f"contained extraction fault in {label}: {exc}",
+            )
+            faulted.append(label)
+            return None
+
     collected: list[tuple] = []
-    collected.extend(edges_from_item(repo, item_raw))
+    for edges in (
+        contained("item edges", edges_from_item, repo, item_raw),
+        contained("file edges", edges_from_files, number, files),
+        contained("timeline edges", edges_from_timeline, repo, number,
+                  timeline or [], merge_commit_lookup),
+        contained("pr-state edges", edges_from_pr_state, repo, item_raw,
+                  title_lookup, issue_number_lookup),
+    ):
+        if edges:
+            collected.extend(edges)
     for rec in issue_comments:
-        collected.extend(edges_from_comment(repo, number, rec))
+        edges = contained("comment edges", edges_from_comment, repo, number, rec)
+        if edges:
+            collected.extend(edges)
     for rec in review_comments:
-        collected.extend(edges_from_comment(repo, number, rec))
+        edges = contained("comment edges", edges_from_comment, repo, number, rec)
+        if edges:
+            collected.extend(edges)
     for rec in reviews:
-        collected.extend(edges_from_review(repo, number, rec))
-    collected.extend(edges_from_files(number, files))
-    collected.extend(edges_from_timeline(repo, number, timeline or [], merge_commit_lookup))
-    collected.extend(edges_from_pr_state(repo, item_raw, title_lookup, issue_number_lookup))
+        edges = contained("review edges", edges_from_review, repo, number, rec)
+        if edges:
+            collected.extend(edges)
     # Commit-message closes_keyword edges derive from the RETAINED pr_commits
     # rows, never from the payload in hand (issue #27): a REST re-ingest or an
     # overflowed commits fetch re-derives IDENTICAL edges from the stored rows,
@@ -962,13 +1072,12 @@ def rebuild_edges(
         (repo, number),
     ).fetchall()
     if commit_rows:
-        collected.extend(
-            edges_from_commit_messages(
-                repo,
-                number,
-                [{"sha": row["sha"], "message": row["message"]} for row in commit_rows],
-            )
+        edges = contained(
+            "commit-message edges", edges_from_commit_messages, repo, number,
+            [{"sha": row["sha"], "message": row["message"]} for row in commit_rows],
         )
+        if edges:
+            collected.extend(edges)
     # Symmetric merge-close derivation (issue #6): a PR merged as commit X
     # closes every issue whose timeline already recorded closed_by_commit X,
     # whichever item ingests first. Self-excluded like the forward lookup,
@@ -1018,24 +1127,77 @@ def rebuild_edges(
         or item_raw.get("merged_at") is not None
         or (isinstance(item_raw.get("base"), dict) and isinstance(item_raw.get("head"), dict))
     ):
-        for row in conn.execute(
-            "SELECT number, head_ref FROM items INDEXED BY idx_items_repo_head"
-            " WHERE repo = ? AND kind = 'pr' AND head_ref IS NOT NULL AND number != ?",
-            (repo, nid),
-        ).fetchall():
-            tokens = branch_number_tokens(row["head_ref"])
-            if len(tokens) == 1 and tokens[0] == number:
-                collected.append(
-                    (
-                        "item",
-                        str(row["number"]),
-                        "branch_ref",
-                        "item",
-                        nid,
-                        f"head_ref {row['head_ref']}",
-                        "keyword",
-                    )
+        # Indexed equality lookup on the stored branch token (issue #67 AC5):
+        # the per-item cost is flat in the repository's PR count instead of
+        # scanning and tokenizing every head_ref in Python. A pre-v12 store
+        # without the column keeps the legacy scan.
+        if "branch_token" in {r[1] for r in conn.execute("PRAGMA table_info(items)")}:
+            rows = conn.execute(
+                "SELECT number, head_ref FROM items INDEXED BY idx_items_repo_branch"
+                " WHERE repo = ? AND kind = 'pr' AND branch_token = ? AND number != ?",
+                (repo, str(number), nid),
+            ).fetchall()
+        else:
+            rows = [
+                row
+                for row in conn.execute(
+                    "SELECT number, head_ref FROM items INDEXED BY idx_items_repo_head"
+                    " WHERE repo = ? AND kind = 'pr' AND head_ref IS NOT NULL"
+                    " AND number != ?",
+                    (repo, nid),
+                ).fetchall()
+                if len(branch_number_tokens(row["head_ref"])) == 1
+                and branch_number_tokens(row["head_ref"])[0] == number
+            ]
+        for row in rows:
+            collected.append(
+                (
+                    "item",
+                    str(row["number"]),
+                    "branch_ref",
+                    "item",
+                    nid,
+                    f"head_ref {row['head_ref']}",
+                    "keyword",
                 )
+            )
+    # Every extraction is contained above; only now, with the full edge set
+    # in hand, are the owned edges replaced (issue #66 AC2): a contained
+    # fault can never leave this item's edges half-deleted.
+    if faulted:
+        prior_owned = conn.execute(
+            # EVERY edge class the replacement below would remove or
+            # mutate: any item-source row (delete_owned_edges' first
+            # delete, plus link rows, which rebuild_links replaces), and
+            # the actor relations pointing at the item (its second delete)
+            # — mirroring delete_owned_edges exactly, so no prior owned
+            # edge can disappear under a faulted re-ingest (PR #76 review
+            # PRR-005; round-2 link-only and round-3 actor-only probes).
+            "SELECT 1 FROM edges WHERE repo = ? AND ("
+            " (src_type = 'item' AND src_id = ?)"
+            " OR (dst_type = 'item' AND dst_id = ?"
+            "     AND rel IN ('authored', 'commented', 'reviewed'))"
+            ") LIMIT 1",
+            (repo, str(number), str(number)),
+        ).fetchone()
+        if prior_owned:
+            # A faulted re-ingest of an item that already holds ANY owned
+            # edge (or link) changes nothing (PR #76 review PRR-005):
+            # delete-and-insert a partial set would retract the faulted
+            # stream's stored evidence under a clean verdict, and the
+            # healthy streams' new edges arrive on the next fault-free
+            # re-ingest. The fetch_log row recorded above names the fault.
+            return
+        # Nothing owned yet: nothing to lose, so the healthy streams
+        # land and the faulted stream's part stays absent — the containment
+        # contract the extraction-fault tests pin (issue #66 AC2: the
+        # faulted comment's edges never appear, the item's own and the
+        # healthy sibling's do).
+    delete_owned_edges(conn, repo, number)
+    # GitHub-reported links replace/union per connection BEFORE the keyword
+    # edges insert (issue #27): the link stream's own exemption keeps a
+    # degraded re-ingest from retracting them.
+    rebuild_links(conn, repo, number, links, links_incomplete)
     for edge in collapse_edges(collected):
         insert_edge(conn, repo, edge)
 
@@ -1048,16 +1210,37 @@ def bump_watermark(conn: sqlite3.Connection, repo: str, updated_at: str | None) 
     nxt = current
     if updated_at and (current is None or updated_at > current):
         nxt = updated_at
-    conn.execute(
-        """
-        INSERT INTO sync_state(repo, issues_since, last_error)
-        VALUES (?, ?, NULL)
-        ON CONFLICT(repo) DO UPDATE SET
-            issues_since = excluded.issues_since,
-            last_error = NULL
-        """,
-        (repo, nxt),
-    )
+    # An unresolved DURABLE OBLIGATION keeps its recorded error (issue #66
+    # AC4 for the deletion pass; PR #76 review PRR-003/PRR-004 for the torn
+    # retry): the per-item bump runs on every committed item, so clearing
+    # unconditionally would launder a failed pass or retry into a clean
+    # verdict before any finalizer could see it. ANY open sync_pending row
+    # is the evidence; the EXISTS is an index seek on its primary key.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")}
+    if "number" in cols:
+        conn.execute(
+            """
+            INSERT INTO sync_state(repo, issues_since, last_error)
+            VALUES (?, ?, NULL)
+            ON CONFLICT(repo) DO UPDATE SET
+                issues_since = excluded.issues_since,
+                last_error = CASE WHEN EXISTS (
+                    SELECT 1 FROM sync_pending WHERE repo = ?
+                ) THEN last_error ELSE NULL END
+            """,
+            (repo, nxt, repo),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO sync_state(repo, issues_since, last_error)
+            VALUES (?, ?, NULL)
+            ON CONFLICT(repo) DO UPDATE SET
+                issues_since = excluded.issues_since,
+                last_error = NULL
+            """,
+            (repo, nxt),
+        )
 
 
 def recount(conn: sqlite3.Connection, repo: str) -> None:
@@ -1077,6 +1260,96 @@ def recount(conn: sqlite3.Connection, repo: str) -> None:
         """,
         (repo, items, comments, edges),
     )
+
+
+def write_pending(
+    conn: sqlite3.Connection, repo: str, numbers, reason: str
+) -> None:
+    """Record the durable per-item retry set (issue #65/#66): the numbers a
+    run could not resolve this time, keyed by reason ('torn' for an
+    unresolved listing/pull tear, 'deletion' for a deletion pass that did
+    not complete). Written BEFORE the unresolved work is attempted, so any
+    raise leaves every number pending for the next run — the watermark can
+    never seal an item the run did not actually resolve. Idempotent."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        stamp = utcnow()
+        for n in sorted({int(x) for x in numbers}):
+            # computed_at records WHEN the obligation was first recorded and
+            # never moves (ON CONFLICT DO NOTHING): a row pending for weeks
+            # says so (issue #66).
+            conn.execute(
+                "INSERT INTO sync_pending(repo, number, reason, computed_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(repo, number, reason) DO NOTHING",
+                (repo, n, reason, stamp),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def clear_pending(
+    conn: sqlite3.Connection, repo: str, numbers=None, reason: str | None = None
+) -> None:
+    """Drop resolved (or all) pending rows for a repo."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if numbers is None and reason is None:
+            conn.execute("DELETE FROM sync_pending WHERE repo = ?", (repo,))
+        elif numbers is None:
+            conn.execute(
+                "DELETE FROM sync_pending WHERE repo = ? AND reason = ?",
+                (repo, reason),
+            )
+        elif reason is None:
+            for n in sorted({int(x) for x in numbers}):
+                conn.execute(
+                    "DELETE FROM sync_pending WHERE repo = ? AND number = ?",
+                    (repo, n),
+                )
+        else:
+            for n in sorted({int(x) for x in numbers}):
+                conn.execute(
+                    "DELETE FROM sync_pending WHERE repo = ? AND number = ?"
+                    " AND reason = ?",
+                    (repo, n, reason),
+                )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def pending_numbers(
+    conn: sqlite3.Connection, repo: str, reason: str | None = None
+) -> dict[str, list[int]]:
+    """The durable retry set as {reason: [numbers]}, or one reason's list
+    under its own key when `reason` is given. A pre-v12 store (no table)
+    reads as empty."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")}
+    if "number" not in cols:
+        return {} if reason is None else {reason: []}
+    if reason is None:
+        out: dict[str, list[int]] = {}
+        for r in conn.execute(
+            "SELECT reason, number FROM sync_pending WHERE repo = ?"
+            " ORDER BY reason, number",
+            (repo,),
+        ):
+            out.setdefault(r["reason"], []).append(int(r["number"]))
+        return out
+    return {
+        reason: [
+            int(r["number"])
+            for r in conn.execute(
+                "SELECT number FROM sync_pending WHERE repo = ? AND reason = ?"
+                " ORDER BY number",
+                (repo, reason),
+            )
+        ]
+    }
 
 
 def set_last_error(conn: sqlite3.Connection, repo: str, message: str) -> None:
@@ -1116,39 +1389,70 @@ def mark_sync_finished(
     interrupted-full corpus still reads incomplete. A targeted run that
     ingested NOTHING (ingested_count == 0) leaves a previous `last_error`
     standing: a no-op refresh must not launder a failed sync's error into a
-    clean readiness verdict (PR #37 review).
+    clean readiness verdict (PR #37 review). Nor does a targeted run that
+    DID ingest, while a durable obligation (a torn or deletion pending row)
+    is still open — the pending set, not the ingest count, is what makes
+    the previous error true (issue #66 AC4; PR #76 review PRR-003).
 
     The rate-limit columns carry the window this run slept through (NULL when
     it saw none), verbatim as the source reported it (issue #5 AC4).
     """
     now = utcnow()
     conn.execute("INSERT OR IGNORE INTO sync_state(repo) VALUES (?)", (repo,))
+    # An unresolved DURABLE OBLIGATION — any sync_pending row, torn or
+    # deletion — keeps the incomplete marker AND the error (issue #66 AC4
+    # for the deletion pass; PR #76 review PRR-003 for the torn retry): a
+    # run that leaves an owed number behind must not certify a clean
+    # readiness verdict, or a listed item the store never ingested would
+    # read as complete. The pending set is the evidence, consulted by BOTH
+    # finish paths so a `sync --numbers` run that ingests one item cannot
+    # erase the error either obligation recorded. A pre-v12 store has no
+    # table and reads as nothing pending.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_pending)")}
+    pending_open = 0
+    if "number" in cols:
+        pending_open = conn.execute(
+            "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
+            (repo,),
+        ).fetchone()[0]
     if targeted:
         conn.execute(
             """
             UPDATE sync_state SET
-                last_error = CASE WHEN :ingested > 0 THEN NULL ELSE last_error END,
+                last_error = CASE WHEN :ingested > 0 AND :pending_open = 0
+                            THEN NULL ELSE last_error END,
                 rate_limit_remaining = :rate_remaining,
                 rate_limit_reset_at = :rate_reset_at
             WHERE repo = :repo
             """,
             {
                 "ingested": ingested_count,
+                "pending_open": pending_open,
                 "repo": repo,
                 "rate_remaining": rate_limit_remaining,
                 "rate_reset_at": rate_limit_reset_at,
             },
         )
         return
+    # (the non-targeted UPDATE below carries :pending_open)
+    #
+    # The freshness stamps and the incomplete marker move TOGETHER (PR #76
+    # review PRR-014): the completion stamp may only advance on a finish
+    # that actually discharges every open obligation, never from the
+    # pre-update flag while the same statement withholds that flag.
     conn.execute(
         """
         UPDATE sync_state SET
-            last_full_sync_at = CASE WHEN full_sync_pending = 1
+            last_full_sync_at = CASE WHEN :pending_open = 0
+                                AND full_sync_pending = 1
                                 THEN :now ELSE last_full_sync_at END,
-            last_incr_sync_at = CASE WHEN full_sync_pending = 0
+            last_incr_sync_at = CASE WHEN :pending_open = 0
+                                AND full_sync_pending = 0
                                 THEN :now ELSE last_incr_sync_at END,
-            full_sync_pending = 0,
-            last_error = NULL,
+            full_sync_pending = CASE WHEN :pending_open > 0
+                                THEN 1 ELSE 0 END,
+            last_error = CASE WHEN :pending_open > 0
+                        THEN last_error ELSE NULL END,
             rate_limit_remaining = :rate_remaining,
             rate_limit_reset_at = :rate_reset_at
         WHERE repo = :repo
@@ -1156,6 +1460,7 @@ def mark_sync_finished(
         {
             "now": now,
             "repo": repo,
+            "pending_open": pending_open,
             "rate_remaining": rate_limit_remaining,
             "rate_reset_at": rate_limit_reset_at,
         },
@@ -1185,7 +1490,7 @@ def replace_releases(conn: sqlite3.Connection, repo: str, releases: list[dict]) 
         if rid is None or not tag:
             continue
         author = _login(rec)
-        upsert_actor(conn, author)
+        upsert_actor(conn, author, is_bot=actor_is_bot(author, rec.get("author")))
         conn.execute(
             """
             INSERT INTO releases(

@@ -52,6 +52,17 @@ shouldn't.
 - **A `closes_keyword` reference is not also a `mentions` reference.** The two
   are mutually exclusive within a single text payload; across payloads one
   pair can carry both (per-payload suppression only).
+- **A closing keyword is honoured only where GitHub honours it (issue #67).**
+  `closes_keyword` is derived from a PR description or a retained commit
+  message; the same words in an issue body, a comment, or a review record a
+  `mentions` reference and never a closure. Every `source='keyword'`
+  relation's derivation is bounded (reference digits are capped, so an
+  oversized token matches nothing instead of wedging `int()`) and is
+  offline-derivable from the stored payloads — migration v12 re-derives them
+  all under exactly these rules (a row the extractors cannot take — an
+  unparseable payload, or a wrong-typed field after its sanitizer — keeps
+  its prior keyword edges instead: a failure never discards evidence, and
+  the migration reports nothing it could not derive).
 - **Cross-repo keyword references are dropped, never localized; timeline
   cross-references are kept repo-qualified.** A `#5` in another repo's URL
   must not attach to local item 5, and a foreign cross-reference is stored as
@@ -100,7 +111,12 @@ shouldn't.
   fails to parse, a carried plural null, or a list on a singular connection
   is malformed, not a removal, so it is union-only like an overflow
   (issue #53) — while a complete, well-formed re-fetch retracts removed
-  links and a degraded one never does
+  links and a degraded one never does; a re-ingest whose EXTRACTION
+  faulted keeps every prior owned edge (including the links) until a
+  fault-free re-ingest refreshes the REPLACEABLE streams — the protected
+  GitHub-reported classes (timeline, closing_ref, and the link
+  connection rules above) keep their own survival rules either way (PR
+  #76 review PRR-005, N3)
   (docs/schema.md). Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.

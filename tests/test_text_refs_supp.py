@@ -127,15 +127,18 @@ class MigrationBackfillTests(TempDBTest):
             ).fetchall()
         }
         # Offsets index the ORIGINAL body; '#' of '#2' and '#3' respectively.
+        # Issue #67 narrowed the closing keyword to PR descriptions and
+        # retained commit messages, so an ISSUE body's "fixes #2" is a
+        # MENTION: the v12 re-derivation, which runs after this backfill in
+        # the same chain, rewrites that edge's rel, keeps its offset and
+        # drops the closing-keyword suffix a mention does not carry.
         self.assertEqual(
-            evidence[("closes_keyword", "2")],
-            f"body@{body.find('#2')} closing keyword",
+            evidence[("mentions", "2")],
+            f"body@{body.find('#2')}",
         )
         self.assertEqual(evidence[("duplicate_keyword", "3")], f"body@{body.find('#3')}")
-        # Live-path parity (review round 1): the CLOSED #2 is not also a
-        # mention; the duplicate-referenced #3 is (mentions and duplicates
-        # are independent streams).
-        self.assertNotIn(("mentions", "2"), evidence)
+        # Live-path parity (review round 1): the duplicate-referenced #3 is
+        # also a mention; mentions and duplicates are independent streams.
         self.assertEqual(evidence[("mentions", "3")], f"body@{body.find('#3')}")
         # Backfill idempotence: rerun the v9 migration; row counts must not
         # grow (the PKs dedup; keyword edges evidence-upsert to the same).
@@ -302,13 +305,41 @@ class MigrationBackfillTests(TempDBTest):
             .edges_from_review(REPO, 5, {"id": 601, "user": {"login": "bob"}, "state": "APPROVED", "body": "fixes #8 in this review"})
             if e[6] == "keyword"
         }
-        for key, expected in {**live_comment, **live_review}.items():
+        # The v9 slot keeps its own rules: a review's closing keyword is a
+        # closes_keyword there (with the payload's own mention suppressed),
+        # while the live extractor records a mention (issue #67 AC1). What
+        # this test pins is the LIVE PREFIX on every migrated edge: dropping
+        # the prefix argument on either loop reverts the evidence to the
+        # default body@<offset>, which points at the item body.
+        for (rel, dst), ev in evidence.items():
+            self.assertTrue(
+                ev.startswith("comment:501@") or ev.startswith("review:601@"),
+                f"COMMENT-REVIEW-PREFIX: {rel}->{dst} evidence {ev!r} carries"
+                " no live comment:/review: prefix",
+            )
+        # The comment's references match the live comment extractor exactly.
+        for key, expected in live_comment.items():
             self.assertEqual(
                 evidence.get(key),
                 expected,
                 f"COMMENT-REVIEW-PREFIX: {key} migrated evidence"
-                f" {evidence.get(key)!r} != live {expected!r}",
+                f" {evidence.get(key)!r} != live comment {expected!r}",
             )
+        # The slot difference itself is pinned: the migrated review edge keeps
+        # the v9 relation with the live review prefix, and the review's
+        # mention is suppressed inside that payload exactly as v9 derived it.
+        self.assertEqual(
+            evidence.get(("closes_keyword", "8")),
+            "review:601@6 closing keyword",
+            "the v9 slot's review closing edge keeps its relation and the"
+            " live review prefix",
+        )
+        self.assertNotIn(
+            ("mentions", "8"),
+            {k for k, ev in evidence.items() if ev.startswith("review:")},
+            "the v9 slot suppresses the review's own mention of its closing"
+            " target within that payload",
+        )
 
     def test_multipayload_closes_collision_merges(self) -> None:
         """A stored item body AND comment both closing #N yield ONE

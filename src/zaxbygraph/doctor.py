@@ -102,6 +102,12 @@ _COPY_TABLES = (
     ("item_signatures", None),
     ("item_events", None),
     ("pr_commits", None),
+    # v12 durable retry set (issue #65/#66): keyed (repo, number, reason),
+    # so it leads with (repo, number) like the other children and the
+    # drift guard demands it. It is copied because it carries an OBLIGATION,
+    # not evidence: dropping it would let an adopted corpus forget that the
+    # next sync still owes those numbers a retry.
+    ("sync_pending", None),
 )
 
 
@@ -701,6 +707,8 @@ def _copy_table(
     table: str,
     autoinc_pk: str | None,
     repo_l: str,
+    *,
+    or_ignore: bool = False,
 ) -> None:
     """Copy one repo-keyed table from the candidate into the store.
 
@@ -737,7 +745,8 @@ def _copy_table(
         (repo_l,) if "repo" in cols else (),
     ).fetchall()
     insert_sql = (
-        f"INSERT INTO {_quote_ident(table)} ({', '.join(quoted)}) "
+        f"INSERT{' OR IGNORE' if or_ignore else ''} INTO"
+        f" {_quote_ident(table)} ({', '.join(quoted)}) "
         f"VALUES ({placeholders})"
     )
     dst.executemany(insert_sql, [tuple(r) for r in rows])
@@ -808,6 +817,18 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
         try:
             dst.execute("BEGIN IMMEDIATE")
             try:
+                # The store's own recovery floor for this repo, captured
+                # BEFORE the copy loop replaces sync_state (issue #65 AC1):
+                # adoption folds the EARLIEST unresolved floor of the store
+                # and the candidate, because a floor is an obligation to
+                # re-drain a window — dropping either side would let the next
+                # sync drain from the watermark and seal a window neither run
+                # quiesced.
+                prior_floor = dst.execute(
+                    "SELECT listing_floor, listing_floor_active FROM sync_state"
+                    " WHERE repo = ?",
+                    (repo_l,),
+                ).fetchone()
                 for table, autoinc_pk in _COPY_TABLES:
                     if table == "revisions":
                         continue  # per-item scoping below (issue #40)
@@ -851,10 +872,27 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         else:
                             preserved_tables.append(table)
                             continue
+                    if table == "sync_pending":
+                        # Open retry obligations the STORE owes are never
+                        # dropped (PR #76 review PRR-019): the copy below
+                        # unions the candidate's rows in with OR IGNORE
+                        # instead of replace-the-slug, so an adopted corpus
+                        # keeps every number the next sync still owes a
+                        # retry — and reports the debt instead of silently
+                        # forgetting it.
+                        continue
                     dst.execute(
                         f"DELETE FROM {_quote_ident(table)} WHERE repo = ?",
                         (repo_l,)
                     )
+                # Capture the store's markers BEFORE its sync_state row is
+                # replaced: open obligations below re-impose them on top of
+                # the candidate's state (PR #76 review PRR-019).
+                prior_state = dst.execute(
+                    "SELECT full_sync_pending, last_error FROM sync_state"
+                    " WHERE repo = ?",
+                    (repo_l,),
+                ).fetchone()
                 dst.execute("DELETE FROM sync_state WHERE repo = ?", (repo_l,))
 
                 # Snapshot provenance (issue #34) drops on consolidation:
@@ -972,7 +1010,14 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                         # set and is adopted here (swarm-pr-review N-02).
                         continue
                     try:
-                        _copy_table(src, dst, table, autoinc_pk, repo_l)
+                        _copy_table(
+                            src, dst, table, autoinc_pk, repo_l,
+                            # The store's rows were kept above (PR #76
+                            # review PRR-019): union the candidate's in,
+                            # never conflicting with an obligation the
+                            # store already owes.
+                            or_ignore=(table == "sync_pending"),
+                        )
                     except sqlite3.DatabaseError as exc:
                         # A candidate whose schema diverges from the tool's
                         # can defeat the copy as well as the fold (an extra
@@ -1036,13 +1081,133 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                             "UPDATE sync_state SET fetch_source = ? WHERE repo = ?",
                             (state["fetch_source"], repo_l),
                         )
+                    cand_floor = (
+                        state["listing_floor"]
+                        if "listing_floor_active" in src_cols else None
+                    )
+                    cand_floor_active = bool(
+                        state["listing_floor_active"]
+                    ) if "listing_floor_active" in src_cols else False
+                else:
+                    # A candidate with no sync_state row still folds the
+                    # STORE's floor: the row was deleted above, and losing an
+                    # active floor would let the next sync drain from the
+                    # watermark and seal a window no run quiesced.
+                    cand_floor, cand_floor_active = None, False
+                store_floor = (
+                    prior_floor["listing_floor"]
+                    if prior_floor is not None else None
+                )
+                store_floor_active = bool(
+                    prior_floor["listing_floor_active"]
+                ) if prior_floor is not None else False
+                active = store_floor_active or cand_floor_active
+                floor: str | None = None
+                if active:
+                    # A NULL active floor means "from the beginning" — it
+                    # subsumes any timestamp, exactly as the sync's own
+                    # floor read treats it. Otherwise the earliest
+                    # unresolved window wins.
+                    if (store_floor_active and store_floor is None) or (
+                        cand_floor_active and cand_floor is None
+                    ):
+                        floor = None
+                    else:
+                        stamps = [
+                            f for f, on in (
+                                (store_floor, store_floor_active),
+                                (cand_floor, cand_floor_active),
+                            ) if on and isinstance(f, str)
+                        ]
+                        floor = min(stamps) if stamps else None
+                if active or prior_floor is not None:
+                    # An upsert: a candidate with no sync_state row left no
+                    # row to fold into, and dropping the store's floor there
+                    # would be the very loss this fold exists to prevent.
+                    # recount() below fills the count columns either way.
+                    dst.execute(
+                        "INSERT INTO sync_state(repo, listing_floor,"
+                        " listing_floor_active) VALUES (?, ?, ?)"
+                        " ON CONFLICT(repo) DO UPDATE SET"
+                        " listing_floor = excluded.listing_floor,"
+                        " listing_floor_active = excluded.listing_floor_active",
+                        (repo_l, floor, 1 if active else 0),
+                    )
+                # Open retry obligations survive WITH their markers
+                # (PR #76 review PRR-019): the candidate's clean sync_state
+                # must not launder debts the store still owes. The obligation
+                # rows were unioned above; status reads the marker, so an
+                # adopted corpus that still owes a retry reads incomplete
+                # (and keeps the store's error text when the candidate
+                # carries none) until a clean sync discharges it.
+                pending_cols = {
+                    r[1] for r in dst.execute("PRAGMA table_info(sync_pending)")
+                }
+                # An interrupted full sync can leave ONLY the marker and
+                # the error — a full run sets full_sync_pending before it
+                # walks anything, so an early failure writes no pending row
+                # at all. Those must survive a clean candidate too,
+                # independently of sync_pending (PR #76 review N1), or the
+                # adopted corpus reads complete and the next sync
+                # tail-walks instead of re-walking the corpus it never
+                # finished.
+                prior_flag = (
+                    int(prior_state["full_sync_pending"] or 0)
+                    if prior_state is not None else 0
+                )
+                prior_error = (
+                    prior_state["last_error"]
+                    if prior_state is not None else None
+                )
+                open_n = 0
+                if "number" in pending_cols:
+                    open_n = dst.execute(
+                        "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
+                        (repo_l,),
+                    ).fetchone()[0]
+                if prior_flag or open_n or prior_error:
+                    dst.execute(
+                        "INSERT OR IGNORE INTO sync_state(repo) VALUES (?)",
+                        (repo_l,),
+                    )
+                    # The incomplete marker returns only for a real
+                    # incompleteness (an interrupted full or an open
+                    # obligation); a lone prior error is restored as text
+                    # without inventing a full-sync debt.
+                    dst.execute(
+                        "UPDATE sync_state SET"
+                        " full_sync_pending = CASE WHEN ? = 1 THEN 1"
+                        " ELSE full_sync_pending END,"
+                        " last_error = COALESCE(last_error, ?)"
+                        " WHERE repo = ?",
+                        (
+                            1 if (prior_flag or open_n) else 0,
+                            prior_error,
+                            repo_l,
+                        ),
+                    )
                 # actors is a global login->url table (no repo column), so it
                 # is copied wholesale despite the slug-scoped delete above.
-                for actor, url in src.execute("SELECT login, html_url FROM actors"):
+                # is_bot (schema v12, issue #67) rides along and NEVER
+                # downgrades: MAX keeps a store that already knows a login
+                # as a bot from being reset by a candidate that predates the
+                # column (or whose payload never carried the signal).
+                src_actor_cols = {
+                    row[1] for row in src.execute("PRAGMA table_info(actors)")
+                }
+                carries_bot = "is_bot" in src_actor_cols
+                for row in src.execute(
+                    "SELECT login, html_url"
+                    + (", is_bot" if carries_bot else "")
+                    + " FROM actors"
+                ):
+                    bot = int(row[2]) if carries_bot else 0
                     dst.execute(
-                        "INSERT INTO actors(login, html_url) VALUES (?, ?) "
-                        "ON CONFLICT(login) DO UPDATE SET html_url = excluded.html_url",
-                        (actor, url),
+                        "INSERT INTO actors(login, html_url, is_bot) VALUES (?, ?, ?) "
+                        "ON CONFLICT(login) DO UPDATE SET"
+                        " html_url = excluded.html_url,"
+                        " is_bot = MAX(COALESCE(actors.is_bot, 0), excluded.is_bot)",
+                        (row[0], row[1], bot),
                     )
                 recount(dst, repo_l)
                 dst.commit()
