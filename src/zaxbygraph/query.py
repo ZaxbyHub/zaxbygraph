@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
 import re
 import sqlite3
+import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
@@ -38,6 +41,55 @@ _MAX_FETCH_LIMIT = 2**31 - 2
 #: accepts, so refusing above it removes a crash without changing any
 #: working request.
 _MAX_SQL_LIMIT = 2**63 - 1
+
+#: Default wall-clock deadline (seconds) for one `run_sql` call, including
+#: the fetch loop, the vocabulary-warning pass and the completion count.
+#: The progress handler turns this into SQLite's `interrupted` abort, so a
+#: query that would run forever is bounded instead of hanging the caller.
+_DEFAULT_SQL_DEADLINE_S = 5.0
+
+#: Upper clamp for the env override ZAXBYGRAPH_SQL_TIMEOUT_S (issue #71
+#: AC1): a caller may extend the budget, not remove it.
+_SQL_DEADLINE_MAX_S = 600.0
+
+#: Default serialized-result budget (bytes, measured as rendered-cell
+#: chars) for one `run_sql` call. The fetch loop stops once the budget is
+#: exceeded and reports `truncated: true` (issue #71 AC2).
+_DEFAULT_SQL_MAX_BYTES = 1048576
+
+#: Per-cell cap: one oversized TEXT cell must not eat the whole budget or
+#: the caller's context. The marker is explicit so a truncated cell is
+#: never mistaken for the stored value.
+_SQL_CELL_CAP = 4096
+_SQL_CELL_MARKER = "…[cell truncated]"
+
+#: Progress-handler cadence: sqlite3 invokes the handler every N VDBE
+#: instructions, so this is the deadline's interrupt granularity.
+_SQL_PROGRESS_OPS = 1000
+
+#: Chunk size for the incremental fetch loop (bounded pulls; the loop still
+#: never materializes more than limit+1 rows plus one in-flight chunk).
+_FETCH_CHUNK = 256
+
+#: DISTINCT sample bound for vocabulary warnings: enough to name the real
+#: vocabulary of every enum/repo column without unbounded probing.
+_VOCAB_DISTINCT_LIMIT = 100
+
+#: Fixed enum vocabulary columns (issue #71 AC10): a literal compared to
+#: one of these that matches no stored value is almost certainly a wrong
+#: guess at the vocabulary, not a real filter. Repo columns are NOT listed
+#: here — they are discovered from the live schema so every table carrying
+#: a `repo` column warns, not just items.
+_ENUM_VOCAB_COLUMNS = frozenset(
+    {
+        ("items", "kind"),
+        ("items", "state"),
+        ("comments", "kind"),
+        ("edges", "rel"),
+        ("edges", "source"),
+    }
+)
+
 
 
 #: Small fixed English stopword set for the search fallback (issue #4). Kept
@@ -256,34 +308,37 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
 #: One merged, ranked search pass (issue #4): item-text hits (weighted bm25)
 #: UNION ALL comment hits (plain bm25), grouped per item so each item appears
 #: once with its best rank, an item-text-hit flag, and the EXACT count of its
-#: matching comments. `total_matches` counts this grouping pre-limit; the
-#: page is `ORDER BY score ASC, updated_at DESC LIMIT ?` — recency breaks
-#: ties between equal bm25 scores.
+#: matching comments. Rows carry repo and number as separate columns so the
+#: phrase tier can join against item-text phrase hits (issue #72 C15).
 _SEARCH_MERGED = """
-    SELECT hit_key, MIN(score) AS score,
-           MAX(CASE WHEN src = 1 THEN 1 ELSE 0 END) AS has_item_hit,
-           SUM(CASE WHEN src = 0 THEN 1 ELSE 0 END) AS matching_comments,
-           SUM(CASE WHEN src = 2 THEN 1 ELSE 0 END) AS matching_reviews,
-           MAX(upd) AS updated_at
+    SELECT hit.repo AS repo, hit.number AS number,
+           hit.repo || '#' || hit.number AS hit_key,
+           MIN(hit.score) AS score,
+           MAX(CASE WHEN hit.src = 1 THEN 1 ELSE 0 END) AS has_item_hit,
+           SUM(CASE WHEN hit.src = 0 THEN 1 ELSE 0 END) AS matching_comments,
+           SUM(CASE WHEN hit.src = 2 THEN 1 ELSE 0 END) AS matching_reviews,
+           MAX(hit.upd) AS updated_at
     FROM (
-        SELECT items.repo || '#' || items.number AS hit_key,
+        SELECT items.repo AS repo, items.number AS number,
                {item_bm25} AS score,
                1 AS src,
                items.updated_at AS upd
         FROM items_fts
         JOIN items ON items.id = items_fts.rowid
+        {item_bots}
         WHERE items_fts MATCH :match{item_repo}
         UNION ALL
-        SELECT comments.repo || '#' || comments.number AS hit_key,
+        SELECT comments.repo AS repo, comments.number AS number,
                bm25(comments_fts) AS score,
                0 AS src,
                items.updated_at AS upd
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
+        {comment_bots}
         JOIN items ON items.repo = comments.repo AND items.number = comments.number
         WHERE comments_fts MATCH :match{comment_repo}{reviews_arm}
-    )
-    GROUP BY hit_key
+    ) AS hit
+    GROUP BY hit.repo, hit.number
 """
 
 #: Review-body hits (issue #24 AC4) merge into the owning item like comment
@@ -294,15 +349,92 @@ _SEARCH_MERGED = """
 #: reads never migrate.
 _REVIEWS_ARM = """
         UNION ALL
-        SELECT reviews.repo || '#' || reviews.number AS hit_key,
+        SELECT reviews.repo AS repo, reviews.number AS number,
                bm25(reviews_fts) AS score,
                2 AS src,
                items.updated_at AS upd
         FROM reviews_fts
         JOIN reviews ON reviews.id = reviews_fts.rowid
+        {review_bots}
         JOIN items ON items.repo = reviews.repo AND items.number = reviews.number
         WHERE reviews_fts MATCH :match{review_repo}
 """
+
+#: Bot-exclusion semi-joins (issue #71 C6 / plan CF-D), spliced into every
+#: search arm IN THE SQL — pre-ranking, so counts, snippets and pagination
+#: are computed over the filtered set. Inner JOIN on the author's actors row
+#: with is_bot = 0 drops bot-authored rows; sync upserts an actors row for
+#: every author it stores, so the join never loses a human row.
+_ITEM_BOT_FILTER = (
+    " JOIN actors item_actors ON item_actors.login = items.author"
+    " AND item_actors.is_bot = 0"
+)
+_COMMENT_BOT_FILTER = (
+    " JOIN actors comment_actors ON comment_actors.login = comments.author"
+    " AND comment_actors.is_bot = 0"
+)
+_REVIEW_BOT_FILTER = (
+    " JOIN actors review_actors ON review_actors.login = reviews.author"
+    " AND review_actors.is_bot = 0"
+)
+
+
+def _content_tokens(raw: str) -> list[str]:
+    """The query's non-stopword tokens (the broadened pass's vocabulary)."""
+    return [t for t in raw.split() if t and t.lower() not in _STOPWORDS]
+
+
+def build_phrase_query(raw: str) -> str | None:
+    """The adjacent-phrase MATCH string for the ranking tier (issue #72 C15),
+    or None when the query cannot form one (fewer than two content tokens —
+    a single-token phrase is just the strict match). Tokens are quoted as one
+    FTS5 phrase, so user input is never FTS5 syntax."""
+    content = _content_tokens(raw)
+    if len(content) < 2:
+        return None
+    phrase = " ".join(content)
+    return f'"{phrase.replace(chr(34), " ")}"'
+
+
+def _merged_search_sql(
+    repo: str | None,
+    *,
+    legacy: bool = False,
+    exclude_bots: bool = False,
+) -> str:
+    """The formatted _SEARCH_MERGED pass SQL (repo/number-grouped, bot
+    semi-joins spliced in when exclude_bots)."""
+    item_repo = " AND items.repo = :repo" if repo else ""
+    comment_repo = " AND comments.repo = :repo" if repo else ""
+    review_repo = " AND reviews.repo = :repo" if repo else ""
+    return _SEARCH_MERGED.format(
+        item_bm25=_ITEM_BM25_LEGACY if legacy else _ITEM_BM25,
+        item_repo=item_repo,
+        item_bots=_ITEM_BOT_FILTER if exclude_bots else "",
+        comment_bots=_COMMENT_BOT_FILTER if exclude_bots else "",
+        comment_repo=comment_repo,
+        reviews_arm="" if legacy else _REVIEWS_ARM.format(
+            review_repo=review_repo,
+            review_bots=_REVIEW_BOT_FILTER if exclude_bots else "",
+        ),
+    )
+
+
+def _search_pass_total(
+    conn: sqlite3.Connection,
+    match: str,
+    repo: str | None,
+    *,
+    legacy: bool = False,
+    exclude_bots: bool = False,
+) -> int:
+    """The pass's distinct-item COUNT, independent of any page limit (issue
+    #72 C14): the count queries materialize no rows."""
+    merged = _merged_search_sql(repo, legacy=legacy, exclude_bots=exclude_bots)
+    params: dict[str, object] = {"match": match}
+    if repo:
+        params["repo"] = repo
+    return int(conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0])
 
 
 def _run_search_pass(
@@ -312,39 +444,112 @@ def _run_search_pass(
     limit: int,
     *,
     legacy: bool = False,
+    exclude_bots: bool = False,
+    phrase: str | None = None,
 ) -> tuple[int, list[sqlite3.Row]]:
     """One MATCH pass over items+comments (+reviews on v7 stores): returns
-    (total distinct items, top-`limit` rows by best score). Total is computed
-    pre-limit so the fallback decision and `total_matches` are honest for any
-    limit."""
-    item_repo = " AND items.repo = :repo" if repo else ""
-    comment_repo = " AND comments.repo = :repo" if repo else ""
-    review_repo = " AND reviews.repo = :repo" if repo else ""
-    merged = _SEARCH_MERGED.format(
-        item_bm25=_ITEM_BM25_LEGACY if legacy else _ITEM_BM25,
-        item_repo=item_repo,
-        comment_repo=comment_repo,
-        reviews_arm="" if legacy else _REVIEWS_ARM.format(review_repo=review_repo),
-    )
+    (total distinct items, top-`limit` rows). Total is computed pre-limit so
+    the fallback decision and `total_matches` are honest for any limit.
+
+    The page's ORDER BY is the deterministic surface-tier ranking (issue #72
+    C15): item-text hits (title/body/labels/paths) above comment/review-only
+    hits, an adjacent-phrase hit in the item text above scattered tokens
+    within the item-text tier, then bm25, recency, and (repo, number) as the
+    stable tie-breaks. The tier flags ride every row so hydration and the
+    caller never re-derive them."""
+    merged = _merged_search_sql(repo, legacy=legacy, exclude_bots=exclude_bots)
     params: dict[str, object] = {"match": match}
     if repo:
         params["repo"] = repo
     total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
+    if phrase is None:
+        page_sql = (
+            f"SELECT * FROM ({merged}) "
+            "ORDER BY has_item_hit DESC, score ASC, updated_at DESC, "
+            "repo ASC, number ASC LIMIT :limit"
+        )
+        page = conn.execute(page_sql, {**params, "limit": limit}).fetchall()
+        return total, page
+    # Phrase tier: item-text rows whose title/body carry the content tokens
+    # as one adjacent phrase rank above scattered same-tier rows. Joined, not
+    # correlated, so the ranking stays a single sorted pass.
+    phrase_repo = " AND items.repo = :repo" if repo else ""
+    page_sql = (
+        "WITH phrase_hits(repo, number) AS ("
+        "SELECT items.repo, items.number FROM items_fts "
+        "JOIN items ON items.id = items_fts.rowid "
+        f"WHERE items_fts MATCH :phrase{phrase_repo}) "
+        f"SELECT m.*, CASE WHEN p.repo IS NULL THEN 0 ELSE 1 END AS phrase_hit "
+        f"FROM ({merged}) AS m "
+        "LEFT JOIN phrase_hits p ON p.repo = m.repo AND p.number = m.number "
+        "ORDER BY m.has_item_hit DESC, phrase_hit DESC, m.score ASC, "
+        "m.updated_at DESC, m.repo ASC, m.number ASC LIMIT :limit"
+    )
     page = conn.execute(
-        f"{merged} ORDER BY score ASC, updated_at DESC, hit_key ASC LIMIT :limit",
-        {**params, "limit": limit},
+        page_sql, {**params, "phrase": phrase, "limit": limit}
     ).fetchall()
     return total, page
 
 
+def _search_bots_omitted(
+    conn: sqlite3.Connection,
+    match: str,
+    repo: str | None,
+    *,
+    legacy: bool = False,
+) -> int:
+    """Count the bot-authored matches the exclusion filter removes (issue #71
+    C6): matching item rows whose own author is a bot plus matching comment
+    and review rows authored by bots, under the widest (broadened) match.
+    One bounded COUNT, no row materialization."""
+    item_repo = " AND items.repo = :repo" if repo else ""
+    comment_repo = " AND comments.repo = :repo" if repo else ""
+    review_repo = " AND reviews.repo = :repo" if repo else ""
+    arms = [
+        "SELECT COUNT(*) FROM items_fts "
+        "JOIN items ON items.id = items_fts.rowid "
+        "JOIN actors ON actors.login = items.author "
+        f"WHERE items_fts MATCH :match AND actors.is_bot = 1{item_repo}",
+        "SELECT COUNT(*) FROM comments_fts "
+        "JOIN comments ON comments.pk = comments_fts.rowid "
+        "JOIN actors ON actors.login = comments.author "
+        f"WHERE comments_fts MATCH :match AND actors.is_bot = 1{comment_repo}",
+    ]
+    if not legacy:
+        arms.append(
+            "SELECT COUNT(*) FROM reviews_fts "
+            "JOIN reviews ON reviews.id = reviews_fts.rowid "
+            "JOIN actors ON actors.login = reviews.author "
+            f"WHERE reviews_fts MATCH :match AND actors.is_bot = 1{review_repo}"
+        )
+    params: dict[str, object] = {"match": match}
+    if repo:
+        params["repo"] = repo
+    row = conn.execute(
+        "SELECT " + " + ".join(f"({arm})" for arm in arms), params
+    ).fetchone()
+    return int(row[0]) if row is not None else 0
+
+
 def _hydrate_search_hit(
-    conn: sqlite3.Connection, match: str, hit: sqlite3.Row
+    conn: sqlite3.Connection,
+    match: str,
+    hit: sqlite3.Row,
+    *,
+    exclude_bots: bool = False,
 ) -> dict | None:
     """Materialize one merged hit: item columns, an item-text snippet when the
     item text matched, the exact matching-comment count, and the best
-    matching comment's snippet when comments matched."""
-    repo, _, number = str(hit["hit_key"]).rpartition("#")
-    number = int(number)
+    matching comment's snippet when comments matched.
+
+    `snippet` is the item-text snippet when present, else the comment
+    snippet, else the review snippet (issue #72 C15): a comment-only or
+    review-only match never answers an empty snippet while a matching body
+    exists somewhere. The bot filter (issue #71 C6) is applied INSIDE the
+    comment/review snippet lookups — before the fallback is selected — so a
+    bot's comment can never feed the surfaced snippet."""
+    repo = hit["repo"]
+    number = int(hit["number"])
     row = conn.execute(
         "SELECT repo, number, kind, title, state, author, updated_at, html_url "
         "FROM items WHERE repo = ? AND number = ?",
@@ -363,13 +568,19 @@ def _hydrate_search_hit(
             (match, repo, number),
         ).fetchone()
         snippet = found[0] if found else ""
-    rec["snippet"] = snippet
     rec["matching_comments"] = int(hit["matching_comments"] or 0)
     comment_snippet: str = ""
     if rec["matching_comments"]:
+        comment_bots = (
+            " JOIN actors comment_actors ON comment_actors.login = comments.author"
+            " AND comment_actors.is_bot = 0"
+            if exclude_bots
+            else ""
+        )
         found = conn.execute(
             "SELECT snippet(comments_fts, -1, '«', '»', '…', 12) "
-            "FROM comments_fts JOIN comments ON comments.pk = comments_fts.rowid "
+            "FROM comments_fts JOIN comments ON comments.pk = comments_fts.rowid"
+            f"{comment_bots} "
             "WHERE comments_fts MATCH ? AND comments.repo = ? AND comments.number = ? "
             "ORDER BY bm25(comments_fts) ASC LIMIT 1",
             (match, repo, number),
@@ -379,37 +590,65 @@ def _hydrate_search_hit(
     rec["matching_reviews"] = int(hit["matching_reviews"] or 0)
     review_snippet: str = ""
     if rec["matching_reviews"]:
+        review_bots = (
+            " JOIN actors review_actors ON review_actors.login = reviews.author"
+            " AND review_actors.is_bot = 0"
+            if exclude_bots
+            else ""
+        )
         found = conn.execute(
             "SELECT snippet(reviews_fts, -1, '«', '»', '…', 12) "
-            "FROM reviews_fts JOIN reviews ON reviews.id = reviews_fts.rowid "
+            "FROM reviews_fts JOIN reviews ON reviews.id = reviews_fts.rowid"
+            f"{review_bots} "
             "WHERE reviews_fts MATCH ? AND reviews.repo = ? AND reviews.number = ? "
             "ORDER BY bm25(reviews_fts) ASC LIMIT 1",
             (match, repo, number),
         ).fetchone()
         review_snippet = found[0] if found else ""
     rec["review_snippet"] = review_snippet
+    rec["snippet"] = snippet or comment_snippet or review_snippet
     return rec
 
 
-def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | None = None) -> dict:
+def search(
+    conn: sqlite3.Connection,
+    query: str,
+    limit: int = 20,
+    repo: str | None = None,
+    *,
+    offset: int = 0,
+    exclude_bots: bool = False,
+) -> dict:
     """Natural-language search over items and comments (issue #4).
 
     Tokens are quoted (never FTS5 syntax) and stemmed via the porter
-    tokenizer. Ranking is bm25 (title-weighted) with `updated_at` as the
-    tie-break. When the strict all-tokens pass finds fewer hits than the
-    requested page, the page keeps every strict hit first and the broadened
-    pass (stopwords removed, tokens OR-joined) fills the remaining slots;
-    `matched_mode` reports whether broadening contributed ("any") or the
-    strict pass answered alone ("all"). Comment hits merge into their parent
-    item with `matching_comments` and `comment_snippet`; `total_matches`
-    counts the broadened set pre-limit, and `corpus_items` the scoped item
-    count — together they distinguish "no hits in N items" from an empty
-    corpus. `index_stale` is true when the database predates the current
-    schema (reads never migrate), so a zero-hit result on an un-migrated v2
-    index is not mistaken for prior-art absence.
-    """
+    tokenizer. The result is a DEDUPLICATED STRICT-FIRST STREAM: every
+    strict (all-tokens) hit precedes the broadened pass's non-duplicate hits,
+    and `offset` walks that stream — later pages cannot be starved by strict
+    duplicates. Within each pass the surface tiers apply (issue #72 C15):
+    item-text hits above comment/review-only hits, an adjacent phrase in the
+    item text above scattered tokens, then bm25, recency and (repo, number)
+    tie-breaks. `matched_mode` reports "any" when the returned page carries a
+    broadened-contributed row, else "all". Comment hits merge into their
+    parent item with `matching_comments` and `comment_snippet`; `snippet`
+    falls back item text -> comment -> review so a comment-only match never
+    answers empty.
+
+    Counts are limit-independent (issue #72 C14): `strict_matches` and
+    `broadened_matches` come from COUNT queries over each pass (the broadened
+    COUNT runs whenever the strict pass ran, even when its rows did not fill
+    the page), and `total_matches` is the broadened total — the widest set a
+    wider page could reach. `truncated` is true when the page returned fewer
+    rows than `total_matches` (the adapters promote it to the envelope).
+    `exclude_bots` (issue #71 C6) filters bot-authored item/comment/review
+    rows OUT of the match SQL — pre-ranking, so counts, snippets and paging
+    are all computed over the filtered set — and reports the excluded
+    bot-authored matches as `bots_omitted`. `corpus_items` is the scoped item
+    count and `index_stale` flags a store predating the current schema (reads
+    never migrate)."""
     repo = _fold_repo(repo)
     limit = _clamp_limit(limit)
+    offset = max(0, int(offset))
     user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
     index_stale = user_version < CURRENT_USER_VERSION
     corpus_items = conn.execute(
@@ -422,50 +661,86 @@ def search(conn: sqlite3.Connection, query: str, limit: int = 20, repo: str | No
             "items": [],
             "matched_mode": "all",
             "total_matches": 0,
+            "strict_matches": 0,
+            "broadened_matches": 0,
+            "truncated": False,
+            "offset": offset,
             "corpus_items": corpus_items,
             "index_stale": index_stale,
         }
-    mode = "all"
-    match = all_query
     # Feature gate, not staleness (issue #25): the v7 search arms
     # (paths_text/reviews_fts) exist on any store at or past slot 7, so the
     # legacy decision pins _V7_USER_VERSION — a v7 store keeps those arms
     # after the build moves to v8. `index_stale` above keeps its own
     # current-schema meaning and stays a separate signal.
     legacy = user_version < _V7_USER_VERSION
-    total, page = _run_search_pass(conn, match, repo, limit, legacy=legacy)
-    # Blocks keep the page honest under the fallback: the strict pass's page
-    # is kept whole (its rows hydrated against the all-tokens match, so their
-    # snippets show every term), and the broadened pass fills the remaining
-    # slots with rows the strict page does not already have (hydrated against
-    # the broadened match). Without this, a top-`limit` broadened page could
-    # silently evict the very items the strict pass matched.
-    blocks: list[tuple[str, list[sqlite3.Row]]] = [(match, page)]
-    if total < limit and any_query != all_query:
-        match = any_query
-        total, or_page = _run_search_pass(conn, match, repo, limit, legacy=legacy)
-        seen = {row["hit_key"] for row in page}
+    phrase = build_phrase_query(query)
+    # The stream must cover offset+limit rows; every strict hit precedes the
+    # broadened non-duplicates, so the strict pass fetches the whole window
+    # and the broadened pass fills only what the strict set cannot.
+    window = offset + limit
+    strict_total, strict_rows = _run_search_pass(
+        conn, all_query, repo, window, legacy=legacy,
+        exclude_bots=exclude_bots, phrase=phrase,
+    )
+    if any_query != all_query:
+        # The broadened COUNT runs whenever the strict pass ran, even when
+        # the strict rows already fill the page (issue #72 C14): counts are
+        # limit-independent by construction.
+        broadened_total = _search_pass_total(
+            conn, any_query, repo, legacy=legacy, exclude_bots=exclude_bots
+        )
+    else:
+        broadened_total = strict_total
+    total = broadened_total
+    # The deduplicated stream: (match, row, strict?) in final order. The
+    # strict rows keep their block so hydration uses the all-tokens match
+    # (snippets show every term); broadened extras hydrate against the
+    # broadened match.
+    stream: list[tuple[str, sqlite3.Row, bool]] = [
+        (all_query, row, True) for row in strict_rows
+    ]
+    if any_query != all_query and strict_total < window:
+        need = window - len(strict_rows)
+        # Fetch enough broadened rows that removing the strict duplicates
+        # still leaves `need` fresh ones (broadened ⊇ strict at the item
+        # level, so strict_total duplicates are the worst case).
+        _b_total, or_rows = _run_search_pass(
+            conn, any_query, repo, strict_total + need, legacy=legacy,
+            exclude_bots=exclude_bots, phrase=phrase,
+        )
+        seen = {(row["repo"], int(row["number"])) for row in strict_rows}
         extra = [
             row
-            for row in or_page
-            if row["hit_key"] not in seen
-        ][: max(0, limit - len(page))]
-        if extra:
-            mode = "any"
-            blocks.append((match, extra))
+            for row in or_rows
+            if (row["repo"], int(row["number"])) not in seen
+        ][:need]
+        stream.extend((any_query, row, False) for row in extra)
+    page = stream[offset : offset + limit]
     items = []
-    for block_match, block_rows in blocks:
-        for hit in block_rows:
-            rec = _hydrate_search_hit(conn, block_match, hit)
-            if rec is not None:
-                items.append(rec)
-    return {
+    for block_match, hit, _strict in page:
+        rec = _hydrate_search_hit(
+            conn, block_match, hit, exclude_bots=exclude_bots
+        )
+        if rec is not None:
+            items.append(rec)
+    result: dict = {
         "items": items,
-        "matched_mode": mode,
+        "matched_mode": "any" if any(not s for _, _, s in page) else "all",
         "total_matches": total,
+        "strict_matches": strict_total,
+        "broadened_matches": broadened_total,
+        "truncated": offset + len(items) < total,
+        "offset": offset,
         "corpus_items": corpus_items,
         "index_stale": index_stale,
     }
+    if exclude_bots:
+        widest = any_query if any_query != all_query else all_query
+        result["bots_omitted"] = _search_bots_omitted(
+            conn, widest, repo, legacy=legacy
+        )
+    return result
 
 
 def _edges_source_available(conn: sqlite3.Connection) -> bool:
@@ -507,7 +782,13 @@ def _item_edge_rows(
     ).fetchall()
 
 
-def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict | None:
+def item(
+    conn: sqlite3.Connection,
+    number: int,
+    repo: str | None = None,
+    *,
+    exclude_bots: bool = False,
+) -> dict | None:
     repo = _fold_repo(repo)
     if repo:
         row = conn.execute(
@@ -521,6 +802,23 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
     rec.pop("raw_json", None)
     r = rec["repo"]
     n = rec["number"]
+    # Bot exclusion (issue #71 C6 / plan CF-D) filters comments and reviews
+    # IN THE QUERY, before any omission counting: the rows never reach the
+    # payload, and bots_omitted counts exactly the excluded comment+review
+    # rows. Sync upserts an actors row for every author, so the inner join
+    # never drops a human row.
+    comment_bots = (
+        " JOIN actors comment_actors ON comment_actors.login = comments.author"
+        " AND comment_actors.is_bot = 0"
+        if exclude_bots
+        else ""
+    )
+    review_bots = (
+        " JOIN actors review_actors ON review_actors.login = reviews.author"
+        " AND review_actors.is_bot = 0"
+        if exclude_bots
+        else ""
+    )
     rec["labels"] = [
         _row_to_dict(x)
         for x in conn.execute(
@@ -530,19 +828,36 @@ def item(conn: sqlite3.Connection, number: int, repo: str | None = None) -> dict
     rec["comments"] = [
         _row_to_dict(x)
         for x in conn.execute(
-            "SELECT pk, github_id, kind, author, created_at, body, html_url "
-            "FROM comments WHERE repo = ? AND number = ? ORDER BY created_at",
+            "SELECT comments.pk AS pk, comments.github_id AS github_id,"
+            " comments.kind AS kind, comments.author AS author,"
+            " comments.created_at AS created_at, comments.body AS body,"
+            " comments.html_url AS html_url "
+            f"FROM comments{comment_bots} "
+            "WHERE comments.repo = ? AND comments.number = ? ORDER BY created_at",
             (r, n),
         ).fetchall()
     ]
     rec["reviews"] = [
         _row_to_dict(x)
         for x in conn.execute(
-            "SELECT id, author, state, submitted_at, body, html_url "
-            "FROM reviews WHERE repo = ? AND number = ? ORDER BY submitted_at",
+            "SELECT reviews.id AS id, reviews.author AS author,"
+            " reviews.state AS state, reviews.submitted_at AS submitted_at,"
+            " reviews.body AS body, reviews.html_url AS html_url "
+            f"FROM reviews{review_bots} "
+            "WHERE reviews.repo = ? AND reviews.number = ? ORDER BY submitted_at",
             (r, n),
         ).fetchall()
     ]
+    if exclude_bots:
+        omitted = conn.execute(
+            "SELECT"
+            " (SELECT COUNT(*) FROM comments c JOIN actors a ON a.login = c.author"
+            " WHERE c.repo = ? AND c.number = ? AND a.is_bot = 1)"
+            " + (SELECT COUNT(*) FROM reviews v JOIN actors a ON a.login = v.author"
+            " WHERE v.repo = ? AND v.number = ? AND a.is_bot = 1)",
+            (r, n, r, n),
+        ).fetchone()[0]
+        rec["bots_omitted"] = int(omitted)
     rec["files"] = [
         _row_to_dict(x)
         for x in conn.execute(
@@ -691,13 +1006,18 @@ def _versioned_text(
 
 
 def item_history(
-    conn: sqlite3.Connection, number: int, repo: str | None = None
+    conn: sqlite3.Connection,
+    number: int,
+    repo: str | None = None,
+    *,
+    exclude_bots: bool = False,
 ) -> dict | None:
     """`item N --history` (issue #25): the standard item envelope (same
     nested collections as `item`) plus `revisions`, the item's revision
     sequence ordered by id. Pre-v8 stores read-degrade with an honest note;
-    the plain (no-flag) item surface is untouched."""
-    rec = item(conn, number, repo=repo)
+    the plain (no-flag) item surface is untouched. `exclude_bots` (issue #71
+    C6) carries into the underlying item fetch."""
+    rec = item(conn, number, repo=repo, exclude_bots=exclude_bots)
     if rec is None:
         return None
     user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -722,7 +1042,12 @@ def item_history(
 
 
 def item_as_of(
-    conn: sqlite3.Connection, number: int, at: datetime, repo: str | None = None
+    conn: sqlite3.Connection,
+    number: int,
+    at: datetime,
+    repo: str | None = None,
+    *,
+    exclude_bots: bool = False,
 ) -> dict | None:
     """`item N --as-of T` (issue #25): every text entity's version whose
     `[valid_from, valid_to)` contains T (or the live version when T is at or
@@ -730,8 +1055,9 @@ def item_as_of(
     Edges and index_stale are omitted: edges carry no recorded history, so
     presenting the current graph beside an as-of text view would conflate
     two time bases. Pre-v8 stores reconstruct from live rows only, with the
-    same note as --history."""
-    base = item(conn, number, repo=repo)
+    same note as --history. `exclude_bots` (issue #71 C6) carries into the
+    underlying item fetch."""
+    base = item(conn, number, repo=repo, exclude_bots=exclude_bots)
     if base is None:
         return None
     rec: dict = {k: v for k, v in base.items() if k not in ("edges", "index_stale")}
@@ -902,60 +1228,133 @@ def item_as_of(
     return rec
 
 
-def related(conn: sqlite3.Connection, number: int, depth: int = 1, repo: str | None = None) -> dict:
+#: Default budgets for related() (issue #71 C7 / plan CF-D): the expansion
+#: stops at this many nodes or this much accumulated serialized payload
+#: (JSON-length of the collected edge and node rows), whichever trips first.
+_RELATED_MAX_NODES = 100
+_RELATED_MAX_BYTES = 1048576
+
+
+def _serialized_size(rec: dict) -> int:
+    """Deterministic serialized size of one graph row for the byte budget."""
+    return len(json.dumps(rec, sort_keys=True, ensure_ascii=True, default=str))
+
+
+def related(
+    conn: sqlite3.Connection,
+    number: int,
+    depth: int = 1,
+    repo: str | None = None,
+    *,
+    max_nodes: int = _RELATED_MAX_NODES,
+    max_bytes: int = _RELATED_MAX_BYTES,
+) -> dict:
+    """The item's graph neighborhood (BFS over stored edges).
+
+    Bounded expansion (issue #71 C7 / plan CF-D): the walk stops once it has
+    collected `max_nodes` distinct item nodes (the queried hub included) or
+    the accumulated serialized size of the collected edge rows exceeds
+    `max_bytes` (1 MiB by default; node rows also count against what
+    remains, with the hub node always emitted), and reports
+    `truncated: true` in the data when either budget cut something. The
+    truncation order is deterministic: nodes are discovered and emitted
+    breadth-first from the hub in edge order (src endpoint before dst), edges
+    in discovery order, and the budgets simply stop the walk — the survivors
+    are always a prefix of that order, so two calls at the same budget return
+    the same neighborhood."""
     repo = _fold_repo(repo)
     if repo is None:
         row = conn.execute("SELECT repo FROM items WHERE number = ?", (number,)).fetchone()
         if row is None:
-            return {"number": number, "nodes": [], "edges": []}
+            # A ghost input (issue #72 C11): an unstored number answers
+            # LookupError so the runners map it to not_found/exit 1 — never
+            # an ok:true empty neighborhood.
+            raise LookupError(f"item #{number} is not stored")
         repo = row["repo"]
+    elif conn.execute(
+        "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, number)
+    ).fetchone() is None:
+        raise LookupError(f"item #{number} is not stored")
+    budget_nodes = max(1, int(max_nodes))
+    budget_bytes = max(1, int(max_bytes))
     seen_edges: list[dict] = []
-    frontier = {str(number)}
-    visited = set(frontier)
+    edges_bytes = 0
+    frontier = [str(number)]
+    visited = {str(number)}
+    # Discovery order: hub first, then breadth-first neighbors — the
+    # deterministic node order the budget cuts into.
+    order: list[str] = [str(number)]
+    truncated = False
+    stop = False
     source_available = _edges_source_available(conn)
     index_stale = not source_available
     for _ in range(max(1, depth)):
-        nxt: set[str] = set()
+        if stop:
+            break
+        nxt: list[str] = []
         for nid in frontier:
+            if stop:
+                break
             rows = _item_edge_rows(conn, repo, nid, source_available)
             for row in rows:
                 rec = _row_to_dict(row)
+                size = _serialized_size(rec)
+                if edges_bytes + size > budget_bytes:
+                    truncated = True
+                    stop = True
+                    break
                 seen_edges.append(rec)
+                edges_bytes += size
                 for typ, ident in ((rec["src_type"], rec["src_id"]), (rec["dst_type"], rec["dst_id"])):
                     # Foreign repo-qualified ids are frontier dead ends: they
                     # carry no local edges of their own beyond the mirror row,
                     # and expanding them at depth >= 2 would connect unrelated
                     # local items through a third-party hub.
                     if typ == "item" and ident not in visited and ident.isdigit():
-                        nxt.add(ident)
+                        if len(order) >= budget_nodes:
+                            truncated = True
+                            stop = True
+                            break
                         visited.add(ident)
+                        order.append(ident)
+                        nxt.append(ident)
+                if stop:
+                    break
         frontier = nxt
     nodes = []
-    for nid in visited:
+    nodes_bytes = 0
+    for index, nid in enumerate(order):
         # Repo-qualified foreign cross-reference ids (owner/repo#N, issue #6)
         # have no local items row and are not numeric: surface them as
         # unresolved placeholder nodes instead of crashing on int().
         try:
             number_value = int(nid)
         except ValueError:
-            nodes.append(
-                {"number": None, "id": nid, "kind": None, "title": None, "state": None}
-            )
-            continue
-        it = conn.execute(
-            "SELECT number, kind, title, state FROM items WHERE repo = ? AND number = ?",
-            (repo, number_value),
-        ).fetchone()
-        if it:
-            nodes.append(_row_to_dict(it))
+            node = {"number": None, "id": nid, "kind": None, "title": None, "state": None}
         else:
-            nodes.append({"number": number_value, "kind": None, "title": None, "state": None})
+            it = conn.execute(
+                "SELECT number, kind, title, state FROM items WHERE repo = ? AND number = ?",
+                (repo, number_value),
+            ).fetchone()
+            node = (
+                _row_to_dict(it)
+                if it
+                else {"number": number_value, "kind": None, "title": None, "state": None}
+            )
+        if index > 0:
+            size = _serialized_size(node)
+            if nodes_bytes + size > budget_bytes - edges_bytes:
+                truncated = True
+                break
+            nodes_bytes += size
+        nodes.append(node)
     return {
         "number": number,
         "repo": repo,
         "nodes": nodes,
         "edges": seen_edges,
         "index_stale": index_stale,
+        "truncated": truncated,
     }
 
 
@@ -1168,13 +1567,20 @@ def path_between(conn: sqlite3.Connection, a: str, b: str, repo: str | None = No
     Traverses item, file, and commit nodes. Note the `path` CLI endpoint
     grammar parses any non-digit argument as a file, so commit and foreign
     item endpoints are reachable only as intermediate hops, not as `path`
-    arguments."""
+    arguments. A numeric endpoint that is not a stored item raises
+    LookupError (issue #72 C11: a ghost input answers not_found, never an
+    ok:true "no path"); file endpoints keep their lookup semantics."""
     repo = _fold_repo(repo)
     if repo is None:
         row = conn.execute("SELECT repo FROM items LIMIT 1").fetchone()
         if row is None:
             return {"a": a, "b": b, "path": None, "reason": "empty graph"}
         repo = row["repo"]
+    for value in (a, b):
+        if value.isdigit() and conn.execute(
+            "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, int(value))
+        ).fetchone() is None:
+            raise LookupError(f"item {value} is not stored")
 
     def node_key(kind: str, ident: str) -> str:
         return f"{kind}:{ident}"
@@ -1345,43 +1751,409 @@ def assert_read_sql(sql: str) -> None:
         raise ValueError("SQL must start with SELECT, WITH, or EXPLAIN")
 
 
-def run_sql(conn: sqlite3.Connection, sql: str, limit: int = 200, repo: str | None = None) -> dict:
+class SqlTimeoutError(ValueError):
+    """A statement (or one of run_sql's bounded passes) exceeded its
+    wall-clock deadline and was interrupted by the progress handler.
+
+    Subclasses ValueError so existing `except ValueError` mappings still
+    catch it, while the CLI/MCP adapters can single it out for the
+    dedicated `timeout` error code — never `runtime` (issue #71 AC1)."""
+
+    def __init__(self, deadline: float) -> None:
+        super().__init__(
+            f"sql timeout: the statement exceeded its {deadline:g}s "
+            "deadline and was interrupted"
+        )
+
+
+def sql_deadline_from_env() -> float:
+    """ZAXBYGRAPH_SQL_TIMEOUT_S parsed and clamped to (0, 600] (issue #71
+    AC1). Malformed, empty or non-positive values fall back to the 5s
+    default — the env var may widen the budget, never remove it."""
+    raw = os.environ.get("ZAXBYGRAPH_SQL_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        return _DEFAULT_SQL_DEADLINE_S
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_SQL_DEADLINE_S
+    if not value > 0.0:  # also rejects NaN
+        return _DEFAULT_SQL_DEADLINE_S
+    return min(value, _SQL_DEADLINE_MAX_S)
+
+
+def sql_max_bytes_from_env() -> int:
+    """ZAXBYGRAPH_SQL_MAX_BYTES parsed and clamped positive (issue #71
+    AC2). Malformed, empty or non-positive values fall back to the 1 MiB
+    default."""
+    raw = os.environ.get("ZAXBYGRAPH_SQL_MAX_BYTES")
+    if raw is None or not raw.strip():
+        return _DEFAULT_SQL_MAX_BYTES
+    try:
+        value = int(raw, 10)
+    except ValueError:
+        return _DEFAULT_SQL_MAX_BYTES
+    return value if value > 0 else _DEFAULT_SQL_MAX_BYTES
+
+
+def _sql_error(exc: sqlite3.Error, deadline: float) -> ValueError:
+    """Map a stepping sqlite3 error: the progress handler's `interrupted`
+    abort becomes SqlTimeoutError (so the adapters can code it `timeout`);
+    every other sqlite error keeps the historical ValueError conversion."""
+    if isinstance(exc, sqlite3.OperationalError) and "interrupted" in str(exc).lower():
+        return SqlTimeoutError(deadline)
+    return ValueError(str(exc))
+
+
+def _render_cell(value):
+    """One result cell as it rides out of run_sql: bytes values become hex
+    strings (never the sqlite3 `b'...'` repr), and an oversized TEXT cell
+    is capped at _SQL_CELL_CAP chars with an explicit marker (issue #71
+    AC2). Other types (ints, floats, None) pass through unchanged."""
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, str) and len(value) > _SQL_CELL_CAP:
+        return value[:_SQL_CELL_CAP] + _SQL_CELL_MARKER
+    return value
+
+
+def _quote_ident(name: str) -> str:
+    """Safely double-quote a schema-derived identifier (names come from
+    sqlite_master / cursor.description, never from user SQL)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
+def store_table_names(conn: sqlite3.Connection) -> list[str]:
+    """User tables of the live store, PRAGMA-free (AGENTS.md escape-hatch
+    invariant: no path through the sql surface may issue a PRAGMA, so the
+    table list is read from sqlite_master instead of PRAGMA table_list)."""
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+            " AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(row[0]) for row in rows if row[0]]
+
+
+def store_tables_hint(conn: sqlite3.Connection) -> str | None:
+    """Hint text listing the store's tables for a no-such-table error
+    (issue #71 AC11). Shared by the CLI and MCP error-mapping sites so the
+    two surfaces cannot drift."""
+    names = store_table_names(conn)
+    if not names:
+        return None
+    return "tables in this store: " + ", ".join(names)
+
+
+def _store_schema(conn: sqlite3.Connection) -> dict[str, list[str]]:
+    """table -> column names, discovered from the LIVE store PRAGMA-free:
+    sqlite_master for the table list, then a safely-quoted zero-row
+    `SELECT * FROM "table" LIMIT 0` read through cursor.description for
+    each table's columns (the default-deny authorizer denies PRAGMA, so
+    table_info is not an option — and never becomes one). A table whose
+    probe fails (exotic virtual tables) is simply skipped."""
+    schema: dict[str, list[str]] = {}
+    for table in store_table_names(conn):
+        try:
+            probe = conn.execute(f"SELECT * FROM {_quote_ident(table)} LIMIT 0")
+        except sqlite3.Error:
+            continue
+        if probe.description is not None:
+            cols = [d[0] for d in probe.description]
+            if cols:
+                schema[table] = cols
+    return schema
+
+
+def _statement_for_wrap(sql: str) -> str | None:
+    """The statement text as an inner subquery: comments stripped (they
+    would not survive re-nesting legibly), trailing BOM/';'/whitespace
+    removed. None when nothing remains."""
+    inner = _strip_sql_comments(sql).strip().lstrip(_BOM).strip()
+    while inner.endswith(";"):
+        inner = inner[:-1].rstrip()
+    return inner or None
+
+
+def _completion_count(conn: sqlite3.Connection, sql: str, deadline: float) -> int | None:
+    """Fully evaluate the statement inside SQLite as
+    `SELECT COUNT(*) FROM (<statement>)` (issue #71 AC1).
+
+    Why run_sql needs this: SQLite steps a SELECT lazily, so fetching
+    `limit+1` rows alone proves nothing about the statement's total cost —
+    an unbounded recursive CTE happily yields five rows and would then run
+    forever on the next fetch. The wrapped count runs the SAME statement to
+    completion at C speed under the SAME deadline handler: a statement
+    that cannot finish inside the deadline is interrupted (progress
+    handler -> OperationalError('interrupted') -> SqlTimeoutError), and a
+    statement that does finish yields an honest total for the truncation
+    flag. Any sqlite error other than the interrupt (e.g. an EXPLAIN
+    statement that cannot nest) skips the pass — truncation was already
+    detected by the over-fetch."""
+    inner = _statement_for_wrap(sql)
+    if inner is None:
+        return None
+    try:
+        row = conn.execute(f"SELECT COUNT(*) FROM ({inner})").fetchone()
+    except sqlite3.OperationalError as exc:
+        if "interrupted" in str(exc).lower():
+            raise SqlTimeoutError(deadline) from exc
+        return None
+    except sqlite3.Error:
+        return None
+    return int(row[0]) if row is not None else None
+
+
+#: FROM/JOIN table reference with an optional alias. Applied to CODE spans
+#: only (comment- and literal-aware) so words inside string literals never
+#: masquerade as scope.
+_SCOPE_TABLE_RE = re.compile(
+    r"\b(?:from|join)\s+([A-Za-z_][A-Za-z0-9_]*)"
+    r"(?:\s+(?:as\s+)?([A-Za-z_][A-Za-z0-9_]*))?",
+    re.IGNORECASE,
+)
+
+#: Keywords that may legitimately follow a table name without being an
+#: alias; a captured identifier in this set is a clause keyword, not a name.
+_SCOPE_ALIAS_STOPWORDS = frozenset(
+    {
+        "and", "asc", "as", "between", "by", "collate", "cross", "desc",
+        "except", "full", "from", "glob", "group", "having", "in", "inner",
+        "intersect", "is", "join", "left", "like", "limit", "match", "natural",
+        "not", "on", "or", "order", "outer", "regexp", "right", "set", "union",
+        "using", "values", "where", "window",
+    }
+)
+
+
+def _scope_tables(sql: str, schema: dict[str, list[str]]) -> tuple[list[str], dict[str, str]]:
+    """(real tables referenced after FROM/JOIN, alias -> canonical table).
+
+    Only names that exist in the live schema count as scope: CTE names and
+    subquery aliases are not vocabulary-bearing store tables, so they are
+    conservatively ignored."""
+    lower_map = {t.lower(): t for t in schema}
+    code = " ".join(text for kind, text in _sql_tokens(sql) if kind == "code")
+    tables: list[str] = []
+    aliases: dict[str, str] = {}
+    for match in _SCOPE_TABLE_RE.finditer(code):
+        name = lower_map.get(match.group(1).lower())
+        if name is not None and name not in tables:
+            tables.append(name)
+        alias = match.group(2)
+        if (
+            name is not None
+            and alias is not None
+            and alias.lower() not in _SCOPE_ALIAS_STOPWORDS
+        ):
+            resolved = lower_map.get(alias.lower())
+            if resolved is not None:
+                # An alias that collides with a real table name would be
+                # ambiguous; the table name wins (conservative).
+                if alias.lower() not in lower_map:
+                    aliases[alias.lower()] = name
+            else:
+                aliases[alias.lower()] = name
+    return tables, aliases
+
+
+def _vocabulary_warnings(
+    conn: sqlite3.Connection, sql: str, deadline: float
+) -> list[dict]:
+    """Out-of-vocabulary literal warnings (issue #71 AC10).
+
+    The statement is NEVER rewritten and the guard layers are untouched:
+    this pass only reads. It compares string literals found next to a
+    column comparison (`col = 'lit'`, bare or table/alias-qualified) against
+    the DISTINCT stored values of exactly that table.column, for the fixed
+    enum columns plus every `repo` column discovered from the live schema.
+    A warning fires ONLY when the literal matches no stored value — rows
+    are returned unchanged either way; the warning just names the column,
+    the literal and the stored vocabulary (for a repo column that includes
+    the case-differing stored slug). All probes run under the same deadline
+    handler as the statement itself."""
+    stripped = _strip_sql_comments(sql)
+    if "'" not in stripped:
+        # Fast path: no string literal anywhere in the statement can be
+        # compared to a vocabulary column.
+        return []
+    schema = _store_schema(conn)
+    if not schema:
+        return []
+    scope, aliases = _scope_tables(sql, schema)
+    if not scope:
+        return []
+
+    # Which in-scope table(s) own each bare column name: a bare reference
+    # is only attributed when exactly one in-scope table has the column.
+    owners: dict[str, list[str]] = defaultdict(list)
+    for table in scope:
+        for column in schema[table]:
+            owners[column].append(table)
+
+    warnings: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    stored_cache: dict[tuple[str, str], list | None] = {}
+
+    def _stored(table: str, column: str) -> list | None:
+        key = (table, column)
+        if key not in stored_cache:
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT {_quote_ident(column)} FROM {_quote_ident(table)}"
+                    f" WHERE {_quote_ident(column)} IS NOT NULL"
+                    f" LIMIT {_VOCAB_DISTINCT_LIMIT}"
+                ).fetchall()
+                stored_cache[key] = [row[0] for row in rows]
+            except sqlite3.OperationalError as exc:
+                if "interrupted" in str(exc).lower():
+                    raise SqlTimeoutError(deadline) from exc
+                stored_cache[key] = None
+            except sqlite3.Error:
+                # A probe we cannot run must not fabricate an "empty
+                # vocabulary" warning — skip the column instead.
+                stored_cache[key] = None
+        return stored_cache[key]
+
+    vocab: list[tuple[str, str]] = []
+    for table, columns in schema.items():
+        for column in columns:
+            if column == "repo" or (table, column) in _ENUM_VOCAB_COLUMNS:
+                vocab.append((table, column))
+
+    for table, column in vocab:
+        if table not in scope:
+            continue
+        refs: list[str] = [table]
+        refs.extend(
+            alias for alias, target in aliases.items() if target == table
+        )
+        patterns = [
+            rf"\b{re.escape(ref)}\s*\.\s*{re.escape(column)}\s*=\s*'([^']*)'"
+            for ref in refs
+        ]
+        if owners.get(column) == [table]:
+            # Bare reference: not preceded by an identifier char or a dot,
+            # so `items.kind = 'x'` is not re-matched by the bare pattern.
+            patterns.append(rf"(?<![\w.]){re.escape(column)}\s*=\s*'([^']*)'")
+        literals: list[str] = []
+        for pattern in patterns:
+            for literal in re.findall(pattern, stripped, re.IGNORECASE):
+                if literal and literal not in literals:
+                    literals.append(literal)
+        for literal in literals[:32]:
+            key = (f"{table}.{column}", literal)
+            if key in seen:
+                continue
+            seen.add(key)
+            stored = _stored(table, column)
+            if stored is not None and literal not in stored:
+                warnings.append(
+                    {
+                        "column": f"{table}.{column}",
+                        "literal": literal,
+                        "stored_values": stored,
+                    }
+                )
+    return warnings
+
+
+def run_sql(
+    conn: sqlite3.Connection,
+    sql: str,
+    limit: int = 200,
+    repo: str | None = None,
+    deadline: float = _DEFAULT_SQL_DEADLINE_S,
+    max_bytes: int = _DEFAULT_SQL_MAX_BYTES,
+) -> dict:
     assert_read_sql(sql)
     limit = _clamp_fetch_limit(limit)
-    cur = conn.cursor()
+    deadline = float(deadline)
+    if not deadline > 0.0:
+        raise ValueError("deadline must be a positive number of seconds")
+    max_bytes = int(max_bytes)
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be a positive byte budget")
+
+    deadline_at = time.monotonic() + deadline
+
+    def _deadline_handler() -> int:
+        # sqlite3 invokes this every _SQL_PROGRESS_OPS VDBE instructions;
+        # a nonzero return aborts the stepping statement with
+        # OperationalError('interrupted'). One handler covers the execute,
+        # the fetch loop, the vocabulary pass and the completion count.
+        return 1 if time.monotonic() >= deadline_at else 0
+
+    conn.set_progress_handler(_deadline_handler, _SQL_PROGRESS_OPS)
     try:
-        cur.execute(sql)
-    except sqlite3.Error as exc:
-        raise ValueError(str(exc)) from exc
-    if cur.description is None:
-        return {"columns": [], "rows": [], "truncated": False}
-    cols = [d[0] for d in cur.description]
-    try:
+        cur = conn.cursor()
+        try:
+            cur.execute(sql)
+        except sqlite3.Error as exc:
+            raise _sql_error(exc, deadline) from exc
+        if cur.description is None:
+            return {"columns": [], "rows": [], "truncated": False}
+        cols = [d[0] for d in cur.description]
+        rows: list[list] = []
+        truncated = False
+        exhausted = False
+        budget_left = max_bytes
+        remaining = limit + 1
         # Fetch at most limit+1 rows so we can detect truncation without
         # ever materializing the full result set (a multi-million-row
         # recursive CTE must not be pulled to exhaustion just to return
         # `limit` rows — fetchall() would step the VDBE through every row
-        # before we ever get to slice it down).
-        fetched = cur.fetchmany(limit + 1)
-    except sqlite3.Error as exc:
-        raise ValueError(str(exc)) from exc
-    truncated = len(fetched) > limit
-    # Positional extraction only: sqlite3.Row resolves duplicate column
-    # names to the FIRST match (row["body"] on a joined SELECT returns the
-    # left table's value for both positions), so name-based access silently
-    # substitutes values. list(row) keeps every duplicate position honest.
-    rows = [list(row) for row in fetched[:limit]]
-    if repo is not None and "repo" in cols:
-        # Issue #2 AC4: rows that carry a repo column show only the resolved
-        # repo. Post-fetch and column-name based; a projection without a
-        # repo column cannot be filtered (per-slug stores make that
-        # store-scoped by construction — documented in README).
-        # truncated reports the PRE-filter rowset (PRR-004): the unfiltered
-        # query genuinely had more rows than the limit, so raising the limit
-        # always converges; the flag must not be recomputed post-filter.
-        idx = cols.index("repo")
-        rows = [row for row in rows if row[idx] == repo]
-    return {"columns": cols, "rows": rows, "truncated": truncated}
+        # before we ever get to slice it down). Chunks stay bounded; the
+        # serialized-cell budget stops the pull early when a result is
+        # wide rather than long (issue #71 AC2).
+        while remaining > 0:
+            try:
+                chunk = cur.fetchmany(min(remaining, _FETCH_CHUNK))
+            except sqlite3.Error as exc:
+                raise _sql_error(exc, deadline) from exc
+            if not chunk:
+                exhausted = True
+                break
+            for row in chunk:
+                rendered = [_render_cell(value) for value in row]
+                budget_left -= sum(len(str(value)) for value in rendered)
+                rows.append(rendered)
+                remaining -= 1
+                if budget_left < 0:
+                    truncated = True
+                    break
+            if truncated:
+                break
+        if not exhausted and not truncated and len(rows) > limit:
+            truncated = True
+        # Positional extraction only: sqlite3.Row resolves duplicate column
+        # names to the FIRST match (row["body"] on a joined SELECT returns the
+        # left table's value for both positions), so name-based access silently
+        # substitutes values. list(row) keeps every duplicate position honest.
+        rows = rows[:limit]
+        if repo is not None and "repo" in cols:
+            # Issue #2 AC4: rows that carry a repo column show only the resolved
+            # repo. Post-fetch and column-name based; a projection without a
+            # repo column cannot be filtered (per-slug stores make that
+            # store-scoped by construction — documented in README).
+            # truncated reports the PRE-filter rowset (PRR-004): the unfiltered
+            # query genuinely had more rows than the limit, so raising the limit
+            # always converges; the flag must not be recomputed post-filter.
+            idx = cols.index("repo")
+            rows = [row for row in rows if row[idx] == repo]
+        warnings = _vocabulary_warnings(conn, sql, deadline)
+        result: dict = {"columns": cols, "rows": rows, "truncated": truncated}
+        if warnings:
+            result["warnings"] = warnings
+        if truncated:
+            total = _completion_count(conn, sql, deadline)
+            if total is not None:
+                result["total_rows"] = total
+        return result
+    finally:
+        conn.set_progress_handler(None, 0)
 
 
 def export_graph(conn: sqlite3.Connection, repo: str | None = None) -> dict:
@@ -1711,3 +2483,74 @@ def cap_comments(data: dict, max_comments: int, repo: str | None = None) -> dict
     data["comments"] = [c for i, c in enumerate(comments) if i in keep]
     data["comments_omitted"] = total - len(data["comments"])
     return data
+
+
+#: Default item read bounds (issue #71 C5 / plan CF-D): the plain item
+#: surface bounds the item body to 20 KiB (with an explicit truncation
+#: marker carrying the omitted count) and the comment/review lists to 5
+#: entries each, reporting comments_omitted/reviews_omitted. Explicit
+#: --max-body-chars/--max-comments flags stay authoritative when given.
+_ITEM_BODY_CHARS_DEFAULT = 20 * 1024
+_ITEM_COMMENTS_DEFAULT = 5
+_ITEM_REVIEWS_DEFAULT = 5
+
+
+def _cap_reviews(data: dict, max_reviews: int) -> None:
+    """The review-list analog of cap_comments: keep the first `max_reviews`
+    in stored (submitted_at) order, report reviews_omitted (always set — 0
+    when nothing was capped)."""
+    if max_reviews < 0:
+        raise ValueError("max_reviews must be >= 0")
+    reviews = data.get("reviews")
+    if not isinstance(reviews, list):
+        return
+    if len(reviews) <= max_reviews:
+        data["reviews_omitted"] = 0
+        return
+    data["reviews"] = reviews[:max_reviews]
+    data["reviews_omitted"] = len(reviews) - max_reviews
+
+
+def apply_item_bounds(
+    data: dict,
+    repo: str | None = None,
+    *,
+    max_body_chars: int | None = None,
+    max_comments: int | None = None,
+    max_reviews: int | None = None,
+) -> bool:
+    """Bound one item payload (issue #71 C5 / plan CF-D). Used by BOTH read
+    adapters (CLI `item` and MCP `get_item`) so the defaults cannot drift.
+
+    Flags given (max_body_chars/max_comments/max_reviews) keep their
+    explicit-cap semantics — max_body_chars is NOT applied here (the caller
+    has already run _truncate_bodies with it); flags absent fall to the
+    documented defaults: body <= 20 KiB with an appended truncation marker
+    carrying the omitted char count, comments <= 5 (cap_comments' first/last/
+    maintainer preference), reviews <= 5. comments_omitted/reviews_omitted
+    are ALWAYS set (0 when nothing was capped). Returns whether anything was
+    cut, for the envelope's truncated flag."""
+    if not isinstance(data, dict) or data.get("not_found"):
+        # A per-row not_found marker (issue #72 C22) is not an item payload.
+        return False
+    cut = False
+    cap = max_comments if max_comments is not None else _ITEM_COMMENTS_DEFAULT
+    before = len(data.get("comments") or []) if isinstance(data.get("comments"), list) else 0
+    cap_comments(data, cap, repo)
+    if int(data.get("comments_omitted") or 0) > 0 or before != len(data.get("comments") or []):
+        cut = True
+    _cap_reviews(data, max_reviews if max_reviews is not None else _ITEM_REVIEWS_DEFAULT)
+    if int(data.get("reviews_omitted") or 0) > 0:
+        cut = True
+    if max_body_chars is None:
+        body = data.get("body")
+        if isinstance(body, str) and len(body) > _ITEM_BODY_CHARS_DEFAULT:
+            omitted = len(body) - _ITEM_BODY_CHARS_DEFAULT
+            data["body"] = (
+                body[:_ITEM_BODY_CHARS_DEFAULT]
+                + f"…[body truncated: {omitted} chars omitted]"
+            )
+            data["body_chars_omitted"] = omitted
+            data["truncated"] = True
+            cut = True
+    return cut

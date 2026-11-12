@@ -79,6 +79,37 @@ _FIXED_DATE = "1970-01-01T00:00:00Z"
 #: compares the size against it rather than against zero.
 _WAL_HEADER_BYTES = 32
 
+#: git's own wording for "the source was reached and it does not have that
+#: ref" (issue #72 C16 / plan CF-H). Everything ELSE a failed fetch can say --
+#: no such repository, no network, auth refused, terminal prompts disabled --
+#: means the SOURCE could not be reached at all, which is a different failure
+#: (and a different exit class) from a reachable source holding no snapshot.
+#: Both spellings are matched ("ref" / "reference") because git changed the
+#: wording across versions.
+_ABSENT_REF_SIGNATURE_RE = re.compile(
+    r"couldn'?t find remote ref(erence)?", re.IGNORECASE
+)
+
+
+def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError:
+    """Classify one failed ``git fetch`` of a snapshot ref (issue #72 C16).
+
+    An absent-ref signature stays ``snapshot_absent``'s business (the caller
+    keeps it as "this ref contributed no candidate"); any OTHER nonzero exit
+    is a transport/auth failure against the source and raises the coded
+    ``source_unreachable`` carrying git's own error text, at exit 1 -- the
+    per-attempt class, distinct from the exit-2 guard rejections."""
+    text = stderr.decode("utf-8", "replace")
+    if _ABSENT_REF_SIGNATURE_RE.search(text):
+        return None
+    return SnapshotError(
+        "source_unreachable",
+        f"git could not fetch {ref} from the snapshot source: {_tail(stderr)}",
+        hint="check the source path/URL and credentials (gh auth status),"
+             " then re-pull",
+        exit_code=1,
+    )
+
 
 class SnapshotError(Exception):
     """Snapshot failure with an envelope-shaped payload.
@@ -88,10 +119,13 @@ class SnapshotError(Exception):
     on retry unchanged"), so every existing raise site keeps its current exit
     code.
 
-    A raise passes 1 only when what blocked it was a stat or open fault on the
-    destination or store path itself -- an uninspectable, busy or I/O-faulted
-    destination. That is a per-attempt condition, so it belongs to the class
-    ``README.md`` says "sometimes will" succeed on retry.
+    A raise passes 1 when what blocked it was a per-attempt condition a retry
+    can genuinely clear: a stat or open fault on the destination or store path
+    itself (an uninspectable, busy or I/O-faulted destination), or -- issue
+    #72 C16 -- ``source_unreachable``, a git transport/auth failure against
+    the SNAPSHOT SOURCE (the fetch exited nonzero without the absent-ref
+    signature, so the source itself could not be reached, as opposed to a
+    reachable source that simply holds no snapshot).
 
     Everything else keeps the default 2, and that is a POLICY rather than a
     claim about causes or about where a refusal fires. Three reasons it cannot
@@ -586,10 +620,19 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
     # custom ref left behind by a namespace refusal must not keep serving
     # the first snapshot forever (swarm-pr-review PRR-H)
     candidates = {}
+    fetch_failures: list[SnapshotError | None] = []
+    any_fetch_ok = False
     for ref in (SNAPSHOT_REF, "refs/heads/" + SNAPSHOT_BRANCH):
         f = _run_git(["fetch", source, ref], wd, check=False)
         if f.returncode != 0:
+            # Classified, not swallowed (issue #72 C16): a fetch that failed
+            # WITHOUT the absent-ref signature is a transport/auth failure
+            # against the source. It only RAISES below, when no fetch at all
+            # reached the source -- a fetch that succeeded for the other ref
+            # still leaves the source reachable and the pull serviceable.
+            fetch_failures.append(_fetch_failure(f.stderr, ref, source))
             continue
+        any_fetch_ok = True
         commit = _run_git(["rev-parse", "FETCH_HEAD"], wd).stdout.decode().strip()
         mbytes = _run_git(["cat-file", "blob", commit + ":manifest.json"],
                           wd, check=False)
@@ -609,6 +652,19 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             wm = ""
         candidates[ref] = (wm, commit, mbytes.stdout)
     if not candidates:
+        # No ref answered. Which failure that IS depends on git's own words
+        # (issue #72 C16): every fetch failing with the absent-ref signature
+        # is a REACHED source holding no snapshot (snapshot_absent, exit 2);
+        # any other nonzero fetch is source_unreachable (exit 1) carrying
+        # git's message -- an unreachable source must not masquerade as
+        # "nothing published here". source_unreachable only speaks when NO
+        # fetch reached the source: a succeeded fetch with an unusable
+        # manifest is the reachable-source case (its refusal is the
+        # manifest-validation codes below or snapshot_absent).
+        if not any_fetch_ok:
+            for failure in fetch_failures:
+                if failure is not None:
+                    raise failure
         raise SnapshotError(
             "snapshot_absent",
             f"source has neither {SNAPSHOT_REF} nor the fallback branch",

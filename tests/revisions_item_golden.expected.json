@@ -99,7 +99,9 @@
         "source": "payload"
       }
     ],
-    "index_stale": false
+    "index_stale": false,
+    "comments_omitted": 0,
+    "reviews_omitted": 0
   },
   "truncated": false
 }

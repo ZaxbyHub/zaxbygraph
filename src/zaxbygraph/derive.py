@@ -2288,8 +2288,11 @@ def bundle(
     ``pool``) minus ``exclude``, with in-pool blocker relaxation
     (blocked-only items whose blockers are all in the pool stay,
     ``gate_relaxed: true``); ``--exclude`` wins over pool membership and the
-    relaxation alike. Pool members absent from the ranked pool are dropped
-    silently — the echoed ``pool`` array is the disclosure. Pair affinity
+    relaxation alike. Every explicitly named ``--pool`` member that does not
+    survive into the pool is reported in ``dropped`` as ``{number, reason}``
+    (``not_stored``/``pr``/``closed``/``excluded``/``gated``) — the echo of
+    who was asked for and did not make it, next to the echoed ``pool`` array
+    of who did. Pair affinity
     and the stage-2 analog scans run under ``weights`` — the effective
     ``[derive]`` table (None -> ``load_weights()`` defaults, preserving
     bare library-call behavior) — over the exact pipeline
@@ -2352,6 +2355,42 @@ def bundle(
                 members.add(number)
                 relaxed.add(number)
                 changed = True
+
+    # Dropped pool members (issue #72 C12): every explicitly named --pool
+    # member that did not survive into `members` is reported with a short
+    # reason. Computed AFTER the blocker-relaxation fixpoint so a relaxed
+    # member is never reported dropped, and classified against the items
+    # table so the reason names WHY the member is gone.
+    dropped: list[dict] = []
+    if pool is not None:
+        pool_numbers = sorted({int(n) for n in pool})
+        stored_kind_state: dict[int, tuple[str, str]] = {}
+        for start in range(0, len(pool_numbers), 400):
+            chunk = pool_numbers[start : start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            for row in conn.execute(
+                "SELECT number, kind, state FROM items"
+                f" WHERE repo = ? AND number IN ({placeholders})",
+                [repo, *chunk],
+            ):
+                stored_kind_state[int(row["number"])] = (row["kind"], row["state"])
+        excluded_set = set(excluded)
+        for n in pool_numbers:
+            if n in members:
+                continue
+            if n not in stored_kind_state:
+                reason = "not_stored"
+            elif stored_kind_state[n][0] == "pr":
+                reason = "pr"
+            elif stored_kind_state[n][1] != "open":
+                reason = "closed"
+            elif n in excluded_set:
+                reason = "excluded"
+            else:
+                # Stored, open, not excluded — it sat outside the ranked
+                # pool (gated) and no in-pool blocker relaxation rescued it.
+                reason = "gated"
+            dropped.append({"number": n, "reason": reason})
 
     ctx = compute["ctx"]
     # The context arrives with the coupling index already attached (built
@@ -2562,6 +2601,7 @@ def bundle(
         "related_not_bundleable": related_not_bundleable,
         "excluded": excluded,
         "pool": sorted(members),
+        "dropped": dropped,
         "weights": weights_echo,
         "config_source": cfg["_config_source"],
         "formula_version": cfg["formula_version"],
@@ -2985,6 +3025,7 @@ def brief(
     live: bool = False,
     gh_path: str = "gh",
     weights: dict | None = None,
+    exclude_bots: bool = False,
 ) -> dict:
     """The work packet for one issue (issue #30, 04-root-cause.md section
     4): the triage feature row, the body truncated at paragraph boundaries,
@@ -3025,7 +3066,10 @@ def brief(
     budget or not (pr45 review CUB#4de28cd7).
     ``live`` shells out to ``gh`` (argv list, no shell) for linked-PR CI
     state/reviews; any failure degrades to ``live: null`` +
-    ``live_error``. Read-only."""
+    ``live_error``. Read-only. ``exclude_bots`` (issue #71 C6 / plan CF-D)
+    filters bot-authored rows out of the comment ranking and bot-authored
+    items (linked PRs, the analog) out of the packet, reporting
+    ``bots_omitted`` (the filtered rows)."""
     if budget_tokens is None or budget_tokens <= 0:
         # Mirrors --size: a non-positive budget is a bad request, never a
         # silently-disabled cap (pr45 review K09).
@@ -3054,6 +3098,17 @@ def brief(
     if item_row is None:  # pragma: no cover - triage rows are open issues
         raise LookupError(f"item not found: #{number}")
 
+    # Bot exclusion (issue #71 C6 / plan CF-D) filters the comment ranking
+    # IN THE QUERY, before the top-5 cap and budget accounting; the linked-PR
+    # and analog legs below drop bot-authored items the same way. Sync
+    # upserts an actors row for every author, so the inner join never loses a
+    # human row. bots_omitted counts the filtered rows.
+    comment_bots = (
+        " JOIN actors comment_actors ON comment_actors.login = comments.author"
+        " AND comment_actors.is_bot = 0"
+        if exclude_bots
+        else ""
+    )
     comment_rows = [
         {
             "author": crow["author"],
@@ -3062,11 +3117,26 @@ def brief(
             "body": crow["body"] or "",
         }
         for crow in conn.execute(
-            "SELECT author, author_association, created_at, body FROM comments"
-            " WHERE repo = ? AND number = ? AND kind = 'issue_comment'",
+            "SELECT comments.author AS author,"
+            " comments.author_association AS author_association,"
+            " comments.created_at AS created_at, comments.body AS body"
+            f" FROM comments{comment_bots}"
+            " WHERE comments.repo = ? AND comments.number = ?"
+            " AND comments.kind = 'issue_comment'",
             (repo, number),
         )
     ]
+    bots_omitted = 0
+    if exclude_bots:
+        bots_omitted = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM comments c"
+                " JOIN actors a ON a.login = c.author"
+                " WHERE c.repo = ? AND c.number = ? AND c.kind = 'issue_comment'"
+                " AND a.is_bot = 1",
+                (repo, number),
+            ).fetchone()[0]
+        )
     ranked_comments: list[dict] = []
     for rank in (0, 1, 2):
         bucket = [
@@ -3109,15 +3179,34 @@ def brief(
                 "additions": arow["additions"],
                 "deletions": arow["deletions"],
             }
+            if exclude_bots and conn.execute(
+                "SELECT 1 FROM items i JOIN actors a ON a.login = i.author"
+                " WHERE i.repo = ? AND i.number = ? AND a.is_bot = 1",
+                (repo, analog["number"]),
+            ).fetchone() is not None:
+                # A bot-authored PR is not a work analog (issue #71 C6).
+                analog_block = None
+                bots_omitted += 1
 
+    #: The linked-PR legs flag each PR's author bot status when --no-bots is
+    #: set, so bot-authored PRs drop out of the packet and into the count.
+    link_bot_select = (
+        ", CAST(COALESCE(la.is_bot, 0) AS INTEGER) AS author_is_bot"
+        if exclude_bots
+        else ""
+    )
+    link_bot_join = (
+        " LEFT JOIN actors la ON la.login = i.author" if exclude_bots else ""
+    )
     linked: list[dict] = []
     seen_prs: set[int] = set()
     # linked_pr: the issue (src) points at its linked PR (dst); the closes
     # fallback: the PR (src) points at the issue (dst).
     for erow in conn.execute(
         "SELECT CAST(e.dst_id AS INTEGER) AS pr, i.title AS pr_title,"
-        " i.state AS pr_state FROM edges e JOIN items i"
+        f" i.state AS pr_state{link_bot_select} FROM edges e JOIN items i"
         " ON i.repo = e.repo AND i.number = CAST(e.dst_id AS INTEGER)"
+        f"{link_bot_join}"
         " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
         " AND e.rel = 'linked_pr' AND e.src_id = ? AND i.kind = 'pr'",
         (repo, str(number)),
@@ -3126,6 +3215,9 @@ def brief(
         if pr is None or pr in seen_prs:
             continue
         seen_prs.add(pr)
+        if exclude_bots and erow["author_is_bot"]:
+            bots_omitted += 1
+            continue
         linked.append(
             {
                 "number": pr,
@@ -3135,8 +3227,9 @@ def brief(
         )
     for erow in conn.execute(
         "SELECT CAST(e.src_id AS INTEGER) AS pr, i.title AS pr_title,"
-        " i.state AS pr_state FROM edges e JOIN items i"
+        f" i.state AS pr_state{link_bot_select} FROM edges e JOIN items i"
         " ON i.repo = e.repo AND i.number = CAST(e.src_id AS INTEGER)"
+        f"{link_bot_join}"
         " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
         " AND e.rel IN ('closes', 'closes_keyword') AND e.dst_id = ?"
         " AND i.kind = 'pr'",
@@ -3146,6 +3239,9 @@ def brief(
         if pr is None or pr in seen_prs:
             continue
         seen_prs.add(pr)
+        if exclude_bots and erow["author_is_bot"]:
+            bots_omitted += 1
+            continue
         linked.append(
             {
                 "number": pr,
@@ -3186,6 +3282,10 @@ def brief(
         "config_source": cfg["_config_source"],
         "formula_version": cfg["formula_version"],
     }
+    if exclude_bots:
+        # Issue #71 C6: the packet reports how many bot-authored rows the
+        # filter removed (comments, linked PRs, a dropped analog).
+        packet["bots_omitted"] = bots_omitted
 
     # The live block attaches BEFORE the budget enforcement so the envelope
     # covers the complete packet, --live content included.

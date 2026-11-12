@@ -295,13 +295,22 @@ class SnapshotExitClassCensusTests(unittest.TestCase):
     disagree (one 1, one 2) is dropped as unclassifiable rather than failed,
     because such a code is a split-class refusal like ``out_is_database`` and
     the census has no way to tell a legitimate split from a mistake. A split
-    class therefore has to be pinned by a targeted test, not by this census."""
+    class therefore has to be pinned by a targeted test, not by this census.
+
+    Issue #72 C16 (plan CF-H) widened the exit-1 set BY DESIGN:
+    ``source_unreachable`` (a git transport/auth failure against the snapshot
+    SOURCE, without the absent-ref signature -- distinct from
+    ``snapshot_absent``'s reachable-source-holds-no-snapshot) joins
+    ``dest_uninspectable`` as the per-attempt class a retry can clear; the
+    README/SKILL.md exit tables name it, and
+    tests/test_surface_honesty.py::SnapshotHonestyTests pins the observable
+    behaviour (exit 1, git's message in the envelope)."""
 
     #: Codes the docs name as answering 2 by name.
     EXIT_TWO = ("git_timeout", "dest_open", "dest_sidecar_stale",
                 "corpus_mismatch")
     #: The only refusals allowed to answer 1.
-    EXIT_ONE = ("dest_uninspectable",)
+    EXIT_ONE = ("dest_uninspectable", "source_unreachable")
 
     @staticmethod
     def _census():
@@ -339,8 +348,9 @@ class SnapshotExitClassCensusTests(unittest.TestCase):
         census = self._census()
         ones = sorted(c for c, v in census.items() if v == {1})
         self.assertEqual(ones, sorted(self.EXIT_ONE),
-                         "a refusal other than the documented inspection"
-                         " refusal answers exit 1")
+                         "a refusal other than the documented exit-1 set"
+                         " (dest_uninspectable, source_unreachable) answers"
+                         " exit 1")
 
 
 if __name__ == "__main__":

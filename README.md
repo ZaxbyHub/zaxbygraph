@@ -895,16 +895,20 @@ Machine-readable rules, worth knowing before scripting against this:
   request was malformed (bad flags, non-read SQL, multiple statements), or the
   resolved DB holds other repos but not this one. **`1`** — a runtime failure:
   item not found, sync error, an authorizer denial at execution time, or one of
-  the two inspection refusals below. **`3`** — no corpus for the resolved repo
+  the per-attempt refusals below. **`3`** — no corpus for the resolved repo
   (issue #2): the resolved DB is missing or holds nothing for it; the message
   names the path and the exact `sync` command. The distinction matters for
   retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
   request, or sync first), while a `1` sometimes will.
-  **The two inspection refusals that answer `1` are narrow, not a general
-  rule.** `snapshot pull`'s `dest_uninspectable` and `export-corpus`'s
-  `out_is_database`-on-an-uninspectable-path answer `1`, because what blocked
-  them was a stat or open fault on the destination or store path itself — a
-  per-attempt condition a retry can clear. Every other snapshot guard rejection
+  **The inspection and source-reachability refusals that answer `1` are
+  narrow, not a general rule.** `snapshot pull`'s `dest_uninspectable`,
+  `snapshot pull`'s `source_unreachable` (git could not reach the snapshot
+  SOURCE — a transport or auth failure, carrying git's own message, distinct
+  from `snapshot_absent`'s reachable-source-holds-no-snapshot), and
+  `export-corpus`'s `out_is_database`-on-an-uninspectable-path answer `1`,
+  because what blocked them was a stat or open fault on the destination or
+  store path itself, or a per-attempt failure to reach the source —
+  conditions a retry can clear. Every other snapshot guard rejection
   stays `2`, including the four whose hint says to retry or re-pull
   (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). That is
   a **policy**, not a claim about what caused them: two of the four can have a

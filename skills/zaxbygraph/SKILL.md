@@ -227,6 +227,32 @@ carries `total_matches: 0` and `corpus_items: <n>`, so "no prior art" is
 distinguishable from an empty corpus). `path` is `null` when no route exists —
 with exit code 0, because "not connected" is an answer.
 
+**Per-command data keys** — one shape registry feeds this table, the MCP
+`tools/list` outputSchemas, and `zaxbygraph schema --output COMMAND` (which
+prints the live declaration plus the payload kind and a description; the
+sets are exact by construction). `churn` and `open` answer a BARE list of
+row objects, so their cells are the row fields; `item N1 N2 ...` likewise
+answers a bare list of item rows. Conditional keys (`next_cursor`,
+`bots_omitted`, `warnings`, ...) are not listed — only always-present keys are.
+
+| command | data keys |
+| --- | --- |
+| brief | analog, body, comments, config_source, content_trust, derived, features, files, formula_version, linked_prs, number, repo, weights |
+| bundle | bundles, config_source, derived, dropped, excluded, formula_version, merge_candidates, pool, related_not_bundleable, repo, weights |
+| churn | additions, deletions, path, prs |
+| file-history | entries, index_stale |
+| item | author, body, comments, comments_omitted, created_at, edges, files, html_url, index_stale, kind, labels, number, repo, reviews, reviews_omitted, state, title, updated_at |
+| open | assignees, author, html_url, kind, labels, linked_open_prs, number, repo, title, updated_at |
+| overlap | pairs |
+| path | a, b, path, repo |
+| related | edges, index_stale, nodes, number, repo |
+| search | broadened_matches, corpus_items, index_stale, items, matched_mode, offset, strict_matches, total_matches |
+| similar | candidates, capabilities, derived, ls_files_applied, ls_files_head, repo, resolved_path_count, target, weights |
+| sql | columns, rows |
+| status | counts, coverage, repos, snapshot |
+| triage | blocking_source, config_source, cursor, derived, formula_version, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
+| what-closed | commits, index_stale, keyword_closes, kind, number, prs |
+
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
 per-column notes (TEXT-typed `edges.src_id`/`dst_id`; `edges.source` names the
 provenance stream; `pr_files.patch` is NULL
@@ -240,8 +266,8 @@ answers from the database you are querying.
 | --- | --- | --- |
 | `0` | Success | — |
 | `2` | Bad request: bad flags, non-read SQL, multiple statements, environment guards (SQLite too old, database newer than this build), the DB holds other repos but not the resolved one (the error lists them) — and every other snapshot guard rejection, including the four whose hint says to retry or re-pull (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`) | **Fix the request or the environment.** Retrying unchanged always fails again. Those four stay `2` by policy, not because of what caused them: two can have a busy or an uninspectable destination as their immediate cause (`dest_open` covers a store held open by another process; `dest_sidecar_stale`'s first leg is an uninspectable `-wal`), so the boundary cannot be stated as "transient causes answer 1". What the two exit-1 refusals share is that they fire *before* the destination is touched, so a retry is a genuinely fresh attempt. |
-| `1` | Runtime: item not found, sync failure, authorizer denial, or one of the two inspection refusals — `snapshot pull`'s `dest_uninspectable` (the destination cannot be stat-ed or opened) and `export-corpus`'s `out_is_database` *on its cannot-inspect legs only* (the same code answers `2` on its alias, hard-link and device legs, so the code alone does not tell you the exit class) | Situational — may be a real absence, or worth one retry. **Narrow, not a general rule:** a guard rejection whose hint says "re-pull" does *not* by itself mean 1. Several pre-existing refusals that answer 1 are unrelated to this rule and are not snapshot guard rejections: `export-corpus --require-complete`'s `incomplete_store` (the store is genuinely not ready, so a retry after a sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`), `store_unreadable` (the store could not be opened at all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime` class (a storage fault at execution time). |
-| `3` | No corpus for the resolved repo: the resolved DB is missing or empty | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
+| `1` | Runtime: item not found, sync failure, authorizer denial, or one of the per-attempt refusals — `snapshot pull`'s `dest_uninspectable` (the destination cannot be stat-ed or opened), `snapshot pull`'s `source_unreachable` (git could not reach the snapshot SOURCE: transport or auth failure, carrying git's own message), and `export-corpus`'s `out_is_database` *on its cannot-inspect legs only* (the same code answers `2` on its alias, hard-link and device legs, so the code alone does not tell you the exit class) | Situational — may be a real absence, or worth one retry. **Narrow, not a general rule:** a guard rejection whose hint says "re-pull" does *not* by itself mean 1. Several pre-existing refusals that answer 1 are unrelated to this rule and are not snapshot guard rejections: `export-corpus --require-complete`'s `incomplete_store` (the store is genuinely not ready, so a retry after a sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`), `store_unreadable` (the store could not be opened at all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime` class (a storage fault at execution time). |
+| `3` | No corpus for the resolved repo: zero items and no completed full sync (a failed first sync is still no corpus) | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
 
 Errors print `error: MESSAGE` to stderr and answer with the structured
 `{ok: false, error: {code, message, hint?}}` envelope on stdout (exit codes
@@ -266,8 +292,13 @@ guessable, and three things trip up most first attempts:
   aiming `--db` at a multi-repo file.
 - `pr_files.patch` is `NULL` unless the sync used `--include-patches`.
 
-Results are capped (default 200 rows) and fetched incrementally, so a broad
-query is safe to run.
+Results are capped (default 200 rows), fetched incrementally, and bounded by
+a deadline and a result byte budget: a query that runs past the deadline
+(default 5 s; `ZAXBYGRAPH_SQL_TIMEOUT_S`, clamped to (0, 600]) is interrupted
+and answers the coded `timeout` error, and oversized results stop fetching
+with `truncated: true` (oversized cells are capped with an explicit marker).
+No broad query is unbounded — narrow it (`LIMIT`, tighter predicates) or
+raise the timeout instead of retrying blind.
 
 ## Interpreting `closes` correctly
 
