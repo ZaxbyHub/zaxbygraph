@@ -113,7 +113,10 @@ shouldn't.
   (issue #53) — while a complete, well-formed re-fetch retracts removed
   links and a degraded one never does; a re-ingest whose EXTRACTION
   faulted keeps every prior owned edge (including the links) until a
-  fault-free re-ingest replaces them (PR #76 review PRR-005)
+  fault-free re-ingest refreshes the REPLACEABLE streams — the protected
+  GitHub-reported classes (timeline, closing_ref, and the link
+  connection rules above) keep their own survival rules either way (PR
+  #76 review PRR-005, N3)
   (docs/schema.md). Inbound `mentions`/`closes` from *other*
   items must survive, or re-syncing one item silently erases another item's
   references to it.

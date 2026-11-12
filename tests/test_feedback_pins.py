@@ -140,6 +140,106 @@ class TornObligationReportingTests(TempDBTest):
                              "the run result must carry the failure too")
 
 
+class InterruptedFullMarkerTests(unittest.TestCase):
+    """N1: an interrupted full sync can leave ONLY full_sync_pending +
+    last_error (no durable pending row); those must survive a clean
+    candidate's consolidation independently of sync_pending."""
+
+    def test_marker_and_error_survive_a_clean_candidate(self) -> None:
+        store = _prep(Path(tempfile.mkdtemp()) / "store" / "history.db")
+        _seed_store(store, (1, 2), "2027-05-01T00:00:00Z")
+        cand = _prep(Path(tempfile.mkdtemp()) / "cand" / "history.db")
+        _seed_store(cand, (1, 2), "2027-06-01T00:00:00Z")
+        cwd = _prep(Path(tempfile.mkdtemp()) / "cwd")
+
+        conn = connect(store)
+        conn.execute(
+            "UPDATE sync_state SET full_sync_pending = 1,"
+            " last_error = 'rate limit exhausted' WHERE repo = ?",
+            (REPO,),
+        )
+        conn.commit()
+        conn.close()
+
+        envelope = doctor_mod_doctor(cwd, REPO, store, extra_scans=[cand],
+                                     consolidate_flag=True)
+        self.assertTrue(envelope.get("ok"), envelope)
+
+        check = connect(store)
+        rows = check.execute(
+            "SELECT COUNT(*) FROM sync_pending WHERE repo = ?", (REPO,),
+        ).fetchone()[0]
+        state = check.execute(
+            "SELECT full_sync_pending, last_error FROM sync_state"
+            " WHERE repo = ?", (REPO,),
+        ).fetchone()
+        check.close()
+        self.assertEqual(
+            rows, 0,
+            "the fixture has no durable pending rows — the marker-only shape")
+        self.assertEqual(
+            state["full_sync_pending"], 1,
+            "the interrupted-full marker must survive a clean candidate "
+            "independently of sync_pending (PR #76 review N1)")
+        self.assertEqual(
+            state["last_error"], "rate limit exhausted",
+            "the interrupted-full error must survive too (PR #76 review N1)")
+
+
+class TerminalStateResurrectionTests(TempDBTest):
+    """N4: the store-freshness fast path must not preserve a terminal
+    (deleted/transferred) row when a live listing re-delivers the item."""
+
+    def test_live_redelivery_resurrects_a_terminal_row(self) -> None:
+        from test_sync_integrity import _TornPullSource, _dated_pull
+
+        src = _TornPullSource()
+        # Stored healthy first: listing and pull agree at ts(100).
+        src.add_pr(
+            issue(8, title="p8", kind="pr", state="open",
+                  updated_at=ts(100), comments=0),
+            _dated_pull(8, ts(100), ts(45)), files=[],
+        )
+        src.add_pr(
+            issue(9, title="p9", kind="pr", state="closed",
+                  updated_at=ts(130), comments=0),
+            _dated_pull(9, ts(125), ts(125)), files=[],
+        )
+        self.src = src
+        self.sync()
+        self.conn.execute(
+            "UPDATE items SET state = 'deleted' WHERE repo = ?"
+            " AND number = 8", (REPO,),
+        )
+        self.conn.commit()
+
+        # A --force resync serves the stale LIVE listing row (ts(50))
+        # while its pull (ts(90)) is newer than the listing but older
+        # than the stored row (ts(100)) — the freshness shortcut would
+        # preserve the terminal state; the item must instead fall
+        # through, refresh and re-ingest as live. (--force is the
+        # reachable shape: a since-filtered incremental walk would never
+        # re-serve a row below the watermark.)
+        src.issues[8] = issue(8, title="p8", kind="pr", state="open",
+                              updated_at=ts(50), comments=0)
+        src.pulls[8] = _dated_pull(8, ts(90), ts(45))
+        src.refresh[8] = [
+            issue(8, title="p8", kind="pr", state="open",
+                  updated_at=ts(95), comments=0),
+        ]
+        self.sync(force=True)
+        row = self.conn.execute(
+            "SELECT state FROM items WHERE repo = ? AND number = 8",
+            (REPO,),
+        ).fetchone()
+        self.assertIsNotNone(row, "the live listing must re-store the item")
+        self.assertEqual(
+            row["state"], "open",
+            "a terminal stored row must not be preserved by the freshness "
+            "shortcut when a live listing re-delivers the item "
+            "(PR #76 review N4)")
+
+
 class FaultedReingestPreservesEdgesTests(TempDBTest):
     """PRR-005: a contained extraction fault on re-ingest must not delete
     the item's previously stored owned edges."""
@@ -598,20 +698,48 @@ class ExtractNoiseBoundaryTests(unittest.TestCase):
             "a double-backtick code span is quoting noise regardless of "
             "delimiter length (PR #76 review PRR-009)")
 
+    def test_comment_id_suppression_survives_arbitrary_whitespace(self) -> None:
+        """N6: a comment-id reference stays noise even with far more
+        whitespace before it than any fixed tail bound would see — the
+        probe walks backward instead of slicing a window."""
+        body = "comment" + (" " * 400) + "#5"
+        got = list(extract.iter_mention_locations(body, REPO))
+        self.assertEqual(
+            got, [],
+            "the documented end-anchored noise rule must hold for "
+            "arbitrary whitespace gaps (PR #76 review N6)")
+
+    def test_unmatched_descending_runs_stay_literal_and_later_spans_pair(
+            self) -> None:
+        """N7: unmatched opener runs are literal without re-scanning the
+        suffix, and a later well-formed span still pairs correctly."""
+        body = "runs: ``````` `````` ````` `fixes #5` and #7"
+        got = list(extract.iter_closing_locations(body, REPO))
+        self.assertEqual(
+            got, [],
+            "the trailing well-formed span must mask its own reference "
+            "even after unmatched descending runs (PR #76 review N7)")
+        mentions = list(extract.iter_mention_locations(body, REPO))
+        self.assertEqual(
+            [n for n, _ in mentions], [7],
+            "text outside every span keeps its references")
+
 
 class ProbeFailureCounterTests(TempDBTest):
-    """PRR-033: a successful probe clears EVERY probe-failure marker, so a
-    superseded gh-version key cannot keep status.coverage counting a
-    recovered probe as failed."""
+    """PRR-033: a successful probe clears this host's probe-failure
+    markers (every superseded version key), so status.coverage cannot
+    keep counting a recovered probe as failed; N8: other hosts' markers
+    survive."""
 
     def test_success_clears_stale_version_keys(self) -> None:
         from zaxbygraph import sync as sync_mod
         from zaxbygraph.db import set_meta
 
-        # A failure recorded under an OLDER host/version key (the shape an
-        # upgrade leaves behind).
+        # A failure recorded under an OLDER VERSION of the SAME host (the
+        # shape a gh upgrade leaves behind).
+        host = sync_mod._gh_host()
         set_meta(self.conn,
-                 "capability_probe_failed:v3:somehost:gh-0.0-old",
+                 f"capability_probe_failed:v3:{host}:gh-0.0-old",
                  "boom: probe failed once")
         self.conn.commit()
 
@@ -636,9 +764,55 @@ class ProbeFailureCounterTests(TempDBTest):
         ).fetchone()[0]
         self.assertEqual(
             remaining, 0,
-            "one success must clear every probe-failure key: the old"
-            " version-scoped key used to survive and status.coverage kept"
-            " counting it (PR #76 review PRR-033)")
+            "one success must clear this host's superseded version key: it"
+            " used to survive and status.coverage kept counting it"
+            " (PR #76 review PRR-033)")
+
+    def test_success_keeps_other_hosts_failure_keys(self) -> None:
+        """Probe markers are host-specific: a success against THIS host
+        must not erase another host's active failure (PR #76 review N8)."""
+        from zaxbygraph import sync as sync_mod
+        from zaxbygraph.db import set_meta
+
+        host = sync_mod._gh_host()
+        other = "some-other-host.example"
+        assert other != host
+        set_meta(self.conn,
+                 f"capability_probe_failed:v3:{host}:gh-0.0-old",
+                 "boom: this host's old-version failure")
+        set_meta(self.conn,
+                 f"capability_probe_failed:v3:{other}:gh-9.9",
+                 "boom: the other host's active failure")
+        self.conn.commit()
+
+        class _ProbeSource:
+            gh_bin = "gh"
+            attached: dict = {}
+
+            def probe_capabilities(self):
+                return {"Issue": ["number"]}
+
+            def attach_capabilities(self, caps):
+                type(self).attached = caps
+
+        with patch.dict(sync_mod._GH_VERSION_CACHE, {"gh": "offline"}):
+            failed = sync_mod._attach_capabilities(
+                self.conn, _ProbeSource(), REPO)
+        self.assertFalse(failed, "the fresh probe succeeded")
+        rows = {
+            r[0]: r[1]
+            for r in self.conn.execute(
+                "SELECT key, value FROM meta"
+                " WHERE key LIKE 'capability_probe_failed:%'"
+                " AND value IS NOT NULL AND value != ''",
+            )
+        }
+        self.assertNotIn(
+            f"capability_probe_failed:v3:{host}:gh-0.0-old", rows,
+            "this host's superseded key must be cleared")
+        self.assertIn(
+            f"capability_probe_failed:v3:{other}:gh-9.9", rows,
+            "another host's active failure must survive a success here")
 
     def test_probe_failure_marker_is_bounded(self) -> None:
         """The failure marker stores _error_text (bounded), not raw gh

@@ -161,7 +161,11 @@ def _resolve_bash() -> str:
     shell."""
     env = os.environ.get("ZAXBYGRAPH_BASH")
     if env:
-        return env
+        p = Path(env)
+        if not p.is_absolute():
+            p = ROOT / p
+        if p.exists():
+            return str(p)
     git_bash = Path("C:/Program Files/Git/bin/bash.exe")
     if git_bash.exists():
         return str(git_bash)
@@ -179,8 +183,15 @@ def _resolve_repro_check() -> str:
     installed skill's scripts directory, then the path this trace's own
     replay script records, then fail with both options named."""
     env = os.environ.get("REPRO_CHECK_SH")
-    if env and Path(env).exists():
-        return env
+    if env:
+        p = Path(env)
+        # A relative override is resolved against THIS script's repo root,
+        # not the caller's cwd — the verifier itself runs with cwd=ROOT
+        # (PR #76 review N5).
+        if not p.is_absolute():
+            p = ROOT / p
+        if p.exists():
+            return str(p)
     skill = Path.home() / ".zcode/skills/issue-tracer/scripts/repro-check.sh"
     if skill.exists():
         return str(skill)
@@ -188,8 +199,12 @@ def _resolve_repro_check() -> str:
     if replay_script.exists():
         for line in replay_script.read_text(encoding="utf-8").splitlines():
             m = re.match(r'RC="([^"]+repro-check\.sh)"', line.strip())
-            if m and Path(m.group(1)).exists():
-                return m.group(1)
+            if m:
+                rp = Path(m.group(1))
+                if not rp.is_absolute():
+                    rp = ROOT / rp
+                if rp.exists():
+                    return str(rp)
     raise SystemExit(
         "repro-check.sh not found: set REPRO_CHECK_SH or install the "
         "issue-tracer skill (~/.zcode/skills/issue-tracer)"

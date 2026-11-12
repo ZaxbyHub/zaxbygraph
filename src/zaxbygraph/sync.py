@@ -229,14 +229,17 @@ def _already_covered(
     return seen_this_pass <= prev_pass_counts.get(number, 0)
 
 
-#: Rate-limit windows slept through per fetch-layer call before giving up
-#: (issue #5). Five is the ceiling PER ATTEMPT — the listing pass loop
-#: resets this budget at each pass boundary and after a detected boundary
-#: shift, so a run that keeps quiescing into new passes can sleep up to
-#: five windows per pass (PR #76 review PRR-012; the whole-run worst case
-#: is five times _MAX_LISTING_PASSES windows, and the whole-run lock is
-#: held the entire time). Each sleep is additionally clamped so a hostile
-#: or far-future reset can never park the sync indefinitely.
+#: Rate-limit windows slept through before giving up (issue #5). The
+#: constant is TWO budgets (PR #76 review PRR-012 / N9): each
+#: fetch-layer call's ladder in `_call_with_rate_retry` may sleep up to
+#: five windows before re-raising, AND the listing walk keeps its own
+#: five-window restart budget that the pass loop resets at every pass
+#: boundary and detected shift. A single pass therefore sleeps far more
+#: than five windows in total (per-call ladders inside each walk), a run
+#: that keeps quiescing into new passes multiplies that by
+#: _MAX_LISTING_PASSES, and the whole-run lock is held the entire time.
+#: Each sleep is additionally clamped so a hostile or far-future reset
+#: can never park the sync indefinitely.
 _MAX_RATE_WINDOWS = 5
 
 #: Listing-completeness passes (issue #65 AC1): the window is walked at least
@@ -1379,15 +1382,20 @@ def _probe_failed_key(source: GitHubSource) -> str:
 
 
 def _clear_probe_failures(conn: sqlite3.Connection) -> None:
-    """Drop EVERY capability-probe failure marker on a successful probe.
+    """Drop THIS HOST's capability-probe failure markers on a successful
+    probe.
 
     status.coverage counts every non-empty `capability_probe_failed:%` row,
     so clearing only this host+version's key would leave a superseded
     gh-version key reporting failure forever after an upgrade — the count
     the code comment promises is "never cumulative" (PR #76 review
-    PRR-033). The store is local to one machine, so one success proves the
-    host recovered for every key it ever wrote."""
-    conn.execute("DELETE FROM meta WHERE key LIKE 'capability_probe_failed:%'")
+    PRR-033). The delete is scoped to the CURRENT host's keys: probe
+    markers are host-specific, and a success against one host must not
+    erase another host's active failure (PR #76 review N8)."""
+    conn.execute(
+        "DELETE FROM meta WHERE key LIKE ?",
+        (f"capability_probe_failed:%:{_gh_host()}:%",),
+    )
 
 
 def _attach_capabilities(conn: sqlite3.Connection, source: GitHubSource, repo: str) -> bool:
@@ -1890,14 +1898,26 @@ def sync_repo(
                             # a resolved item re-encounter its own stale
                             # listing row inside one run).
                             stored_row = conn.execute(
-                                "SELECT updated_at FROM items"
+                                "SELECT updated_at, state FROM items"
                                 " WHERE repo = ? AND number = ?",
                                 (repo, number),
                             ).fetchone()
                             stored_ts = (
                                 stored_row["updated_at"] if stored_row else None
                             )
-                            if isinstance(stored_ts, str) and stored_ts >= pull_ts:
+                            stored_state = (
+                                stored_row["state"] if stored_row else None
+                            )
+                            # Terminal rows are excluded: a deleted or
+                            # transferred row whose listing is served live
+                            # again must fall through and re-ingest, never
+                            # be preserved by the freshness shortcut (PR #76
+                            # review N4).
+                            if (
+                                isinstance(stored_ts, str)
+                                and stored_ts >= pull_ts
+                                and stored_state not in ("deleted", "transferred")
+                            ):
                                 last_number = number
                                 continue
                             refreshed = _resolve_torn_row(source, list_raw, pull_ts)

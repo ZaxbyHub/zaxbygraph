@@ -1143,26 +1143,49 @@ def consolidate(store_db: Path, path: Path, repo: str) -> tuple[int, int, list[s
                 pending_cols = {
                     r[1] for r in dst.execute("PRAGMA table_info(sync_pending)")
                 }
+                # An interrupted full sync can leave ONLY the marker and
+                # the error — a full run sets full_sync_pending before it
+                # walks anything, so an early failure writes no pending row
+                # at all. Those must survive a clean candidate too,
+                # independently of sync_pending (PR #76 review N1), or the
+                # adopted corpus reads complete and the next sync
+                # tail-walks instead of re-walking the corpus it never
+                # finished.
+                prior_flag = (
+                    int(prior_state["full_sync_pending"] or 0)
+                    if prior_state is not None else 0
+                )
+                prior_error = (
+                    prior_state["last_error"]
+                    if prior_state is not None else None
+                )
+                open_n = 0
                 if "number" in pending_cols:
                     open_n = dst.execute(
                         "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
                         (repo_l,),
                     ).fetchone()[0]
-                    if open_n:
-                        prior_error = (
-                            prior_state["last_error"]
-                            if prior_state is not None else None
-                        )
-                        dst.execute(
-                            "INSERT OR IGNORE INTO sync_state(repo) VALUES (?)",
-                            (repo_l,),
-                        )
-                        dst.execute(
-                            "UPDATE sync_state SET full_sync_pending = 1,"
-                            " last_error = COALESCE(last_error, ?)"
-                            " WHERE repo = ?",
-                            (prior_error, repo_l),
-                        )
+                if prior_flag or open_n or prior_error:
+                    dst.execute(
+                        "INSERT OR IGNORE INTO sync_state(repo) VALUES (?)",
+                        (repo_l,),
+                    )
+                    # The incomplete marker returns only for a real
+                    # incompleteness (an interrupted full or an open
+                    # obligation); a lone prior error is restored as text
+                    # without inventing a full-sync debt.
+                    dst.execute(
+                        "UPDATE sync_state SET"
+                        " full_sync_pending = CASE WHEN ? = 1 THEN 1"
+                        " ELSE full_sync_pending END,"
+                        " last_error = COALESCE(last_error, ?)"
+                        " WHERE repo = ?",
+                        (
+                            1 if (prior_flag or open_n) else 0,
+                            prior_error,
+                            repo_l,
+                        ),
+                    )
                 # actors is a global login->url table (no repo column), so it
                 # is copied wholesale despite the slug-scoped delete above.
                 # is_bot (schema v12, issue #67) rides along and NEVER

@@ -383,13 +383,14 @@ resumes rather than restarting.
 Rate limits are budgeted, not fatal: a core rate-limit failure with an
 exhausted budget is slept out until the reported reset (reported afterwards
 as `rate_limit_remaining` / `rate_limit_reset_at` in the sync result and in
-`status`), then the listing resumes — after five slept windows *per
-listing pass* (`graphql`
-also sleeps proactively when its budget is already at the floor; each
-pass boundary and detected shift resets the budget, so a run that keeps
-quiescing into new passes can sleep up to five windows per pass while
-holding the whole-run lock) the run
-gives up and reports the error. Secondary limits that carry no resolvable
+`status`), then the listing resumes. Two budgets apply, and a pass can
+therefore sleep far more than five windows in total: every fetch-layer
+call may sleep up to five windows of its own before giving up, and the
+listing walk keeps a five-window restart budget that each pass boundary
+and detected shift resets (`graphql` also sleeps proactively when its
+budget is already at the floor). When a walk exhausts its five-window
+budget the run gives up and reports the error — all while the whole-run
+lock stays held. Secondary limits that carry no resolvable
 reset fail fast as before. A full sync that starts without a watermark and
 drains its listing also consults the source's deletion oracle (the shipped
 GraphQL source; plain REST has no oracle): stored items the source reports

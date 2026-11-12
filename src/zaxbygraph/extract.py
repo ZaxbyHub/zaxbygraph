@@ -17,17 +17,15 @@ _MAX_REF_DIGITS = 10
 #: distinguish — the inner line's code then leaked out as references.
 _FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 _HUNK_HEADER_RE = re.compile(r"^@@ .* @@")
-_COMMENT_ID_RE = re.compile(r"(?i)\bcomment\s*$")
-_FOREIGN_SPACED_RE = re.compile(r"(?i)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\s*$")
-#: Both noise probes above are END-anchored (\\bcomment\\s*$ and a
-#: trailing owner/repo), so they can only match at the very end of the
-#: prefix given to them: a bounded tail is the entire match surface.
-#: GitHub's owner (39) + repo (100) name caps keep any real foreign-spaced
-#: match far under this bound, 'comment' is seven letters, and a longer
-#: tail could only re-scan text the anchors can never reach (PR #76 review
-#: PRR-007: an unbounded per-reference copy + scan of the whole prefix
-#: made extraction quadratic in body length).
-_NOISE_TAIL_PROBE = 256
+#: Character class for a GitHub owner/repo slug, walked directly by the
+#: end-anchored foreign-spaced probe (PR #76 review N6): parsing the slug
+#: that ends immediately before a reference costs only that token's own
+#: length, so arbitrary whitespace before it — even far more than any
+#: fixed bound — cannot change the documented noise rules, and the sum of
+#: the walks stays linear in the body.
+_SLUG_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+)
 
 
 def item_kind(raw: dict) -> str:
@@ -132,38 +130,45 @@ def _code_span_ranges(line: str) -> list[tuple[int, int]]:
     """Inline code-span ranges on one line: an opener run of N backticks
     closed by the next run of at least N (PR #76 review PRR-009: the old
     single-backtick regex could not see ``fixes #5`` as one span, so a
-    double-backtick span's reference leaked out as an edge). A linear scan
-    with no backtracking — a long run that never finds its closer is
-    literal text and costs one pass, not a blowup."""
-    ranges: list[tuple[int, int]] = []
-    i = 0
+    double-backtick span's reference leaked out as an edge).
+
+    Two linear passes: one collects the backtick runs, one computes each
+    run's first-to-the-right partner of >= length with a monotonic stack.
+    An unmatched opener costs O(1) here — the earlier inner scan re-walked
+    the whole remaining line for every unmatched run, so a body of
+    descending run lengths was superlinear (PR #76 review N7)."""
     n = len(line)
+    runs: list[tuple[int, int]] = []
+    i = 0
     while i < n:
-        if line[i] != "`":
-            i += 1
-            continue
-        j = i
-        while j < n and line[j] == "`":
-            j += 1
-        opener = j - i
-        k = j
-        close_start = -1
-        while k < n:
-            if line[k] == "`":
-                s = k
-                while k < n and line[k] == "`":
-                    k += 1
-                if k - s >= opener:
-                    close_start = s
-                    break
-            else:
-                k += 1
-        if close_start < 0:
-            # No closer of sufficient length: literal backticks.
+        if line[i] == "`":
+            j = i
+            while j < n and line[j] == "`":
+                j += 1
+            runs.append((i, j))
             i = j
+        else:
+            i += 1
+    # next_ge[p] = the first run after p whose length is >= run p's
+    # (right-to-left monotonic stack of increasing lengths).
+    next_ge = [-1] * len(runs)
+    stack: list[int] = []
+    for idx in range(len(runs) - 1, -1, -1):
+        length = runs[idx][1] - runs[idx][0]
+        while stack and (runs[stack[-1]][1] - runs[stack[-1]][0]) < length:
+            stack.pop()
+        next_ge[idx] = stack[-1] if stack else -1
+        stack.append(idx)
+    ranges: list[tuple[int, int]] = []
+    p = 0
+    while p < len(runs):
+        q = next_ge[p]
+        if q == -1:
+            # No closer of sufficient length: literal backticks.
+            p += 1
             continue
-        ranges.append((i, k))
-        i = k
+        ranges.append((runs[p][0], runs[q][1]))
+        p = q + 1
     return ranges
 
 
@@ -221,17 +226,42 @@ def _is_noise_reference(
     spaced form stays a reference, matching its compact form).
 
     `noise_mask` is the byte-per-character membership of the noise ranges
-    (built once per payload), and the two end-anchored probes read only a
-    bounded tail of the prefix — both are the PR #76 review PRR-007 fix
-    that keeps extraction linear in body length."""
+    (built once per payload). The two end-anchored probes then walk
+    BACKWARD from the token: whitespace is skipped to the first
+    non-whitespace character, and only that character's own context is
+    examined ('comment' ending there with a word boundary, or the slug
+    parsed token-boundedly before it). The walk costs the immediate
+    whitespace run plus the token's length — linear in the body, and the
+    documented noise rules hold for ARBITRARY whitespace gaps, unlike a
+    fixed-size tail slice (PR #76 review PRR-007 / N6)."""
     for i in range(start, end):
         if noise_mask[i]:
             return True
-    probe = masked[max(0, start - _NOISE_TAIL_PROBE):start].rstrip()
-    if _COMMENT_ID_RE.search(probe):
+    i = start
+    while i > 0 and masked[i - 1].isspace():
+        i -= 1
+    # 'comment #<id>': the word must end exactly here, with a word
+    # boundary in front (mirrors \bcomment\s*$ on the rstripped prefix).
+    if i >= 7 and masked[i - 7:i].lower() == "comment" and (
+        i - 7 == 0
+        or not (masked[i - 8].isalnum() or masked[i - 8] == "_")
+    ):
         return True
-    tail = _FOREIGN_SPACED_RE.search(probe)
-    return bool(tail) and tail.group(1).lower() != repo.lower()
+    # 'owner/repo #N': parse the slug that ends here, token-boundedly.
+    j = i
+    while j > 0 and masked[j - 1] in _SLUG_CHARS:
+        j -= 1
+    repo_part = masked[j:i]
+    if repo_part and j > 0 and masked[j - 1] == "/":
+        k = j - 1
+        while k > 0 and masked[k - 1] in _SLUG_CHARS:
+            k -= 1
+        owner = masked[k:j - 1]
+        if owner:
+            slug = f"{owner}/{repo_part}"
+            if slug.lower() != repo.lower():
+                return True
+    return False
 
 
 def _iter_reference_locations(
