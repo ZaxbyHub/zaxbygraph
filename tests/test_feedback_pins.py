@@ -219,6 +219,44 @@ class FaultedReingestPreservesEdgesTests(TempDBTest):
             "prior edge this item holds (PR #76 review PRR-005, round-2 "
             "link-only probe)")
 
+    def test_faulted_reingest_keeps_an_actor_only_item_intact(self) -> None:
+        """Round-3: an item whose ONLY owned prior is the actor `authored`
+        relation must keep it on a faulted re-ingest — the guard mirrors
+        BOTH of delete_owned_edges' deletes (item-source rows and the
+        actor relations pointing at the item)."""
+        payload = issue(1, title="one", body="plain prose", updated_at=ts(10))
+        common = dict(
+            pull_raw=None, issue_comments=[], review_comments=[],
+            reviews=[], files=[], include_patches=False,
+        )
+        ingest_item(self.conn, REPO, payload, **common)
+        self.conn.commit()
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND dst_id = '1'"
+                " AND rel = 'authored'", (REPO,)),
+            1, "the fixture must hold the actor authored edge")
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND src_id = '1'",
+                (REPO,)),
+            0, "and no item-source row (the actor-only shape)")
+
+        def boom(repo, raw):
+            raise ValueError("deterministic extraction fault marker")
+
+        with patch("zaxbygraph.store.edges_from_item", side_effect=boom):
+            ingest_item(self.conn, REPO, payload, **common)
+        self.conn.commit()
+        self.assertEqual(
+            self.count(
+                "SELECT COUNT(*) FROM edges WHERE repo = ? AND dst_id = '1'"
+                " AND rel = 'authored'", (REPO,)),
+            1,
+            "a faulted re-ingest must not retract the actor relation the "
+            "faulted stream itself produced (PR #76 review PRR-005, "
+            "round-3 actor-only probe)")
+
 
 class MigrationWrongTypedPayloadTests(unittest.TestCase):
     """PRR-006: a stored wrong-typed title must not abort the v12

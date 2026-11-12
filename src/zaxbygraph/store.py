@@ -1166,24 +1166,29 @@ def rebuild_edges(
     # fault can never leave this item's edges half-deleted.
     if faulted:
         prior_owned = conn.execute(
-            # ANY prior edge this item carries — link rows included: the
-            # replacement below mutates the link stream too (rebuild_links),
-            # so a faulted re-ingest must leave everything alone, not only
-            # the non-link rows (PR #76 review PRR-005, round-2 probe of
-            # the link-only case).
-            "SELECT 1 FROM edges WHERE repo = ? AND src_type = 'item'"
-            " AND src_id = ? LIMIT 1",
-            (repo, str(number)),
+            # EVERY edge class the replacement below would remove or
+            # mutate: any item-source row (delete_owned_edges' first
+            # delete, plus link rows, which rebuild_links replaces), and
+            # the actor relations pointing at the item (its second delete)
+            # — mirroring delete_owned_edges exactly, so no prior owned
+            # edge can disappear under a faulted re-ingest (PR #76 review
+            # PRR-005; round-2 link-only and round-3 actor-only probes).
+            "SELECT 1 FROM edges WHERE repo = ? AND ("
+            " (src_type = 'item' AND src_id = ?)"
+            " OR (dst_type = 'item' AND dst_id = ?"
+            "     AND rel IN ('authored', 'commented', 'reviewed'))"
+            ") LIMIT 1",
+            (repo, str(number), str(number)),
         ).fetchone()
         if prior_owned:
-            # A faulted re-ingest of an item that already holds ANY edge
-            # changes nothing (PR #76 review PRR-005): delete-and-insert a
-            # partial set would retract the faulted stream's stored evidence
-            # under a clean verdict, and the healthy streams' new edges
-            # arrive on the next fault-free re-ingest. The fetch_log row
-            # recorded above names the fault.
+            # A faulted re-ingest of an item that already holds ANY owned
+            # edge (or link) changes nothing (PR #76 review PRR-005):
+            # delete-and-insert a partial set would retract the faulted
+            # stream's stored evidence under a clean verdict, and the
+            # healthy streams' new edges arrive on the next fault-free
+            # re-ingest. The fetch_log row recorded above names the fault.
             return
-        # No prior edges at all: nothing to lose, so the healthy streams
+        # Nothing owned yet: nothing to lose, so the healthy streams
         # land and the faulted stream's part stays absent — the containment
         # contract the extraction-fault tests pin (issue #66 AC2: the
         # faulted comment's edges never appear, the item's own and the
