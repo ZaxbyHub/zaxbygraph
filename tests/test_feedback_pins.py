@@ -1,9 +1,16 @@
 """Swarm-pr-feedback pins for PR #76's review fixes (run pr76-20261111).
 
-Each test discriminates ONE fix from the review round: reverting the fix
-must make the pin fail. Kept in a NEW module so the frozen checkpoint
-manifest (which anchors whole file blobs) needs no amendment for these
-rows — only for edits to the frozen check files themselves.
+Each test pins ONE fix's behavior from the review round, and most fail
+when the fix is reverted (the round's probes recorded that per pin). Two
+honest boundaries: where a fix is output-equivalent to the superseded
+implementation — the N7 linear span pairing produces the same spans as
+the old rescan, only cheaper — no output assertion can discriminate it,
+so the complexity claim rests on the code reading and the ledger's
+recorded "no timing pin" boundary (PRR-007); and the N5 path-resolution
+fix lives in the generator, which executes its whole evidence chain at
+import and therefore has no unit pin. Kept in a NEW module so the frozen
+checkpoint manifest (which anchors whole file blobs) needs no amendment
+for these rows — only for edits to the frozen check files themselves.
 
 Offline: no network, no live `gh`.
 """
@@ -711,8 +718,11 @@ class ExtractNoiseBoundaryTests(unittest.TestCase):
 
     def test_unmatched_descending_runs_stay_literal_and_later_spans_pair(
             self) -> None:
-        """N7: unmatched opener runs are literal without re-scanning the
-        suffix, and a later well-formed span still pairs correctly."""
+        """N7 (behavioral half): unmatched opener runs are literal and a
+        later well-formed span still pairs correctly. Output-equivalent
+        to the superseded rescan — the linearity claim is structural
+        (two passes + monotonic stack) and is recorded as a code-reviewed
+        claim, not a timing pin (see the module docstring)."""
         body = "runs: ``````` `````` ````` `fixes #5` and #7"
         got = list(extract.iter_closing_locations(body, REPO))
         self.assertEqual(

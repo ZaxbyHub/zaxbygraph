@@ -384,9 +384,10 @@ Rate limits are budgeted, not fatal: a core rate-limit failure with an
 exhausted budget is slept out until the reported reset (reported afterwards
 as `rate_limit_remaining` / `rate_limit_reset_at` in the sync result and in
 `status`), then the listing resumes. Two budgets apply, and a pass can
-therefore sleep far more than five windows in total: every fetch-layer
-call may sleep up to five windows of its own before giving up, and the
-listing walk keeps a five-window restart budget that each pass boundary
+therefore sleep far more than five windows in total: every call on the
+rate-retry ladder may sleep up to five windows of its own before giving
+up, and the listing walk keeps a five-window restart budget that each
+pass boundary
 and detected shift resets (`graphql` also sleeps proactively when its
 budget is already at the floor). When a walk exhausts its five-window
 budget the run gives up and reports the error — all while the whole-run

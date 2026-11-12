@@ -854,9 +854,12 @@ fetched": `truncation_notes` maps `fetch_log.resource` to the count of that
 resource's notes containing `truncated`; `dropped_fields` counts
 capability-probe `omitted <field>` notes; `probe_failures` (v12) counts
 `meta` keys of the form `capability_probe_failed:<host>:<gh-version>`
-holding a non-empty value — the LATEST probe failure, so a run that
-recovered by re-probing reads `0` while a still-failing probe reads `1`
-(issue #65 AC9: the failure is reported, not only logged);
+holding a non-empty value — the latest failure PER HOST (a successful
+probe clears that host's keys only, so a run that recovered by
+re-probing reads `0` for its host while another host's active failure,
+or a still-failing probe, reads `1` and a multi-host store reads the
+sum of its hosts' active failures) (issue #65 AC9: the failure is
+reported, not only logged);
 `null_v7_rows` counts items rows
 where `reactions_total` or `author_association` is `NULL` — the two listing
 keys GitHub always carries with a non-null value, so their `NULL`
