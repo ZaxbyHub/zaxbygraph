@@ -194,7 +194,7 @@ Every command accepts:
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. `0` is the explicit uncapped override (the default 20 KiB body bound does not apply); a negative value is a usage error. The MCP `get_item` `max_body_chars` argument follows the same contract. |
 | `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
-| `--no-bots` | `item`, `search`, `brief`: drop bot-authored rows in the query, before ranking, counting, or pagination, and report `bots_omitted`. `item` filters only the requested item's comments and reviews (the item itself is always returned); `search` also drops bot-authored items; `brief` also drops bot-authored linked PRs and the analog. The MCP twins take `exclude_bots`. |
+| `--no-bots` | `item`, `search`, `brief`: drop bot-authored rows in the query, before ranking, counting, or pagination, and report `bots_omitted`. `item` filters only the requested item's comments and reviews (the item itself is always returned); `search` also drops bot-authored items; `brief` also drops bot-authored linked PRs, and drops a bot-ranked analog AFTER ranking (a bot analog in the top slot leaves the packet analog-less rather than promoting the runner-up). The MCP twins take `exclude_bots`. |
 | `--offset N` | `search` only: walk the deduplicated strict-first stream from item N (issue #72 AC5). |
 | `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the store's recorded fetch source (issue #48: `sync_state.fetch_source`, stamped whenever a run explicitly states a source — `--source rest` or the refresh honoring the stored value; a `sync` that did not state a source never rewrites it, so a store deliberately kept on `--source rest` never profile-drifts). Both refresh settings are re-read under the sync lock, so a concurrent writer's changes are honored, never reverted. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
 
@@ -510,9 +510,9 @@ zaxbygraph item N
 Returns the stored `items` fields (everything except `raw_json`) plus nested
 `labels`, `comments`, `reviews`, `files`, and `edges` — bounded by default:
 comments return the first, last, and maintainer entries first (survivors
-chronological, up to 5), reviews keep the first 5 in submitted order
-(`--max-comments K` caps the comment list at K; `0` returns no comments;
-reviews have no CLI override), the body caps at 20 KiB, and
+chronological, up to 5 by default; `--max-comments K` overrides the count and
+`0` returns no comments), reviews keep the first 5 in submitted order (MCP
+`get_item` `max_reviews` overrides), the body caps at 20 KiB, and
 `comments_omitted`/`reviews_omitted` are always present. This is the one command
 that returns bodies, so it is the expensive one — reach for `search` or `sql`
 when you need breadth.
