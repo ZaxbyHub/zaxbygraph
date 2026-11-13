@@ -197,8 +197,12 @@ payloads — rows only, no envelope, no identity fields; any `head -n` prefix
 parses) · `text` (default on a TTY, renders the payload only; the only
 format with the stderr identity line — never merge streams when parsing it).
 `--fields repo,number` projects rows to those keys that exist (unknown keys
-are omitted) — applies to list payloads and `sql` rows in both row modes, not
-to nested arrays inside dict payloads. `sql` rows are objects keyed by column
+are omitted) — applies to list payloads including the row lists inside dict
+payloads (search items, related nodes, similar candidates, triage rows,
+bundle bundles — sibling keys of the list are dropped on those commands),
+`item` (single object or multi-number rows), and `sql` rows in both row
+modes, not to other nested arrays. `--format jsonl` streams those row lists
+one JSON object per line (rows only, no envelope). `sql` rows are objects keyed by column
 by default — duplicate column names are suffixed `name_2`, `name_3`, ... so
 no value is lost (`--rows array` keeps positional lists with exact
 duplicates; `--limit N` for the cap). `item N --max-comments K` caps the comment list (first, last and maintainer

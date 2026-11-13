@@ -291,9 +291,23 @@ def build_envelope(
     return env
 
 
+def _write_stdout(text: str) -> None:
+    """One stdout write, translated at the boundary: Windows reports a dead
+    pipe as plain OSError(EINVAL) from the buffered writer, which main()'s
+    dispatch-level BrokenPipeError catch would never see - a mid-render
+    failure on a large output must reach the quiet-exit handler (final-critic
+    r1 f2; check C24's small-output leg cannot discriminate this)."""
+    try:
+        sys.stdout.write(text)
+    except OSError as exc:
+        if exc.errno in (errno.EINVAL, errno.EPIPE):
+            raise BrokenPipeError(str(exc)) from exc
+        raise
+
+
 def _render_json(env: dict, indent: int | None) -> None:
-    json.dump(env, sys.stdout, indent=indent, ensure_ascii=False, default=str)
-    sys.stdout.write("\n")
+    _write_stdout(json.dumps(env, indent=indent, ensure_ascii=False, default=str))
+    _write_stdout("\n")
 
 
 def emit_result(
@@ -334,6 +348,15 @@ def emit_result(
     if fields and error is None:
         if isinstance(data, list):
             payload = [_project(row, fields) for row in data]
+        elif (
+            getattr(args, "cmd", None) == "item"
+            and isinstance(data, dict)
+            and "number" in data
+        ):
+            # Single-number item under --fields: AC4 names item; the frozen
+            # check pins the multi-number stream, this projects the one-item
+            # dict (no flag -> byte-identical, final-critic r1 f4).
+            payload = _project(data, fields)
         elif (
             list_key is not None
             and isinstance(data, dict)
@@ -385,9 +408,7 @@ def emit_result(
         stream = None if error is not None else _selected_rows(payload, list_key)
         if stream is not None:
             for row in stream:
-                sys.stdout.write(
-                    json.dumps(row, ensure_ascii=False, default=str) + "\n"
-                )
+                _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         else:
             _render_json(env, indent=None)
     elif fmt == "compact":
@@ -2552,8 +2573,10 @@ def _schema_output_shape(args: argparse.Namespace, command: str) -> int:
     mcp_server.py declares for that command's MCP twin (single source of
     truth: tools/list outputSchemas, this command and the SKILL.md shape
     table all read it). The shape is static, so no store is opened and no
-    corpus guard applies; an unknown or non-read command name is a
-    bad_request naming the commands that do declare shapes."""
+    corpus guard applies; an unknown or undeclared command name is a
+    bad_request naming the commands that do declare shapes (the CLI-only
+    derived commands — explain, coupling, eval — are read commands whose
+    shape declarations land with #70's registry extension)."""
     # Lazy import: mcp_server imports this module at scope, so the CLI only
     # pulls the registry (and its heavier imports) when --output runs.
     from zaxbygraph.mcp_server import CLI_OUTPUT_SHAPES
@@ -2564,7 +2587,7 @@ def _schema_output_shape(args: argparse.Namespace, command: str) -> int:
         return emit_failure(
             args,
             2,
-            f"unknown or non-read command {command!r}: --output declares the"
+            f"unknown or undeclared command {command!r}: --output declares the"
             " shape of a read command's result payload",
             slug=getattr(args, "repo", None) or None,
             db_path=getattr(args, "db", None),
@@ -3093,6 +3116,9 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
     (difflib over the parser's own option strings); for messages without a
     flag token (missing positional), point at the parser's --help."""
     known: list[str] = []
+    own: list[str] = []
+    for action in parser._actions:  # noqa: SLF001 - argparse introspection
+        own.extend(a for a in action.option_strings if a not in own)
     actions = list(parser._actions)  # noqa: SLF001 - argparse introspection
     for action in parser._actions:  # noqa: SLF001 - argparse introspection
         choices = getattr(action, "choices", None)
@@ -3113,6 +3139,11 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
         if " " in parser.prog
         else "zaxbygraph COMMAND --help"
     )
+    # NOTE: the match pool is the raising parser's own flags UNION every
+    # subcommand's: a single best match wins, so `--limt` still finds
+    # --limit (frozen C21). A cross-command nearest flag (item --number ->
+    # sync's --numbers) is mildly confusing but names a real flag; left as
+    # documented behavior (final-critic r1 note).
     for token in tokens:
         match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
         if match:
@@ -3139,14 +3170,20 @@ def _usage_envelope_exit(
     identity is best-effort pre-scanned from argv (parsing already failed)."""
     fmt = None
     db = repo = None
-    if argv:
-        for i, tok in enumerate(argv):
-            if tok == "--format" and i + 1 < len(argv):
-                fmt = argv[i + 1]
-            elif tok == "--db" and i + 1 < len(argv):
-                db = argv[i + 1]
-            elif tok == "--repo" and i + 1 < len(argv):
-                repo = argv[i + 1]
+    if argv is None:
+        # The real entry points (python -m zaxbygraph, the console script)
+        # call main() with no list: the pre-scan must read the process argv,
+        # or an explicit --format json on a TTY would fall back to text and
+        # the usage error would bypass the envelope (final-critic r1 f1).
+        argv = sys.argv[1:]
+    for i, tok in enumerate(argv):
+        name, sep, value = tok.partition("=")
+        if name == "--format" and (sep or i + 1 < len(argv)):
+            fmt = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+        elif name == "--db" and (sep or i + 1 < len(argv)):
+            db = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+        elif name == "--repo" and (sep or i + 1 < len(argv)):
+            repo = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
     if fmt is None:
         fmt = "json" if not sys.stdout.isatty() else "text"
     error = {"code": "bad_request", "message": exc.message}

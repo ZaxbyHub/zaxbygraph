@@ -190,7 +190,7 @@ Every command accepts:
 | `--db PATH` | Database location. Default as above. |
 | `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. Exception: `export-corpus` and the derived reads (all seven of `similar`/`explain`/`coupling`/`eval`/`triage`/`bundle`/`brief`) refuse `--repo ''` (`repo_required`) — results are defined per repo. |
 | `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
-| `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
+| `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads (including the row lists inside dict payloads — search items, related nodes, similar candidates, triage rows, bundle bundles; sibling keys such as `total_matches` are dropped on those commands), `item` (single object or multi-number rows), and `sql` rows in both row modes; not to other nested arrays. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
 | `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. `0` is the explicit uncapped override (the default 20 KiB body bound does not apply); a negative value is a usage error. The MCP `get_item` `max_body_chars` argument follows the same contract. |
 | `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
@@ -883,9 +883,12 @@ Machine-readable rules, worth knowing before scripting against this:
   identity fields on that surface; stderr stays silent) and the whole
   envelope for single-payload commands, so any `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
   never envelope keys. `--fields repo,number` projects rows to exactly those
-  keys that exist (unknown keys are omitted) — it applies to list payloads and
-  to `sql` rows in both modes (objects: keys; `--rows array`: positions), not
-  to nested arrays inside dict payloads. With duplicate-suffixed objects
+  keys that exist (unknown keys are omitted) — it applies to list payloads
+  (including the row lists inside dict payloads: search items, related
+  nodes, similar candidates, triage rows, bundle bundles — sibling keys of
+  the list are dropped on those commands), to `item` (single object or
+  multi-number rows), and to `sql` rows in both modes (objects: keys;
+  `--rows array`: positions), not to other nested arrays. With duplicate-suffixed objects
   rows, project by the suffixed key (`columns` keeps the true names). `sql` rows are objects keyed by
   column by default — duplicate column names are suffixed `name_2`, `name_3`,
   … so no value is lost (`columns` keeps the true names; `--rows array` keeps

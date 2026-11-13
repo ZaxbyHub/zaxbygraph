@@ -34,11 +34,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull, review
+from zaxbygraph import cli
 from test_mcp import McpSession, pin_env_for, run_cli, tool_envelope
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.query import page_truncated
@@ -415,6 +417,50 @@ class SearchHonestyExtTests(unittest.TestCase):
         for args, want in table:
             with self.subTest(args=args):
                 self.assertIs(page_truncated(*args), want)
+
+    def test_usage_envelope_survives_a_tty_with_explicit_format(self) -> None:
+        # Final-critic r1 f1: the real entry points call main() with no argv
+        # list; the machine-format pre-scan must fall back to sys.argv and
+        # honour --format=json (and the =value spelling) even when stdout
+        # claims to be a TTY - the frozen check passes argv explicitly and
+        # a piped subprocess stdout is never a TTY, so neither could see it.
+        import io as _io
+
+        class _FakeTty(_io.StringIO):
+            def isatty(self) -> bool:
+                return True
+
+        db_path = _seed_scratch_db(self.root / "history.db", _schema_seed)
+        real_out, real_argv = sys.stdout, sys.argv
+        fake = _FakeTty()
+        sys.stdout = fake
+        sys.argv = [
+            "zaxbygraph", "item", "--number", "1", "--format", "json",
+            "--db", str(db_path), "--repo", REPO,
+        ]
+        try:
+            code = cli.main(None)
+        finally:
+            sys.stdout, sys.argv = real_out, real_argv
+        self.assertEqual(code, 2, "the usage failure keeps exit 2")
+        env = json.loads(fake.getvalue())
+        self.assertEqual(env.get("error", {}).get("code"), "bad_request", "an explicit --format json on a TTY must still answer the envelope on stdout")
+        self.assertIn("--number", str(env["error"].get("message", "")), "argparse's own message rides the envelope")
+
+        # The =value spelling through the same path.
+        fake2 = _FakeTty()
+        sys.stdout = fake2
+        sys.argv = [
+            "zaxbygraph", "item", "--number=1", "--format=json",
+            "--db", str(db_path), "--repo", REPO,
+        ]
+        try:
+            code = cli.main(None)
+        finally:
+            sys.stdout, sys.argv = real_out, real_argv
+        self.assertEqual(code, 2)
+        env2 = json.loads(fake2.getvalue())
+        self.assertEqual(env2.get("error", {}).get("code"), "bad_request", "the --format=json spelling is recognised by the pre-scan too")
 
 
 class BodyBoundSemanticsExtTests(unittest.TestCase):
