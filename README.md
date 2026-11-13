@@ -192,7 +192,7 @@ Every command accepts:
 | `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
 | `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
-| `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
+| `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. `0` is the explicit uncapped override (the default 20 KiB body bound does not apply); a negative value is a usage error. The MCP `get_item` `max_body_chars` argument follows the same contract. |
 | `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
 | `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the store's recorded fetch source (issue #48: `sync_state.fetch_source`, stamped whenever a run explicitly states a source — `--source rest` or the refresh honoring the stored value; a `sync` that did not state a source never rewrites it, so a store deliberately kept on `--source rest` never profile-drifts). Both refresh settings are re-read under the sync lock, so a concurrent writer's changes are honored, never reverted. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
 
@@ -776,6 +776,12 @@ zaxbygraph mcp [--stale-seconds N]
   `ZAXBYGRAPH_MCP_STALE_SECONDS`), the answer still comes from current data
   and one background incremental sync starts (guarded by the sync lock);
   `freshness.refreshing` is `true` on the answer that started or joined a background refresh; the key is absent otherwise (it never reads `false`).
+  A background refresh that FAILS is isolated from the store (its
+  `sync_state` writes are restored to the pre-run snapshot, so a complete
+  store stays complete), retries for that store are suppressed for the
+  backoff window (`ZAXBYGRAPH_REFRESH_BACKOFF_S`, default 300 s), and reads
+  inside the window still answer from current data but carry
+  `freshness.refresh_failed: "<reason>"` instead of `refreshing`.
 
 Register it (Claude Code):
 
@@ -884,8 +890,16 @@ Machine-readable rules, worth knowing before scripting against this:
   column by default — duplicate column names are suffixed `name_2`, `name_3`,
   … so no value is lost (`columns` keeps the true names; `--rows array` keeps
   positional lists and exact duplicates); `--limit N` overrides the 200-row
-  cap. `item N --max-body-chars C` truncates bodies and marks them
-  `"truncated": true`. `zaxbygraph schema [TABLE]` prints live DDL plus
+  cap. The `sql` surface is additionally bounded by a wall-clock deadline
+  (default 5 s; `ZAXBYGRAPH_SQL_TIMEOUT_S`, clamped to (0, 600] — past it
+  the query is interrupted and answers the coded `timeout` error) and a
+  serialized-result byte budget (`ZAXBYGRAPH_SQL_MAX_BYTES`, default 1 MiB —
+  over it fetching stops with `truncated: true` and oversized cells are
+  capped with an explicit marker); both knobs govern the CLI `sql` command
+  and the MCP `sql` tool alike. `item N --max-body-chars C` truncates bodies
+  and marks them `"truncated": true` (`0` is the explicit uncapped override
+  — the default 20 KiB body bound does not apply; negatives are a usage
+  error). `zaxbygraph schema [TABLE]` prints live DDL plus
   per-column notes - use it instead of a file path to learn the schema.
 - **Output encoding.** stdout and stderr are UTF-8 on every platform,
   regardless of the ambient locale — emoji and CJK in titles and bodies

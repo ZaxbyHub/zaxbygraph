@@ -91,20 +91,22 @@ _ABSENT_REF_SIGNATURE_RE = re.compile(
 )
 
 
-def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError:
+def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError | None:
     """Classify one failed ``git fetch`` of a snapshot ref (issue #72 C16).
 
     An absent-ref signature stays ``snapshot_absent``'s business (the caller
-    keeps it as "this ref contributed no candidate"); any OTHER nonzero exit
-    is a transport/auth failure against the source and raises the coded
-    ``source_unreachable`` carrying git's own error text, at exit 1 -- the
-    per-attempt class, distinct from the exit-2 guard rejections."""
+    keeps it as "this ref contributed no candidate" -- returns None); any
+    OTHER nonzero exit is a transport/auth failure against the source and
+    raises the coded ``source_unreachable`` carrying git's own error text,
+    at exit 1 -- the per-attempt class, distinct from the exit-2 guard
+    rejections."""
     text = stderr.decode("utf-8", "replace")
     if _ABSENT_REF_SIGNATURE_RE.search(text):
         return None
     return SnapshotError(
         "source_unreachable",
-        f"git could not fetch {ref} from the snapshot source: {_tail(stderr)}",
+        f"git could not fetch {ref} from the snapshot source:"
+        f" {_actionable_stderr(stderr)}",
         hint="check the source path/URL and credentials (gh auth status),"
              " then re-pull",
         exit_code=1,
@@ -300,6 +302,33 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
 
 def _tail(b: bytes) -> str:
     return b.decode("utf-8", "replace").strip().splitlines()[-1] if b.strip() else "(no output)"
+
+
+#: how many of git's actionable lines a source_unreachable message carries
+#: (08b review finding 4): enough to show the diagnostic AND its follow-up
+#: line ("fatal: ... / Please make sure you have the correct access
+#: rights"), never the whole noisy stream.
+_ACTIONABLE_LINE_LIMIT = 3
+
+
+def _actionable_stderr(stderr: bytes) -> str:
+    """The ACTIONABLE lines of git's stderr for the ``source_unreachable``
+    message (08b review finding 4): the first lines git prefixed with
+    ``fatal:``/``error:`` -- the diagnostics that say WHY the source could
+    not be reached -- up to :data:`_ACTIONABLE_LINE_LIMIT`. Git's trailing
+    footer can be the exact opposite of the condition ("and the repository
+    exists." against a repository that does not), so the LAST line
+    (:func:`_tail`) is only the fallback when git printed no actionable
+    line at all."""
+    lines = stderr.decode("utf-8", "replace").splitlines()
+    actionable = [
+        line.strip()
+        for line in lines
+        if line.strip().lower().startswith(("fatal:", "error:"))
+    ][:_ACTIONABLE_LINE_LIMIT]
+    if actionable:
+        return "; ".join(actionable)
+    return _tail(stderr)
 
 
 def _check_completeness(conn: sqlite3.Connection, repo: str) -> None:

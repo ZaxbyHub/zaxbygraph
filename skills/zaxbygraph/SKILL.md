@@ -91,12 +91,19 @@ registers it.
   `InputRequiredResult` naming `repo` when nothing pins one — the same
   slug-keyed store the CLI resolves, so a worktree and its main checkout share
   one graph. Pass `repo` explicitly when your roots span more than one
-  checkout. (Legacy note: the server asks the client for roots on every repo-less
-call that no `--repo` pin resolves; a client that never answers that
-request stalls that call.)
+  checkout. (Legacy note: the roots/list round-trip is capability-gated — it
+  is sent only to a legacy client that DECLARED the roots capability at
+  `initialize`; an undeclared client is never asked, and its repo-less calls
+  resolve through the server pin or the server cwd's git origin, else answer
+  a structured error naming `repo`.)
 - Stale reads (default threshold 15 minutes) answer immediately and start one
   background sync; `freshness.refreshing: true` tells you new data is landing.
-  Use `graph_status` for sync progress. Note the `sync` tool's own envelope
+  Use `graph_status` for sync progress. When a background refresh FAILS, the
+  store's sync_state is restored untouched, retries are suppressed for the
+  backoff window (`ZAXBYGRAPH_REFRESH_BACKOFF_S`, default 300 s), and reads
+  inside that window still answer from current data but carry
+  `freshness.refresh_failed: "<reason>"` instead of `refreshing`.
+  Note the `sync` tool's own envelope
   always carries `freshness.complete: false` (the job is async — freshness is
   not yet known); that is not the "broken corpus" signal it means on `status`.
 - The CLI remains the fallback surface. Writes: `sync` exists on BOTH surfaces
@@ -198,7 +205,9 @@ duplicates; `--limit N` for the cap). `item N --max-comments K` caps the comment
 preferred, reporting `comments_omitted`); read commands accept `--max-age D`
 to refresh a stale store first (reports `freshness.refreshed: true`; reads
 never write without the flag). `item N --max-body-chars C` truncates
-bodies and marks them `truncated: true`.
+bodies and marks them `truncated: true` (`0` is the explicit uncapped
+override — the default 20 KiB body bound does not apply; negatives are a
+usage error).
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
 `{items[], matched_mode, total_matches, corpus_items, index_stale}`
@@ -296,7 +305,9 @@ Results are capped (default 200 rows), fetched incrementally, and bounded by
 a deadline and a result byte budget: a query that runs past the deadline
 (default 5 s; `ZAXBYGRAPH_SQL_TIMEOUT_S`, clamped to (0, 600]) is interrupted
 and answers the coded `timeout` error, and oversized results stop fetching
-with `truncated: true` (oversized cells are capped with an explicit marker).
+with `truncated: true` (oversized cells are capped with an explicit marker;
+the budget is `ZAXBYGRAPH_SQL_MAX_BYTES`, default 1 MiB — the same knob on
+both the CLI and the MCP `sql` tool).
 No broad query is unbounded — narrow it (`LIMIT`, tighter predicates) or
 raise the timeout instead of retrying blind.
 

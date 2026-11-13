@@ -44,6 +44,7 @@ from zaxbygraph.query import (
     path_between,
     pr_overlap,
     related,
+    resolve_file_history_path,
     run_sql,
     search,
     sql_deadline_from_env,
@@ -51,6 +52,7 @@ from zaxbygraph.query import (
     SqlTimeoutError,
     status,
     store_tables_hint,
+    UnknownFilePathError,
     what_closed,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
@@ -457,18 +459,6 @@ class _ReadFailure(Exception):
         self.code_key = code_key
 
 
-class _UnknownPathError(Exception):
-    """file-history's ghost-input refusal (issue #72 C11): the normalized
-    path matches no stored path exactly. Carries the message and a
-    suggestion hint (case-insensitive/basename near-misses, never a disk
-    resolve)."""
-
-    def __init__(self, message: str, hint: str | None = None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.hint = hint
-
-
 def _resolved_repo(args: argparse.Namespace) -> tuple[str | None, str]:
     """(repo, host) for a command. An explicitly empty --repo means
     "no filter" (repo None). A bare --repo slug carries no host: it keys
@@ -511,6 +501,20 @@ def _parse_comment_cap(value: str) -> int:
     if re.fullmatch(r"[0-9]+", text) is None:
         raise argparse.ArgumentTypeError(
             f"invalid --max-comments value: {value!r}"
+        )
+    return int(text)
+
+
+def _parse_body_chars(value: str) -> int:
+    """--max-body-chars N (08b review Q2, unified with the MCP get_item
+    contract): ASCII non-negative integer. 0 is the EXPLICIT "uncapped"
+    override — the default 20 KiB body bound does not apply — and a
+    negative value is the standard usage error (exit 2 / bad_request
+    envelope under machine formats), never a silently-ignored flag."""
+    text = str(value).strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-body-chars value: {value!r}"
         )
     return int(text)
 
@@ -1202,7 +1206,8 @@ def cmd_item(args: argparse.Namespace) -> int:
                     data = item_history(conn, number, repo=repo, exclude_bots=exclude_bots)
             if data is not None:
                 # --max-body-chars keeps its explicit semantics (issue #25
-                # AC6); the default bounds (issue #71 C5: body <= 20 KiB with
+                # AC6; 0 = the explicit uncapped override, 08b review Q2);
+                # the default bounds (issue #71 C5: body <= 20 KiB with
                 # a marker, comments/reviews <= 5, omission counts, envelope
                 # truncated on any cut) apply wherever a flag is absent.
                 truncated = _truncate_bodies(data, args.max_body_chars)
@@ -1765,9 +1770,10 @@ def _run_read_promote_truncated(
             truncated = bool(data.pop("truncated"))
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
-    except _UnknownPathError as exc:
+    except UnknownFilePathError as exc:
         # file-history's ghost path (issue #72 C11): unknown_path, exit 1,
-        # with the suggestion hint.
+        # with the suggestion hint. The gate itself is shared with the MCP
+        # file_history tool (query.resolve_file_history_path).
         return emit_failure(
             args,
             1,
@@ -1823,48 +1829,18 @@ def cmd_overlap(args: argparse.Namespace) -> int:
     return _run_read_promote_truncated(args, pr_overlap, args.numbers)
 
 
-def _file_history_suggestions(normalized: str, stored: list[str]) -> list[str]:
-    """Up to 5 stored paths that look like `normalized` (issue #72 C11):
-    equal case-insensitively, or sharing the basename. Pure string
-    comparison over the stored vocabulary — nothing is resolved on disk."""
-    norm_lower = normalized.lower()
-    base = normalized.rsplit("/", 1)[-1].lower()
-    hits = sorted(
-        p
-        for p in stored
-        if p.lower() == norm_lower or p.rsplit("/", 1)[-1].lower() == base
-    )
-    return hits[:5]
-
-
 def cmd_file_history(args: argparse.Namespace) -> int:
     raw_path = str(getattr(args, "path", ""))
 
     def _query(conn: sqlite3.Connection, repo: str | None):
-        if not repo:
-            # The no-filter branch keeps the query layer's own guard (a
-            # repo is required) and its existing bad_request mapping.
-            return file_history(conn, raw_path, args.limit, repo=repo)
-        # C11: backslashes normalize, then the lookup is EXACT-CASE against
-        # the stored pr_files vocabulary. A miss answers unknown_path with
-        # suggestions — never a silent case-fold, never a disk resolve.
-        normalized = raw_path.replace("\\", "/")
-        stored = sorted(
-            r[0]
-            for r in conn.execute(
-                "SELECT DISTINCT path FROM pr_files WHERE repo = ?", (repo,)
-            )
-        )
-        if normalized not in set(stored):
-            suggestions = _file_history_suggestions(normalized, stored)
-            hint = (
-                "stored paths that look similar: " + ", ".join(suggestions)
-                if suggestions
-                else "no stored path looks similar; churn or"
-                " `sql \"SELECT DISTINCT path FROM pr_files\"` lists the"
-                " stored vocabulary"
-            )
-            raise _UnknownPathError(f"unknown path: {normalized}", hint)
+        # C11/AC2 gate shared with the MCP file_history tool
+        # (query.resolve_file_history_path): backslashes normalize, then the
+        # lookup is EXACT-CASE against the stored pr_files vocabulary. A
+        # miss answers unknown_path with suggestions — never a silent
+        # case-fold, never a disk resolve. The no-filter branch keeps the
+        # query layer's own guard (a repo is required) and its existing
+        # bad_request mapping.
+        normalized = resolve_file_history_path(conn, repo, raw_path)
         return file_history(conn, normalized, args.limit, repo=repo)
 
     return _run_read_promote_truncated(args, _query)
@@ -2751,10 +2727,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument(
         "--max-body-chars",
-        type=int,
+        type=_parse_body_chars,
         default=None,
         metavar="N",
-        help="Truncate the item/comment/review bodies to N chars (marks truncated)",
+        help="Truncate the item/comment/review bodies to N chars (marks"
+        " truncated); 0 is the explicit uncapped override (the default"
+        " 20 KiB body bound does not apply), negatives are a usage error",
     )
     sp.add_argument(
         "--max-comments",
@@ -3126,12 +3104,20 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
     for action in actions:
         known.extend(a for a in action.option_strings if a not in known)
     tokens = re.findall(r"--?[A-Za-z][\w-]*", message)
+    # A subparser's prog already carries the full invocation path
+    # ("zaxbygraph search"); prefixing the program name again produced the
+    # doubled "zaxbygraph zaxbygraph search --help" (08b review nit). The
+    # bare top-level prog keeps the "zaxbygraph COMMAND --help" shape.
+    help_ref = (
+        f"{parser.prog} --help"
+        if " " in parser.prog
+        else "zaxbygraph COMMAND --help"
+    )
     for token in tokens:
         match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
         if match:
-            return f"did you mean {match[0]}? (see `zaxbygraph {parser.prog} --help`)"
-    prog = parser.prog if " " in parser.prog else "COMMAND"
-    return f"see `zaxbygraph {prog} --help` for this command's arguments"
+            return f"did you mean {match[0]}? (see `{help_ref}`)"
+    return f"see `{help_ref}` for this command's arguments"
 
 
 class _Parser(argparse.ArgumentParser):

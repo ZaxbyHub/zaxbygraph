@@ -70,9 +70,11 @@ from zaxbygraph.query import (
     file_history,
     item,
     open_items,
+    page_truncated,
     path_between,
     pr_overlap,
     related,
+    resolve_file_history_path,
     run_sql,
     search,
     sql_deadline_from_env,
@@ -80,6 +82,7 @@ from zaxbygraph.query import (
     SqlTimeoutError,
     status,
     store_tables_hint,
+    UnknownFilePathError,
     what_closed,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
@@ -377,17 +380,27 @@ def _refresh_backoff_s() -> float:
     return value if value > 0 else 0.0
 
 
-def _snapshot_sync_state(db_path, slug: str) -> dict | None:
+#: Sentinel _snapshot_sync_state returns when the pre-run row could not be
+#: READ (open/transport fault) — distinct from None, which means the row
+#: genuinely does not exist. Containment must never touch a store whose
+#: pre-run state it could not observe (08b review Q4): a DELETE issued on
+#: an unread snapshot can erase a sync_state row it never saw.
+_SNAPSHOT_READ_FAILED = object()
+
+
+def _snapshot_sync_state(db_path, slug: str):
     """The repo's FULL sync_state row before an isolated refresh run
     (every column — error/pending flags, sync stamps, watermark fields —
-    so a restore is byte-faithful), or None when no row exists yet.
+    so a restore is byte-faithful): the row dict, None when no row exists
+    yet, or the _SNAPSHOT_READ_FAILED sentinel when the read itself failed
+    (a restore then cannot know what to restore and must not run).
 
     Read-only: a failed refresh must be isolated FROM the store, so the
     snapshot itself must never write (connect_readonly_query)."""
     try:
         conn = connect_readonly_query(db_path)
     except (FileNotFoundError, RuntimeError, sqlite3.Error, OSError):
-        return None
+        return _SNAPSHOT_READ_FAILED
     try:
         row = conn.execute(
             "SELECT * FROM sync_state WHERE repo = ?", (slug,)
@@ -396,7 +409,7 @@ def _snapshot_sync_state(db_path, slug: str) -> dict | None:
             return None
         return {key: row[key] for key in row.keys()}
     except sqlite3.Error:
-        return None
+        return _SNAPSHOT_READ_FAILED
     finally:
         conn.close()
 
@@ -425,14 +438,28 @@ def _restore_sync_state(db_path, slug: str, snapshot: dict | None) -> None:
         conn.close()
 
 
-def _contain_refresh_failure(db_path, slug: str, snapshot: dict | None) -> None:
+def _contain_refresh_failure(db_path, slug: str, snapshot) -> None:
     """The isolated wrapper's failure path: restore the pre-run
     sync_state snapshot, then arm the failure backoff. Restore faults are
-    logged, never raised over the refresh's own exception."""
-    try:
-        _restore_sync_state(db_path, slug, snapshot)
-    except Exception as exc:  # restoration is best-effort containment
-        _log(f"staleness refresh state restore for {slug} failed: {exc}")
+    logged, never raised over the refresh's own exception.
+
+    A _SNAPSHOT_READ_FAILED sentinel means the pre-run row could not be
+    read (08b review Q4): containment REFUSES to touch the store — a
+    blind DELETE/UPDATE against an unobserved row is exactly the poison
+    the isolation exists to prevent — logs, and still arms the backoff so
+    the failure stays reported and suppressed; the original failure is
+    re-raised by the caller either way."""
+    if snapshot is _SNAPSHOT_READ_FAILED:
+        _log(
+            f"staleness refresh containment for {slug} on {db_path} skipped:"
+            " the pre-run sync_state snapshot could not be read; the store"
+            " is left as the failed run left it"
+        )
+    else:
+        try:
+            _restore_sync_state(db_path, slug, snapshot)
+        except Exception as exc:  # restoration is best-effort containment
+            _log(f"staleness refresh state restore for {slug} failed: {exc}")
     with _BACKOFF_LOCK:
         _REFRESH_BACKOFF[(str(db_path), slug)] = time.monotonic()
 
@@ -910,11 +937,13 @@ def _tool_search(arguments: dict, ctx) -> dict:
         # < matched, issue #72 C14) promotes into the envelope flag here.
         data_truncated = bool(result.pop("truncated", False))
         # Truncation is judged against the source's own match count, not
-        # the capped fetch — AND a full page always offers a cursor: the
-        # AND-to-OR fallback can reveal more matches at a wider window,
-        # so "page length == limit" alone must not read as "the end"
-        # (review F10).
-        truncated = isinstance(total, int) and offset + len(result["items"]) < total
+        # the capped fetch — via the same honest page_truncated formula the
+        # CLI search uses (08b review Q3: an offset PAST the end skipped
+        # matches the caller never saw and must not read as "everything
+        # shown") — AND a full page always offers a cursor: the AND-to-OR
+        # fallback can reveal more matches at a wider window, so "page
+        # length == limit" alone must not read as "the end" (review F10).
+        truncated = page_truncated(offset, len(result["items"]), limit, total)
         if len(result["items"]) == limit:
             truncated = True
         truncated = truncated or data_truncated
@@ -954,9 +983,10 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
                 slug=slug,
                 db_path=db_path,
             )
-        # An explicit max_body_chars keeps its cap semantics; absent flags
-        # fall to the bounded defaults (issue #71 C5 / plan CF-D), shared
-        # with the CLI item command via query.apply_item_bounds.
+        # An explicit max_body_chars keeps its cap semantics — 0 is the
+        # explicit UNCAPPED override on both adapters (08b review Q2);
+        # absent flags fall to the bounded defaults (issue #71 C5 / plan
+        # CF-D), shared with the CLI item command via query.apply_item_bounds.
         truncated = _truncate_bodies(data, max_body_chars)
         truncated = apply_item_bounds(
             data,
@@ -1004,6 +1034,11 @@ def _tool_related(arguments: dict, ctx) -> dict:
         # #71 C7); promote it to the envelope like the CLI read path.
         truncated = bool(data.pop("truncated", False))
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
+    except LookupError as exc:
+        # A ghost number is the caller's not_found (issue #72 AC2, 08b
+        # review finding 2), not an internal error — exactly like the CLI
+        # read path and _tool_what_closed.
+        raise ToolError("not_found", str(exc), hint="run graph_status or search to list stored items", slug=slug, db_path=db_path) from exc
     finally:
         conn.close()
 
@@ -1018,6 +1053,10 @@ def _tool_path(arguments: dict, ctx) -> dict:
     try:
         data = path_between(conn, a, b, repo=slug)
         return _read_envelope(conn, slug, db_path, data, False, ctx)
+    except LookupError as exc:
+        # A ghost endpoint number is not_found (issue #72 AC2, 08b review
+        # finding 2) — same mapping as the CLI read path and what_closed.
+        raise ToolError("not_found", str(exc), hint="run graph_status or search to list stored items", slug=slug, db_path=db_path) from exc
     finally:
         conn.close()
 
@@ -1065,7 +1104,21 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
     try:
         limit = _clamp_limit(min(_int_arg(arguments, "limit", 30), _MAX_PAGE))
         offset = _int_cursor(arguments.get("cursor"), "file_history")
-        result = file_history(conn, path, limit=limit + offset, repo=slug)
+        # AC2 gate shared with the CLI (08b review finding 3): backslashes
+        # normalize, then the lookup is EXACT-CASE against the stored
+        # pr_files vocabulary. A miss is unknown_path with the suggestion
+        # hint — never ok:true with entries:[].
+        try:
+            normalized = resolve_file_history_path(conn, slug, path)
+        except UnknownFilePathError as exc:
+            raise ToolError(
+                "unknown_path",
+                exc.message,
+                hint=exc.hint,
+                slug=slug,
+                db_path=db_path,
+            ) from exc
+        result = file_history(conn, normalized, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
         result["entries"] = entries[offset : offset + limit]
         # file_history over-fetches limit+1 at the window size, so its own
@@ -1882,8 +1935,22 @@ _TOOL_SHAPES: dict[str, dict] = {
                 },
                 "warnings": {
                     "type": "array",
-                    "items": _STR,
-                    "description": "out-of-vocabulary literal warnings",
+                    "items": _props(
+                        {
+                            "column": _STR,
+                            "literal": _STR,
+                            "stored_values": {
+                                "type": "array",
+                                "items": _STR,
+                                "description": "the stored DISTINCT"
+                                " vocabulary of that column (bounded)",
+                            },
+                        },
+                        ("column", "literal", "stored_values"),
+                    ),
+                    "description": "out-of-vocabulary literal warnings"
+                    " ({column, literal, stored_values}; query.run_sql"
+                    " emits one object per warning)",
                 },
                 "total_rows": {
                     "type": "integer",
@@ -2065,7 +2132,15 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "comments": _open_objects(
                     "{author, author_association, created_at, body}"
                 ),
-                "body": _STR,
+                "body": {
+                    "type": "object",
+                    "properties": {"untrusted_text": _STR},
+                    "required": ["untrusted_text"],
+                    "additionalProperties": True,
+                    "description": "the item body inside the AC6"
+                    " untrusted-content wrapper"
+                    " {untrusted_text: str} (derive._untrusted)",
+                },
                 "files": {
                     "type": "object",
                     "properties": {
@@ -2256,7 +2331,7 @@ _TOOLS: list[dict] = [
         "inputSchema": _schema(
             {
                 "number": {"type": "integer"},
-                "max_body_chars": {"type": "integer", "minimum": 1, "description": "Truncate item/comment/review bodies to N chars (overrides the default 20 KiB body bound)"},
+                "max_body_chars": {"type": "integer", "minimum": 0, "description": "Truncate item/comment/review bodies to N chars (overrides the default 20 KiB body bound; 0 is the explicit uncapped override, matching the CLI --max-body-chars 0)"},
                 "max_comments": {"type": "integer", "minimum": 0, "description": "Cap the comment list to K entries (overrides the default 5; reports comments_omitted)"},
                 "max_reviews": {"type": "integer", "minimum": 0, "description": "Cap the review list to K entries (overrides the default 5; reports reviews_omitted)"},
                 "exclude_bots": {

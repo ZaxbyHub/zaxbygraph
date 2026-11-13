@@ -336,6 +336,7 @@ _SEARCH_MERGED = """
         JOIN comments ON comments.pk = comments_fts.rowid
         {comment_bots}
         JOIN items ON items.repo = comments.repo AND items.number = comments.number
+        {comment_item_bots}
         WHERE comments_fts MATCH :match{comment_repo}{reviews_arm}
     ) AS hit
     GROUP BY hit.repo, hit.number
@@ -356,7 +357,8 @@ _REVIEWS_ARM = """
         FROM reviews_fts
         JOIN reviews ON reviews.id = reviews_fts.rowid
         {review_bots}
-        JOIN items ON items.repo = reviews.repo AND items.number = reviews.number
+        JOIN items ON items.repo = reviews.repo AND reviews.number = reviews.number
+        {review_item_bots}
         WHERE reviews_fts MATCH :match{review_repo}
 """
 
@@ -365,6 +367,10 @@ _REVIEWS_ARM = """
 #: are computed over the filtered set. Inner JOIN on the author's actors row
 #: with is_bot = 0 drops bot-authored rows; sync upserts an actors row for
 #: every author it stores, so the join never loses a human row.
+#: _ITEM_BOT_FILTER is ALSO spliced after the comment/review arms' JOIN
+#: items (08b review Q1): a bot-authored ITEM leaves the stream even when a
+#: HUMAN comment or review matched it — its row is omitted and counted in
+#: bots_omitted, not surfaced under the bot's title.
 _ITEM_BOT_FILTER = (
     " JOIN actors item_actors ON item_actors.login = items.author"
     " AND item_actors.is_bot = 0"
@@ -412,10 +418,12 @@ def _merged_search_sql(
         item_repo=item_repo,
         item_bots=_ITEM_BOT_FILTER if exclude_bots else "",
         comment_bots=_COMMENT_BOT_FILTER if exclude_bots else "",
+        comment_item_bots=_ITEM_BOT_FILTER if exclude_bots else "",
         comment_repo=comment_repo,
         reviews_arm="" if legacy else _REVIEWS_ARM.format(
             review_repo=review_repo,
             review_bots=_REVIEW_BOT_FILTER if exclude_bots else "",
+            review_item_bots=_ITEM_BOT_FILTER if exclude_bots else "",
         ),
     )
 
@@ -499,17 +507,21 @@ def _search_bots_omitted(
     legacy: bool = False,
 ) -> int:
     """Count the bot-authored matches the exclusion filter removes (issue #71
-    C6): matching item rows whose own author is a bot plus matching comment
-    and review rows authored by bots, under the widest (broadened) match.
-    One bounded COUNT, no row materialization."""
-    item_repo = " AND items.repo = :repo" if repo else ""
+    C6, amended by the 08b review): DISTINCT matched ITEMS whose own author
+    is a bot — omitted as rows however they matched (own text, a human
+    comment, a human review) — plus matching comment and review rows
+    authored by bots, under the widest (broadened) match. Bounded COUNTs, no
+    row materialization."""
     comment_repo = " AND comments.repo = :repo" if repo else ""
     review_repo = " AND reviews.repo = :repo" if repo else ""
+    # One row per matched item (the merged pass GROUPs by repo+number), so
+    # COUNT(*) over the bot-author join is the distinct omitted-item count.
+    merged = _merged_search_sql(repo, legacy=legacy, exclude_bots=False)
     arms = [
-        "SELECT COUNT(*) FROM items_fts "
-        "JOIN items ON items.id = items_fts.rowid "
+        f"SELECT COUNT(*) FROM ({merged}) AS m "
+        "JOIN items ON items.repo = m.repo AND items.number = m.number "
         "JOIN actors ON actors.login = items.author "
-        f"WHERE items_fts MATCH :match AND actors.is_bot = 1{item_repo}",
+        "WHERE actors.is_bot = 1",
         "SELECT COUNT(*) FROM comments_fts "
         "JOIN comments ON comments.pk = comments_fts.rowid "
         "JOIN actors ON actors.login = comments.author "
@@ -610,6 +622,31 @@ def _hydrate_search_hit(
     return rec
 
 
+def page_truncated(
+    offset: int, page_len: int, limit: int, total: int | None
+) -> bool:
+    """The honest truncation flag for one paged search page (issue #72 AC5;
+    08b review Q3): true when matches exist that this call did not return.
+
+    That is the plain formula `offset + page_len < total` (matches remain
+    after the page) PLUS the overshoot case: a page whose window ends PAST
+    the end (`offset + page_len > total`) while returning fewer rows than
+    asked means the offset skipped matches the caller never saw — 0 of 3 at
+    offset 99 must not read as "everything shown". A page that ends exactly
+    at the end stays false (nothing remains; a cursor follower must not
+    loop on an empty terminal page)."""
+    if not isinstance(total, int):
+        return False
+    if offset + page_len < total:
+        return True
+    return (
+        total > 0
+        and offset > 0
+        and page_len < limit
+        and offset + page_len > total
+    )
+
+
 def search(
     conn: sqlite3.Connection,
     query: str,
@@ -638,12 +675,17 @@ def search(
     `broadened_matches` come from COUNT queries over each pass (the broadened
     COUNT runs whenever the strict pass ran, even when its rows did not fill
     the page), and `total_matches` is the broadened total — the widest set a
-    wider page could reach. `truncated` is true when the page returned fewer
-    rows than `total_matches` (the adapters promote it to the envelope).
+    wider page could reach. `truncated` is true when matches exist that the
+    page did not return (page_truncated: more remain after the page, or the
+    offset overshot matches the caller never saw; the adapters promote it to
+    the envelope).
     `exclude_bots` (issue #71 C6) filters bot-authored item/comment/review
     rows OUT of the match SQL — pre-ranking, so counts, snippets and paging
     are all computed over the filtered set — and reports the excluded
-    bot-authored matches as `bots_omitted`. `corpus_items` is the scoped item
+    bot-authored matches as `bots_omitted`. A bot-authored ITEM is omitted
+    however it matched (own text, a human comment, a human review — the
+    08b review Q1 rule): its row never surfaces under the bot's title.
+    `corpus_items` is the scoped item
     count and `index_stale` flags a store predating the current schema (reads
     never migrate)."""
     repo = _fold_repo(repo)
@@ -730,7 +772,7 @@ def search(
         "total_matches": total,
         "strict_matches": strict_total,
         "broadened_matches": broadened_total,
-        "truncated": offset + len(items) < total,
+        "truncated": page_truncated(offset, len(items), limit, total),
         "offset": offset,
         "corpus_items": corpus_items,
         "index_stale": index_stale,
@@ -2260,6 +2302,65 @@ def pr_overlap(conn: sqlite3.Connection, numbers, repo: str | None = None) -> di
             a, b = numbers[i], numbers[j]
             pairs.append({"a": a, "b": b, "shared": sorted(paths[a] & paths[b])})
     return {"pairs": pairs}
+
+
+class UnknownFilePathError(Exception):
+    """file-history's ghost-input refusal (issue #72 AC2/C11), shared by the
+    CLI and MCP adapters: the normalized path matches no stored path
+    exactly. Carries the message and a suggestion hint
+    (case-insensitive/basename near-misses over the stored vocabulary,
+    never a disk resolve)."""
+
+    def __init__(self, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+def file_path_suggestions(normalized: str, stored: list[str]) -> list[str]:
+    """Up to 5 stored paths that look like `normalized` (issue #72 AC2/C11):
+    equal case-insensitively, or sharing the basename. Pure string
+    comparison over the stored vocabulary — nothing is resolved on disk."""
+    norm_lower = normalized.lower()
+    base = normalized.rsplit("/", 1)[-1].lower()
+    hits = sorted(
+        p
+        for p in stored
+        if p.lower() == norm_lower or p.rsplit("/", 1)[-1].lower() == base
+    )
+    return hits[:5]
+
+
+def resolve_file_history_path(
+    conn: sqlite3.Connection, repo: str | None, raw_path: str
+) -> str:
+    """The file-history input gate BOTH adapters share (issue #72 AC2; 08b
+    review finding 3): backslashes normalize, then the lookup is EXACT-CASE
+    against the stored pr_files vocabulary for the repo. Returns the
+    normalized path on a hit; raises UnknownFilePathError on a miss with
+    the suggestion hint — never a silent case-fold, never an empty-success
+    answer, never a disk resolve. A None repo skips the gate and keeps the
+    query layer's own repo-required guard."""
+    if not repo:
+        return raw_path.replace("\\", "/")
+    normalized = raw_path.replace("\\", "/")
+    stored = sorted(
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT path FROM pr_files WHERE repo = ?", (repo,)
+        )
+    )
+    if normalized not in set(stored):
+        suggestions = file_path_suggestions(normalized, stored)
+        hint = (
+            "stored paths that look similar: " + ", ".join(suggestions)
+            if suggestions
+            else "no stored path looks similar; churn or"
+            " `sql \"SELECT DISTINCT path FROM pr_files\"` lists the"
+            " stored vocabulary"
+        )
+        raise UnknownFilePathError(f"unknown path: {normalized}", hint)
+    return normalized
 
 
 def file_history(
