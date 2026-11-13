@@ -38,7 +38,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull
+from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull, review
 from test_mcp import McpSession, pin_env_for, run_cli, tool_envelope
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.query import page_truncated
@@ -82,6 +82,7 @@ def _schema_seed(src: FakeGitHubSource) -> None:
     src.add_pr(issue(4, title="other pr", body="more files", kind="pr", state="closed"), pull(4, changed_files=1, merged=True), files=[pr_file("src/store.py")])
     src.add_pr(issue(5, title="chore deps", body="routine bump", kind="pr", state="closed", author="dependabot[bot]"), pull(5, changed_files=1, merged=True), files=[pr_file("pkg/x.txt")])
     src.comment_on(5, "human says zyzzyxneedle here", author="alice")
+    src.reviews[5] = [review(910_005, "APPROVED", body="human review: zyzzyxneedle looks fine")]
     src.add_issue(issue(6, title="real work", body="mentions zyzzyxneedle", state="open"))
 
 
@@ -353,6 +354,19 @@ class SearchHonestyExtTests(unittest.TestCase):
         self.assertGreater(int(data.get("bots_omitted") or 0), 0, "the omitted bot-authored item must be counted in bots_omitted")
         self.assertEqual(data["total_matches"], 1, f"counts are computed over the filtered stream; total_matches must be 1, got {data['total_matches']!r}")
 
+        # The reviews arm joins items with a REAL predicate (08b r2: a
+        # tautological reviews.number = reviews.number let the planner drop
+        # the join, fanning items out repo-wide so the bot filter saw the
+        # wrong rows and the bot PR survived a HUMAN review match).
+        code, out, err = run_cli(["search", "looks fine", "--no-bots", *base])
+        self.assertEqual(code, 0, f"the review-only search must succeed: {err}")
+        data_r = _env_of(out, "q1")["data"]
+        self.assertNotIn(5, [i["number"] for i in data_r["items"]], "a BOT-authored item must be omitted under --no-bots even when the match came only from a HUMAN REVIEW (the reviews arm must join items by repo AND number)")
+        code, out, err = run_cli(["search", "looks fine", *base])
+        self.assertEqual(code, 0, err)
+        data_p = _env_of(out, "q1")["data"]
+        self.assertIn(5, [i["number"] for i in data_p["items"]], "fixture sanity: without --no-bots the review-only match surfaces")
+
     def test_offset_past_the_end_reports_truncated(self) -> None:
         def seed(src: FakeGitHubSource) -> None:
             for number in (21, 22, 23):
@@ -384,6 +398,7 @@ class SearchHonestyExtTests(unittest.TestCase):
         self.assertIs(env.get("ok"), True, f"the MCP paged read must succeed: {env.get('error')!r}")
         self.assertEqual((env.get("data") or {}).get("items"), [], "fixture: cursor 99 is past all matches")
         self.assertIs(env.get("truncated"), True, f"MCP search must report the same honest overshoot flag; got truncated={env.get('truncated')!r}")
+        self.assertNotIn("next_cursor", env.get("data") or {}, "an overshoot page must NOT emit next_cursor: str(offset) would repeat the cursor it was handed and trap a while-truncated follower in a self-loop (08b r2)")
         session.stop()
 
         # Unit truth table for the shared formula.

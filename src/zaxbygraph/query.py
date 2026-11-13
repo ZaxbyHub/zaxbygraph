@@ -357,9 +357,10 @@ _REVIEWS_ARM = """
         FROM reviews_fts
         JOIN reviews ON reviews.id = reviews_fts.rowid
         {review_bots}
-        JOIN items ON items.repo = reviews.repo AND reviews.number = reviews.number
+        JOIN items ON items.repo = reviews.repo AND items.number = reviews.number
         {review_item_bots}
         WHERE reviews_fts MATCH :match{review_repo}
+          AND items.repo = reviews.repo AND items.number = reviews.number
 """
 
 #: Bot-exclusion semi-joins (issue #71 C6 / plan CF-D), spliced into every

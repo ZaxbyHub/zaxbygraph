@@ -947,7 +947,10 @@ def _tool_search(arguments: dict, ctx) -> dict:
         if len(result["items"]) == limit:
             truncated = True
         truncated = truncated or data_truncated
-        if truncated:
+        if truncated and result["items"]:
+            # An overshoot page (offset past the end) reports truncated:true
+            # with NO next_cursor: repeating str(offset) would trap any
+            # while-truncated cursor follower in a self-loop (08b r2).
             result["next_cursor"] = str(offset + len(result["items"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
