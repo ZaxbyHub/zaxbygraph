@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import errno
 import os
 import re
 import sqlite3
@@ -449,19 +450,28 @@ def _contain_refresh_failure(db_path, slug: str, snapshot) -> None:
     the isolation exists to prevent — logs, and still arms the backoff so
     the failure stays reported and suppressed; the original failure is
     re-raised by the caller either way."""
+    # The backoff arms FIRST (FB-023): _log writes stderr bare, and a dead
+    # stderr stream raising out of a log must not leave the failure
+    # unsuppressed — the storm is the harm, the line is a nicety.
+    with _BACKOFF_LOCK:
+        _REFRESH_BACKOFF[(str(db_path), slug)] = time.monotonic()
     if snapshot is _SNAPSHOT_READ_FAILED:
-        _log(
-            f"staleness refresh containment for {slug} on {db_path} skipped:"
-            " the pre-run sync_state snapshot could not be read; the store"
-            " is left as the failed run left it"
-        )
+        try:
+            _log(
+                f"staleness refresh containment for {slug} on {db_path}"
+                " skipped: the pre-run sync_state snapshot could not be"
+                " read; the store is left as the failed run left it"
+            )
+        except OSError:
+            pass
     else:
         try:
             _restore_sync_state(db_path, slug, snapshot)
         except Exception as exc:  # restoration is best-effort containment
-            _log(f"staleness refresh state restore for {slug} failed: {exc}")
-    with _BACKOFF_LOCK:
-        _REFRESH_BACKOFF[(str(db_path), slug)] = time.monotonic()
+            try:
+                _log(f"staleness refresh state restore for {slug} failed: {exc}")
+            except OSError:
+                pass
 
 
 def _isolated_refresh_runner(inner):
@@ -875,7 +885,16 @@ def _int_cursor(raw, tool: str) -> int:
             f"{tool} cursor is malformed: {raw!r}",
             hint="pass the next_cursor value from the previous page verbatim",
         ) from None
-    if value <= 0:
+    if value < 0:
+        # The producer mints only non-negative offsets: a negative cursor is
+        # hand-crafted input, answered as bad_request rather than the silent
+        # page-1 reset this function's own docstring forbids (FB-010).
+        raise ToolError(
+            "bad_request",
+            f"{tool} cursor is malformed: {raw!r}",
+            hint="pass the next_cursor value from the previous page verbatim",
+        )
+    if value == 0:
         return 0
     return min(value, _MAX_CURSOR)
 
@@ -927,11 +946,24 @@ def _tool_search(arguments: dict, ctx) -> dict:
     try:
         limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
         offset = _int_cursor(arguments.get("cursor"), "search")
-        result = search(
-            conn, query, limit=limit + offset, repo=slug, exclude_bots=exclude_bots
-        )
-        items = result.get("items") or []
-        result["items"] = items[offset : offset + limit]
+        # offset rides INTO the query (FB-006): search() stamps
+        # data.offset/matched_mode/bots_omitted against the page it
+        # computed, so cursor pages must ask for their own window — the
+        # old fetch-wide-then-slice answered metadata from page 0 on
+        # every cursor page.
+        try:
+            result = search(
+                conn, query, limit=limit, offset=offset, repo=slug,
+                exclude_bots=exclude_bots,
+            )
+        except ValueError as exc:
+            # The pre-v12 bot-flag gate (FB-004): a structured refusal
+            # naming the sync remedy, not the runtime catch-all.
+            raise ToolError(
+                "bad_request", str(exc),
+                hint="run: zaxbygraph sync --repo <repo> to upgrade the store",
+                slug=slug, db_path=db_path,
+            ) from None
         total = result.get("total_matches")
         # The query layer's own limit-independent truncation evidence (page
         # < matched, issue #72 C14) promotes into the envelope flag here.
@@ -947,10 +979,13 @@ def _tool_search(arguments: dict, ctx) -> dict:
         if len(result["items"]) == limit:
             truncated = True
         truncated = truncated or data_truncated
-        if truncated and result["items"]:
+        if truncated and result["items"] and offset + len(result["items"]) <= _MAX_CURSOR:
             # An overshoot page (offset past the end) reports truncated:true
             # with NO next_cursor: repeating str(offset) would trap any
-            # while-truncated cursor follower in a self-loop (08b r2).
+            # while-truncated cursor follower in a self-loop (08b r2). A
+            # mint past the _MAX_CURSOR clamp is the same live-loop at the
+            # boundary — the follower would clamp back to the same window
+            # forever (FB-011) — so the ceiling page is terminal too.
             result["next_cursor"] = str(offset + len(result["items"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
@@ -977,7 +1012,17 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        data = item(conn, number, repo=slug, exclude_bots=exclude_bots)
+        try:
+            data = item(conn, number, repo=slug, exclude_bots=exclude_bots)
+        except ValueError as exc:
+            # The pre-v12 bot-flag gate (FB-004): a structured refusal
+            # naming the sync remedy, matching _tool_search — not the
+            # runtime catch-all with a stderr traceback.
+            raise ToolError(
+                'bad_request', str(exc),
+                hint='run: zaxbygraph sync --repo <repo> to upgrade the store',
+                slug=slug, db_path=db_path,
+            ) from None
         if data is None:
             raise ToolError(
                 "not_found",
@@ -1128,7 +1173,9 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
         # truncated flag is the post-offset more-exist evidence. Promote
         # (and remove) it for shape parity with the file-history command.
         truncated = bool(result.pop("truncated", False))
-        if truncated:
+        if truncated and offset + len(result["entries"]) <= _MAX_CURSOR:
+            # A mint past the _MAX_CURSOR clamp live-loops the follower
+            # (FB-011, same boundary shape as search's) — terminal page.
             result["next_cursor"] = str(offset + len(result["entries"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
@@ -1159,7 +1206,8 @@ def _tool_open_items(arguments: dict, ctx) -> dict:
         truncated = len(rows) > limit
         page = rows[:limit]
         data: dict = {"items": page}
-        if truncated:
+        if truncated and offset + len(page) <= _MAX_CURSOR:
+            # Terminal at the clamp ceiling (FB-011, same as search).
             data["next_cursor"] = str(offset + len(page))
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
     finally:
@@ -1444,12 +1492,19 @@ def _tool_triage(arguments: dict, ctx) -> dict:
         total_text, _, number_text = cursor.partition(":")
         try:
             int(number_text)
-            float(total_text)
+            total = float(total_text)
         except ValueError:
             raise ToolError(
                 "bad_request", f"cursor is malformed: {cursor!r}",
                 hint="pass the cursor value from the previous triage page verbatim",
             ) from None
+        if total != total or total in (float("inf"), float("-inf")):
+            # nan/inf parse as floats but the producer never mints them
+            # (FB-012): accepting them restarted pagination at page one.
+            raise ToolError(
+                "bad_request", f"cursor is malformed: {cursor!r}",
+                hint="pass the cursor value from the previous triage page verbatim",
+            )
     top_k = arguments.get("top_k")
     if top_k is not None:
         if isinstance(top_k, bool) or not isinstance(top_k, int):
@@ -1701,10 +1756,18 @@ _TOOL_SHAPES: dict[str, dict] = {
         " a bare list of these rows in input order, unstored numbers included"
         " as per-row not_found entries.",
         "data_keys": (
-            "author", "body", "comments", "comments_omitted", "created_at",
-            "edges", "files", "html_url", "index_stale", "kind", "labels",
-            "number", "repo", "reviews", "reviews_omitted", "state", "title",
-            "updated_at",
+            "additions", "api_url", "author", "author_association",
+            "base_ref", "body", "branch_token", "changed_files", "closed_at",
+            "comment_count", "comments", "comments_omitted", "commits",
+            "created_at", "deletions", "dependencies_blocked_by",
+            "dependencies_blocking", "dependencies_total_blocked_by",
+            "dependencies_total_blocking", "draft", "edges", "files",
+            "head_ref", "html_url", "id", "index_stale", "item_type", "kind",
+            "labels", "labels_text", "locked", "merge_commit", "merged_at",
+            "merged_by", "milestone", "node_id", "number", "paths_text",
+            "reactions_total", "repo", "reviews", "reviews_omitted", "state",
+            "state_reason", "sub_issues_completed", "sub_issues_total",
+            "title", "updated_at",
         ),
         "row_fields": {
             "comments": ("author", "body", "created_at", "github_id",
@@ -1861,7 +1924,8 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "next_cursor": {
                     "type": "string",
                     "description": "present when the page is truncated"
-                    " (MCP; the CLI pages with --offset)",
+                    " (MCP-only paging; the file-history CLI returns the"
+                    " whole list)",
                 },
             },
             ("entries", "index_stale"),
@@ -2539,9 +2603,18 @@ _TOOL_HANDLERS = {
 
 
 def _send(stdout, obj: dict) -> None:
-    stdout.write(json.dumps(obj, ensure_ascii=False))
-    stdout.write("\n")
-    stdout.flush()
+    try:
+        stdout.write(json.dumps(obj, ensure_ascii=False))
+        stdout.write("\n")
+        stdout.flush()
+    except OSError as exc:
+        # Same translation as cli._write_stdout (FB-007): a dead client on
+        # Windows raises plain OSError(EINVAL) that main()'s
+        # BrokenPipeError catch would never see, turning the documented
+        # quiet exit into a traceback + exit 1.
+        if exc.errno in (errno.EINVAL, errno.EPIPE):
+            raise BrokenPipeError(str(exc)) from exc
+        raise
 
 
 def _result(stdout, req_id, result: dict) -> None:
@@ -2738,6 +2811,11 @@ def _process(msg: dict, ctx: "_Context") -> None:
                 "content": [{"type": "text", "text": _InputRequired().hint_text()}],
             },
         )
+    except BrokenPipeError:
+        # The translated dead-pipe signal (FB-007): leave quietly
+        # via the main() handler -- a traceback here re-breaks the
+        # quiet exit.
+        raise
     except ToolError as exc:
         if method == "tools/call":
             env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)

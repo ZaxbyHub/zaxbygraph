@@ -89,6 +89,12 @@ _WAL_HEADER_BYTES = 32
 _ABSENT_REF_SIGNATURE_RE = re.compile(
     r"couldn'?t find remote ref(erence)?", re.IGNORECASE
 )
+#: Only git's OWN diagnostic lines carry the signatures (FB-024): remote-
+#: controlled sideband text ("remote: ...") must never classify the failure.
+_DIAGNOSTIC_LINE_RE = re.compile(r"^(fatal:|error:)", re.IGNORECASE)
+#: Per-line bound for the carried message (FB-024): git stderr lines are
+#: remote-influenced and must not push an unbounded payload into an envelope.
+_ACTIONABLE_LINE_CAP = 200
 
 
 def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError | None:
@@ -101,7 +107,10 @@ def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError | None
     at exit 1 -- the per-attempt class, distinct from the exit-2 guard
     rejections."""
     text = stderr.decode("utf-8", "replace")
-    if _ABSENT_REF_SIGNATURE_RE.search(text):
+    diagnostic_lines = [
+        line for line in text.splitlines() if _DIAGNOSTIC_LINE_RE.match(line)
+    ]
+    if any(_ABSENT_REF_SIGNATURE_RE.search(line) for line in diagnostic_lines):
         return None
     return SnapshotError(
         "source_unreachable",
@@ -242,6 +251,11 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_DATE": _FIXED_DATE,
         "GIT_COMMITTER_DATE": _FIXED_DATE,
+        # The stderr classifiers match git's English diagnostics; a
+        # localized catalog would translate them away and flip the
+        # snapshot_absent/source_unreachable exit class per host (FB-024).
+        "LC_ALL": "C",
+        "LANG": "C",
     })
     # the temp-repo plumbing must not inherit an ambient checkout context
     # or an ambient identity (which would override the -c identity below
@@ -327,8 +341,20 @@ def _actionable_stderr(stderr: bytes) -> str:
         if line.strip().lower().startswith(("fatal:", "error:"))
     ][:_ACTIONABLE_LINE_LIMIT]
     if actionable:
-        return "; ".join(actionable)
-    return _tail(stderr)
+        # Remote-influenced text: bound each line and strip control
+        # characters (ANSI/OSC escapes survive strip()) so the envelope
+        # message cannot carry terminal garbage (FB-024).
+        cleaned = []
+        for line in actionable:
+            line = "".join(ch for ch in line if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+            cleaned.append(line)
+        return "; ".join(cleaned)
+    # The fallback tail is remote-influenced too: the same bound + scrub
+    # applies (Stage B ROOT-024 — the actionable branch was capped, the
+    # tail was not).
+    tail = _tail(stderr)
+    tail = "".join(ch for ch in tail if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+    return tail
 
 
 def _check_completeness(conn: sqlite3.Connection, repo: str) -> None:

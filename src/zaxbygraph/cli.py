@@ -31,6 +31,7 @@ from zaxbygraph.paths import (
     store_db_path,
 )
 from zaxbygraph.query import (
+    _MAX_FETCH_LIMIT,
     apply_item_bounds,
     assert_read_sql,
     churn,
@@ -169,10 +170,14 @@ def corpus_state(
     if conn is None or not repo:
         return count, last_full
     try:
+        # EXISTS/LIMIT-1 decides the same zero-items gate without scanning
+        # the whole items table per read (FB-019: the COUNT's lower(repo)
+        # predicate defeated the repo index and cost ~47 ms per read at
+        # 300k items; the caller only ever tests count == 0).
         row = conn.execute(
-            "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo,)
+            "SELECT 1 FROM items WHERE lower(repo) = ? LIMIT 1", (repo,)
         ).fetchone()
-        count = int(row[0]) if row is not None else 0
+        count = 0 if row is None else 1
     except sqlite3.Error:
         # A store predating the items table (or unreadable now) has no
         # corpus this decision can see.
@@ -546,13 +551,22 @@ def _parse_body_chars(value: str) -> int:
 
 def _parse_offset(value: str) -> int:
     """--offset N (search paging, issue #72 C14): ASCII non-negative integer;
-    negative values are rejected at the parser, never silently clamped."""
+    negative values are rejected at the parser, never silently clamped. The
+    magnitude shares --limit's ceiling: a huge offset reaches the SQL bind
+    as window=offset+limit and would raise OverflowError past every
+    envelope (FB-002, the #55 class)."""
     text = str(value).strip()
     if re.fullmatch(r"[0-9]+", text) is None:
         raise argparse.ArgumentTypeError(
             f"invalid --offset value: {value!r}"
         )
-    return int(text)
+    parsed = int(text)
+    if parsed > _MAX_FETCH_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"--offset value too large: {value!r}"
+            f" (maximum {_MAX_FETCH_LIMIT})"
+        )
+    return parsed
 
 
 def _sync_core(
@@ -1221,7 +1235,8 @@ def cmd_item(args: argparse.Namespace) -> int:
         numbers = list(getattr(args, "number") or [])
         exclude_bots = bool(getattr(args, "no_bots", False))
         if len(numbers) <= 1:
-            # Single number: the historical object payload, byte-identical.
+            # Single number: the historical object payload, byte-identical to
+            # the pre-v8 shape when neither evidence-history flag is passed.
             number = numbers[0] if numbers else None
             data = item(conn, number, repo=repo, exclude_bots=exclude_bots)
             if data is not None:
@@ -1272,6 +1287,39 @@ def cmd_item(args: argparse.Namespace) -> int:
             data = rows
             fresh = _freshness(conn, repo)
             line = _identity_line(conn, repo, db_path)
+    except ValueError as exc:
+        # The pre-v12 bot-flag gate (FB-004) raises ValueError from
+        # query.item: a structured bad_request naming the sync remedy,
+        # never a raw traceback.
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_request",
+        )
+    except sqlite3.Error as exc:
+        # A mid-query storage fault is reported, not a traceback (AGENTS
+        # invariant; FB-003): cmd_item carried no arm while its siblings
+        # did.
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
+    except LookupError as exc:
+        return emit_failure(
+            args,
+            1,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="not_found",
+        )
     finally:
         conn.close()
     if data is None:
@@ -1828,6 +1876,18 @@ def _run_read_promote_truncated(
             db_path=db_path,
             code_key="bad_request",
         )
+    except sqlite3.Error as exc:
+        # A mid-query storage fault is reported, not a traceback (AGENTS
+        # invariant; FB-003): search/related/item ran through this runner
+        # without the arm _run_read has had since the pr45 review.
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
     finally:
         conn.close()
     emit_result(
@@ -2100,6 +2160,10 @@ def cmd_sql(args: argparse.Namespace) -> int:
             used.add(f"{c}_{i}")
         rows = [dict(zip(keys, row)) for row in rows]
     payload: dict = {"columns": cols, "rows": rows}
+    if data.get("total_rows") is not None:
+        # The honest unfiltered total rides the CLI payload like the MCP
+        # twin and the shared shape registry declare (FB-014/ROOT-014).
+        payload["total_rows"] = data["total_rows"]
     if data.get("warnings"):
         # Issue #71 AC10: out-of-vocabulary warnings ride at the payload
         # top level so they survive --fields projection (which only touches
@@ -3250,14 +3314,22 @@ def main(argv: list[str] | None = None) -> int:
     except UsageError as exc:
         # A failed parse answers the structured envelope under a machine
         # format (issue #72 AC12); text mode on a TTY keeps the human line.
-        return _usage_envelope_exit(exc, argv)
+        try:
+            return _usage_envelope_exit(exc, argv)
+        except BrokenPipeError:
+            # The usage envelope itself can hit the dead pipe (FB-022):
+            # the quiet exit is the same contract the dispatch path has.
+            return _silence_broken_stdout()
     if getattr(args, "repo", None):
         try:
             args.repo = validate_slug(args.repo)
         except RepoError as exc:
             # Post-parse validation: still answers with the structured
             # envelope on stdout (argparse's own usage errors stay on stderr).
-            return emit_failure(args, 2, str(exc))
+            try:
+                return emit_failure(args, 2, str(exc))
+            except BrokenPipeError:
+                return _silence_broken_stdout()
     try:
         code = int(args.func(args))
     except BrokenPipeError:

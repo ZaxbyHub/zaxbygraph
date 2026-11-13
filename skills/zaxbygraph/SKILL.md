@@ -219,8 +219,10 @@ usage error).
 `comment_snippet`; `index_stale` is true when the DB predates the schema —
 reads never migrate) · `item` → all item
 columns plus
-`labels[] comments[] reviews[] files[] edges[]` (+ `comments_omitted` under
-`--max-comments`) · `related` →
+`labels[] comments[] reviews[] files[] edges[]` (comments/reviews default to
+the 5 most relevant; `--max-comments K` caps the comment list at K and `0`
+returns no comments; reviews keep the 5-entry cap with no CLI override; the body caps at
+20 KiB; `comments_omitted`/`reviews_omitted` are always present) · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row
 objects · `overlap` → `{pairs: [{a, b, shared}]}` · `file-history` →
@@ -254,7 +256,7 @@ answers a bare list of item rows. Conditional keys (`next_cursor`,
 | bundle | bundles, config_source, derived, dropped, excluded, formula_version, merge_candidates, pool, related_not_bundleable, repo, weights |
 | churn | additions, deletions, path, prs |
 | file-history | entries, index_stale |
-| item | author, body, comments, comments_omitted, created_at, edges, files, html_url, index_stale, kind, labels, number, repo, reviews, reviews_omitted, state, title, updated_at |
+| item | additions, api_url, author, author_association, base_ref, body, branch_token, changed_files, closed_at, comment_count, comments, comments_omitted, commits, created_at, deletions, dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by, dependencies_total_blocking, draft, edges, files, head_ref, html_url, id, index_stale, item_type, kind, labels, labels_text, locked, merge_commit, merged_at, merged_by, milestone, node_id, number, paths_text, reactions_total, repo, reviews, reviews_omitted, state, state_reason, sub_issues_completed, sub_issues_total, title, updated_at |
 | open | assignees, author, html_url, kind, labels, linked_open_prs, number, repo, title, updated_at |
 | overlap | pairs |
 | path | a, b, path, repo |

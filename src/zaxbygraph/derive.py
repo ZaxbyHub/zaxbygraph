@@ -3103,9 +3103,17 @@ def brief(
     # and analog legs below drop bot-authored items the same way. Sync
     # upserts an actors row for every author, so the inner join never loses a
     # human row. bots_omitted counts the filtered rows.
+    if exclude_bots:
+        # Same pre-v12 gate as search/item (FB-004): a structured refusal
+        # instead of a 'no such column' fault mid-brief.
+        from zaxbygraph.query import _require_bot_flags
+
+        _require_bot_flags(conn)
+    # NULL-safe (FB-005): comments whose author is unknown (NULL or no
+    # actors row) are NOT established bots and survive the filter.
     comment_bots = (
-        " JOIN actors comment_actors ON comment_actors.login = comments.author"
-        " AND comment_actors.is_bot = 0"
+        " AND NOT EXISTS (SELECT 1 FROM actors ca"
+        " WHERE ca.login = comments.author AND ca.is_bot = 1)"
         if exclude_bots
         else ""
     )
@@ -3120,8 +3128,8 @@ def brief(
             "SELECT comments.author AS author,"
             " comments.author_association AS author_association,"
             " comments.created_at AS created_at, comments.body AS body"
-            f" FROM comments{comment_bots}"
-            " WHERE comments.repo = ? AND comments.number = ?"
+            " FROM comments"
+            f" WHERE comments.repo = ? AND comments.number = ?{comment_bots}"
             " AND comments.kind = 'issue_comment'",
             (repo, number),
         )
@@ -3199,7 +3207,8 @@ def brief(
         " LEFT JOIN actors la ON la.login = i.author" if exclude_bots else ""
     )
     linked: list[dict] = []
-    seen_prs: set[int] = set()
+    live_prs: set[int] = set()
+    omitted_prs: set[int] = set()
     # linked_pr: the issue (src) points at its linked PR (dst); the closes
     # fallback: the PR (src) points at the issue (dst).
     for erow in conn.execute(
@@ -3212,12 +3221,17 @@ def brief(
         (repo, str(number)),
     ):
         pr = erow["pr"]
-        if pr is None or pr in seen_prs:
+        if pr is None or pr in live_prs or pr in omitted_prs:
             continue
-        seen_prs.add(pr)
         if exclude_bots and erow["author_is_bot"]:
+            # One bot PR can be referenced by several edges (linked_pr plus
+            # closes/closes_keyword); it is omitted ONCE, not once per edge
+            # (FB-013 + closeout X-1). Omitted PRs stay out of live_prs so
+            # _brief_live's gh fan-out can never carry one back in.
+            omitted_prs.add(pr)
             bots_omitted += 1
             continue
+        live_prs.add(pr)
         linked.append(
             {
                 "number": pr,
@@ -3236,12 +3250,13 @@ def brief(
         (repo, str(number)),
     ):
         pr = erow["pr"]
-        if pr is None or pr in seen_prs:
+        if pr is None or pr in live_prs or pr in omitted_prs:
             continue
-        seen_prs.add(pr)
         if exclude_bots and erow["author_is_bot"]:
+            omitted_prs.add(pr)
             bots_omitted += 1
             continue
+        live_prs.add(pr)
         linked.append(
             {
                 "number": pr,
@@ -3290,7 +3305,7 @@ def brief(
     # The live block attaches BEFORE the budget enforcement so the envelope
     # covers the complete packet, --live content included.
     if live:
-        live_block, live_error = _brief_live(repo, sorted(seen_prs), gh_path)
+        live_block, live_error = _brief_live(repo, sorted(live_prs), gh_path)
         packet["live"] = live_block
         if live_block is not None and live_block.get("omitted_prs"):
             # The live fan is aggregate-capped (pr49 review PRR-010); the

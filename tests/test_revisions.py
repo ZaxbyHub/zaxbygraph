@@ -566,10 +566,12 @@ class RevisionReadTests(TempDBTest):
         self.assertEqual(cov["revision_bytes"], 0)
 
     def test_plain_item_unchanged(self) -> None:
-        """AC6: the no-flag item output stays byte-identical to the base
-        shape. The golden was captured at base 548c07a (trace
-        repro/item_golden_base.json); the per-run temp db value is the only
-        normalization, and the fixture is never regenerated here."""
+        """AC6: the no-flag item output stays byte-identical to the shape
+        this PR ships. The golden was captured at base 548c07a (trace
+        repro/item_golden_base.json) and REGENERATED in PR #78 (PRR TI-008:
+        comments_omitted/reviews_omitted became always-present per issue #71
+        AC5 — the only delta); the per-run temp db value is the only other
+        normalization."""
         self.conn.execute("BEGIN")
         ingest_item(self.conn, REPO,
                     issue(1, title="golden one", body="GOLDEN-BODY-ONE",

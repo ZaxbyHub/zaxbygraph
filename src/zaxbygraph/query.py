@@ -325,8 +325,7 @@ _SEARCH_MERGED = """
                items.updated_at AS upd
         FROM items_fts
         JOIN items ON items.id = items_fts.rowid
-        {item_bots}
-        WHERE items_fts MATCH :match{item_repo}
+        WHERE items_fts MATCH :match{item_repo}{item_bots}
         UNION ALL
         SELECT comments.repo AS repo, comments.number AS number,
                bm25(comments_fts) AS score,
@@ -334,10 +333,8 @@ _SEARCH_MERGED = """
                items.updated_at AS upd
         FROM comments_fts
         JOIN comments ON comments.pk = comments_fts.rowid
-        {comment_bots}
         JOIN items ON items.repo = comments.repo AND items.number = comments.number
-        {comment_item_bots}
-        WHERE comments_fts MATCH :match{comment_repo}{reviews_arm}
+        WHERE comments_fts MATCH :match{comment_repo}{comment_bots}{comment_item_bots}{reviews_arm}
     ) AS hit
     GROUP BY hit.repo, hit.number
 """
@@ -356,34 +353,51 @@ _REVIEWS_ARM = """
                items.updated_at AS upd
         FROM reviews_fts
         JOIN reviews ON reviews.id = reviews_fts.rowid
-        {review_bots}
         JOIN items ON items.repo = reviews.repo AND items.number = reviews.number
-        {review_item_bots}
         WHERE reviews_fts MATCH :match{review_repo}
-          AND items.repo = reviews.repo AND items.number = reviews.number
+          AND items.repo = reviews.repo AND items.number = reviews.number{review_bots}{review_item_bots}
 """
 
 #: Bot-exclusion semi-joins (issue #71 C6 / plan CF-D), spliced into every
 #: search arm IN THE SQL — pre-ranking, so counts, snippets and pagination
 #: are computed over the filtered set. Inner JOIN on the author's actors row
-#: with is_bot = 0 drops bot-authored rows; sync upserts an actors row for
-#: every author it stores, so the join never loses a human row.
-#: _ITEM_BOT_FILTER is ALSO spliced after the comment/review arms' JOIN
-#: items (08b review Q1): a bot-authored ITEM leaves the stream even when a
-#: HUMAN comment or review matched it — its row is omitted and counted in
-#: bots_omitted, not surfaced under the bot's title.
+#: with is_bot = 1 EXCLUDES established bot rows only (FB-005: the inner
+#: is_bot=0 join silently dropped NULL-author rows — ghost/deleted GitHub
+#: accounts have no actors row — which are not established bots and were
+#: never counted in bots_omitted). NOT EXISTS is NULL-safe: a row whose
+#: author is NULL (or has no actors row) can never match the bot lookup and
+#: is kept, exactly like brief's LEFT JOIN+COALESCE treatment. Each constant
+#: is a WHERE fragment (" AND NOT EXISTS ..."), spliced INTO the host
+#: clause — never between joins, where a WHERE would be a syntax error.
+#: _ITEM_BOT_FILTER is ALSO spliced into the comment/review arms (08b review
+#: Q1): a bot-authored ITEM leaves the stream even when a HUMAN comment or
+#: review matched it — its row is omitted and counted in bots_omitted, not
+#: surfaced under the bot's title.
 _ITEM_BOT_FILTER = (
-    " JOIN actors item_actors ON item_actors.login = items.author"
-    " AND item_actors.is_bot = 0"
+    " AND NOT EXISTS (SELECT 1 FROM actors ia WHERE ia.login = items.author"
+    " AND ia.is_bot = 1)"
 )
 _COMMENT_BOT_FILTER = (
-    " JOIN actors comment_actors ON comment_actors.login = comments.author"
-    " AND comment_actors.is_bot = 0"
+    " AND NOT EXISTS (SELECT 1 FROM actors ca WHERE ca.login = comments.author"
+    " AND ca.is_bot = 1)"
 )
 _REVIEW_BOT_FILTER = (
-    " JOIN actors review_actors ON review_actors.login = reviews.author"
-    " AND review_actors.is_bot = 0"
+    " AND NOT EXISTS (SELECT 1 FROM actors ra WHERE ra.login = reviews.author"
+    " AND ra.is_bot = 1)"
 )
+
+
+def _require_bot_flags(conn: sqlite3.Connection) -> None:
+    """actors.is_bot exists only from schema v12; reads never migrate, so a
+    pre-v12 store cannot serve --no-bots/exclude_bots at all (FB-004). A
+    structured refusal naming the remedy replaces what would otherwise be
+    a raw 'no such column' OperationalError on the old store."""
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version < 12:
+        raise ValueError(
+            "exclude_bots/--no-bots needs schema v12+ (actors.is_bot);"
+            " this store is v%d — run 'zaxbygraph sync' to upgrade" % version
+        )
 
 
 def _content_tokens(raw: str) -> list[str]:
@@ -455,6 +469,7 @@ def _run_search_pass(
     legacy: bool = False,
     exclude_bots: bool = False,
     phrase: str | None = None,
+    known_total: int | None = None,
 ) -> tuple[int, list[sqlite3.Row]]:
     """One MATCH pass over items+comments (+reviews on v7 stores): returns
     (total distinct items, top-`limit` rows). Total is computed pre-limit so
@@ -470,7 +485,13 @@ def _run_search_pass(
     params: dict[str, object] = {"match": match}
     if repo:
         params["repo"] = repo
-    total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
+    # A caller that just computed the pass total (the fallback's broadened
+    # COUNT) hands it in: re-running the identical COUNT re-evaluated the
+    # whole merged FTS pass a second time for a discarded value (FB-018).
+    if known_total is not None:
+        total = known_total
+    else:
+        total = conn.execute(f"SELECT COUNT(*) FROM ({merged})", params).fetchone()[0]
     if phrase is None:
         page_sql = (
             f"SELECT * FROM ({merged}) "
@@ -584,17 +605,12 @@ def _hydrate_search_hit(
     rec["matching_comments"] = int(hit["matching_comments"] or 0)
     comment_snippet: str = ""
     if rec["matching_comments"]:
-        comment_bots = (
-            " JOIN actors comment_actors ON comment_actors.login = comments.author"
-            " AND comment_actors.is_bot = 0"
-            if exclude_bots
-            else ""
-        )
+        comment_bots = _COMMENT_BOT_FILTER if exclude_bots else ""
         found = conn.execute(
             "SELECT snippet(comments_fts, -1, '«', '»', '…', 12) "
-            "FROM comments_fts JOIN comments ON comments.pk = comments_fts.rowid"
+            "FROM comments_fts JOIN comments ON comments.pk = comments_fts.rowid "
+            "WHERE comments_fts MATCH ? AND comments.repo = ? AND comments.number = ?"
             f"{comment_bots} "
-            "WHERE comments_fts MATCH ? AND comments.repo = ? AND comments.number = ? "
             "ORDER BY bm25(comments_fts) ASC LIMIT 1",
             (match, repo, number),
         ).fetchone()
@@ -603,17 +619,12 @@ def _hydrate_search_hit(
     rec["matching_reviews"] = int(hit["matching_reviews"] or 0)
     review_snippet: str = ""
     if rec["matching_reviews"]:
-        review_bots = (
-            " JOIN actors review_actors ON review_actors.login = reviews.author"
-            " AND review_actors.is_bot = 0"
-            if exclude_bots
-            else ""
-        )
+        review_bots = _REVIEW_BOT_FILTER if exclude_bots else ""
         found = conn.execute(
             "SELECT snippet(reviews_fts, -1, '«', '»', '…', 12) "
-            "FROM reviews_fts JOIN reviews ON reviews.id = reviews_fts.rowid"
+            "FROM reviews_fts JOIN reviews ON reviews.id = reviews_fts.rowid "
+            "WHERE reviews_fts MATCH ? AND reviews.repo = ? AND reviews.number = ?"
             f"{review_bots} "
-            "WHERE reviews_fts MATCH ? AND reviews.repo = ? AND reviews.number = ? "
             "ORDER BY bm25(reviews_fts) ASC LIMIT 1",
             (match, repo, number),
         ).fetchone()
@@ -693,6 +704,8 @@ def search(
     limit = _clamp_limit(limit)
     offset = max(0, int(offset))
     user_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if exclude_bots:
+        _require_bot_flags(conn)
     index_stale = user_version < CURRENT_USER_VERSION
     corpus_items = conn.execute(
         "SELECT COUNT(*) FROM items" + (" WHERE repo = ?" if repo else ""),
@@ -750,7 +763,7 @@ def search(
         # level, so strict_total duplicates are the worst case).
         _b_total, or_rows = _run_search_pass(
             conn, any_query, repo, strict_total + need, legacy=legacy,
-            exclude_bots=exclude_bots, phrase=phrase,
+            exclude_bots=exclude_bots, phrase=phrase, known_total=broadened_total,
         )
         seen = {(row["repo"], int(row["number"])) for row in strict_rows}
         extra = [
@@ -848,20 +861,11 @@ def item(
     # Bot exclusion (issue #71 C6 / plan CF-D) filters comments and reviews
     # IN THE QUERY, before any omission counting: the rows never reach the
     # payload, and bots_omitted counts exactly the excluded comment+review
-    # rows. Sync upserts an actors row for every author, so the inner join
-    # never drops a human row.
-    comment_bots = (
-        " JOIN actors comment_actors ON comment_actors.login = comments.author"
-        " AND comment_actors.is_bot = 0"
-        if exclude_bots
-        else ""
-    )
-    review_bots = (
-        " JOIN actors review_actors ON review_actors.login = reviews.author"
-        " AND review_actors.is_bot = 0"
-        if exclude_bots
-        else ""
-    )
+    # rows. NOT EXISTS keeps NULL-author rows (not established bots — FB-005).
+    if exclude_bots:
+        _require_bot_flags(conn)
+    comment_bots = _COMMENT_BOT_FILTER if exclude_bots else ""
+    review_bots = _REVIEW_BOT_FILTER if exclude_bots else ""
     rec["labels"] = [
         _row_to_dict(x)
         for x in conn.execute(
@@ -875,8 +879,9 @@ def item(
             " comments.kind AS kind, comments.author AS author,"
             " comments.created_at AS created_at, comments.body AS body,"
             " comments.html_url AS html_url "
-            f"FROM comments{comment_bots} "
-            "WHERE comments.repo = ? AND comments.number = ? ORDER BY created_at",
+            "FROM comments "
+            f"WHERE comments.repo = ? AND comments.number = ?{comment_bots} "
+            "ORDER BY created_at",
             (r, n),
         ).fetchall()
     ]
@@ -886,8 +891,9 @@ def item(
             "SELECT reviews.id AS id, reviews.author AS author,"
             " reviews.state AS state, reviews.submitted_at AS submitted_at,"
             " reviews.body AS body, reviews.html_url AS html_url "
-            f"FROM reviews{review_bots} "
-            "WHERE reviews.repo = ? AND reviews.number = ? ORDER BY submitted_at",
+            "FROM reviews "
+            f"WHERE reviews.repo = ? AND reviews.number = ?{review_bots} "
+            "ORDER BY submitted_at",
             (r, n),
         ).fetchall()
     ]
@@ -1391,6 +1397,28 @@ def related(
                 break
             nodes_bytes += size
         nodes.append(node)
+    # Nodes the budget cut are gone from the payload; edges still naming them
+    # would dangle (FB-015). Drop those edges — the fragment stays internally
+    # consistent, and truncated:true already discloses the cut.
+    emitted = {str(node["number"]) for node in nodes}
+    def _endpoint_cut(kind: str, ident) -> bool:
+        # Only a LOCAL item endpoint can dangle (its node was budget-cut);
+        # repo-qualified foreign ids were never node candidates and actor/
+        # file/commit endpoints live outside nodes[] by shape (FB-015).
+        return (
+            kind == "item"
+            and isinstance(ident, str)
+            and ident.isdigit()
+            and ident not in emitted
+        )
+    seen_edges = [
+        edge
+        for edge in seen_edges
+        if not (
+            _endpoint_cut(edge["src_type"], edge["src_id"])
+            or _endpoint_cut(edge["dst_type"], edge["dst_id"])
+        )
+    ]
     return {
         "number": number,
         "repo": repo,
@@ -1839,11 +1867,22 @@ def sql_max_bytes_from_env() -> int:
     return value if value > 0 else _DEFAULT_SQL_MAX_BYTES
 
 
-def _sql_error(exc: sqlite3.Error, deadline: float) -> ValueError:
+def _sql_error(
+    exc: sqlite3.Error, deadline_at: float, deadline: float
+) -> ValueError:
     """Map a stepping sqlite3 error: the progress handler's `interrupted`
     abort becomes SqlTimeoutError (so the adapters can code it `timeout`);
-    every other sqlite error keeps the historical ValueError conversion."""
-    if isinstance(exc, sqlite3.OperationalError) and "interrupted" in str(exc).lower():
+    every other sqlite error keeps the historical ValueError conversion.
+    The interrupt is believed only when the deadline INSTANT has actually
+    passed (Stage B: comparing monotonic() against the relative duration
+    was an uptime bug) — an identifier that merely contains the word
+    "interrupted" (a column named interrupted_at) keeps its real
+    diagnostic (FB-009)."""
+    if (
+        isinstance(exc, sqlite3.OperationalError)
+        and "interrupted" in str(exc).lower()
+        and time.monotonic() >= deadline_at
+    ):
         return SqlTimeoutError(deadline)
     return ValueError(str(exc))
 
@@ -1854,7 +1893,10 @@ def _render_cell(value):
     is capped at _SQL_CELL_CAP chars with an explicit marker (issue #71
     AC2). Other types (ints, floats, None) pass through unchanged."""
     if isinstance(value, bytes):
-        return value.hex()
+        hexed = value.hex()
+        if len(hexed) > _SQL_CELL_CAP:
+            return hexed[:_SQL_CELL_CAP] + _SQL_CELL_MARKER
+        return hexed
     if isinstance(value, str) and len(value) > _SQL_CELL_CAP:
         return value[:_SQL_CELL_CAP] + _SQL_CELL_MARKER
     return value
@@ -1920,7 +1962,9 @@ def _statement_for_wrap(sql: str) -> str | None:
     return inner or None
 
 
-def _completion_count(conn: sqlite3.Connection, sql: str, deadline: float) -> int | None:
+def _completion_count(
+    conn: sqlite3.Connection, sql: str, deadline_at: float, deadline: float
+) -> int | None:
     """Fully evaluate the statement inside SQLite as
     `SELECT COUNT(*) FROM (<statement>)` (issue #71 AC1).
 
@@ -1941,7 +1985,7 @@ def _completion_count(conn: sqlite3.Connection, sql: str, deadline: float) -> in
     try:
         row = conn.execute(f"SELECT COUNT(*) FROM ({inner})").fetchone()
     except sqlite3.OperationalError as exc:
-        if "interrupted" in str(exc).lower():
+        if "interrupted" in str(exc).lower() and time.monotonic() >= deadline_at:
             raise SqlTimeoutError(deadline) from exc
         return None
     except sqlite3.Error:
@@ -2003,7 +2047,7 @@ def _scope_tables(sql: str, schema: dict[str, list[str]]) -> tuple[list[str], di
 
 
 def _vocabulary_warnings(
-    conn: sqlite3.Connection, sql: str, deadline: float
+    conn: sqlite3.Connection, sql: str, deadline_at: float, deadline: float
 ) -> list[dict]:
     """Out-of-vocabulary literal warnings (issue #71 AC10).
 
@@ -2051,7 +2095,10 @@ def _vocabulary_warnings(
                 ).fetchall()
                 stored_cache[key] = [row[0] for row in rows]
             except sqlite3.OperationalError as exc:
-                if "interrupted" in str(exc).lower():
+                if (
+                    "interrupted" in str(exc).lower()
+                    and time.monotonic() >= deadline_at
+                ):
                     raise SqlTimeoutError(deadline) from exc
                 stored_cache[key] = None
             except sqlite3.Error:
@@ -2067,6 +2114,10 @@ def _vocabulary_warnings(
                 vocab.append((table, column))
 
     for table, column in vocab:
+        # Pure-Python regex fan-out: the progress handler cannot interrupt
+        # this loop, so the wall-clock bail lives HERE (Stage B ROOT-008).
+        if time.monotonic() >= deadline_at:
+            raise SqlTimeoutError(deadline)
         if table not in scope:
             continue
         refs: list[str] = [table]
@@ -2083,7 +2134,16 @@ def _vocabulary_warnings(
             patterns.append(rf"(?<![\w.]){re.escape(column)}\s*=\s*'([^']*)'")
         literals: list[str] = []
         for pattern in patterns:
-            for literal in re.findall(pattern, stripped, re.IGNORECASE):
+            for m in re.finditer(pattern, stripped, re.IGNORECASE):
+                # '([^']*)' stops at the first quote: the escaped shape
+                # ('it''s fine') yields the prefix 'it', a string the
+                # statement never compared (FB-026). A capture whose match
+                # ends right before another quote is that ambiguous prefix;
+                # skip it (the token-stream literal parser is the honest
+                # fix, owned by the vocabulary-pass rework).
+                if stripped[m.end(): m.end() + 1] == "'":
+                    continue
+                literal = m.group(1)[:_SQL_CELL_CAP]
                 if literal and literal not in literals:
                     literals.append(literal)
         for literal in literals[:32]:
@@ -2135,7 +2195,7 @@ def run_sql(
         try:
             cur.execute(sql)
         except sqlite3.Error as exc:
-            raise _sql_error(exc, deadline) from exc
+            raise _sql_error(exc, deadline_at, deadline) from exc
         if cur.description is None:
             return {"columns": [], "rows": [], "truncated": False}
         cols = [d[0] for d in cur.description]
@@ -2155,18 +2215,25 @@ def run_sql(
             try:
                 chunk = cur.fetchmany(min(remaining, _FETCH_CHUNK))
             except sqlite3.Error as exc:
-                raise _sql_error(exc, deadline) from exc
+                raise _sql_error(exc, deadline_at, deadline) from exc
             if not chunk:
                 exhausted = True
                 break
             for row in chunk:
                 rendered = [_render_cell(value) for value in row]
-                budget_left -= sum(len(str(value)) for value in rendered)
-                rows.append(rendered)
-                remaining -= 1
-                if budget_left < 0:
+                # Serialized size in UTF-8 bytes (FB-001: len(str) counted
+                # characters, so non-ASCII rows undercounted against a byte
+                # budget), and the over-budget row is NOT returned — the
+                # caller's context bound must hold for every row shipped.
+                row_bytes = sum(
+                    len(str(value).encode("utf-8", "replace")) for value in rendered
+                )
+                if row_bytes > budget_left:
                     truncated = True
                     break
+                budget_left -= row_bytes
+                rows.append(rendered)
+                remaining -= 1
             if truncated:
                 break
         if not exhausted and not truncated and len(rows) > limit:
@@ -2186,12 +2253,19 @@ def run_sql(
             # always converges; the flag must not be recomputed post-filter.
             idx = cols.index("repo")
             rows = [row for row in rows if row[idx] == repo]
-        warnings = _vocabulary_warnings(conn, sql, deadline)
+        # Auxiliary passes share the statement's deadline (frozen AC1/C1
+        # pins a runaway statement answering the coded timeout, and a
+        # runaway completion pass IS the statement still running — the
+        # FB-016 reviewers' "judgment call" is settled by that contract):
+        # a diagnostic overrun converts the call to `timeout` exactly as
+        # the fetch phase does. Rows-then-timeout was probed and rejected
+        # as a frozen-contract violation; recorded in the PR ledger.
+        warnings = _vocabulary_warnings(conn, sql, deadline_at, deadline)
         result: dict = {"columns": cols, "rows": rows, "truncated": truncated}
         if warnings:
             result["warnings"] = warnings
         if truncated:
-            total = _completion_count(conn, sql, deadline)
+            total = _completion_count(conn, sql, deadline_at, deadline)
             if total is not None:
                 result["total_rows"] = total
         return result

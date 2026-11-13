@@ -45,6 +45,7 @@ from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull, review
 from zaxbygraph import cli
 from test_mcp import McpSession, pin_env_for, run_cli, tool_envelope
 from zaxbygraph.db import connect, init_schema
+from zaxbygraph import query
 from zaxbygraph.query import page_truncated
 from zaxbygraph.sync import sync_repo
 
@@ -62,8 +63,8 @@ class _Problems(list):
     def leg(self, label: str):
         try:
             yield
-        except AssertionError as exc:
-            self.append(f"{label}: {exc}")
+        except Exception as exc:  # ROOT-041: any failure names the leg and continues
+            self.append(f"{label}: {type(exc).__name__}: {exc}")
 
 
 def _seed_scratch_db(db_path: Path, seeder) -> Path:
@@ -420,6 +421,144 @@ class SearchHonestyExtTests(unittest.TestCase):
             with self.subTest(args=args):
                 self.assertIs(page_truncated(*args), want)
 
+    def test_mcp_related_over_budget_reports_truncated(self) -> None:
+        # TF-002 (#71 AC7 MCP leg): the CLI-only frozen check never drove the
+        # MCP related adapter's truncated promotion over budget.
+        def seed(src: FakeGitHubSource) -> None:
+            # One hub mentioning 109 stored neighbors (the frozen C7 fixture's
+            # shape): mention edges give a 110-node one-hop neighborhood.
+            neighbors = range(1, 110)
+            src.add_issue(issue(200, title="hub", state="open", body="star " + " ".join(f"#{n}" for n in neighbors)))
+            for n in neighbors:
+                src.add_issue(issue(n, title=f"star {n}", state="open"))
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        pin_env_for(self, self.root, db=db_path)
+        session = McpSession(self, cwd=str(self.root), repo=REPO, db=str(db_path), stale_after_s=_NO_REFRESH_S)
+        self.addCleanup(session.stop)
+        session.initialize()
+        _result, env = tool_envelope(
+            self,
+            session.call_tool("related", {"repo": REPO, "number": 200}),
+            "tf002",
+        )
+        self.assertIs(env.get("ok"), True, f"related must succeed: {env.get('error')!r}")
+        self.assertGreater(
+            len((env.get("data") or {}).get("nodes") or []), 0, "fixture sanity: the hub must return its neighborhood"
+        )
+        self.assertIs(
+            env.get("truncated"), True,
+            "a >100-node neighborhood over the default budget must promote truncated:true on the MCP surface",
+        )
+        session.stop()
+
+    def test_mcp_brief_exclude_bots_filters_ranking(self) -> None:
+        # TF-003 (#71 AC6 brief MCP leg): the flag threads into derive's
+        # comment ranking and bot-authored items are dropped.
+        def seed(src: FakeGitHubSource) -> None:
+            src.add_issue(issue(40, title="bot brief target", body="briefme", state="open", comments=2))
+            src.comment_on(40, "human note briefme", author="alice")
+            src.comment_on(40, "bot noise briefme", author="dependabot[bot]")
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        conn = connect(db_path)
+        init_schema(conn)
+        conn.execute("UPDATE actors SET is_bot = 1 WHERE login = 'dependabot[bot]'")
+        conn.commit()
+        conn.close()
+        pin_env_for(self, self.root, db=db_path)
+        session = McpSession(self, cwd=str(self.root), repo=REPO, db=str(db_path), stale_after_s=_NO_REFRESH_S)
+        self.addCleanup(session.stop)
+        session.initialize()
+        _result, env = tool_envelope(
+            self,
+            session.call_tool("brief", {"repo": REPO, "number": 40, "exclude_bots": True}),
+            "tf003",
+        )
+        self.assertIs(env.get("ok"), True, f"brief must succeed: {env.get('error')!r}")
+        data = env.get("data") or {}
+        authors = [c.get("author") for c in data.get("comments") or []]
+        self.assertNotIn("dependabot[bot]", authors, f"bot comments must be filtered from the brief ranking; got {authors}")
+        self.assertIn("alice", authors, "the human comment must survive")
+        session.stop()
+
+    def test_sql_env_knobs_clamp_and_wire(self) -> None:
+        # TF-004: the documented env-knob semantics (clamp/fallback) and the
+        # CLI/MCP adapter byte-budget wiring were untested. The knobs read
+        # os.environ at CALL time, so mock.patch.dict is enough -- NO
+        # importlib.reload: a reload re-executes the module and forks the
+        # SqlTimeoutError/UnknownFilePathError classes, so the cli and
+        # mcp_server catch arms stop matching them (closeout X-2: ordering
+        # this test before the frozen C1 leg broke 'runtime' != 'timeout').
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"ZAXBYGRAPH_SQL_TIMEOUT_S": "9999", "ZAXBYGRAPH_SQL_MAX_BYTES": "-5"}):
+            self.assertEqual(query.sql_deadline_from_env(), 600.0,
+                             "the timeout clamp (0,600] pins 9999 to 600")
+            self.assertEqual(query.sql_max_bytes_from_env(), query._DEFAULT_SQL_MAX_BYTES,
+                             "a non-positive byte budget falls back to the default")
+        with mock.patch.dict(os.environ, {"ZAXBYGRAPH_SQL_TIMEOUT_S": "junk", "ZAXBYGRAPH_SQL_MAX_BYTES": "4096"}):
+            self.assertEqual(query.sql_deadline_from_env(), query._DEFAULT_SQL_DEADLINE_S,
+                             "malformed timeout falls back to the default")
+            self.assertEqual(query.sql_max_bytes_from_env(), 4096,
+                             "a positive byte budget is honoured")
+
+        # Adapter wiring: a tiny byte budget through the CLI answers
+        # truncated with total_rows (the budget, not the row limit, tripped).
+        def seed(src: FakeGitHubSource) -> None:
+            for n in range(1, 6):
+                src.add_issue(issue(n, title=f"wide {n}", body="y" * 900, state="open"))
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        base = ["--repo", REPO, "--db", str(db_path)]
+        saved_max = os.environ.get("ZAXBYGRAPH_SQL_MAX_BYTES")
+        os.environ["ZAXBYGRAPH_SQL_MAX_BYTES"] = "2000"
+        try:
+            code, out, err = run_cli(["sql", "SELECT number, body FROM items ORDER BY number", "--format", "json", *base])
+            self.assertEqual(code, 0, err)
+            env = _env_of(out, "tf004")
+            data = env["data"]
+            self.assertTrue(env.get("truncated") or data.get("truncated"), "a 2000-byte budget must truncate a ~4.5KB result")
+            self.assertLess(len(data.get("rows") or []), 5, "fewer than all 5 rows ride under the budget")
+        finally:
+            if saved_max is None:
+                os.environ.pop("ZAXBYGRAPH_SQL_MAX_BYTES", None)
+            else:
+                os.environ["ZAXBYGRAPH_SQL_MAX_BYTES"] = saved_max
+
+    def test_search_total_matches_equal_across_limits(self) -> None:
+        # cubic-t355: the AC5 frozen check never compared total_matches at
+        # limit 1 vs 20; pin the equality here (limit-independent counts).
+        def seed(src: FakeGitHubSource) -> None:
+            for n in range(1, 9):
+                src.add_issue(issue(n, title=f"equal counts {n}", body="needle sunset here"))
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        base = ["--repo", REPO, "--db", str(db_path), "--format", "json"]
+        totals = []
+        for limit in ("1", "20"):
+            code, out, err = run_cli(["search", "needle sunset", "--limit", limit, *base])
+            self.assertEqual(code, 0, err)
+            data = _env_of(out, "t355")["data"]
+            totals.append((data["total_matches"], data["strict_matches"], data["broadened_matches"]))
+        self.assertEqual(totals[0], totals[1], f"counts must be limit-independent; got {totals}")
+
+    def test_item_bounded_body_is_real_and_marked(self) -> None:
+        # cubic-t718: the frozen AC5 leg accepts a silently DROPPED body;
+        # pin body non-empty + the truncation marker + the omitted count.
+        def seed(src: FakeGitHubSource) -> None:
+            src.add_issue(issue(50, title="bounded", body="z" * 30000, state="open"))
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        base = ["--repo", REPO, "--db", str(db_path), "--format", "json"]
+        code, out, err = run_cli(["item", "50", *base])
+        self.assertEqual(code, 0, err)
+        data = _env_of(out, "t718")["data"]
+        body = data.get("body") or ""
+        self.assertGreater(len(body), 0, "a bounded body must still be delivered, never dropped")
+        self.assertIn("truncated", body, f"the body must carry its truncation marker; got tail {body[-80:]!r}")
+        self.assertEqual(int(data.get("body_chars_omitted") or 0), 30000 - 20480, "the omitted-char count names exactly what was cut")
+
     def test_usage_envelope_survives_a_tty_with_explicit_format(self) -> None:
         # Final-critic r1 f1: the real entry points call main() with no argv
         # list; the machine-format pre-scan must fall back to sys.argv and
@@ -484,6 +623,9 @@ class SearchHonestyExtTests(unittest.TestCase):
     def test_large_text_pipe_exits_quietly(self) -> None:
         # Final-critic r2 R2-1: text mode on a payload larger than the pipe
         # buffer must ride the same boundary wrapper (print() bypassed it).
+        # >64 KiB verified (TI-003): the fixture's bodies ARE the payload via
+        # item multi-number — `open` never rendered bodies and the old leg
+        # measured 8.8 KiB, a ~660-byte margin over the 8 KiB chunk.
         def seed(src: FakeGitHubSource) -> None:
             for number in range(30):
                 src.add_issue(issue(number, title=f"drain {number}", body="x" * 4000, state="open", comments=4))
@@ -497,7 +639,8 @@ class SearchHonestyExtTests(unittest.TestCase):
         for fmt in ("text", "json"):
             with tempfile.TemporaryFile() as err_file:
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "zaxbygraph", "open", "--limit", "50", "--format", fmt,
+                    [sys.executable, "-m", "zaxbygraph", "item", *[str(n) for n in range(1, 31)],
+                     "--format", fmt,
                      "--repo", REPO, "--db", str(db_path)],
                     stdout=subprocess.PIPE, stderr=err_file, stdin=subprocess.DEVNULL, env=env, cwd=str(self.root),
                 )
@@ -523,8 +666,21 @@ class SearchHonestyExtTests(unittest.TestCase):
         self.assertEqual(sorted(data.keys()), ["number", "title"], f"the single item projects to the requested keys; got {sorted(data.keys())}")
         code_a, out_a, _ = run_cli(["item", "1", "--format", "json", *base])
         code_b, out_b, _ = run_cli(["item", "1", "--format", "json", *base])
-        self.assertEqual(code_a, code_b, 0)
-        self.assertEqual(out_a, out_b, "no-flag output is deterministic (byte-identical across runs)")
+        self.assertEqual(code_a, 0, out_a)
+        self.assertEqual(code_b, 0, out_b)
+
+        def _strip_freshness(text: str) -> str:
+            env = json.loads(text)
+            env.pop("freshness", None)  # age_s ticks per second (TI-001)
+            env["db"] = ""
+            return json.dumps(env, sort_keys=True)
+
+        self.assertEqual(
+            _strip_freshness(out_a),
+            _strip_freshness(out_b),
+            "no-flag output is deterministic (byte-identical across runs"
+            " once the ticking freshness clock is stripped)",
+        )
 
 
 class BodyBoundSemanticsExtTests(unittest.TestCase):
