@@ -91,12 +91,19 @@ registers it.
   `InputRequiredResult` naming `repo` when nothing pins one — the same
   slug-keyed store the CLI resolves, so a worktree and its main checkout share
   one graph. Pass `repo` explicitly when your roots span more than one
-  checkout. (Legacy note: the server asks the client for roots on every repo-less
-call that no `--repo` pin resolves; a client that never answers that
-request stalls that call.)
+  checkout. (Legacy note: the roots/list round-trip is capability-gated — it
+  is sent only to a legacy client that DECLARED the roots capability at
+  `initialize`; an undeclared client is never asked, and its repo-less calls
+  resolve through the server pin or the server cwd's git origin, else answer
+  a structured error naming `repo`.)
 - Stale reads (default threshold 15 minutes) answer immediately and start one
   background sync; `freshness.refreshing: true` tells you new data is landing.
-  Use `graph_status` for sync progress. Note the `sync` tool's own envelope
+  Use `graph_status` for sync progress. When a background refresh FAILS, the
+  store's sync_state is restored untouched, retries are suppressed for the
+  backoff window (`ZAXBYGRAPH_REFRESH_BACKOFF_S`, default 300 s), and reads
+  inside that window still answer from current data but carry
+  `freshness.refresh_failed: "<reason>"` instead of `refreshing`.
+  Note the `sync` tool's own envelope
   always carries `freshness.complete: false` (the job is async — freshness is
   not yet known); that is not the "broken corpus" signal it means on `status`.
 - The CLI remains the fallback surface. Writes: `sync` exists on BOTH surfaces
@@ -190,15 +197,21 @@ payloads — rows only, no envelope, no identity fields; any `head -n` prefix
 parses) · `text` (default on a TTY, renders the payload only; the only
 format with the stderr identity line — never merge streams when parsing it).
 `--fields repo,number` projects rows to those keys that exist (unknown keys
-are omitted) — applies to list payloads and `sql` rows in both row modes, not
-to nested arrays inside dict payloads. `sql` rows are objects keyed by column
+are omitted) — applies to list payloads including the row lists inside dict
+payloads (search items, related nodes, similar candidates, triage rows,
+bundle bundles — sibling keys of the list are dropped on those commands),
+`item` (single object or multi-number rows), and `sql` rows in both row
+modes, not to other nested arrays. `--format jsonl` streams those row lists
+one JSON object per line (rows only, no envelope). `sql` rows are objects keyed by column
 by default — duplicate column names are suffixed `name_2`, `name_3`, ... so
 no value is lost (`--rows array` keeps positional lists with exact
 duplicates; `--limit N` for the cap). `item N --max-comments K` caps the comment list (first, last and maintainer
 preferred, reporting `comments_omitted`); read commands accept `--max-age D`
 to refresh a stale store first (reports `freshness.refreshed: true`; reads
 never write without the flag). `item N --max-body-chars C` truncates
-bodies and marks them `truncated: true`.
+bodies and marks them `truncated: true` (`0` is the explicit uncapped
+override — the default 20 KiB body bound does not apply; negatives are a
+usage error).
 
 **Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
 `{items[], matched_mode, total_matches, corpus_items, index_stale}`
@@ -206,8 +219,11 @@ bodies and marks them `truncated: true`.
 `comment_snippet`; `index_stale` is true when the DB predates the schema —
 reads never migrate) · `item` → all item
 columns plus
-`labels[] comments[] reviews[] files[] edges[]` (+ `comments_omitted` under
-`--max-comments`) · `related` →
+`labels[] comments[] reviews[] files[] edges[]` (comments use the first/last/
+maintainer preference, survivors chronological, up to 5 by default --
+`--max-comments K` overrides the count and `0` returns none; reviews keep the
+first 5 in submitted order, MCP get_item `max_reviews` overrides; the body caps at
+20 KiB; `comments_omitted`/`reviews_omitted` are always present) · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row
 objects · `overlap` → `{pairs: [{a, b, shared}]}` · `file-history` →
@@ -227,6 +243,32 @@ carries `total_matches: 0` and `corpus_items: <n>`, so "no prior art" is
 distinguishable from an empty corpus). `path` is `null` when no route exists —
 with exit code 0, because "not connected" is an answer.
 
+**Per-command data keys** — one shape registry feeds this table, the MCP
+`tools/list` outputSchemas, and `zaxbygraph schema --output COMMAND` (which
+prints the live declaration plus the payload kind and a description; the
+sets are exact by construction). `churn` and `open` answer a BARE list of
+row objects, so their cells are the row fields; `item N1 N2 ...` likewise
+answers a bare list of item rows. Conditional keys (`next_cursor`,
+`bots_omitted`, `warnings`, ...) are not listed — only always-present keys are.
+
+| command | data keys |
+| --- | --- |
+| brief | analog, body, comments, config_source, content_trust, derived, features, files, formula_version, linked_prs, number, repo, weights |
+| bundle | bundles, config_source, derived, dropped, excluded, formula_version, merge_candidates, pool, related_not_bundleable, repo, weights |
+| churn | additions, deletions, path, prs |
+| file-history | entries, index_stale |
+| item | additions, api_url, author, author_association, base_ref, body, branch_token, changed_files, closed_at, comment_count, comments, comments_omitted, commits, created_at, deletions, dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by, dependencies_total_blocking, draft, edges, files, head_ref, html_url, id, index_stale, item_type, kind, labels, labels_text, locked, merge_commit, merged_at, merged_by, milestone, node_id, number, paths_text, reactions_total, repo, reviews, reviews_omitted, state, state_reason, sub_issues_completed, sub_issues_total, title, updated_at |
+| open | assignees, author, html_url, kind, labels, linked_open_prs, number, repo, title, updated_at |
+| overlap | pairs |
+| path | a, b, path, repo |
+| related | edges, index_stale, nodes, number, repo |
+| search | broadened_matches, corpus_items, index_stale, items, matched_mode, offset, strict_matches, total_matches |
+| similar | candidates, capabilities, derived, ls_files_applied, ls_files_head, repo, resolved_path_count, target, weights |
+| sql | columns, rows |
+| status | counts, coverage, repos, snapshot |
+| triage | blocking_source, config_source, cursor, derived, formula_version, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
+| what-closed | commits, index_stale, keyword_closes, kind, number, prs |
+
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
 per-column notes (TEXT-typed `edges.src_id`/`dst_id`; `edges.source` names the
 provenance stream; `pr_files.patch` is NULL
@@ -240,8 +282,8 @@ answers from the database you are querying.
 | --- | --- | --- |
 | `0` | Success | — |
 | `2` | Bad request: bad flags, non-read SQL, multiple statements, environment guards (SQLite too old, database newer than this build), the DB holds other repos but not the resolved one (the error lists them) — and every other snapshot guard rejection, including the four whose hint says to retry or re-pull (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`) | **Fix the request or the environment.** Retrying unchanged always fails again. Those four stay `2` by policy, not because of what caused them: two can have a busy or an uninspectable destination as their immediate cause (`dest_open` covers a store held open by another process; `dest_sidecar_stale`'s first leg is an uninspectable `-wal`), so the boundary cannot be stated as "transient causes answer 1". What the two exit-1 refusals share is that they fire *before* the destination is touched, so a retry is a genuinely fresh attempt. |
-| `1` | Runtime: item not found, sync failure, authorizer denial, or one of the two inspection refusals — `snapshot pull`'s `dest_uninspectable` (the destination cannot be stat-ed or opened) and `export-corpus`'s `out_is_database` *on its cannot-inspect legs only* (the same code answers `2` on its alias, hard-link and device legs, so the code alone does not tell you the exit class) | Situational — may be a real absence, or worth one retry. **Narrow, not a general rule:** a guard rejection whose hint says "re-pull" does *not* by itself mean 1. Several pre-existing refusals that answer 1 are unrelated to this rule and are not snapshot guard rejections: `export-corpus --require-complete`'s `incomplete_store` (the store is genuinely not ready, so a retry after a sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`), `store_unreadable` (the store could not be opened at all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime` class (a storage fault at execution time). |
-| `3` | No corpus for the resolved repo: the resolved DB is missing or empty | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
+| `1` | Runtime: item not found, sync failure, authorizer denial, or one of the per-attempt refusals — `snapshot pull`'s `dest_uninspectable` (the destination cannot be stat-ed or opened), `snapshot pull`'s `source_unreachable` (git could not reach the snapshot SOURCE: transport or auth failure, carrying git's own message), and `export-corpus`'s `out_is_database` *on its cannot-inspect legs only* (the same code answers `2` on its alias, hard-link and device legs, so the code alone does not tell you the exit class) | Situational — may be a real absence, or worth one retry. **Narrow, not a general rule:** a guard rejection whose hint says "re-pull" does *not* by itself mean 1. Several pre-existing refusals that answer 1 are unrelated to this rule and are not snapshot guard rejections: `export-corpus --require-complete`'s `incomplete_store` (the store is genuinely not ready, so a retry after a sync can succeed), `bad_as_of` (a malformed `--as-of`; see `item`), `store_unreadable` (the store could not be opened at all), `refresh_failed` (a `--max-age` refresh failed), and the `runtime` class (a storage fault at execution time). |
+| `3` | No corpus for the resolved repo: zero items and no completed full sync (a failed first sync is still no corpus) | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
 
 Errors print `error: MESSAGE` to stderr and answer with the structured
 `{ok: false, error: {code, message, hint?}}` envelope on stdout (exit codes
@@ -266,8 +308,15 @@ guessable, and three things trip up most first attempts:
   aiming `--db` at a multi-repo file.
 - `pr_files.patch` is `NULL` unless the sync used `--include-patches`.
 
-Results are capped (default 200 rows) and fetched incrementally, so a broad
-query is safe to run.
+Results are capped (default 200 rows), fetched incrementally, and bounded by
+a deadline and a result byte budget: a query that runs past the deadline
+(default 5 s; `ZAXBYGRAPH_SQL_TIMEOUT_S`, clamped to (0, 600]) is interrupted
+and answers the coded `timeout` error, and oversized results stop fetching
+with `truncated: true` (oversized cells are capped with an explicit marker;
+the budget is `ZAXBYGRAPH_SQL_MAX_BYTES`, default 1 MiB — the same knob on
+both the CLI and the MCP `sql` tool).
+No broad query is unbounded — narrow it (`LIMIT`, tighter predicates) or
+raise the timeout instead of retrying blind.
 
 ## Interpreting `closes` correctly
 

@@ -190,10 +190,12 @@ Every command accepts:
 | `--db PATH` | Database location. Default as above. |
 | `--repo OWNER/REPO` | Which repo to act on. Defaults to the `origin` remote of the current git repo — for real, on every command (issue #2). Pass `--repo ''` for an explicit no-filter across the whole DB. Exception: `export-corpus` and the derived reads (all seven of `similar`/`explain`/`coupling`/`eval`/`triage`/`bundle`/`brief`) refuse `--repo ''` (`repo_required`) — results are defined per repo. |
 | `--format json\|compact\|jsonl\|text` | Output format. Defaults to `text` on a TTY and `json` when piped. `json` and `compact` always carry the envelope; `jsonl` prints list payloads one object per line (any `head -n` prefix parses; rows only — no envelope, so no identity fields on that surface); `text` is a light flattening of the payload only and the only format with the stderr identity line — **prefer `json` for anything parsed**. |
-| `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads and `sql` rows in both row modes; not to nested arrays inside dict payloads. |
+| `--fields a,b` | Project rows to those keys (unknown keys are omitted). Applies to list payloads (including the row lists inside dict payloads — search items, related nodes, similar candidates, triage rows, bundle bundles; sibling keys such as `total_matches` are dropped on those commands), `item` (single object or multi-number rows), and `sql` rows in both row modes; not to other nested arrays. |
 | `--rows objects\|array`, `--limit N` | `sql` only: row shape (objects by default) and row cap (default 200). |
-| `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. |
+| `--max-body-chars N` | `item` only: truncate bodies to N chars and mark them `truncated: true`. `0` is the explicit uncapped override (the default 20 KiB body bound does not apply); a negative value is a usage error. The MCP `get_item` `max_body_chars` argument follows the same contract. |
 | `--max-comments K` | `item` only: cap the comment list to K entries (first, last, and maintainer comments preferred, survivors chronological) and report `comments_omitted`. Maintainer means the repo owner's login. |
+| `--no-bots` | `item`, `search`, `brief`: drop bot-authored rows in the query, before ranking, counting, or pagination, and report `bots_omitted`. `item` filters only the requested item's comments and reviews (the item itself is always returned); `search` also drops bot-authored items; `brief` also drops bot-authored linked PRs, and drops a bot-ranked analog AFTER ranking (a bot analog in the top slot leaves the packet analog-less rather than promoting the runner-up). The MCP twins take `exclude_bots`. |
+| `--offset N` | `search` only: walk the deduplicated strict-first stream from item N (issue #72 AC5). |
 | `--max-age D` | Reads: when the store is older than D seconds (or `Ns`/`Nm`/`Nh`/`Nd`), run one locked incremental sync first - waiting out a concurrent writer (the wait is unbounded, like `sync --wait`) and re-checking before writing - and report `freshness.refreshed: true` when the store was refreshed during this invocation, by this process or by the writer it waited for. A failed refresh answers the sync error, never a stale payload. The refresh keeps the store's own patch retention and fetches from the store's recorded fetch source (issue #48: `sync_state.fetch_source`, stamped whenever a run explicitly states a source — `--source rest` or the refresh honoring the stored value; a `sync` that did not state a source never rewrites it, so a store deliberately kept on `--source rest` never profile-drifts). Both refresh settings are re-read under the sync lock, so a concurrent writer's changes are honored, never reverted. Without the flag reads never write. Accepted on the standard reads, the derived tier, and `schema`; absent from `sql`, `where`, the export/doctor writers, and `mcp` by design, and inert under `--repo ''` (a sync needs a repo to scope to). |
 
 ### Derived reads — `similar`, `explain`, `coupling`, `eval`
@@ -294,8 +296,9 @@ file set only; `linked`/`analog` evidence paths are reported but never
 constrain selection — the file-set cap (`max_files`) and cross-bundle
 disjointness (lift with `--allow-shared-files`);
 `--exclude` removes numbers from the pool entirely, overriding `--pool`
-and the in-pool blocker relaxation; `--pool` members that never ranked are
-dropped silently — the echoed `pool` array is the disclosure. Each bundle
+and the in-pool blocker relaxation; `--pool` members that cannot be used
+(unstored, PRs, closed) are reported in `dropped: [{number, reason}]` —
+every drop names its cause. Each bundle
 payload carries members, per-pair rationale, direct/linked/analog files,
 co-changed tests (`test_globs`-filtered coupling partners), open-PR
 collisions, the in-pool `blocked_by` order, a risk summary, cohesion,
@@ -448,13 +451,19 @@ the strict all-tokens pass finds fewer items than the page, the page keeps
 every strict hit first and the broadened pass — common English stopwords
 removed, tokens OR-joined — fills the remaining slots; `matched_mode`
 reports whether broadening contributed (`"any"`) or the strict pass
-answered alone (`"all"`). `total_matches` counts the final matching set — strict or broadened — before the limit. Comment hits merge into their parent item — the
+answered alone (`"all"`). `total_matches` is the limit-independent broadened
+total (`broadened_matches`; `strict_matches` carries the all-tokens count),
+identical at any `--limit`, and `--offset` walks the deduplicated
+strict-first stream. `--no-bots` drops bot-authored rows (items, comments,
+reviews) pre-ranking and reports `bots_omitted`. Comment hits merge into their parent item — the
 item appears once with `matching_comments` (exact count) and
 `comment_snippet` (a highlighted snippet from the best-matching comment);
-an item-text hit keeps its highlight in `snippet`. Item and comment bm25
-scores share one ordering axis without cross-table normalization (the
-issue-pinned "best bm25 of either" rule), so cross-source rank ordering is
-approximate.
+an item-text hit keeps its highlight in `snippet` — falling back to the
+comment or review snippet when the item text itself never matched. The
+ranking is three-tiered and deterministic: items matched in title/body rank
+above comment-only matches, an adjacent-phrase hit in the item text ranks
+above scattered same-tier tokens, then bm25 with `updated_at` and
+`(repo, number)` as the stable tie-breaks.
 
 ```json
 {
@@ -465,10 +474,15 @@ approximate.
     "html_url": "https://github.com/acme/forgegate/issues/10",
     "snippet": "«Init» hangs on empty repo",
     "matching_comments": 0,
-    "comment_snippet": ""
+    "comment_snippet": "",
+    "matching_reviews": 0,
+    "review_snippet": ""
   }],
   "matched_mode": "all",
   "total_matches": 1,
+  "strict_matches": 1,
+  "broadened_matches": 1,
+  "offset": 0,
   "corpus_items": 42,
   "index_stale": false
 }
@@ -480,10 +494,11 @@ filter resolves, the repo's items when one does — so "no hits in 42 items"
 is distinguishable from an empty database. Every result also carries
 `index_stale`: true when the database predates the current schema (reads
 never migrate), so a zero-hit answer from an un-migrated v2 index is not
-mistaken for prior-art absence. Search cost scales with the match set: a
-every query pays an O(corpus) scan for `corpus_items`, and a term that matches most of the corpus pays an O(corpus) match-set count, and each
-returned item costs at most three small indexed queries (row, item
-snippet, comment snippet). **Shape change (v0.3): the separate
+mistaken for prior-art absence. Search cost scales with the match set:
+every query pays an O(corpus) scan for `corpus_items`, a term that matches
+most of the corpus pays an O(corpus) match-set count, and each returned
+item costs at most four small indexed queries (row, item snippet, comment
+snippet, review snippet). **Shape change (v0.3): the separate
 `comments` list is gone** — comment hits are items now, as shown above.
 
 ### `item` — one issue or PR in full
@@ -493,7 +508,12 @@ zaxbygraph item N
 ```
 
 Returns the stored `items` fields (everything except `raw_json`) plus nested
-`labels`, `comments`, `reviews`, `files`, and `edges`. This is the one command
+`labels`, `comments`, `reviews`, `files`, and `edges` — bounded by default:
+comments return the first, last, and maintainer entries first (survivors
+chronological, up to 5 by default; `--max-comments K` overrides the count and
+`0` returns no comments), reviews keep the first 5 in submitted order (MCP
+`get_item` `max_reviews` overrides), the body caps at 20 KiB, and
+`comments_omitted`/`reviews_omitted` are always present. This is the one command
 that returns bodies, so it is the expensive one — reach for `search` or `sql`
 when you need breadth.
 
@@ -776,6 +796,12 @@ zaxbygraph mcp [--stale-seconds N]
   `ZAXBYGRAPH_MCP_STALE_SECONDS`), the answer still comes from current data
   and one background incremental sync starts (guarded by the sync lock);
   `freshness.refreshing` is `true` on the answer that started or joined a background refresh; the key is absent otherwise (it never reads `false`).
+  A background refresh that FAILS is isolated from the store (its
+  `sync_state` writes are restored to the pre-run snapshot, so a complete
+  store stays complete), retries for that store are suppressed for the
+  backoff window (`ZAXBYGRAPH_REFRESH_BACKOFF_S`, default 300 s), and reads
+  inside the window still answer from current data but carry
+  `freshness.refresh_failed: "<reason>"` instead of `refreshing`.
 
 Register it (Claude Code):
 
@@ -873,19 +899,32 @@ Machine-readable rules, worth knowing before scripting against this:
   builds.
 - **Formats and rows.** `--format json` (pretty, default when piped) and
   `compact` (one line) always carry the envelope; `jsonl` prints one JSON
-  object per line for list payloads (rows only — no envelope, so no
-  identity fields on that surface; stderr stays silent) and the whole
-  envelope for single-payload commands, so any `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
+  object per row for LIST payloads AND for the row lists inside dict
+  payloads (search items, related nodes, similar candidates, triage rows,
+  bundle bundles — rows only, no envelope, no identity fields on that
+  surface; stderr stays silent) and the whole envelope for the remaining
+  single-payload commands, so any `head -n` prefix parses; `text` (default on a TTY) renders the payload only,
   never envelope keys. `--fields repo,number` projects rows to exactly those
-  keys that exist (unknown keys are omitted) — it applies to list payloads and
-  to `sql` rows in both modes (objects: keys; `--rows array`: positions), not
-  to nested arrays inside dict payloads. With duplicate-suffixed objects
+  keys that exist (unknown keys are omitted) — it applies to list payloads
+  (including the row lists inside dict payloads: search items, related
+  nodes, similar candidates, triage rows, bundle bundles — sibling keys of
+  the list are dropped on those commands), to `item` (single object or
+  multi-number rows), and to `sql` rows in both modes (objects: keys;
+  `--rows array`: positions), not to other nested arrays. With duplicate-suffixed objects
   rows, project by the suffixed key (`columns` keeps the true names). `sql` rows are objects keyed by
   column by default — duplicate column names are suffixed `name_2`, `name_3`,
   … so no value is lost (`columns` keeps the true names; `--rows array` keeps
   positional lists and exact duplicates); `--limit N` overrides the 200-row
-  cap. `item N --max-body-chars C` truncates bodies and marks them
-  `"truncated": true`. `zaxbygraph schema [TABLE]` prints live DDL plus
+  cap. The `sql` surface is additionally bounded by a wall-clock deadline
+  (default 5 s; `ZAXBYGRAPH_SQL_TIMEOUT_S`, clamped to (0, 600] — past it
+  the query is interrupted and answers the coded `timeout` error) and a
+  serialized-result byte budget (`ZAXBYGRAPH_SQL_MAX_BYTES`, default 1 MiB —
+  over it fetching stops with `truncated: true` and oversized cells are
+  capped with an explicit marker); both knobs govern the CLI `sql` command
+  and the MCP `sql` tool alike. `item N --max-body-chars C` truncates bodies
+  and marks them `"truncated": true` (`0` is the explicit uncapped override
+  — the default 20 KiB body bound does not apply; negatives are a usage
+  error). `zaxbygraph schema [TABLE]` prints live DDL plus
   per-column notes - use it instead of a file path to learn the schema.
 - **Output encoding.** stdout and stderr are UTF-8 on every platform,
   regardless of the ambient locale — emoji and CJK in titles and bodies
@@ -895,16 +934,20 @@ Machine-readable rules, worth knowing before scripting against this:
   request was malformed (bad flags, non-read SQL, multiple statements), or the
   resolved DB holds other repos but not this one. **`1`** — a runtime failure:
   item not found, sync error, an authorizer denial at execution time, or one of
-  the two inspection refusals below. **`3`** — no corpus for the resolved repo
+  the per-attempt refusals below. **`3`** — no corpus for the resolved repo
   (issue #2): the resolved DB is missing or holds nothing for it; the message
   names the path and the exact `sync` command. The distinction matters for
   retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
   request, or sync first), while a `1` sometimes will.
-  **The two inspection refusals that answer `1` are narrow, not a general
-  rule.** `snapshot pull`'s `dest_uninspectable` and `export-corpus`'s
-  `out_is_database`-on-an-uninspectable-path answer `1`, because what blocked
-  them was a stat or open fault on the destination or store path itself — a
-  per-attempt condition a retry can clear. Every other snapshot guard rejection
+  **The inspection and source-reachability refusals that answer `1` are
+  narrow, not a general rule.** `snapshot pull`'s `dest_uninspectable`,
+  `snapshot pull`'s `source_unreachable` (git could not reach the snapshot
+  SOURCE — a transport or auth failure, carrying git's own message, distinct
+  from `snapshot_absent`'s reachable-source-holds-no-snapshot), and
+  `export-corpus`'s `out_is_database`-on-an-uninspectable-path answer `1`,
+  because what blocked them was a stat or open fault on the destination or
+  store path itself, or a per-attempt failure to reach the source —
+  conditions a retry can clear. Every other snapshot guard rejection
   stays `2`, including the four whose hint says to retry or re-pull
   (`git_timeout`, `dest_open`, `dest_sidecar_stale`, `corpus_mismatch`). That is
   a **policy**, not a claim about what caused them: two of the four can have a

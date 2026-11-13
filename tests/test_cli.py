@@ -65,8 +65,14 @@ class CliTests(unittest.TestCase):
         # Issue #2: reads resolve the repo and require its corpus. --repo is
         # explicit here (origin resolution would key a different slug in
         # forks/CI), and the corpus row makes the no-corpus guard pass.
+        # Issue #72 C10: the no-corpus decision is live items == 0 AND no
+        # completed full sync — this zero-item store stamps a completed
+        # first sync, so it IS a corpus (an empty one) and reads proceed.
         conn = connect(Path(self.db))
-        conn.execute("INSERT INTO sync_state(repo) VALUES (?)", (REPO,))
+        conn.execute(
+            "INSERT INTO sync_state(repo, last_full_sync_at) VALUES (?, ?)",
+            (REPO, "2026-01-01T00:00:00Z"),
+        )
         conn.commit()
         conn.close()
         code, out, err = self.run_cmd(
@@ -91,9 +97,14 @@ class CliTests(unittest.TestCase):
 
     def test_item_missing(self) -> None:
         # Issue #2: scoped lookup needs the corpus row (same reason as
-        # test_search_json_shape).
+        # test_search_json_shape; the zero-item store stamps a completed
+        # first sync so issue #72's C10 no-corpus gate — live items == 0
+        # AND no completed full sync — sees a corpus and reads proceed).
         conn = connect(Path(self.db))
-        conn.execute("INSERT INTO sync_state(repo) VALUES (?)", (REPO,))
+        conn.execute(
+            "INSERT INTO sync_state(repo, last_full_sync_at) VALUES (?, ?)",
+            (REPO, "2026-01-01T00:00:00Z"),
+        )
         conn.commit()
         conn.close()
         code, out, err = self.run_cmd(
@@ -142,16 +153,20 @@ class CliTests(unittest.TestCase):
             cwd=str(REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 2)
-        # The output must be valid UTF-8 with no crash: pre-reorder, a
-        # cp1252-locale stderr wrote the token as byte 0xFC and this decode
-        # raised (the defect this pins lives on Windows; POSIX argv arrives
-        # surrogate-escaped under LC_ALL=C, so the token itself cannot
-        # survive there regardless of stream encoding).
-        stderr = proc.stderr.decode("utf-8")
-        self.assertIn("invalid int value", stderr)
-        self.assertNotIn("Traceback", stderr)
+        # Issue #72 AC12: a usage failure under a machine format (captured
+        # stdout is not a TTY) answers the bad_request envelope on STDOUT.
+        # The UTF-8 property this test pins is unchanged: the message with
+        # the non-ASCII token must survive a hostile locale with no crash
+        # (pre-reorder, cp1252 wrote the token as byte 0xFC and this decode
+        # raised; POSIX argv arrives surrogate-escaped under LC_ALL=C, so
+        # the token itself cannot survive there regardless of encoding).
+        stdout = proc.stdout.decode("utf-8")
+        self.assertIn('"code": "bad_request"', stdout)
+        self.assertIn("invalid int value", stdout)
+        self.assertNotIn("Traceback", stdout)
+        self.assertNotIn("Traceback", proc.stderr.decode("utf-8", "replace"))
         if sys.platform == "win32":
-            self.assertIn("üser", stderr)
+            self.assertIn("üser", stdout)
 
     def test_sync_storage_fault_reported_not_traceback(self) -> None:
         # A storage fault before the sync starts (bad DB file) is a result

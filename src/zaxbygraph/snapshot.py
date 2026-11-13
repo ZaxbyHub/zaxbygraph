@@ -79,6 +79,48 @@ _FIXED_DATE = "1970-01-01T00:00:00Z"
 #: compares the size against it rather than against zero.
 _WAL_HEADER_BYTES = 32
 
+#: git's own wording for "the source was reached and it does not have that
+#: ref" (issue #72 C16 / plan CF-H). Everything ELSE a failed fetch can say --
+#: no such repository, no network, auth refused, terminal prompts disabled --
+#: means the SOURCE could not be reached at all, which is a different failure
+#: (and a different exit class) from a reachable source holding no snapshot.
+#: Both spellings are matched ("ref" / "reference") because git changed the
+#: wording across versions.
+_ABSENT_REF_SIGNATURE_RE = re.compile(
+    r"couldn'?t find remote ref(erence)?", re.IGNORECASE
+)
+#: Only git's OWN diagnostic lines carry the signatures (FB-024): remote-
+#: controlled sideband text ("remote: ...") must never classify the failure.
+_DIAGNOSTIC_LINE_RE = re.compile(r"^(fatal:|error:)", re.IGNORECASE)
+#: Per-line bound for the carried message (FB-024): git stderr lines are
+#: remote-influenced and must not push an unbounded payload into an envelope.
+_ACTIONABLE_LINE_CAP = 200
+
+
+def _fetch_failure(stderr: bytes, ref: str, source: str) -> SnapshotError | None:
+    """Classify one failed ``git fetch`` of a snapshot ref (issue #72 C16).
+
+    An absent-ref signature stays ``snapshot_absent``'s business (the caller
+    keeps it as "this ref contributed no candidate" -- returns None); any
+    OTHER nonzero exit is a transport/auth failure against the source and
+    raises the coded ``source_unreachable`` carrying git's own error text,
+    at exit 1 -- the per-attempt class, distinct from the exit-2 guard
+    rejections."""
+    text = stderr.decode("utf-8", "replace")
+    diagnostic_lines = [
+        line for line in text.splitlines() if _DIAGNOSTIC_LINE_RE.match(line)
+    ]
+    if any(_ABSENT_REF_SIGNATURE_RE.search(line) for line in diagnostic_lines):
+        return None
+    return SnapshotError(
+        "source_unreachable",
+        f"git could not fetch {ref} from the snapshot source:"
+        f" {_actionable_stderr(stderr)}",
+        hint="check the source path/URL and credentials (gh auth status),"
+             " then re-pull",
+        exit_code=1,
+    )
+
 
 class SnapshotError(Exception):
     """Snapshot failure with an envelope-shaped payload.
@@ -88,10 +130,13 @@ class SnapshotError(Exception):
     on retry unchanged"), so every existing raise site keeps its current exit
     code.
 
-    A raise passes 1 only when what blocked it was a stat or open fault on the
-    destination or store path itself -- an uninspectable, busy or I/O-faulted
-    destination. That is a per-attempt condition, so it belongs to the class
-    ``README.md`` says "sometimes will" succeed on retry.
+    A raise passes 1 when what blocked it was a per-attempt condition a retry
+    can genuinely clear: a stat or open fault on the destination or store path
+    itself (an uninspectable, busy or I/O-faulted destination), or -- issue
+    #72 C16 -- ``source_unreachable``, a git transport/auth failure against
+    the SNAPSHOT SOURCE (the fetch exited nonzero without the absent-ref
+    signature, so the source itself could not be reached, as opposed to a
+    reachable source that simply holds no snapshot).
 
     Everything else keeps the default 2, and that is a POLICY rather than a
     claim about causes or about where a refusal fires. Three reasons it cannot
@@ -206,6 +251,11 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_DATE": _FIXED_DATE,
         "GIT_COMMITTER_DATE": _FIXED_DATE,
+        # The stderr classifiers match git's English diagnostics; a
+        # localized catalog would translate them away and flip the
+        # snapshot_absent/source_unreachable exit class per host (FB-024).
+        "LC_ALL": "C",
+        "LANG": "C",
     })
     # the temp-repo plumbing must not inherit an ambient checkout context
     # or an ambient identity (which would override the -c identity below
@@ -266,6 +316,58 @@ def _run_git(args: list[str], cwd: Path, check: bool = True) -> subprocess.Compl
 
 def _tail(b: bytes) -> str:
     return b.decode("utf-8", "replace").strip().splitlines()[-1] if b.strip() else "(no output)"
+
+
+#: how many of git's actionable lines a source_unreachable message carries
+#: (08b review finding 4): enough to show the diagnostic AND its follow-up
+#: line ("fatal: ... / Please make sure you have the correct access
+#: rights"), never the whole noisy stream.
+_ACTIONABLE_LINE_LIMIT = 3
+
+#: Complete ANSI CSI/OSC sequences (cubic round 2): isprintable() strips the
+#: ESC bytes but leaves the printable FRAGMENTS ('[31m', ']0;title') behind,
+#: so complete sequences are removed first and the printable filter only
+#: mops up anything the grammar does not cover.
+_ANSI_CSI_RE = re.compile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove complete ANSI CSI/OSC escape sequences before the
+    printable-character filter."""
+    return _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", text))
+
+
+def _actionable_stderr(stderr: bytes) -> str:
+    """The ACTIONABLE lines of git's stderr for the ``source_unreachable``
+    message (08b review finding 4): the first lines git prefixed with
+    ``fatal:``/``error:`` -- the diagnostics that say WHY the source could
+    not be reached -- up to :data:`_ACTIONABLE_LINE_LIMIT`. Git's trailing
+    footer can be the exact opposite of the condition ("and the repository
+    exists." against a repository that does not), so the LAST line
+    (:func:`_tail`) is only the fallback when git printed no actionable
+    line at all."""
+    lines = stderr.decode("utf-8", "replace").splitlines()
+    actionable = [
+        line.strip()
+        for line in lines
+        if line.strip().lower().startswith(("fatal:", "error:"))
+    ][:_ACTIONABLE_LINE_LIMIT]
+    if actionable:
+        # Remote-influenced text: bound each line and strip control
+        # characters (ANSI/OSC escapes survive strip()) so the envelope
+        # message cannot carry terminal garbage (FB-024).
+        cleaned = []
+        for line in actionable:
+            line = "".join(ch for ch in _strip_ansi(line) if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+            cleaned.append(line)
+        return "; ".join(cleaned)
+    # The fallback tail is remote-influenced too: the same bound + scrub
+    # applies (Stage B ROOT-024 — the actionable branch was capped, the
+    # tail was not).
+    tail = _tail(stderr)
+    tail = "".join(ch for ch in _strip_ansi(tail) if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+    return tail
 
 
 def _check_completeness(conn: sqlite3.Connection, repo: str) -> None:
@@ -586,10 +688,19 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
     # custom ref left behind by a namespace refusal must not keep serving
     # the first snapshot forever (swarm-pr-review PRR-H)
     candidates = {}
+    fetch_failures: list[SnapshotError | None] = []
+    any_fetch_ok = False
     for ref in (SNAPSHOT_REF, "refs/heads/" + SNAPSHOT_BRANCH):
         f = _run_git(["fetch", source, ref], wd, check=False)
         if f.returncode != 0:
+            # Classified, not swallowed (issue #72 C16): a fetch that failed
+            # WITHOUT the absent-ref signature is a transport/auth failure
+            # against the source. It only RAISES below, when no fetch at all
+            # reached the source -- a fetch that succeeded for the other ref
+            # still leaves the source reachable and the pull serviceable.
+            fetch_failures.append(_fetch_failure(f.stderr, ref, source))
             continue
+        any_fetch_ok = True
         commit = _run_git(["rev-parse", "FETCH_HEAD"], wd).stdout.decode().strip()
         mbytes = _run_git(["cat-file", "blob", commit + ":manifest.json"],
                           wd, check=False)
@@ -609,6 +720,19 @@ def _fetch_and_verify_parts(tmp: Path, source: str) -> tuple[dict, bytes]:
             wm = ""
         candidates[ref] = (wm, commit, mbytes.stdout)
     if not candidates:
+        # No ref answered. Which failure that IS depends on git's own words
+        # (issue #72 C16): every fetch failing with the absent-ref signature
+        # is a REACHED source holding no snapshot (snapshot_absent, exit 2);
+        # any other nonzero fetch is source_unreachable (exit 1) carrying
+        # git's message -- an unreachable source must not masquerade as
+        # "nothing published here". source_unreachable only speaks when NO
+        # fetch reached the source: a succeeded fetch with an unusable
+        # manifest is the reachable-source case (its refusal is the
+        # manifest-validation codes below or snapshot_absent).
+        if not any_fetch_ok:
+            for failure in fetch_failures:
+                if failure is not None:
+                    raise failure
         raise SnapshotError(
             "snapshot_absent",
             f"source has neither {SNAPSHOT_REF} nor the fallback branch",

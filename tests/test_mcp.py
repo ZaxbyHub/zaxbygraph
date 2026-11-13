@@ -271,12 +271,16 @@ class McpSession:
             frame["params"] = params
         self._send_obj(frame)
 
-    def initialize(self) -> dict:
+    def initialize(self, *, declare_roots: bool = False) -> dict:
+        # declare_roots=True sends capabilities.roots (issue #71 AC4): the
+        # server only runs the roots/list round-trip for a client that
+        # declared the capability, so roots-based resolution tests opt in.
+        capabilities: dict = {"roots": {"listChanged": False}} if declare_roots else {}
         req_id = self.request(
             "initialize",
             {
                 "protocolVersion": "2025-06-18",
-                "capabilities": {},
+                "capabilities": capabilities,
                 "clientInfo": {"name": "probe", "version": "0"},
             },
         )
@@ -498,7 +502,7 @@ class McpResolutionTests(StoreHarness):
         session_b = McpSession(self, cwd=str(worktree))
         self.addCleanup(session_b.stop)
         session_b.roots_uris = [other_checkout.as_uri()]
-        session_b.initialize()
+        session_b.initialize(declare_roots=True)
         response = session_b.call_tool("graph_status", {})
         _result, env = tool_envelope(self, response, "MCP2")
         self.assertIs(env.get("ok"), True, f"MCP2: roots-resolved read must succeed: {env}")

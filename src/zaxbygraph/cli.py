@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import difflib
+import errno
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -28,8 +31,9 @@ from zaxbygraph.paths import (
     store_db_path,
 )
 from zaxbygraph.query import (
+    _MAX_FETCH_LIMIT,
+    apply_item_bounds,
     assert_read_sql,
-    cap_comments,
     churn,
     _clamp_limit,
     export_graph,
@@ -41,9 +45,15 @@ from zaxbygraph.query import (
     path_between,
     pr_overlap,
     related,
+    resolve_file_history_path,
     run_sql,
     search,
+    sql_deadline_from_env,
+    sql_max_bytes_from_env,
+    SqlTimeoutError,
     status,
+    store_tables_hint,
+    UnknownFilePathError,
     what_closed,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
@@ -140,6 +150,50 @@ def _item_count(conn: sqlite3.Connection | None, slug: str | None) -> int:
     return int(row["item_count"])
 
 
+def corpus_state(
+    conn: sqlite3.Connection | None, repo: str | None
+) -> tuple[int, str | None]:
+    """(live repo-scoped item count, sync_state.last_full_sync_at) — the ONE
+    shared no-corpus decision input (issue #72 C10 / plan CF-E).
+
+    The count is a live COUNT(*) over items, never the cached
+    sync_state.item_count finish-time snapshot: a run that committed items
+    but never finished can sit at item_count=0 while real rows exist, and
+    such a store must NOT be rejected as no-corpus. A missing items table
+    counts 0. The decision rule (both adapters, CLI `_open_for_read` and
+    the MCP resolution path, call this same helper so neither drifts):
+    no corpus iff the live count is 0 AND last_full_sync_at IS NULL —
+    zero items whose first full sync never completed.
+    """
+    count = 0
+    last_full: str | None = None
+    if conn is None or not repo:
+        return count, last_full
+    try:
+        # EXISTS/LIMIT-1 decides the same zero-items gate without scanning
+        # the whole items table per read (FB-019: the COUNT's lower(repo)
+        # predicate defeated the repo index and cost ~47 ms per read at
+        # 300k items; the caller only ever tests count == 0).
+        row = conn.execute(
+            "SELECT 1 FROM items WHERE lower(repo) = ? LIMIT 1", (repo,)
+        ).fetchone()
+        count = 0 if row is None else 1
+    except sqlite3.Error:
+        # A store predating the items table (or unreadable now) has no
+        # corpus this decision can see.
+        count = 0
+    try:
+        row = conn.execute(
+            "SELECT last_full_sync_at FROM sync_state WHERE lower(repo) = ?",
+            (repo,),
+        ).fetchone()
+        if row is not None:
+            last_full = row[0]
+    except sqlite3.Error:
+        last_full = None
+    return count, last_full
+
+
 def _identity_line(
     conn: sqlite3.Connection | None, slug: str | None, db_path: Path | None
 ) -> str | None:
@@ -176,7 +230,43 @@ def _failure(code: int, message: str, hint: str | None = None) -> dict:
 def _project(row: Any, fields: list[str]) -> Any:
     if not fields or not isinstance(row, dict):
         return row
-    return {k: row[k] for k in fields if k in row}
+    out = {k: row[k] for k in fields if k in row}
+    if row.get("not_found") is True:
+        # The reserved per-row marker (multi-number item, issue #72 C22)
+        # survives projection: it is the row's honest "this number is not
+        # stored" flag, not a data field a caller narrows away.
+        out["not_found"] = True
+    return out
+
+
+#: The per-command list selectors (issue #72 C13 / plan CF-F): the data key
+#: whose list is that command's row stream for --fields projection and
+#: --format jsonl. Commands whose data is already a bare list (open, churn,
+#: multi-number item) need no selector; payloads without an entry here keep
+#: their existing paths (single-number item stays a byte-identical object,
+#: sql keeps its {columns, rows} projection).
+_LIST_KEY_BY_COMMAND = {
+    "search": "items",
+    "related": "nodes",
+    "similar": "candidates",
+    "triage": "rows",
+    "bundle": "bundles",
+}
+
+
+def _selected_rows(payload: Any, list_key: str | None) -> list[Any] | None:
+    """The row stream a --fields/--format jsonl caller targets: a bare list
+    payload, or the selector-named list inside a dict payload. None when
+    this payload has no row stream."""
+    if isinstance(payload, list):
+        return payload
+    if (
+        list_key is not None
+        and isinstance(payload, dict)
+        and isinstance(payload.get(list_key), list)
+    ):
+        return payload[list_key]
+    return None
 
 
 def build_envelope(
@@ -206,9 +296,23 @@ def build_envelope(
     return env
 
 
+def _write_stdout(text: str) -> None:
+    """One stdout write, translated at the boundary: Windows reports a dead
+    pipe as plain OSError(EINVAL) from the buffered writer, which main()'s
+    dispatch-level BrokenPipeError catch would never see - a mid-render
+    failure on a large output must reach the quiet-exit handler (final-critic
+    r1 f2; check C24's small-output leg cannot discriminate this)."""
+    try:
+        sys.stdout.write(text)
+    except OSError as exc:
+        if exc.errno in (errno.EINVAL, errno.EPIPE):
+            raise BrokenPipeError(str(exc)) from exc
+        raise
+
+
 def _render_json(env: dict, indent: int | None) -> None:
-    json.dump(env, sys.stdout, indent=indent, ensure_ascii=False, default=str)
-    sys.stdout.write("\n")
+    _write_stdout(json.dumps(env, indent=indent, ensure_ascii=False, default=str))
+    _write_stdout("\n")
 
 
 def emit_result(
@@ -229,7 +333,8 @@ def emit_result(
     --fields projection, the stderr identity line on text-mode success
     (machine formats stay silent on stderr; the json/compact envelope keeps
     db, repo and freshness - not the line's items count - while jsonl list
-    payloads print rows only with no envelope at all - issue #17), and the
+    payloads print rows only with no envelope at all - issue #17; a dict
+    payload's selected row list streams the same way, issue #72 C13), and the
     one-line stderr error echo on
     failure (the human contract the error-channel tests pin; the structured
     envelope goes to stdout)."""
@@ -242,11 +347,32 @@ def emit_result(
         if freshness is not None:
             freshness = {**freshness, "refreshed": True}
     fields = _fields_of(args)
+    list_key = _LIST_KEY_BY_COMMAND.get(getattr(args, "cmd", None))
     payload = data
     columns: list[str] | None = None
     if fields and error is None:
         if isinstance(data, list):
             payload = [_project(row, fields) for row in data]
+        elif (
+            getattr(args, "cmd", None) == "item"
+            and isinstance(data, dict)
+            and "number" in data
+        ):
+            # Single-number item under --fields: AC4 names item; the frozen
+            # check pins the multi-number stream, this projects the one-item
+            # dict. WITHOUT the flag the payload is untouched byte-for-byte;
+            # WITH it the item projects (final-critic r1 f4, r2 pin).
+            payload = _project(data, fields)
+        elif (
+            list_key is not None
+            and isinstance(data, dict)
+            and isinstance(data.get(list_key), list)
+        ):
+            # The command's named row list (issue #72 C13): --fields narrows
+            # the dict payload to that stream with its rows projected — the
+            # projection is observable even when the stream is empty, and
+            # the envelope still carries db/repo/freshness for identity.
+            payload = {list_key: [_project(row, fields) for row in data[list_key]]}
         elif isinstance(data, dict) and isinstance(data.get("rows"), list):
             # sql's rows project despite dict-shaped data (plan item 5).
             # Objects mode projects keys; array mode projects positions so
@@ -285,11 +411,10 @@ def emit_result(
         if error is None:
             _emit_text(payload)
     elif fmt == "jsonl":
-        if error is None and isinstance(payload, list):
-            for row in payload:
-                sys.stdout.write(
-                    json.dumps(row, ensure_ascii=False, default=str) + "\n"
-                )
+        stream = None if error is not None else _selected_rows(payload, list_key)
+        if stream is not None:
+            for row in stream:
+                _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
         else:
             _render_json(env, indent=None)
     elif fmt == "compact":
@@ -308,19 +433,22 @@ def emit_result(
 
 
 def _emit_text(data: Any) -> None:
-    """The historical text-mode rendering: bare data, never envelope keys."""
+    """The historical text-mode rendering: bare data, never envelope keys.
+    Writes ride _write_stdout so a dead pipe mid-render (text mode on a
+    large payload) still reaches the quiet BrokenPipe exit (final-critic
+    r2 R2-1)."""
     if isinstance(data, dict):
         for key, val in data.items():
             if isinstance(val, (dict, list)):
-                print(f"{key}:")
-                print(json.dumps(val, indent=2, ensure_ascii=False, default=str))
+                _write_stdout(f"{key}:\n")
+                _write_stdout(json.dumps(val, indent=2, ensure_ascii=False, default=str) + "\n")
             else:
-                print(f"{key}: {val}")
+                _write_stdout(f"{key}: {val}\n")
         return
     if isinstance(data, list):
-        print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        _write_stdout(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
         return
-    print(data)
+    _write_stdout(f"{data}\n")
 
 
 def emit_failure(
@@ -405,6 +533,40 @@ def _parse_comment_cap(value: str) -> int:
             f"invalid --max-comments value: {value!r}"
         )
     return int(text)
+
+
+def _parse_body_chars(value: str) -> int:
+    """--max-body-chars N (08b review Q2, unified with the MCP get_item
+    contract): ASCII non-negative integer. 0 is the EXPLICIT "uncapped"
+    override — the default 20 KiB body bound does not apply — and a
+    negative value is the standard usage error (exit 2 / bad_request
+    envelope under machine formats), never a silently-ignored flag."""
+    text = str(value).strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-body-chars value: {value!r}"
+        )
+    return int(text)
+
+
+def _parse_offset(value: str) -> int:
+    """--offset N (search paging, issue #72 C14): ASCII non-negative integer;
+    negative values are rejected at the parser, never silently clamped. The
+    magnitude shares --limit's ceiling: a huge offset reaches the SQL bind
+    as window=offset+limit and would raise OverflowError past every
+    envelope (FB-002, the #55 class)."""
+    text = str(value).strip()
+    if re.fullmatch(r"[0-9]+", text) is None:
+        raise argparse.ArgumentTypeError(
+            f"invalid --offset value: {value!r}"
+        )
+    parsed = int(text)
+    if parsed > _MAX_FETCH_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"--offset value too large: {value!r}"
+            f" (maximum {_MAX_FETCH_LIMIT})"
+        )
+    return parsed
 
 
 def _sync_core(
@@ -730,6 +892,18 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
                     f"run: zaxbygraph doctor --consolidate --repo {slug} to adopt it "
                     f"(or zaxbygraph sync --repo {slug} to rebuild)",
                 )
+            # The no-corpus gate (issue #72 C10 / plan CF-E): a sync_state
+            # row alone is not a corpus. Zero LIVE items AND no completed
+            # full sync (the store a FAILED first sync leaves) is exit-3
+            # no_corpus on every read — decided by the shared corpus_state
+            # helper, never the lagging item_count snapshot.
+            live_items, last_full_sync_at = corpus_state(conn, slug)
+            if live_items == 0 and last_full_sync_at is None:
+                raise _ReadFailure(
+                    3,
+                    f"no graph for {slug}; resolved database: {db_path}; "
+                    f"run: zaxbygraph sync --repo {slug}",
+                )
         else:
             others = [
                 r["repo"] for r in conn.execute("SELECT repo FROM sync_state ORDER BY repo")
@@ -771,6 +945,18 @@ def _run_read(args: argparse.Namespace, query_fn, *extra) -> int:
         data = query_fn(conn, *extra, repo=repo)
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
+    except LookupError as exc:
+        # A ghost input (issue #72 C11): an unstored item number answers
+        # the coded not_found envelope, exit 1 — the same mapping the
+        # derived and product runners already apply.
+        return emit_failure(
+            args,
+            1,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="not_found",
+        )
     except ValueError as exc:
         # A caller-supplied row limit outside the driver's range is a
         # malformed request, not a store fault, and is mapped exactly as
@@ -964,7 +1150,24 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    return _run_read(args, search, args.query, args.limit)
+    # Issue #72 C14: --offset pages the deduplicated strict-first stream and
+    # the payload's limit-independent `truncated` (page < matched) is
+    # promoted to the envelope; --no-bots (issue #71 C6) filters bot-authored
+    # item/comment/review matches out of the SQL, pre-ranking.
+    offset = max(0, int(getattr(args, "offset", 0) or 0))
+    exclude_bots = bool(getattr(args, "no_bots", False))
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        return search(
+            conn,
+            args.query,
+            args.limit,
+            repo=repo,
+            offset=offset,
+            exclude_bots=exclude_bots,
+        )
+
+    return _run_read_promote_truncated(args, _query)
 
 
 def _parse_as_of(value: str) -> datetime:
@@ -975,6 +1178,17 @@ def _parse_as_of(value: str) -> datetime:
     from zaxbygraph.query import _parse_instant
 
     return _parse_instant(value)
+
+
+def _item_not_found_row(number: int) -> dict:
+    """The per-row not_found entry a multi-number item call answers for an
+    unstored number (issue #72 C22): the reserved `not_found: true` marker
+    (which survives --fields projection) plus the coded error object."""
+    return {
+        "number": number,
+        "not_found": True,
+        "error": {"code": "not_found", "message": f"item {number} is not stored"},
+    }
 
 
 def cmd_item(args: argparse.Namespace) -> int:
@@ -1018,28 +1232,101 @@ def cmd_item(args: argparse.Namespace) -> int:
                     db_path=db_path,
                     code_key="bad_as_of",
                 )
-        data = item(conn, args.number, repo=repo)
-        if data is not None:
-            if at is not None:
-                data = item_as_of(conn, args.number, at, repo=repo)
-            elif getattr(args, "history", False):
-                data = item_history(conn, args.number, repo=repo)
-        if data is not None:
-            cap = getattr(args, "max_comments", None)
-            if cap is not None:
-                # Cap the FINAL payload's comments array (issue #31 AC4), so
-                # item, --history and --as-of all honor the bound.
-                data = cap_comments(data, cap, repo)
-            truncated = _truncate_bodies(data, args.max_body_chars)
+        numbers = list(getattr(args, "number") or [])
+        exclude_bots = bool(getattr(args, "no_bots", False))
+        if len(numbers) <= 1:
+            # Single number: the historical object payload, byte-identical to
+            # the pre-v8 shape when neither evidence-history flag is passed.
+            number = numbers[0] if numbers else None
+            data = item(conn, number, repo=repo, exclude_bots=exclude_bots)
+            if data is not None:
+                if at is not None:
+                    data = item_as_of(conn, number, at, repo=repo, exclude_bots=exclude_bots)
+                elif getattr(args, "history", False):
+                    data = item_history(conn, number, repo=repo, exclude_bots=exclude_bots)
+            if data is not None:
+                # --max-body-chars keeps its explicit semantics (issue #25
+                # AC6; 0 = the explicit uncapped override, 08b review Q2);
+                # the default bounds (issue #71 C5: body <= 20 KiB with
+                # a marker, comments/reviews <= 5, omission counts, envelope
+                # truncated on any cut) apply wherever a flag is absent.
+                truncated = _truncate_bodies(data, args.max_body_chars)
+                truncated = apply_item_bounds(
+                    data,
+                    repo,
+                    max_body_chars=args.max_body_chars,
+                    max_comments=getattr(args, "max_comments", None),
+                ) or truncated
+                fresh = _freshness(conn, repo)
+                line = _identity_line(conn, repo, db_path)
+        else:
+            # Multi-number (issue #72 C22): a BARE LIST of per-number rows in
+            # input order — unstored numbers answer per-row not_found entries
+            # instead of failing the call (all-missing included), and every
+            # row gets the same --max-comments/--max-body-chars treatment.
+            rows: list[dict] = []
+            truncated = False
+            for number in numbers:
+                row = item(conn, number, repo=repo, exclude_bots=exclude_bots)
+                if row is not None and at is not None:
+                    row = item_as_of(conn, number, at, repo=repo, exclude_bots=exclude_bots)
+                elif row is not None and getattr(args, "history", False):
+                    row = item_history(conn, number, repo=repo, exclude_bots=exclude_bots)
+                if row is None:
+                    rows.append(_item_not_found_row(number))
+                    continue
+                row_cut = _truncate_bodies(row, args.max_body_chars)
+                row_cut = apply_item_bounds(
+                    row,
+                    repo,
+                    max_body_chars=args.max_body_chars,
+                    max_comments=getattr(args, "max_comments", None),
+                ) or row_cut
+                truncated = truncated or row_cut
+                rows.append(row)
+            data = rows
             fresh = _freshness(conn, repo)
             line = _identity_line(conn, repo, db_path)
+    except ValueError as exc:
+        # The pre-v12 bot-flag gate (FB-004) raises ValueError from
+        # query.item: a structured bad_request naming the sync remedy,
+        # never a raw traceback.
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="bad_request",
+        )
+    except sqlite3.Error as exc:
+        # A mid-query storage fault is reported, not a traceback (AGENTS
+        # invariant; FB-003): cmd_item carried no arm while its siblings
+        # did.
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
+        )
+    except LookupError as exc:
+        return emit_failure(
+            args,
+            1,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key="not_found",
+        )
     finally:
         conn.close()
     if data is None:
         return emit_failure(
             args,
             1,
-            f"item #{args.number} not found",
+            f"item #{numbers[0]} not found",
             slug=repo,
             db_path=db_path,
             code_key="not_found",
@@ -1089,7 +1376,9 @@ def _truncate_bodies(data: dict, limit: int) -> bool:
 
 
 def cmd_related(args: argparse.Namespace) -> int:
-    return _run_read(args, related, args.number, args.depth)
+    # Issue #71 C7 / plan CF-D: the bounded expansion reports its own
+    # `truncated` data flag; promote it to the envelope like file-history.
+    return _run_read_promote_truncated(args, related, args.number, args.depth)
 
 
 def cmd_churn(args: argparse.Namespace) -> int:
@@ -1448,6 +1737,7 @@ def _brief_query(
     number: int,
     budget_tokens: int,
     live: bool,
+    exclude_bots: bool,
     config: str | None,
     repo: str,
     db_path: Path | None = None,
@@ -1464,6 +1754,7 @@ def _brief_query(
         config=config,
         live=live,
         weights=weights,
+        exclude_bots=exclude_bots,
     )
 
 
@@ -1521,6 +1812,7 @@ def cmd_brief(args: argparse.Namespace) -> int:
         args.number,
         args.budget_tokens,
         bool(getattr(args, "live", False)),
+        bool(getattr(args, "no_bots", False)),
         args.config,
     )
 
@@ -1551,6 +1843,19 @@ def _run_read_promote_truncated(
             truncated = bool(data.pop("truncated"))
         fresh = _freshness(conn, repo)
         line = _identity_line(conn, repo, db_path)
+    except UnknownFilePathError as exc:
+        # file-history's ghost path (issue #72 C11): unknown_path, exit 1,
+        # with the suggestion hint. The gate itself is shared with the MCP
+        # file_history tool (query.resolve_file_history_path).
+        return emit_failure(
+            args,
+            1,
+            exc.message,
+            slug=repo,
+            db_path=db_path,
+            code_key="unknown_path",
+            hint=exc.hint,
+        )
     except LookupError as exc:
         return emit_failure(
             args,
@@ -1570,6 +1875,18 @@ def _run_read_promote_truncated(
             slug=repo,
             db_path=db_path,
             code_key="bad_request",
+        )
+    except sqlite3.Error as exc:
+        # A mid-query storage fault is reported, not a traceback (AGENTS
+        # invariant; FB-003): search/related/item ran through this runner
+        # without the arm _run_read has had since the pr45 review.
+        return emit_failure(
+            args,
+            1,
+            f"store unreadable: {exc}",
+            slug=repo,
+            db_path=db_path,
+            code_key="store_unreadable",
         )
     finally:
         conn.close()
@@ -1598,7 +1915,20 @@ def cmd_overlap(args: argparse.Namespace) -> int:
 
 
 def cmd_file_history(args: argparse.Namespace) -> int:
-    return _run_read_promote_truncated(args, file_history, args.path, args.limit)
+    raw_path = str(getattr(args, "path", ""))
+
+    def _query(conn: sqlite3.Connection, repo: str | None):
+        # C11/AC2 gate shared with the MCP file_history tool
+        # (query.resolve_file_history_path): backslashes normalize, then the
+        # lookup is EXACT-CASE against the stored pr_files vocabulary. A
+        # miss answers unknown_path with suggestions — never a silent
+        # case-fold, never a disk resolve. The no-filter branch keeps the
+        # query layer's own guard (a repo is required) and its existing
+        # bad_request mapping.
+        normalized = resolve_file_history_path(conn, repo, raw_path)
+        return file_history(conn, normalized, args.limit, repo=repo)
+
+    return _run_read_promote_truncated(args, _query)
 
 
 def cmd_what_closed(args: argparse.Namespace) -> int:
@@ -1672,6 +2002,22 @@ def _column_hint(conn: sqlite3.Connection, sql_text: str) -> str | None:
     return f"columns of {token}: " + ", ".join(cols)
 
 
+#: Hint for the first-keyword/PRAGMA refusal (issue #71 AC11): a rejected
+#: PRAGMA or INSERT must point at the read contract and the schema command.
+_SQL_GUARD_HINT = (
+    "the sql subcommand runs ONE read-only SELECT/WITH/EXPLAIN statement; "
+    "see `zaxbygraph schema [TABLE]` for the store's tables and columns"
+)
+
+#: Hint for a deadline expiry (issue #71 AC1): the error is coded `timeout`
+#: (never `runtime`), so the fix is narrowing the statement or widening the
+#: env budget — not retrying the identical call.
+_SQL_TIMEOUT_HINT = (
+    "narrow the statement (LIMIT, tighter predicates) or raise "
+    "ZAXBYGRAPH_SQL_TIMEOUT_S (clamped to (0, 600])"
+)
+
+
 def cmd_sql(args: argparse.Namespace) -> int:
     # Write rejection comes FIRST: the read-only contract is about the
     # statement, and it must keep its exit 2 before any DB access.
@@ -1685,6 +2031,7 @@ def cmd_sql(args: argparse.Namespace) -> int:
             slug=getattr(args, "repo", None) or None,
             db_path=getattr(args, "db", None),
             code_key="bad_sql",
+            hint=_SQL_GUARD_HINT,
         )
     repo: str | None = None
     db_path: Path | None = None
@@ -1724,13 +2071,41 @@ def cmd_sql(args: argparse.Namespace) -> int:
         )
     try:
         try:
-            data = run_sql(ro_conn, args.statement, limit=args.limit, repo=repo)
+            data = run_sql(
+                ro_conn,
+                args.statement,
+                limit=args.limit,
+                repo=repo,
+                deadline=sql_deadline_from_env(),
+                max_bytes=sql_max_bytes_from_env(),
+            )
+        except SqlTimeoutError as exc:
+            # A deadline expiry is its own coded failure (issue #71 AC1):
+            # `timeout`, exit 1 — retrying the identical statement cannot
+            # succeed, but it is not a bad_request either.
+            emit_result(
+                args,
+                None,
+                conn=ro_conn,
+                slug=repo,
+                db_path=db_path,
+                error=_error_for("timeout", str(exc), _SQL_TIMEOUT_HINT),
+                identity=False,
+            )
+            return 1
         except ValueError as exc:
             message = str(exc)
             match = _NO_SUCH_RE.match(message)
             if match is not None:
                 code_key = match.group(1).lower().replace(" ", "_")
-                hint = _column_hint(ro_conn, args.statement)
+                if code_key == "no_such_table":
+                    # Issue #71 AC11: a missing table gets the store's real
+                    # table list (PRAGMA-free, from sqlite_master) — the
+                    # per-column probe cannot know a table's columns when
+                    # the table itself does not exist.
+                    hint = store_tables_hint(ro_conn)
+                else:
+                    hint = _column_hint(ro_conn, args.statement)
             elif _LIMIT_RE.match(message):
                 # A caller-supplied row limit outside the driver's range is a
                 # malformed request, not an internal fault: `file-history`
@@ -1784,9 +2159,19 @@ def cmd_sql(args: argparse.Namespace) -> int:
             keys.append(f"{c}_{i}")
             used.add(f"{c}_{i}")
         rows = [dict(zip(keys, row)) for row in rows]
+    payload: dict = {"columns": cols, "rows": rows}
+    if data.get("total_rows") is not None:
+        # The honest unfiltered total rides the CLI payload like the MCP
+        # twin and the shared shape registry declare (FB-014/ROOT-014).
+        payload["total_rows"] = data["total_rows"]
+    if data.get("warnings"):
+        # Issue #71 AC10: out-of-vocabulary warnings ride at the payload
+        # top level so they survive --fields projection (which only touches
+        # rows/columns).
+        payload["warnings"] = data["warnings"]
     emit_result(
         args,
-        {"columns": cols, "rows": rows},
+        payload,
         slug=repo,
         db_path=db_path,
         truncated=truncated,
@@ -1935,6 +2320,52 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def _snapshot_freshness(db_path: Path | str | None, slug: str | None) -> dict:
+    """The store's REAL freshness for a snapshot envelope (issue #72 C16 /
+    plan CF-H): opened READ-ONLY through the same guard connection the sql
+    path uses, so stamping the envelope never writes to (or creates) the
+    store. A store that cannot be opened -- absent, busy, unreadable, or
+    rejected by the environment guard -- answers the null freshness block
+    (synced_at null, complete false), which is itself the truth about a
+    store this operation could not read."""
+    if not db_path or not slug:
+        return _freshness(None, None)
+    try:
+        conn = connect_readonly_query(Path(db_path))
+    except (FileNotFoundError, RuntimeError, OSError, sqlite3.Error):
+        return _freshness(None, slug)
+    try:
+        return _freshness(conn, slug)
+    finally:
+        conn.close()
+
+
+def _emit_snapshot_failure(
+    args: argparse.Namespace,
+    code: int,
+    message: str,
+    *,
+    slug: str | None,
+    db_path: Path | str | None,
+    code_key: str,
+    hint: str | None = None,
+    freshness: dict | None = None,
+) -> int:
+    """emit_failure + the store's real freshness: a snapshot refusal must
+    still say WHEN the store last synced (issue #72 C16), which the plain
+    failure path cannot do (it opens no connection)."""
+    emit_result(
+        args,
+        None,
+        slug=slug,
+        db_path=db_path,
+        error=_error_for(code_key, message, hint),
+        identity=False,
+        freshness=freshness,
+    )
+    return code
+
+
 def cmd_snapshot_publish(args: argparse.Namespace) -> int:
     try:
         if args.repo:
@@ -1947,26 +2378,34 @@ def cmd_snapshot_publish(args: argparse.Namespace) -> int:
     # read command: --db > ZAXBYGRAPH_DB > existing store > legacy in-repo
     # DB > the would-be store path (paths.resolve_db)
     store_db, _chain = resolve_db(repo, explicit=args.db, host=host)
+    # The store's real freshness rides EVERY publish envelope (issue #72
+    # C16): stamped BEFORE the operation from a read-only connection, so a
+    # refusal (and a success) both say what the store actually holds rather
+    # than the null block the connection-less envelope defaulted to.
+    pre_fresh = _snapshot_freshness(store_db, repo)
     try:
         result = snapshot_publish(store_db, args.target, args.publisher,
                                expected_repo=repo)
     except SnapshotError as exc:
         # The refusal's own exit code, honoured here as in cmd_snapshot_pull.
-        # Only the two inspection refusals pass 1: what blocked them was a stat
-        # or open fault on the destination or store path, which is per-attempt.
-        # Every publish-reachable raise -- including git_timeout, whose hint
-        # says to retry -- uses the default 2. That is a policy, not a claim
-        # about causes: dest_open can be a busy destination and
+        # The exit-1 raises are the per-attempt inspection refusal
+        # (dest_uninspectable: a stat/open fault on the destination or store
+        # path). Every publish-reachable raise -- including git_timeout,
+        # whose hint says to retry -- uses the default 2. That is a policy,
+        # not a claim about causes: dest_open can be a busy destination and
         # dest_sidecar_stale's first leg is an uninspectable -wal, and
         # git_timeout fires from the transport before the destination is
         # inspected at all. So this is consistency, not a behaviour change.
-        return emit_failure(args, exc.exit_code, exc.message, slug=repo,
-                            db_path=store_db, code_key=exc.code, hint=exc.hint)
+        return _emit_snapshot_failure(
+            args, exc.exit_code, exc.message, slug=repo, db_path=store_db,
+            code_key=exc.code, hint=exc.hint, freshness=pre_fresh)
     except (OSError, sqlite3.Error) as exc:
         # a storage fault is a result object, never a traceback
-        return emit_failure(args, 1, str(exc), slug=repo, db_path=store_db,
-                            code_key="runtime")
-    emit_result(args, result, slug=repo, db_path=store_db, identity=False)
+        return _emit_snapshot_failure(
+            args, 1, str(exc), slug=repo, db_path=store_db,
+            code_key="runtime", freshness=pre_fresh)
+    emit_result(args, result, slug=repo, db_path=store_db, identity=False,
+                freshness=pre_fresh)
     return 0
 
 
@@ -1979,29 +2418,43 @@ def cmd_snapshot_pull(args: argparse.Namespace) -> int:
     except RepoError as exc:
         return emit_failure(args, 2, str(exc), slug=None)
     store_db, _chain = resolve_db(repo, explicit=args.db, host=host)
+    # Freshness BEFORE the operation (issue #72 C16): every failure envelope
+    # carries what the store held when the pull started -- pull may replace
+    # the whole file, so the pre-operation stamp is the only honest one a
+    # refusal can report.
+    pre_fresh = _snapshot_freshness(store_db, repo)
     try:
         result = snapshot_pull(store_db, args.source, force=args.force,
                                verify_sample=max(0, int(args.verify_sample)),
                                expected_repo=repo, expected_host=host)
     except SnapshotError as exc:
-        # The refusal's own exit code. The default is 2; only the two inspection
-        # refusals pass 1, because what blocked them was a stat or open fault on
-        # the destination or store path -- a per-attempt condition. A hint that
-        # says "re-pull" does NOT by itself mean 1: git_timeout, dest_open,
-        # dest_sidecar_stale and corpus_mismatch all say that and stay 2. That
-        # is a policy, not a claim about their causes -- dest_open can be a busy
-        # destination and dest_sidecar_stale's first leg is an uninspectable
-        # -wal. Three of the four fire once the install is underway or has
-        # landed; git_timeout fires earlier still, from the transport before the
-        # destination is inspected, and stays 2 as transport-policy continuity
-        # rather than because of where it fires (README's exit-code table).
-        return emit_failure(args, exc.exit_code, exc.message, slug=repo,
-                            db_path=store_db, code_key=exc.code, hint=exc.hint)
+        # The refusal's own exit code. The default is 2; the exit-1 raises
+        # are the per-attempt refusals -- dest_uninspectable (a stat or open
+        # fault on the destination or store path) and source_unreachable (a
+        # git transport/auth failure against the snapshot SOURCE that exited
+        # nonzero without the absent-ref signature; issue #72 C16). A hint
+        # that says "re-pull" does NOT by itself mean 1: git_timeout,
+        # dest_open, dest_sidecar_stale and corpus_mismatch all say that and
+        # stay 2. That is a policy, not a claim about their causes --
+        # dest_open can be a busy destination and dest_sidecar_stale's first
+        # leg is an uninspectable -wal. Three of the four fire once the
+        # install is underway or has landed; git_timeout fires earlier
+        # still, from the transport before the destination is inspected, and
+        # stays 2 as transport-policy continuity rather than because of
+        # where it fires (README's exit-code table).
+        return _emit_snapshot_failure(
+            args, exc.exit_code, exc.message, slug=repo, db_path=store_db,
+            code_key=exc.code, hint=exc.hint, freshness=pre_fresh)
     except (OSError, sqlite3.Error) as exc:
         # a storage fault is a result object, never a traceback
-        return emit_failure(args, 1, str(exc), slug=repo, db_path=store_db,
-                            code_key="runtime")
-    emit_result(args, result, slug=repo, db_path=store_db, identity=False)
+        return _emit_snapshot_failure(
+            args, 1, str(exc), slug=repo, db_path=store_db,
+            code_key="runtime", freshness=pre_fresh)
+    # The store was REPLACED: re-open read-only and stamp the SUCCESS
+    # envelope with the installed store's own freshness, never the stale
+    # pre-pull block (issue #72 C16).
+    emit_result(args, result, slug=repo, db_path=store_db, identity=False,
+                freshness=_snapshot_freshness(store_db, repo))
     return 0
 
 
@@ -2142,6 +2595,9 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def cmd_schema(args: argparse.Namespace) -> int:
+    output = getattr(args, "output", None)
+    if output:
+        return _schema_output_shape(args, output)
     repo: str | None = None
     db_path: Path | None = None
     try:
@@ -2179,22 +2635,78 @@ def cmd_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schema_output_shape(args: argparse.Namespace, command: str) -> int:
+    """`schema --output COMMAND` (issue #72 C23 / plan CF-L): print one read
+    command's declared result shape — the SAME shape the shape registry in
+    mcp_server.py declares for that command's MCP twin (single source of
+    truth: tools/list outputSchemas, this command and the SKILL.md shape
+    table all read it). The shape is static, so no store is opened and no
+    corpus guard applies; an unknown or undeclared command name is a
+    bad_request naming the commands that do declare shapes (the CLI-only
+    derived commands — explain, coupling, eval — are read commands whose
+    shape declarations land with #70's registry extension)."""
+    # Lazy import: mcp_server imports this module at scope, so the CLI only
+    # pulls the registry (and its heavier imports) when --output runs.
+    from zaxbygraph.mcp_server import CLI_OUTPUT_SHAPES
+
+    entry = CLI_OUTPUT_SHAPES.get(command)
+    if entry is None:
+        known = ", ".join(sorted(CLI_OUTPUT_SHAPES))
+        return emit_failure(
+            args,
+            2,
+            f"unknown or undeclared command {command!r}: --output declares the"
+            " shape of a read command's result payload",
+            slug=getattr(args, "repo", None) or None,
+            db_path=getattr(args, "db", None),
+            code_key="bad_request",
+            hint=f"read commands with declared shapes: {known}",
+        )
+    emit_result(
+        args,
+        {
+            "command": command,
+            "data_keys": list(entry["data_keys"]),
+            "data_kind": entry.get("data_kind", "object"),
+            "description": entry["description"],
+            "mcp_tool": entry.get("mcp_tool"),
+        },
+        slug=getattr(args, "repo", None) or None,
+        db_path=getattr(args, "db", None),
+        identity=False,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="zaxbygraph",
         description="Local incremental GitHub issue/PR knowledge graph.",
     )
     p.add_argument("--version", action="version", version=f"zaxbygraph {__version__}")
+    # Dual placement (issue #72 AC12): --db/--repo/--format are accepted
+    # BEFORE the subcommand too. The subparser copies (added in add_common)
+    # use default=SUPPRESS so an absent child flag never overwrites the
+    # parent-parsed value, while a child-parsed value still lands.
+    p.add_argument("--db", help="SQLite path (default: user-level store for the repo)")
+    p.add_argument(
+        "--format",
+        choices=("json", "compact", "jsonl", "text"),
+        default=None,
+        help="json when stdout is not a TTY, text when it is; jsonl/compact for streams",
+    )
+    p.add_argument("--repo", help="OWNER/REPO (default: git origin)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common(
         sp: argparse.ArgumentParser, *, repo: bool = True, max_age: bool = False
     ) -> None:
-        sp.add_argument("--db", help="SQLite path (default: user-level store for the repo)")
+        sp.add_argument("--db", default=argparse.SUPPRESS,
+                        help="SQLite path (default: user-level store for the repo)")
         sp.add_argument(
             "--format",
             choices=("json", "compact", "jsonl", "text"),
-            default=None,
+            default=argparse.SUPPRESS,
             help="json when stdout is not a TTY, text when it is; jsonl/compact for streams",
         )
         sp.add_argument(
@@ -2203,7 +2715,8 @@ def build_parser() -> argparse.ArgumentParser:
             help="Comma-separated keys to project result rows to (e.g. repo,number)",
         )
         if repo:
-            sp.add_argument("--repo", help="OWNER/REPO (default: git origin)")
+            sp.add_argument("--repo", default=argparse.SUPPRESS,
+                            help="OWNER/REPO (default: git origin)")
         if max_age:
             # --max-age D (issue #31 AC5): reads may bound staleness and pay
             # one locked incremental sync for freshness. Off by default —
@@ -2273,17 +2786,44 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="page size; also the AND-to-OR fallback threshold",
     )
+    sp.add_argument(
+        "--offset",
+        type=_parse_offset,
+        default=0,
+        metavar="N",
+        help="Skip the first N rows of the deduplicated strict-first result"
+        " stream (strict hits first, then broadened non-duplicates)",
+    )
+    sp.add_argument(
+        "--no-bots",
+        dest="no_bots",
+        action="store_true",
+        help="Omit bot-authored matches (actors.is_bot=1): bot-authored items,"
+        " comments and reviews are filtered out of the match SQL before"
+        " ranking, counts and snippets; reports bots_omitted (excluded"
+        " bot-authored matches)",
+    )
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("item", help="One issue/PR with comments, files, edges")
     add_common(sp, max_age=True)
-    sp.add_argument("number", type=int)
+    sp.add_argument(
+        "number",
+        type=int,
+        nargs="+",
+        metavar="NUMBER",
+        help="One or more item numbers; a single number answers the item"
+        " object, several answer one row per number in order (unstored"
+        " numbers answer per-row not_found, issue #72 C22)",
+    )
     sp.add_argument(
         "--max-body-chars",
-        type=int,
+        type=_parse_body_chars,
         default=None,
         metavar="N",
-        help="Truncate the item/comment/review bodies to N chars (marks truncated)",
+        help="Truncate the item/comment/review bodies to N chars (marks"
+        " truncated); 0 is the explicit uncapped override (the default"
+        " 20 KiB body bound does not apply), negatives are a usage error",
     )
     sp.add_argument(
         "--max-comments",
@@ -2292,7 +2832,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="K",
         help="Cap the comment list to K entries (first, last and maintainer"
-        " comments preferred; reports comments_omitted)",
+        " comments preferred; reports comments_omitted); without the flag the"
+        " default bound is 5 comments and 5 reviews (comments_omitted/"
+        " reviews_omitted report the cut, and the body is bounded to 20 KiB"
+        " with a truncation marker)",
+    )
+    sp.add_argument(
+        "--no-bots",
+        dest="no_bots",
+        action="store_true",
+        help="Omit bot-authored comments and reviews (actors.is_bot=1),"
+        " filtered in the query before omission counting; reports"
+        " bots_omitted (excluded comment+review rows)",
     )
     sp.add_argument(
         "--history",
@@ -2455,6 +3006,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--live", action="store_true",
         help="Also read linked-PR CI state/reviews via gh (never stored; failures degrade)",
     )
+    sp.add_argument(
+        "--no-bots",
+        dest="no_bots",
+        action="store_true",
+        help="Omit bot-authored content: bot comments are filtered out of the"
+        " comment ranking and bot-authored items (linked PRs, the analog)"
+        " out of the packet; reports bots_omitted (filtered rows)",
+    )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_brief)
 
@@ -2483,6 +3042,14 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         help="One table name (default: every table)",
+    )
+    sp.add_argument(
+        "--output",
+        default=None,
+        metavar="COMMAND",
+        help="Print one read command's declared result shape"
+             " (data keys; the same shape registry the MCP outputSchemas"
+             " derive from) instead of the live DDL",
     )
     sp.set_defaults(func=cmd_schema)
 
@@ -2601,17 +3168,179 @@ def _sync_entry(args: argparse.Namespace) -> int:
     return cmd_sync(args)
 
 
+class UsageError(Exception):
+    """A failed command-line parse (issue #72 AC12): argparse's own message
+    plus the nearest valid flag, raised by the parser base instead of
+    printing usage, so a machine-format caller gets an envelope."""
+
+    def __init__(self, message: str, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | None:
+    """The nearest valid flag for an unknown-flag/invalid-value message
+    (difflib over the parser's own option strings); for messages without a
+    flag token (missing positional), point at the parser's --help."""
+    known: list[str] = []
+    own: list[str] = []
+    for action in parser._actions:  # noqa: SLF001 - argparse introspection
+        own.extend(a for a in action.option_strings if a not in own)
+    actions = list(parser._actions)  # noqa: SLF001 - argparse introspection
+    for action in parser._actions:  # noqa: SLF001 - argparse introspection
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict):
+            # Union the subparsers: "unrecognized arguments" is detected at
+            # the top level, after the subparser consumed the rest.
+            for sp in choices.values():
+                actions.extend(sp._actions)  # noqa: SLF001
+    for action in actions:
+        known.extend(a for a in action.option_strings if a not in known)
+    tokens = re.findall(r"--?[A-Za-z][\w-]*", message)
+    # A subparser's prog already carries the full invocation path
+    # ("zaxbygraph search"); prefixing the program name again produced the
+    # doubled "zaxbygraph zaxbygraph search --help" (08b review nit). The
+    # bare top-level prog keeps the "zaxbygraph COMMAND --help" shape.
+    help_ref = (
+        f"{parser.prog} --help"
+        if " " in parser.prog
+        else "zaxbygraph COMMAND --help"
+    )
+    # NOTE: the match pool is the raising parser's own flags UNION every
+    # subcommand's: a single best match wins, so `--limt` still finds
+    # --limit (frozen C21). A cross-command nearest flag (item --number ->
+    # sync's --numbers) is mildly confusing but names a real flag; left as
+    # documented behavior (final-critic r1 note).
+    for token in tokens:
+        match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
+        if match:
+            return f"did you mean {match[0]}? (see `{help_ref}`)"
+    return f"see `{help_ref}` for this command's arguments"
+
+
+class _Parser(argparse.ArgumentParser):
+    """Parser base whose error() raises UsageError instead of printing
+    usage (issue #72 AC12): main() decides the output channel. Help and
+    --version still exit through their own SystemExit(0) paths."""
+
+    def error(self, message: str):  # type: ignore[override]
+        raise UsageError(message, _nearest_flag_hint(message, self))
+
+
+def _usage_envelope_exit(
+    exc: UsageError, argv: list[str] | None
+) -> int:
+    """Answer a usage failure: under a machine format (explicit json/
+    compact/jsonl in argv, or stdout not a TTY) a bad_request envelope goes
+    to stdout with argparse's message and the nearest-flag hint (exit 2);
+    text mode on a TTY keeps the human one-liner on stderr. The db/repo
+    identity is best-effort pre-scanned from argv (parsing already failed)."""
+    fmt = None
+    db = repo = None
+    if argv is None:
+        # The real entry points (python -m zaxbygraph, the console script)
+        # call main() with no list: the pre-scan must read the process argv,
+        # or an explicit --format json on a TTY would fall back to text and
+        # the usage error would bypass the envelope (final-critic r1 f1).
+        argv = sys.argv[1:]
+    for i, tok in enumerate(argv):
+        name, sep, value = tok.partition("=")
+        if name == "--format" and (sep or i + 1 < len(argv)):
+            # Keep only a REAL choice: an invalid value (argparse's error,
+            # which is what we are reporting) must fall through to the
+            # TTY/non-TTY default or a piped caller loses the envelope
+            # (final-critic r2 R2-2).
+            candidate = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+            if candidate in ("json", "compact", "jsonl", "text"):
+                fmt = candidate
+        elif name == "--db" and (sep or i + 1 < len(argv)):
+            db = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+        elif name == "--repo" and (sep or i + 1 < len(argv)):
+            repo = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+    if fmt is None:
+        fmt = "json" if not sys.stdout.isatty() else "text"
+    error = {"code": "bad_request", "message": exc.message}
+    if exc.hint:
+        error["hint"] = exc.hint
+    if fmt in ("json", "compact", "jsonl"):
+        env = build_envelope(
+            None, conn=None, slug=repo, db_path=db, error=error
+        )
+        _render_json(env, indent=None)
+    else:
+        print(f"error: {exc.message}", file=sys.stderr)
+    return 2
+
+
+def _silence_broken_stdout() -> int:
+    """Give the dying process a valid stdout: point fd 1 at os.devnull so the
+    interpreter's own shutdown flush (the buffered tail of whatever was
+    already written) succeeds quietly instead of raising the unraisable
+    'Exception ignored in' noise and a nonzero shutdown exit (issue #71,
+    check C24). Narrowly scoped: only reached from a broken-stdout shape."""
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    try:
+        fd = sys.stdout.fileno()
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, fd)
+        finally:
+            os.close(devnull)
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+    return 0
+
+
+def _is_broken_stdout_flush(exc: OSError) -> bool:
+    """Windows reports the dead pipe at flush time as a plain OSError with
+    errno EINVAL (22), not BrokenPipeError; POSIX raises EPIPE. Only a
+    failure flushing sys.stdout is this shape — the guard that consults this
+    predicate wraps the stdout flush alone, never the dispatch, so unrelated
+    storage/runtime OSErrors keep propagating."""
+    return exc.errno in (errno.EINVAL, errno.EPIPE)
+
+
 def main(argv: list[str] | None = None) -> int:
     # Pin the streams before argparse runs: its usage/error text is the first
     # user-facing output and can carry non-ASCII from bad arguments.
     _force_utf8_streams()
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except UsageError as exc:
+        # A failed parse answers the structured envelope under a machine
+        # format (issue #72 AC12); text mode on a TTY keeps the human line.
+        try:
+            return _usage_envelope_exit(exc, argv)
+        except BrokenPipeError:
+            # The usage envelope itself can hit the dead pipe (FB-022):
+            # the quiet exit is the same contract the dispatch path has.
+            return _silence_broken_stdout()
     if getattr(args, "repo", None):
         try:
             args.repo = validate_slug(args.repo)
         except RepoError as exc:
             # Post-parse validation: still answers with the structured
             # envelope on stdout (argparse's own usage errors stay on stderr).
-            return emit_failure(args, 2, str(exc))
-    return int(args.func(args))
+            try:
+                return emit_failure(args, 2, str(exc))
+            except BrokenPipeError:
+                return _silence_broken_stdout()
+    try:
+        code = int(args.func(args))
+    except BrokenPipeError:
+        # The reader went away (`| head` exited): the quiet success exit.
+        return _silence_broken_stdout()
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        # The shutdown-time shape: the output sat buffered past dispatch and
+        # the interpreter's exit flush hit the dead pipe (Windows EINVAL).
+        if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+            return _silence_broken_stdout()
+        raise
+    return code

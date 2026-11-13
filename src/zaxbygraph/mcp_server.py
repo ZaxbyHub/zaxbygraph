@@ -16,22 +16,31 @@ Disclosed boundaries:
 - Requests are serialized; messages that arrive while the server awaits
   its own `roots/list` reply are buffered and processed after it, so
   every identified request still gets exactly one response.
-- Repo resolution asks the client for roots on every resolution that has
-  no explicit repo argument (or server --repo pin); a client that never
-  answers the roots request stalls that call (spec-conformant clients
-  answer, with an error result at worst).
-- A failed background refresh is retried on the next stale read; there
-  is no backoff.
+- Repo resolution asks the client for roots (one `roots/list` round-trip
+  per resolution) only when the client DECLARED the roots capability in
+  `initialize`; an undeclared client never receives a server-initiated
+  request — resolution falls through to the server --repo pin, then the
+  server cwd's git origin, and a repo-less call that resolves nothing
+  answers bad_request naming the repo argument.
+- A failed staleness refresh is ISOLATED: the store's sync_state row is
+  snapshot-restored after any failed run (a background failure never
+  poisons a previously-complete store), and re-arming is backed off for
+  ZAXBYGRAPH_REFRESH_BACKOFF_S seconds (default 300) — a suppressed read
+  reports freshness.refresh_failed instead of refreshing. The explicit
+  `sync` tool keeps normal error recording (issue #71 C3).
 """
 
 from __future__ import annotations
 
 import itertools
 import json
+import errno
 import os
+import re
 import sqlite3
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 import urllib.request
@@ -47,6 +56,7 @@ from zaxbygraph.cli import (
     _triage_query,
     _truncate_bodies,
     build_envelope,
+    corpus_state,
 )
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.derive import ConfigError as DeriveConfigError
@@ -54,18 +64,26 @@ from zaxbygraph.github import GhApiSource as GhRestSource
 from zaxbygraph.graphql import GraphQLSource as GhApiSource
 from zaxbygraph.paths import resolve_db
 from zaxbygraph.query import (
+    apply_item_bounds,
     _clamp_limit,
     assert_read_sql,
     churn,
     file_history,
     item,
     open_items,
+    page_truncated,
     path_between,
     pr_overlap,
     related,
+    resolve_file_history_path,
     run_sql,
     search,
+    sql_deadline_from_env,
+    sql_max_bytes_from_env,
+    SqlTimeoutError,
     status,
+    store_tables_hint,
+    UnknownFilePathError,
     what_closed,
 )
 from zaxbygraph.repo import DEFAULT_HOST, RepoError, remote_info, validate_slug
@@ -97,6 +115,14 @@ _META_CAPABILITIES_KEY = "io.modelcontextprotocol/clientCapabilities"
 #: static per server, per-resource reads are private to the caller.
 _LISTING_TTL_MS = 300000
 _RESOURCE_READ_TTL_MS = 60000
+
+#: Failure-backoff window for staleness refreshes (issue #71 C3 / plan
+#: CF-B): after a FAILED background refresh, re-arming for that
+#: (db_path, slug) is suppressed for this many seconds. Read from the
+#: environment AT CALL TIME so operators (and tests) can widen or shrink
+#: it per run; a missing or non-numeric value falls back to the default.
+_REFRESH_BACKOFF_ENV = "ZAXBYGRAPH_REFRESH_BACKOFF_S"
+_DEFAULT_REFRESH_BACKOFF_S = 300.0
 
 #: Staleness threshold default: the issue's proposed 15 minutes.
 _DEFAULT_STALE_AFTER_S = 900
@@ -334,6 +360,178 @@ def _jobs_snapshot(db_key: str) -> list[dict]:
         return [dict(job) for job in _JOBS.values() if job["db_path"] == db_key]
 
 
+#: (db_path string, slug) -> time.monotonic() of the last FAILED
+#: staleness refresh. Written by the isolated refresh wrapper's failure
+#: path, read by _read_envelope before re-arming.
+_BACKOFF_LOCK = threading.Lock()
+_REFRESH_BACKOFF: dict[tuple[str, str], float] = {}
+
+
+def _refresh_backoff_s() -> float:
+    """The configured backoff window, read at call time (the env seam:
+    operators and tests change it between reads, never at import)."""
+    raw = os.environ.get(_REFRESH_BACKOFF_ENV)
+    if raw is None:
+        return _DEFAULT_REFRESH_BACKOFF_S
+    try:
+        value = float(raw)
+    except ValueError:
+        _log(f"ignoring non-numeric {_REFRESH_BACKOFF_ENV}={raw!r}")
+        return _DEFAULT_REFRESH_BACKOFF_S
+    return value if value > 0 else 0.0
+
+
+#: Sentinel _snapshot_sync_state returns when the pre-run row could not be
+#: READ (open/transport fault) — distinct from None, which means the row
+#: genuinely does not exist. Containment must never touch a store whose
+#: pre-run state it could not observe (08b review Q4): a DELETE issued on
+#: an unread snapshot can erase a sync_state row it never saw.
+_SNAPSHOT_READ_FAILED = object()
+
+
+def _snapshot_sync_state(db_path, slug: str):
+    """The repo's FULL sync_state row before an isolated refresh run
+    (every column — error/pending flags, sync stamps, watermark fields —
+    so a restore is byte-faithful): the row dict, None when no row exists
+    yet, or the _SNAPSHOT_READ_FAILED sentinel when the read itself failed
+    (a restore then cannot know what to restore and must not run).
+
+    Read-only: a failed refresh must be isolated FROM the store, so the
+    snapshot itself must never write (connect_readonly_query)."""
+    try:
+        conn = connect_readonly_query(db_path)
+    except (FileNotFoundError, RuntimeError, sqlite3.Error, OSError):
+        return _SNAPSHOT_READ_FAILED
+    try:
+        row = conn.execute(
+            "SELECT * FROM sync_state WHERE repo = ?", (slug,)
+        ).fetchone()
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys()}
+    except sqlite3.Error:
+        return _SNAPSHOT_READ_FAILED
+    finally:
+        conn.close()
+
+
+def _restore_sync_state(db_path, slug: str, snapshot: dict | None) -> None:
+    """Put the snapshotted sync_state row back in a FRESH write
+    connection (plan CF-B: cover every failure write site inside sync by
+    restoration, not flag-threading). A None snapshot restores the
+    no-row state (the failed run may have created one)."""
+    conn = connect(db_path)
+    try:
+        if snapshot is None:
+            conn.execute("DELETE FROM sync_state WHERE repo = ?", (slug,))
+        else:
+            key = snapshot.get("repo", slug)
+            columns = [c for c in snapshot if c != "repo"]
+            assignments = ", ".join(
+                f'"{c.replace(chr(34), chr(34) * 2)}" = ?' for c in columns
+            )
+            conn.execute(
+                f"UPDATE sync_state SET {assignments} WHERE repo = ?",
+                [snapshot[c] for c in columns] + [key],
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _contain_refresh_failure(db_path, slug: str, snapshot) -> None:
+    """The isolated wrapper's failure path: restore the pre-run
+    sync_state snapshot, then arm the failure backoff. Restore faults are
+    logged, never raised over the refresh's own exception.
+
+    A _SNAPSHOT_READ_FAILED sentinel means the pre-run row could not be
+    read (08b review Q4): containment REFUSES to touch the store — a
+    blind DELETE/UPDATE against an unobserved row is exactly the poison
+    the isolation exists to prevent — logs, and still arms the backoff so
+    the failure stays reported and suppressed; the original failure is
+    re-raised by the caller either way."""
+    # The backoff arms FIRST (FB-023): _log writes stderr bare, and a dead
+    # stderr stream raising out of a log must not leave the failure
+    # unsuppressed — the storm is the harm, the line is a nicety.
+    with _BACKOFF_LOCK:
+        _REFRESH_BACKOFF[(str(db_path), slug)] = time.monotonic()
+    if snapshot is _SNAPSHOT_READ_FAILED:
+        try:
+            _log(
+                f"staleness refresh containment for {slug} on {db_path}"
+                " skipped: the pre-run sync_state snapshot could not be"
+                " read; the store is left as the failed run left it"
+            )
+        except (OSError, ValueError):
+            # ValueError too (cubic round 2): a CLOSED stream raises
+            # ValueError ('I/O operation on closed file'), not OSError.
+            pass
+    else:
+        try:
+            _restore_sync_state(db_path, slug, snapshot)
+        except Exception as exc:  # restoration is best-effort containment
+            try:
+                _log(f"staleness refresh state restore for {slug} failed: {exc}")
+            except (OSError, ValueError):
+                pass
+
+
+def _isolated_refresh_runner(inner):
+    """Wrap one (db_path, slug) runner with refresh isolation (CF-B).
+
+    Snapshot the store's sync_state row before the run; on ANY failure
+    propagating out of the inner runner, restore that snapshot and arm
+    the backoff, then re-raise so the job registry still records the
+    failure (the honesty reporting reads that recorded error). The
+    two-argument runner seam is preserved: the wrapper is called with
+    exactly (db_path, slug) and calls the inner runner the same way."""
+
+    def _runner(db_path, slug) -> None:
+        snapshot = _snapshot_sync_state(db_path, slug)
+        try:
+            inner(db_path, slug)
+        except BaseException:
+            _contain_refresh_failure(db_path, slug, snapshot)
+            raise
+        # A successful refresh ends the failure streak: the backoff
+        # tracks consecutive failures, not this store's history.
+        with _BACKOFF_LOCK:
+            _REFRESH_BACKOFF.pop((str(db_path), slug), None)
+
+    return _runner
+
+
+#: The production staleness-kick runner: the real background sync under
+#: refresh isolation. _read_envelope installs this when the session uses
+#: the default runner; the explicit `sync` tool keeps the PLAIN runner
+#: (normal error recording — a deliberate sync reports its own failure).
+_stale_refresh_runner = _isolated_refresh_runner(_default_sync_runner)
+
+
+def _refresh_suppressed_reason(db_path, slug: str) -> str | None:
+    """Why a stale read must not re-arm a refresh right now, or None when
+    a refresh may start (no recorded failure, or the backoff window has
+    elapsed). The reason names the job registry's recorded error when it
+    still holds the failed job (the settled-jobs bound prunes old ones)."""
+    with _BACKOFF_LOCK:
+        failed_at = _REFRESH_BACKOFF.get((str(db_path), slug))
+    if failed_at is None:
+        return None
+    remaining = failed_at + _refresh_backoff_s() - time.monotonic()
+    if remaining <= 0:
+        return None
+    recorded: str | None = None
+    for job in _jobs_snapshot(str(db_path)):
+        if job.get("repo") == slug and job.get("state") == "failed":
+            recorded = job.get("error") or recorded  # latest failure wins
+    detail = f" ({recorded})" if recorded else ""
+    return (
+        "background refresh failed"
+        f"{detail}; retry suppressed for {int(remaining) + 1}s "
+        f"({_REFRESH_BACKOFF_ENV})"
+    )
+
+
 def _default_stale_after_s() -> int:
     raw = os.environ.get(_STALE_ENV)
     if not raw:
@@ -422,13 +620,15 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
     """(slug, db_path) for a tool call; raises ToolError on failure.
 
     Resolution order: explicit repo argument > the server --repo pin >
-    MCP roots > the server cwd's git origin — then the same store-first
-    resolve_db chain the CLI uses, so a linked worktree and its main
-    checkout resolve one DB and reads never create. The database itself
-    is operator-pinned (--db / ZAXBYGRAPH_DB); tool calls cannot choose
-    it. On the modern (2026-07-28) path the roots round-trip never runs:
-    a repo-less, un-pinned call raises _InputRequired so the dispatcher
-    answers an InputRequiredResult naming repo."""
+    MCP roots (only for a session whose client declared the roots
+    capability at initialize — issue #71 C4) > the server cwd's git
+    origin — then the same store-first resolve_db chain the CLI uses, so
+    a linked worktree and its main checkout resolve one DB and reads
+    never create. The database itself is operator-pinned (--db /
+    ZAXBYGRAPH_DB); tool calls cannot choose it. On the modern
+    (2026-07-28) path the roots round-trip never runs: a repo-less,
+    un-pinned call raises _InputRequired so the dispatcher answers an
+    InputRequiredResult naming repo."""
     repo_arg = arguments.get("repo")
     if repo_arg is None:
         repo_arg = ctx.default_repo
@@ -451,14 +651,23 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
         # at the dispatch layer.
         raise _InputRequired()
     else:
-        pairs = _roots_slugs(ctx)
-        if len(pairs) > 1:
-            names = ", ".join(sorted(slug for _h, slug in pairs))
-            raise ToolError(
-                "bad_request",
-                f"roots span multiple repos ({names})",
-                hint="pass an explicit repo argument naming one of them",
-            )
+        # Capability-honest roots (issue #71 C4 / plan CF-C): the
+        # roots/list round-trip runs ONLY for a client that declared the
+        # roots capability at initialize (recorded on ctx there). An
+        # undeclared client never receives a server-initiated request —
+        # resolution falls through to the server cwd's git origin, and a
+        # repo-less call that resolves nothing answers the existing
+        # structured bad_request naming repo.
+        pairs: list[tuple[str, str]] = []
+        if ctx.roots_declared:
+            pairs = _roots_slugs(ctx)
+            if len(pairs) > 1:
+                names = ", ".join(sorted(slug for _h, slug in pairs))
+                raise ToolError(
+                    "bad_request",
+                    f"roots span multiple repos ({names})",
+                    hint="pass an explicit repo argument naming one of them",
+                )
         if pairs:
             host, slug = pairs[0]
         else:
@@ -530,6 +739,21 @@ def _open_corpus(slug: str, db_path: Path) -> sqlite3.Connection:
                     slug=slug,
                     db_path=db_path,
                 )
+            # Issue #72 C10 (plan CF-E): the ONE shared no-corpus decision —
+            # a failed FIRST sync leaves a sync_state row with zero items and
+            # no completed full sync; reads must answer no_corpus, not
+            # empty-success. Live count, never the cached item_count.
+            live_items, last_full_sync_at = corpus_state(conn, slug)
+            if live_items == 0 and last_full_sync_at is None:
+                raise ToolError(
+                    "no_corpus",
+                    f"no corpus for {slug} in {db_path}; zero items and no "
+                    "completed full sync (a failed first sync is still no "
+                    "corpus)",
+                    hint=f"run: zaxbygraph sync --repo {slug}",
+                    slug=slug,
+                    db_path=db_path,
+                )
         else:
             others = [
                 r["repo"] for r in conn.execute("SELECT repo FROM sync_state ORDER BY repo")
@@ -572,17 +796,37 @@ def _read_envelope(conn, slug, db_path, data, truncated, ctx) -> dict:
 
     A stale read (age_s > stale_after_s) answers from current data and
     starts at most one background sync; freshness.refreshing is true when
-    a refresh was started or is already in flight. Failed reads never
-    reach this function, so a no-corpus call never kicks a refresh (and
-    never creates anything)."""
+    a refresh was started or is already in flight (a joined read is
+    genuinely refreshing too — preserving C9). The kicked runner runs
+    under CF-B refresh isolation (snapshot-restore + failure backoff);
+    the explicit `sync` tool keeps the plain runner. Only a
+    backoff-suppressed re-arm leaves refreshing unset and carries
+    freshness.refresh_failed naming the recorded failure. Failed reads
+    never reach this function, so a no-corpus call never kicks a refresh
+    (and never creates anything)."""
     fresh = _freshness(conn, slug)
     age = fresh.get("age_s")
     if age is not None and age > ctx.stale_after_s:
-        try:
-            _start_job(db_path, slug, ctx.sync_runner)
-            fresh["refreshing"] = True
-        except Exception as exc:
-            _log(f"staleness refresh for {slug} could not start: {exc}")
+        suppressed = _refresh_suppressed_reason(db_path, slug)
+        if suppressed is not None:
+            # A refresh failed recently for this store: do not storm it.
+            # Honest about it — no refreshing claim, and the recorded
+            # failure is surfaced (issue #71 C3 / plan CF-B).
+            fresh["refresh_failed"] = suppressed
+        else:
+            if ctx.sync_runner is _default_sync_runner:
+                kick_runner = _stale_refresh_runner
+            else:
+                # Injected seam (tests): the SAME isolation wrapped around
+                # the injected body, so the contract holds either way.
+                kick_runner = _isolated_refresh_runner(ctx.sync_runner)
+            try:
+                # started OR joined-in-flight (an external lock holder is
+                # a genuinely running sync too): refreshing is true.
+                _start_job(db_path, slug, kick_runner)
+                fresh["refreshing"] = True
+            except Exception as exc:
+                _log(f"staleness refresh for {slug} could not start: {exc}")
     return build_envelope(
         data, conn=conn, slug=slug, db_path=db_path, truncated=truncated, freshness=fresh
     )
@@ -619,15 +863,40 @@ def _bool_arg(arguments: dict, key: str) -> bool:
     )
 
 
-def _int_cursor(raw) -> int:
+def _int_cursor(raw, tool: str) -> int:
+    """A paging tool's opaque cursor, validated symmetrically with the
+    producer: search/file_history/open_items mint next_cursor as
+    str(offset) — a decimal integer string — and consume it as int(). A
+    cursor that is not a string, or a string that does not decode as
+    that integer shape, is a structured bad_request — never a silent
+    page-1 reset (issue #71 C12). A huge-but-valid offset stays clamped
+    to _MAX_CURSOR."""
+    if raw is None:
+        return 0
+    if not isinstance(raw, str):
+        raise ToolError(
+            "bad_request",
+            f"{tool} cursor must be a string",
+            hint="pass the next_cursor value from the previous page verbatim",
+        )
     try:
         value = int(raw)
-    except (TypeError, ValueError, OverflowError):
-        # int(1e999) raises OverflowError, not ValueError — a wire-reachable
-        # JSON float infinity must be a structured cursor reset, never a
-        # runtime envelope (pr49 review PRR-013).
-        return 0
-    if value <= 0:
+    except ValueError:
+        raise ToolError(
+            "bad_request",
+            f"{tool} cursor is malformed: {raw!r}",
+            hint="pass the next_cursor value from the previous page verbatim",
+        ) from None
+    if value < 0:
+        # The producer mints only non-negative offsets: a negative cursor is
+        # hand-crafted input, answered as bad_request rather than the silent
+        # page-1 reset this function's own docstring forbids (FB-010).
+        raise ToolError(
+            "bad_request",
+            f"{tool} cursor is malformed: {raw!r}",
+            hint="pass the next_cursor value from the previous page verbatim",
+        )
+    if value == 0:
         return 0
     return min(value, _MAX_CURSOR)
 
@@ -673,24 +942,52 @@ def _tool_search(arguments: dict, ctx) -> dict:
     query = arguments.get("query")
     if not isinstance(query, str) or not query.strip():
         raise ToolError("bad_request", "search needs a non-empty query", hint='try search {"query": "watermark"}')
+    exclude_bots = _bool_arg(arguments, "exclude_bots")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
         limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
-        offset = _int_cursor(arguments.get("cursor"))
-        result = search(conn, query, limit=limit + offset, repo=slug)
-        items = result.get("items") or []
-        result["items"] = items[offset : offset + limit]
+        offset = _int_cursor(arguments.get("cursor"), "search")
+        # offset rides INTO the query (FB-006): search() stamps
+        # data.offset/matched_mode/bots_omitted against the page it
+        # computed, so cursor pages must ask for their own window — the
+        # old fetch-wide-then-slice answered metadata from page 0 on
+        # every cursor page.
+        try:
+            result = search(
+                conn, query, limit=limit, offset=offset, repo=slug,
+                exclude_bots=exclude_bots,
+            )
+        except ValueError as exc:
+            # The pre-v12 bot-flag gate (FB-004): a structured refusal
+            # naming the sync remedy, not the runtime catch-all.
+            raise ToolError(
+                "bad_request", str(exc),
+                hint="run: zaxbygraph sync --repo <repo> to upgrade the store",
+                slug=slug, db_path=db_path,
+            ) from None
         total = result.get("total_matches")
+        # The query layer's own limit-independent truncation evidence (page
+        # < matched, issue #72 C14) promotes into the envelope flag here.
+        data_truncated = bool(result.pop("truncated", False))
         # Truncation is judged against the source's own match count, not
-        # the capped fetch — AND a full page always offers a cursor: the
-        # AND-to-OR fallback can reveal more matches at a wider window,
-        # so "page length == limit" alone must not read as "the end"
-        # (review F10).
-        truncated = isinstance(total, int) and offset + len(result["items"]) < total
+        # the capped fetch — via the same honest page_truncated formula the
+        # CLI search uses (08b review Q3: an offset PAST the end skipped
+        # matches the caller never saw and must not read as "everything
+        # shown") — AND a full page always offers a cursor: the AND-to-OR
+        # fallback can reveal more matches at a wider window, so "page
+        # length == limit" alone must not read as "the end" (review F10).
+        truncated = page_truncated(offset, len(result["items"]), limit, total)
         if len(result["items"]) == limit:
             truncated = True
-        if truncated:
+        truncated = truncated or data_truncated
+        if truncated and result["items"] and offset + len(result["items"]) <= _MAX_CURSOR:
+            # An overshoot page (offset past the end) reports truncated:true
+            # with NO next_cursor: repeating str(offset) would trap any
+            # while-truncated cursor follower in a self-loop (08b r2). A
+            # mint past the _MAX_CURSOR clamp is the same live-loop at the
+            # boundary — the follower would clamp back to the same window
+            # forever (FB-011) — so the ceiling page is terminal too.
             result["next_cursor"] = str(offset + len(result["items"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
@@ -699,10 +996,35 @@ def _tool_search(arguments: dict, ctx) -> dict:
 
 def _tool_get_item(arguments: dict, ctx) -> dict:
     number = _item_number(arguments, "get_item")
+    max_body_chars = _int_arg(arguments, "max_body_chars", None)
+    max_comments = _int_arg(arguments, "max_comments", None)
+    max_reviews = _int_arg(arguments, "max_reviews", None)
+    for name, value in (
+        ("max_body_chars", max_body_chars),
+        ("max_comments", max_comments),
+        ("max_reviews", max_reviews),
+    ):
+        if value is not None and value < 0:
+            raise ToolError(
+                "bad_request",
+                f"{name} must be a non-negative integer",
+                hint=f"pass {name} as 0 or a positive integer",
+            )
+    exclude_bots = _bool_arg(arguments, "exclude_bots")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        data = item(conn, number, repo=slug)
+        try:
+            data = item(conn, number, repo=slug, exclude_bots=exclude_bots)
+        except ValueError as exc:
+            # The pre-v12 bot-flag gate (FB-004): a structured refusal
+            # naming the sync remedy, matching _tool_search — not the
+            # runtime catch-all with a stderr traceback.
+            raise ToolError(
+                'bad_request', str(exc),
+                hint='run: zaxbygraph sync --repo <repo> to upgrade the store',
+                slug=slug, db_path=db_path,
+            ) from None
         if data is None:
             raise ToolError(
                 "not_found",
@@ -711,9 +1033,18 @@ def _tool_get_item(arguments: dict, ctx) -> dict:
                 slug=slug,
                 db_path=db_path,
             )
-        truncated = _truncate_bodies(
-            data, _int_arg(arguments, "max_body_chars", None)
-        )
+        # An explicit max_body_chars keeps its cap semantics — 0 is the
+        # explicit UNCAPPED override on both adapters (08b review Q2);
+        # absent flags fall to the bounded defaults (issue #71 C5 / plan
+        # CF-D), shared with the CLI item command via query.apply_item_bounds.
+        truncated = _truncate_bodies(data, max_body_chars)
+        truncated = apply_item_bounds(
+            data,
+            slug,
+            max_body_chars=max_body_chars,
+            max_comments=max_comments,
+            max_reviews=max_reviews,
+        ) or truncated
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
     finally:
         conn.close()
@@ -732,11 +1063,32 @@ def _tool_related(arguments: dict, ctx) -> dict:
             f"depth is capped at {_MAX_DEPTH}",
             hint="each hop is a full graph expansion on a serialized server",
         )
+    max_nodes = _int_arg(arguments, "max_nodes", 100)
+    if max_nodes < 1:
+        raise ToolError(
+            "bad_request",
+            "max_nodes must be at least 1",
+            hint="pass max_nodes as a positive integer",
+        )
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
-        data = related(conn, number, depth=depth, repo=slug)
-        return _read_envelope(conn, slug, db_path, data, False, ctx)
+        data = related(
+            conn,
+            number,
+            depth=depth,
+            repo=slug,
+            max_nodes=min(max_nodes, _MAX_PAGE),
+        )
+        # The bounded expansion reports its own truncation evidence (issue
+        # #71 C7); promote it to the envelope like the CLI read path.
+        truncated = bool(data.pop("truncated", False))
+        return _read_envelope(conn, slug, db_path, data, truncated, ctx)
+    except LookupError as exc:
+        # A ghost number is the caller's not_found (issue #72 AC2, 08b
+        # review finding 2), not an internal error — exactly like the CLI
+        # read path and _tool_what_closed.
+        raise ToolError("not_found", str(exc), hint="run graph_status or search to list stored items", slug=slug, db_path=db_path) from exc
     finally:
         conn.close()
 
@@ -751,6 +1103,10 @@ def _tool_path(arguments: dict, ctx) -> dict:
     try:
         data = path_between(conn, a, b, repo=slug)
         return _read_envelope(conn, slug, db_path, data, False, ctx)
+    except LookupError as exc:
+        # A ghost endpoint number is not_found (issue #72 AC2, 08b review
+        # finding 2) — same mapping as the CLI read path and what_closed.
+        raise ToolError("not_found", str(exc), hint="run graph_status or search to list stored items", slug=slug, db_path=db_path) from exc
     finally:
         conn.close()
 
@@ -797,15 +1153,31 @@ def _tool_file_history(arguments: dict, ctx) -> dict:
     conn = _open_corpus(slug, db_path)
     try:
         limit = _clamp_limit(min(_int_arg(arguments, "limit", 30), _MAX_PAGE))
-        offset = _int_cursor(arguments.get("cursor"))
-        result = file_history(conn, path, limit=limit + offset, repo=slug)
+        offset = _int_cursor(arguments.get("cursor"), "file_history")
+        # AC2 gate shared with the CLI (08b review finding 3): backslashes
+        # normalize, then the lookup is EXACT-CASE against the stored
+        # pr_files vocabulary. A miss is unknown_path with the suggestion
+        # hint — never ok:true with entries:[].
+        try:
+            normalized = resolve_file_history_path(conn, slug, path)
+        except UnknownFilePathError as exc:
+            raise ToolError(
+                "unknown_path",
+                exc.message,
+                hint=exc.hint,
+                slug=slug,
+                db_path=db_path,
+            ) from exc
+        result = file_history(conn, normalized, limit=limit + offset, repo=slug)
         entries = result.get("entries") or []
         result["entries"] = entries[offset : offset + limit]
         # file_history over-fetches limit+1 at the window size, so its own
         # truncated flag is the post-offset more-exist evidence. Promote
         # (and remove) it for shape parity with the file-history command.
         truncated = bool(result.pop("truncated", False))
-        if truncated:
+        if truncated and offset + len(result["entries"]) <= _MAX_CURSOR:
+            # A mint past the _MAX_CURSOR clamp live-loops the follower
+            # (FB-011, same boundary shape as search's) — terminal page.
             result["next_cursor"] = str(offset + len(result["entries"]))
         return _read_envelope(conn, slug, db_path, result, truncated, ctx)
     finally:
@@ -830,17 +1202,25 @@ def _tool_open_items(arguments: dict, ctx) -> dict:
     conn = _open_corpus(slug, db_path)
     try:
         limit = _clamp_limit(min(_int_arg(arguments, "limit", 50), _MAX_PAGE))
-        offset = _int_cursor(arguments.get("cursor"))
+        offset = _int_cursor(arguments.get("cursor"), "open_items")
         # SQL-level paging: the fetch is bounded where the cost is (F1).
         rows = open_items(conn, repo=slug, limit=limit + 1, offset=offset)
         truncated = len(rows) > limit
         page = rows[:limit]
         data: dict = {"items": page}
-        if truncated:
+        if truncated and offset + len(page) <= _MAX_CURSOR:
+            # Terminal at the clamp ceiling (FB-011, same as search).
             data["next_cursor"] = str(offset + len(page))
         return _read_envelope(conn, slug, db_path, data, truncated, ctx)
     finally:
         conn.close()
+
+
+#: sqlite error-message classifier for the sql tool's error mapping
+#: (issue #71 AC11): an unknown table gets the store's real table list as
+#: the hint. The error CODE stays exactly as today (`runtime` at this
+#: surface) — only the hint key is added, mirroring the CLI's cmd_sql.
+_NO_SUCH_TABLE_RE = re.compile(r"^no such table", re.IGNORECASE)
 
 
 def _tool_sql(arguments: dict, ctx) -> dict:
@@ -857,7 +1237,8 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         raise ToolError(
             "bad_sql",
             str(exc),
-            hint="only one SELECT/WITH/EXPLAIN statement per call",
+            hint="only one SELECT/WITH/EXPLAIN statement per call; "
+            "see `zaxbygraph schema [TABLE]` for the store's tables and columns",
         ) from exc
     conn = _open_corpus(slug, db_path)
     try:
@@ -883,22 +1264,60 @@ def _tool_sql(arguments: dict, ctx) -> dict:
         conn.close()
     limit = _clamp_limit(min(_int_arg(arguments, "limit", 200), _MAX_PAGE))
     try:
-        data = run_sql(guarded, statement, limit=limit, repo=slug)
+        data = run_sql(
+            guarded,
+            statement,
+            limit=limit,
+            repo=slug,
+            deadline=sql_deadline_from_env(),
+            max_bytes=sql_max_bytes_from_env(),
+        )
+    except SqlTimeoutError as exc:
+        # A deadline expiry is its own coded failure (issue #71 AC1) —
+        # `timeout`, never `runtime` — so a caller narrows the statement
+        # or widens ZAXBYGRAPH_SQL_TIMEOUT_S instead of retrying blind.
+        guarded.close()
+        raise ToolError(
+            "timeout",
+            str(exc),
+            hint="narrow the statement (LIMIT, tighter predicates) or raise "
+            "ZAXBYGRAPH_SQL_TIMEOUT_S (clamped to (0, 600])",
+            slug=slug,
+            db_path=db_path,
+        ) from exc
     except ValueError as exc:
         # run_sql converts execution-time sqlite failures (no such
         # column/table, malformed expressions) to ValueError — the single
         # most common failure of an sql tool. It must answer as the
-        # envelope error object, never escape the protocol frame.
+        # envelope error object, never escape the protocol frame. The code
+        # stays `runtime` exactly as before; only the hint is enriched
+        # (issue #71 AC11: an unknown table names the store's real tables).
+        message = str(exc)
+        if _NO_SUCH_TABLE_RE.match(message):
+            hint = store_tables_hint(guarded) or (
+                "check table names with the zaxbygraph://schema resource"
+            )
+        else:
+            hint = "check column names with the zaxbygraph://schema resource"
         guarded.close()
         raise ToolError(
             "runtime",
-            str(exc),
-            hint="check column names with the zaxbygraph://schema resource",
+            message,
+            hint=hint,
             slug=slug,
             db_path=db_path,
         ) from exc
     except sqlite3.Error as exc:  # defensive: run_sql converts these today
         guarded.close()
+        if "interrupted" in str(exc).lower():
+            raise ToolError(
+                "timeout",
+                str(exc),
+                hint="narrow the statement (LIMIT, tighter predicates) or raise "
+                "ZAXBYGRAPH_SQL_TIMEOUT_S (clamped to (0, 600])",
+                slug=slug,
+                db_path=db_path,
+            ) from exc
         raise ToolError(
             "runtime",
             str(exc),
@@ -1060,8 +1479,34 @@ def _tool_similar_items(arguments: dict, ctx) -> dict:
 def _tool_triage(arguments: dict, ctx) -> dict:
     limit = _clamp_limit(min(_int_arg(arguments, "limit", 20), _MAX_PAGE))
     cursor = arguments.get("cursor")
-    if cursor is not None and not isinstance(cursor, str):
-        raise ToolError("bad_request", "cursor must be a string", hint="pass the next_cursor value from the previous page")
+    if cursor is not None:
+        if not isinstance(cursor, str):
+            raise ToolError(
+                "bad_request", "cursor must be a string",
+                hint="pass the cursor value from the previous triage page",
+            )
+        # Validated symmetrically with the producer (derive._cursor_key
+        # mints "%.9f:%d" and derive.triage parses total:number halves):
+        # a malformed cursor is a structured bad_request here, never a
+        # silent page-1 reset (issue #71 C12). A well-formed but stale
+        # cursor still restarts from the top inside derive (the
+        # documented restart), which is honest — the shape is valid.
+        total_text, _, number_text = cursor.partition(":")
+        try:
+            int(number_text)
+            total = float(total_text)
+        except ValueError:
+            raise ToolError(
+                "bad_request", f"cursor is malformed: {cursor!r}",
+                hint="pass the cursor value from the previous triage page verbatim",
+            ) from None
+        if total != total or total in (float("inf"), float("-inf")):
+            # nan/inf parse as floats but the producer never mints them
+            # (FB-012): accepting them restarted pagination at page one.
+            raise ToolError(
+                "bad_request", f"cursor is malformed: {cursor!r}",
+                hint="pass the cursor value from the previous triage page verbatim",
+            )
     top_k = arguments.get("top_k")
     if top_k is not None:
         if isinstance(top_k, bool) or not isinstance(top_k, int):
@@ -1113,11 +1558,13 @@ def _tool_brief(arguments: dict, ctx) -> dict:
     number = _item_number(arguments, "brief")
     budget_tokens = _int_arg(arguments, "budget_tokens", 4000)
     live = _bool_arg(arguments, "live")
+    exclude_bots = _bool_arg(arguments, "exclude_bots")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
         data = _translated_derive(
-            _brief_query, conn, slug, db_path, number, budget_tokens, live, None
+            _brief_query, conn, slug, db_path, number, budget_tokens, live,
+            exclude_bots, None,
         )
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
@@ -1164,7 +1611,7 @@ def _schema(properties: dict, required: list[str] | None = None) -> dict:
 _REPO_DB = {
     "repo": {
         "type": "string",
-        "description": "OWNER/REPO slug (default: the server --repo pin, then MCP roots, then the server cwd git origin)",
+        "description": "OWNER/REPO slug (default: the server --repo pin, then MCP roots for clients that declared the roots capability, then the server cwd git origin)",
     },
 }
 _LIMIT = {
@@ -1175,6 +1622,755 @@ _LIMIT = {
 }
 _CURSOR = {"type": "string", "description": "Opaque cursor from a previous truncated page"}
 
+# ---------------------------------------------------------------------------
+# Result shape registry (issue #72 C17/C23, plan CF-I/CF-L): ONE table
+# describing every tool's real payload. tools/list derives each tool's
+# outputSchema from it (_output_schema_for) and the CLI `schema --output
+# COMMAND` prints the same shapes (CLI_OUTPUT_SHAPES) — one source of truth
+# for both surfaces and the SKILL.md shape table.
+#
+# Honesty rules: `data_keys` names the payload's ALWAYS-present top-level
+# keys (a bare-list payload's row fields); the `data` schema may add
+# conditional keys (next_cursor, bots_omitted, ...) as non-required
+# properties; nested row objects stay open (additionalProperties true)
+# because store rows carry more columns than any schema should pin. Types
+# use JSON Schema unions (["string", "null"]) where a value is genuinely
+# nullable. The null alternative for `data` itself is added by
+# _output_schema_for: failure envelopes carry data:null against the same
+# schema.
+
+#: envelope keys every result carries ("error" joins them on failures)
+_ENVELOPE_KEYS = ("ok", "db", "repo", "freshness", "data", "truncated")
+
+_STR = {"type": "string"}
+_STR_NULL = {"type": ["string", "null"]}
+_INT = {"type": "integer"}
+_INT_NULL = {"type": ["integer", "null"]}
+_BOOL = {"type": "boolean"}
+_NUM_NULL = {"type": ["number", "null"]}
+_OPEN_OBJ = {"type": "object", "additionalProperties": True}
+
+
+def _open_objects(description: str | None = None) -> dict:
+    """array of open row objects (row fields are named in the description)."""
+    out: dict = {"type": "array", "items": dict(_OPEN_OBJ)}
+    if description:
+        out["description"] = description
+    return out
+
+
+def _props(fields: dict, required: tuple | None = None) -> dict:
+    out: dict = {"type": "object", "properties": fields, "additionalProperties": True}
+    if required:
+        out["required"] = list(required)
+    return out
+
+
+_TOOL_SHAPES: dict[str, dict] = {
+    "graph_status": {
+        "cli": "status",
+        "description": "Sync state and corpus coverage for the resolved"
+        " repo: one sync_state row per held repo, grouped item counts,"
+        " coverage, and snapshot provenance when the store was installed"
+        " by snapshot pull.",
+        "data_keys": ("counts", "coverage", "repos", "snapshot"),
+        "data": _props(
+            {
+                "repos": _open_objects(
+                    "sync_state rows: repo, item_count, issues_since"
+                    " (watermark), last_error, full_sync_pending,"
+                    " last_full_sync_at, last_incr_sync_at, complete, ..."
+                ),
+                "counts": _open_objects(
+                    "grouped item counts: {repo, kind, state, c}"
+                ),
+                "coverage": dict(
+                    _OPEN_OBJ, description="corpus coverage per stored section"
+                ),
+                "snapshot": {
+                    "type": ["object", "null"],
+                    "additionalProperties": True,
+                    "description": "{publisher, manifest_sha256, pulled_at}"
+                    " when the store came from snapshot pull; null otherwise",
+                },
+                "sync_lock": {
+                    "type": ["object", "null"],
+                    "additionalProperties": True,
+                    "description": "present while another process holds the"
+                    " sync lock",
+                },
+                "jobs": _open_objects("live sync jobs (present while one runs)"),
+            },
+            ("counts", "coverage", "repos", "snapshot"),
+        ),
+    },
+    "search": {
+        "cli": "search",
+        "description": "Ranked matches with limit-independent counts"
+        " (strict_matches/broadened_matches/total_matches never change with"
+        " the page size); comment and review hits merge into their item.",
+        "data_keys": (
+            "broadened_matches", "corpus_items", "index_stale", "items",
+            "matched_mode", "offset", "strict_matches", "total_matches",
+        ),
+        "row_fields": {
+            "items": (
+                "author", "comment_snippet", "html_url", "kind",
+                "matching_comments", "matching_reviews", "number", "repo",
+                "review_snippet", "snippet", "state", "title", "updated_at",
+            ),
+        },
+        "data": _props(
+            {
+                "items": _open_objects(
+                    "hit rows: {repo, number, kind, title, state, author,"
+                    " updated_at, html_url, snippet, matching_comments,"
+                    " comment_snippet, matching_reviews, review_snippet}"
+                ),
+                "matched_mode": _STR,
+                "total_matches": _INT,
+                "strict_matches": _INT,
+                "broadened_matches": _INT,
+                "offset": _INT,
+                "corpus_items": _INT,
+                "index_stale": _BOOL,
+                "next_cursor": {
+                    "type": "string",
+                    "description": "present when the page is truncated"
+                    " (MCP; the CLI pages with --offset)",
+                },
+                "bots_omitted": {
+                    "type": "integer",
+                    "description": "present under exclude_bots/--no-bots",
+                },
+            },
+            (
+                "broadened_matches", "corpus_items", "index_stale", "items",
+                "matched_mode", "offset", "strict_matches", "total_matches",
+            ),
+        ),
+    },
+    "get_item": {
+        "cli": "item",
+        "description": "One item row (every items column) plus labels,"
+        " comments, reviews, files and edges, bounded by default with"
+        " omission counts. The CLI multi-number form (item N1 N2 ...) returns"
+        " a bare list of these rows in input order, unstored numbers included"
+        " as per-row not_found entries.",
+        "data_keys": (
+            "additions", "api_url", "author", "author_association",
+            "base_ref", "body", "branch_token", "changed_files", "closed_at",
+            "comment_count", "comments", "comments_omitted", "commits",
+            "created_at", "deletions", "dependencies_blocked_by",
+            "dependencies_blocking", "dependencies_total_blocked_by",
+            "dependencies_total_blocking", "draft", "edges", "files",
+            "head_ref", "html_url", "id", "index_stale", "item_type", "kind",
+            "labels", "labels_text", "locked", "merge_commit", "merged_at",
+            "merged_by", "milestone", "node_id", "number", "paths_text",
+            "reactions_total", "repo", "reviews", "reviews_omitted", "state",
+            "state_reason", "sub_issues_completed", "sub_issues_total",
+            "title", "updated_at",
+        ),
+        "row_fields": {
+            "comments": ("author", "body", "created_at", "github_id",
+                         "html_url", "kind", "pk"),
+            "edges": ("confidence", "dst_id", "dst_type", "evidence", "rel",
+                      "source", "src_id", "src_type"),
+        },
+        "data": _props(
+            {
+                "repo": _STR,
+                "number": _INT,
+                "kind": _STR,
+                "title": _STR_NULL,
+                "body": _STR_NULL,
+                "state": _STR,
+                "author": _STR_NULL,
+                "created_at": _STR_NULL,
+                "updated_at": _STR_NULL,
+                "html_url": _STR_NULL,
+                "labels": _open_objects("label rows {name, color}"),
+                "comments": _open_objects(
+                    "comment rows {pk, github_id, kind, author, created_at,"
+                    " body, html_url}"
+                ),
+                "reviews": _open_objects(
+                    "review rows {id, author, state, submitted_at, body,"
+                    " html_url}"
+                ),
+                "files": _open_objects(
+                    "pr file rows {path, status, additions, deletions,"
+                    " changes}"
+                ),
+                "edges": _open_objects(
+                    "edge rows {src_type, src_id, rel, dst_type, dst_id,"
+                    " confidence, evidence, source}"
+                ),
+                "index_stale": _BOOL,
+                "comments_omitted": _INT,
+                "reviews_omitted": _INT,
+                "bots_omitted": {
+                    "type": "integer",
+                    "description": "present under exclude_bots/--no-bots",
+                },
+                "body_chars_omitted": {
+                    "type": "integer",
+                    "description": "present when the default body bound cut"
+                    " the body",
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "set on the row when its own body was cut",
+                },
+            },
+            (
+                "author", "body", "comments", "comments_omitted",
+                "created_at", "edges", "files", "html_url", "index_stale",
+                "kind", "labels", "number", "repo", "reviews",
+                "reviews_omitted", "state", "title", "updated_at",
+            ),
+        ),
+    },
+    "related": {
+        "cli": "related",
+        "description": "The item's bounded graph neighborhood (node and"
+        " serialized-byte budgets; truncated:true names the cut).",
+        "data_keys": ("edges", "index_stale", "nodes", "number", "repo"),
+        "row_fields": {
+            "nodes": ("kind", "number", "state", "title"),
+            "edges": ("confidence", "dst_id", "dst_type", "evidence", "rel",
+                      "source", "src_id", "src_type"),
+        },
+        "data": _props(
+            {
+                "number": _INT,
+                "repo": _STR,
+                "nodes": _open_objects(
+                    "{number, kind, title, state}; number is null for"
+                    " repo-qualified foreign cross-reference placeholders"
+                ),
+                "edges": _open_objects(
+                    "edge rows {src_type, src_id, rel, dst_type, dst_id,"
+                    " confidence, evidence, source}"
+                ),
+                "index_stale": _BOOL,
+            },
+            ("edges", "index_stale", "nodes", "number", "repo"),
+        ),
+    },
+    "path": {
+        "cli": "path",
+        "description": "Undirected path between two item numbers or file"
+        " paths; path is null (with exit 0 / ok:true) when no route exists.",
+        "data_keys": ("a", "b", "path", "repo"),
+        "data": _props(
+            {
+                "a": _STR,
+                "b": _STR,
+                "repo": _STR_NULL,
+                "path": {
+                    "type": ["array", "null"],
+                    "items": dict(
+                        _OPEN_OBJ,
+                        description="hop {type, id}",
+                    ),
+                    "description": "null when no route exists",
+                },
+            },
+            ("a", "b", "path", "repo"),
+        ),
+    },
+    "pr_overlap": {
+        "cli": "overlap",
+        "description": "Shared file paths for each unordered pair of the"
+        " given PR numbers ([] for disjoint pairs), in the caller's order.",
+        "data_keys": ("pairs",),
+        "data": _props(
+            {
+                "pairs": {
+                    "type": "array",
+                    "items": _props(
+                        {
+                            "a": _INT,
+                            "b": _INT,
+                            "shared": {
+                                "type": "array",
+                                "items": _STR,
+                                "description": "sorted shared paths",
+                            },
+                        },
+                        ("a", "b", "shared"),
+                    ),
+                },
+            },
+            ("pairs",),
+        ),
+    },
+    "file_history": {
+        "cli": "file-history",
+        "description": "PRs that touched a path, newest first, each entry"
+        " carrying its GitHub-reported closed_issues and keyword-derived"
+        " keyword_closes separately.",
+        "data_keys": ("entries", "index_stale"),
+        "row_fields": {
+            "entries": ("closed_issues", "html_url", "keyword_closes",
+                        "number", "state", "title", "updated_at"),
+        },
+        "data": _props(
+            {
+                "entries": _open_objects(
+                    "{number, title, state, updated_at, html_url,"
+                    " closed_issues, keyword_closes}"
+                ),
+                "index_stale": _BOOL,
+                "next_cursor": {
+                    "type": "string",
+                    "description": "present when the page is truncated"
+                    " (MCP-only paging; the file-history CLI returns the"
+                    " whole list)",
+                },
+            },
+            ("entries", "index_stale"),
+        ),
+    },
+    "what_closed": {
+        "cli": "what-closed",
+        "description": "What closed an issue: GitHub-reported closing PRs"
+        " (prs), keyword-derived closing items (keyword_closes) and closing"
+        " commits, every entry carrying its edge provenance; a PR has no"
+        " closers (the row's kind says which).",
+        "data_keys": ("commits", "index_stale", "keyword_closes", "kind",
+                      "number", "prs"),
+        "data": _props(
+            {
+                "number": _INT,
+                "kind": _STR,
+                "prs": _open_objects("{number, evidence, source?}"),
+                "keyword_closes": _open_objects("{number, evidence, source?}"),
+                "commits": _open_objects("{sha, evidence, source?}"),
+                "index_stale": _BOOL,
+            },
+            ("commits", "index_stale", "keyword_closes", "kind", "number",
+             "prs"),
+        ),
+    },
+    "open_items": {
+        "cli": None,  # the CLI `open` command streams the BARE row list
+        "description": "Open issues and PRs enriched with labels,"
+        " assignees and linked_open_prs. MCP wraps the page one level"
+        " ({items, next_cursor?}); the CLI open command returns the bare"
+        " row list.",
+        "data_keys": ("items",),
+        "row_fields": {
+            "items": ("assignees", "author", "html_url", "kind", "labels",
+                      "linked_open_prs", "number", "repo", "title",
+                      "updated_at"),
+        },
+        "data": _props(
+            {
+                "items": _open_objects(
+                    "{repo, number, kind, title, author, updated_at,"
+                    " html_url, labels, assignees, linked_open_prs}"
+                ),
+                "next_cursor": {
+                    "type": "string",
+                    "description": "present when the page is truncated",
+                },
+            },
+            ("items",),
+        ),
+    },
+    "sql": {
+        "cli": "sql",
+        "description": "Read-only SQL result: the column names and the row"
+        " stream (MCP rows are positional arrays matching columns; the CLI"
+        " defaults to objects keyed by column, --rows array for positional).",
+        "data_keys": ("columns", "rows"),
+        "data": _props(
+            {
+                "columns": {"type": "array", "items": _STR},
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": ["array", "object"],
+                        "description": "positional cells (MCP) or objects"
+                        " keyed by column (CLI default)",
+                    },
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "kept inside data on MCP; the CLI promotes"
+                    " it to the envelope flag",
+                },
+                "warnings": {
+                    "type": "array",
+                    "items": _props(
+                        {
+                            "column": _STR,
+                            "literal": _STR,
+                            "stored_values": {
+                                "type": "array",
+                                "items": _STR,
+                                "description": "the stored DISTINCT"
+                                " vocabulary of that column (bounded)",
+                            },
+                        },
+                        ("column", "literal", "stored_values"),
+                    ),
+                    "description": "out-of-vocabulary literal warnings"
+                    " ({column, literal, stored_values}; query.run_sql"
+                    " emits one object per warning)",
+                },
+                "total_rows": {
+                    "type": "integer",
+                    "description": "present when truncated (the unfiltered"
+                    " total, when computable)",
+                },
+            },
+            ("columns", "rows"),
+        ),
+    },
+    "sync": {
+        "cli": None,  # the write surface; schema --output refuses non-read commands
+        "description": "The started-or-joined background sync job (never"
+        " blocks; graph_status reports progress).",
+        "data_keys": ("job",),
+        "data": _props(
+            {
+                "job": _STR,
+                "started": {
+                    "type": "boolean",
+                    "description": "this call started the job",
+                },
+                "joined": {
+                    "type": "boolean",
+                    "description": "a sync was already running and this call"
+                    " joined it",
+                },
+            },
+            ("job",),
+        ),
+    },
+    "similar_items": {
+        "cli": "similar",
+        "description": "Issues related to one item with per-signal evidence"
+        " and the effective weight table (derived, read-only).",
+        "data_keys": ("candidates", "capabilities", "derived",
+                      "ls_files_applied", "ls_files_head", "repo",
+                      "resolved_path_count", "target", "weights"),
+        "data": _props(
+            {
+                "target": _INT,
+                "repo": _STR,
+                "candidates": _open_objects(
+                    "scored candidates with per-signal evidence"
+                ),
+                "resolved_path_count": _INT,
+                "weights": dict(
+                    _OPEN_OBJ, description="the effective weight table"
+                ),
+                "capabilities": {
+                    "type": "array",
+                    "items": _STR,
+                    "description": "degraded-signal notes (empty when every"
+                    " signal was available)",
+                },
+                "derived": _BOOL,
+                "ls_files_applied": _BOOL,
+                "ls_files_head": _STR_NULL,
+            },
+            ("candidates", "capabilities", "derived", "ls_files_applied",
+             "ls_files_head", "repo", "resolved_path_count", "target",
+             "weights"),
+        ),
+    },
+    "triage": {
+        "cli": "triage",
+        "description": "Open issues ranked workable by the documented"
+        " formula, with gates naming every exclusion; pages via cursor"
+        " (derived, read-only).",
+        "data_keys": ("blocking_source", "config_source", "cursor",
+                      "derived", "formula_version", "hotspot_asof", "repo",
+                      "rows", "stage2_weight", "top_k", "triage_asof",
+                      "truncated", "weights"),
+        "row_fields": {
+            "rows": ("analog", "gates", "hotspot", "note", "number",
+                     "ranked", "regression", "resolved_paths", "scores",
+                     "stage2", "title", "total_score"),
+        },
+        "data": _props(
+            {
+                "repo": _STR,
+                "rows": _open_objects(
+                    "{number, title, gates, ranked, scores, total_score,"
+                    " stage2, hotspot, regression, analog, resolved_paths,"
+                    " note?}"
+                ),
+                "weights": dict(
+                    _OPEN_OBJ, description="the effective weight table"
+                ),
+                "config_source": _STR,
+                "top_k": _INT_NULL,
+                "stage2_weight": _NUM_NULL,
+                "formula_version": _STR,
+                "triage_asof": _STR_NULL,
+                "hotspot_asof": _STR_NULL,
+                "blocking_source": _STR_NULL,
+                "cursor": _STR_NULL,
+                "truncated": _BOOL,
+                "derived": _BOOL,
+            },
+            ("blocking_source", "config_source", "cursor", "derived",
+             "formula_version", "hotspot_asof", "repo", "rows",
+             "stage2_weight", "top_k", "triage_asof", "truncated",
+             "weights"),
+        ),
+    },
+    "bundle": {
+        "cli": "bundle",
+        "description": "Evidence-backed 2-3-issue work bundles over the"
+        " triage pool, with dropped pool members named (derived,"
+        " read-only).",
+        "data_keys": ("bundles", "config_source", "derived", "dropped",
+                      "excluded", "formula_version", "merge_candidates",
+                      "pool", "related_not_bundleable", "repo", "weights"),
+        "data": _props(
+            {
+                "repo": _STR,
+                "bundles": _open_objects(
+                    "bundle payloads: members, file sets, co-changed tests,"
+                    " open-PR collisions, dependency order"
+                ),
+                "merge_candidates": _open_objects(
+                    "{kind, numbers, affinity, evidence}"
+                ),
+                "related_not_bundleable": _open_objects(
+                    "related pairs the bundler could not use"
+                ),
+                "excluded": {
+                    "type": "array",
+                    "items": {"type": ["integer", "object"]},
+                    "description": "numbers (or entry objects) removed from"
+                    " the pool before ranking",
+                },
+                "pool": {
+                    "type": "array",
+                    "items": _INT,
+                    "description": "the numbers the bundles were built from",
+                },
+                "dropped": _open_objects(
+                    "{number, reason} for pool members that could not be used"
+                ),
+                "weights": dict(
+                    _OPEN_OBJ, description="the effective weight table"
+                ),
+                "config_source": _STR,
+                "formula_version": _STR,
+                "derived": _BOOL,
+                "truncated": {
+                    "type": "boolean",
+                    "description": "present when budget_tokens cut the"
+                    " payload",
+                },
+            },
+            ("bundles", "config_source", "derived", "dropped", "excluded",
+             "formula_version", "merge_candidates", "pool",
+             "related_not_bundleable", "repo", "weights"),
+        ),
+    },
+    "brief": {
+        "cli": "brief",
+        "description": "The token-budgeted work packet for one issue:"
+        " triage features, bounded body and comments, implicated files,"
+        " closest analog and linked PRs (derived, read-only; live=true adds"
+        " live CI/review state via gh).",
+        "data_keys": ("analog", "body", "comments", "config_source",
+                      "content_trust", "derived", "features", "files",
+                      "formula_version", "linked_prs", "number", "repo",
+                      "weights"),
+        "data": _props(
+            {
+                "repo": _STR,
+                "number": _INT,
+                "features": dict(
+                    _OPEN_OBJ,
+                    description="the triage row for this issue"
+                    " ({number, title, gates, ranked, scores, ...})",
+                ),
+                "content_trust": _STR,
+                "comments": _open_objects(
+                    "{author, author_association, created_at, body}"
+                ),
+                "body": {
+                    "type": "object",
+                    "properties": {"untrusted_text": _STR},
+                    "required": ["untrusted_text"],
+                    "additionalProperties": True,
+                    "description": "the item body inside the AC6"
+                    " untrusted-content wrapper"
+                    " {untrusted_text: str} (derive._untrusted)",
+                },
+                "files": {
+                    "type": "object",
+                    "properties": {
+                        "resolved": {
+                            "type": "array",
+                            "items": _STR,
+                            "description": "stored paths the item implicates",
+                        },
+                        "unresolved_count": _INT,
+                    },
+                    "additionalProperties": True,
+                },
+                "analog": {
+                    "type": ["object", "null"],
+                    "additionalProperties": True,
+                    "description": "the closest merged-PR analog (null when"
+                    " none scored)",
+                },
+                "linked_prs": _open_objects(
+                    "{number, state, title}"
+                ),
+                "weights": dict(
+                    _OPEN_OBJ, description="the effective weight table"
+                ),
+                "config_source": _STR,
+                "formula_version": _STR,
+                "derived": _BOOL,
+                "bots_omitted": {
+                    "type": "integer",
+                    "description": "present under exclude_bots/--no-bots",
+                },
+                "live": {
+                    "type": ["object", "null"],
+                    "additionalProperties": True,
+                    "description": "live CI/review state (present only"
+                    " under live=true)",
+                },
+                "live_error": {
+                    "type": "string",
+                    "description": "present when the live gh fan failed",
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": "present when the token budget cut the"
+                    " packet",
+                },
+            },
+            ("analog", "body", "comments", "config_source", "content_trust",
+             "derived", "features", "files", "formula_version",
+             "linked_prs", "number", "repo", "weights"),
+        ),
+    },
+    "churn": {
+        "cli": "churn",
+        "description": "Files ranked by PR touch count — a BARE LIST of"
+        " per-path rows (not wrapped in an object), on both surfaces.",
+        "data_keys": ("additions", "deletions", "path", "prs"),
+        "data": {
+            "type": "array",
+            "items": _props(
+                {
+                    "path": _STR,
+                    "prs": _INT,
+                    "additions": _INT_NULL,
+                    "deletions": _INT_NULL,
+                },
+                ("additions", "deletions", "path", "prs"),
+            ),
+            "description": "bare list of per-path rows",
+        },
+    },
+}
+
+
+def _output_schema_for(tool_name: str) -> dict:
+    """The tool's outputSchema, derived from the shape registry (issue #72
+    C17): the shared envelope object plus the tool's own data member.
+    Permissive at both levels (additionalProperties true) — the envelope
+    gains `error` on failures and row objects carry more columns than any
+    schema should pin — and the data member's type union gains the null
+    alternative, because failure envelopes answer data:null against the
+    SAME schema (a representative error result must validate too)."""
+    entry = _TOOL_SHAPES[tool_name]
+    data = dict(entry["data"])
+    declared = data.get("type")
+    if isinstance(declared, str):
+        data["type"] = [declared, "null"]
+    elif isinstance(declared, list) and "null" not in declared:
+        data["type"] = [*declared, "null"]
+    return {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "db": {"type": ["string", "null"]},
+            "repo": {"type": ["string", "null"]},
+            "freshness": {
+                "type": ["object", "null"],
+                "properties": {
+                    "synced_at": _STR_NULL,
+                    "age_s": _INT_NULL,
+                    "complete": _BOOL,
+                    "refreshed": _BOOL,
+                    "refreshing": _BOOL,
+                    "refresh_failed": _STR_NULL,
+                },
+                "additionalProperties": True,
+            },
+            "data": data,
+            "truncated": _BOOL,
+            "error": {
+                "type": ["object", "null"],
+                "properties": {
+                    "code": _STR,
+                    "message": _STR,
+                    "hint": _STR,
+                },
+                "additionalProperties": True,
+            },
+        },
+        "required": list(_ENVELOPE_KEYS),
+        "additionalProperties": True,
+    }
+
+
+#: CLI read command -> the registry shape its payload matches (issue #72
+#: C23 / plan CF-L). Most commands share their MCP twin's entry verbatim;
+#: `open` genuinely differs (the CLI streams the bare row list the
+#: open_items tool wraps under data.items), so it carries its own
+#: bare-list entry whose row fields come from the same registry.
+_CLI_BARE_LIST_NOTE = "bare list of rows (one JSON object per row; no wrapper key)"
+
+CLI_OUTPUT_SHAPES: dict[str, dict] = {
+    command: {
+        "description": entry["description"],
+        "data_kind": "object"
+        if isinstance(entry["data"].get("type"), str)
+        and entry["data"]["type"] == "object"
+        else "list",
+        "data_keys": list(entry["data_keys"]),
+        "mcp_tool": tool,
+    }
+    for tool, entry in _TOOL_SHAPES.items()
+    if (command := entry.get("cli"))
+}
+CLI_OUTPUT_SHAPES["open"] = {
+    "description": _TOOL_SHAPES["open_items"]["description"]
+    + " The CLI payload is the "
+    + _CLI_BARE_LIST_NOTE
+    + " that the open_items MCP tool wraps under data.items.",
+    "data_kind": "list",
+    "data_keys": list(
+        _TOOL_SHAPES["open_items"]["row_fields"]["items"]
+    ),
+    "mcp_tool": "open_items",
+}
+CLI_OUTPUT_SHAPES["item"]["description"] += (
+    " Single-number item answers one row object; multi-number item answers the "
+    + _CLI_BARE_LIST_NOTE
+    + " (unstored numbers included as not_found rows)."
+)
+
 _TOOLS: list[dict] = [
     {
         "name": "graph_status",
@@ -1184,15 +2380,33 @@ _TOOLS: list[dict] = [
     {
         "name": "search",
         "description": "Relevance-ranked full-text search over titles, bodies, labels, comments, review bodies, and PR touched paths",
-        "inputSchema": _schema({"query": {"type": "string"}, "limit": _LIMIT, "cursor": _CURSOR, **_REPO_DB}, ["query"]),
+        "inputSchema": _schema(
+            {
+                "query": {"type": "string"},
+                "limit": _LIMIT,
+                "cursor": _CURSOR,
+                "exclude_bots": {
+                    "type": "boolean",
+                    "description": "Omit bot-authored matches (items, comments, reviews filtered out of the match SQL pre-ranking; reports bots_omitted, the excluded bot-authored matches)",
+                },
+                **_REPO_DB,
+            },
+            ["query"],
+        ),
     },
     {
         "name": "get_item",
-        "description": "One issue/PR with labels, comments, reviews, files, and edges",
+        "description": "One issue/PR with labels, comments, reviews, files, and edges (bounded by default: body <= 20 KiB with a truncation marker, comments/reviews <= 5 with comments_omitted/reviews_omitted)",
         "inputSchema": _schema(
             {
                 "number": {"type": "integer"},
-                "max_body_chars": {"type": "integer", "minimum": 1, "description": "Truncate item/comment/review bodies to N chars"},
+                "max_body_chars": {"type": "integer", "minimum": 0, "description": "Truncate item/comment/review bodies to N chars (overrides the default 20 KiB body bound; 0 is the explicit uncapped override, matching the CLI --max-body-chars 0)"},
+                "max_comments": {"type": "integer", "minimum": 0, "description": "Cap the comment list to K entries (overrides the default 5; reports comments_omitted)"},
+                "max_reviews": {"type": "integer", "minimum": 0, "description": "Cap the review list to K entries (overrides the default 5; reports reviews_omitted)"},
+                "exclude_bots": {
+                    "type": "boolean",
+                    "description": "Omit bot-authored comments and reviews, filtered in the query before omission counting (reports bots_omitted, the excluded comment+review rows)",
+                },
                 **_REPO_DB,
             },
             ["number"],
@@ -1200,11 +2414,12 @@ _TOOLS: list[dict] = [
     },
     {
         "name": "related",
-        "description": "One-hop (or deeper) neighborhood of an item in the graph",
+        "description": "One-hop (or deeper) neighborhood of an item in the graph, bounded by a node budget (default 100) and a serialized byte budget",
         "inputSchema": _schema(
             {
                 "number": {"type": "integer"},
                 "depth": {"type": "integer", "minimum": 1, "maximum": _MAX_DEPTH},
+                "max_nodes": {"type": "integer", "minimum": 1, "maximum": _MAX_PAGE, "description": f"Stop expanding at this many nodes (default 100, capped at {_MAX_PAGE}); truncated:true names the cut"},
                 **_REPO_DB,
             },
             ["number"],
@@ -1322,6 +2537,10 @@ _TOOLS: list[dict] = [
                 "number": {"type": "integer"},
                 "budget_tokens": {"type": "integer", "minimum": 1},
                 "live": {"type": "boolean", "description": "Query live CI/review state via gh"},
+                "exclude_bots": {
+                    "type": "boolean",
+                    "description": "Omit bot-authored content: bot comments leave the comment ranking and bot-authored items (linked PRs, the analog) leave the packet (reports bots_omitted, the filtered rows)",
+                },
                 **_REPO_DB,
             },
             ["number"],
@@ -1340,13 +2559,24 @@ _TOOLS: list[dict] = [
     },
 ]
 
-# Issue #32: every tool declares a permissive outputSchema (results are the
-# JSON envelope, additionalProperties true) and carries annotations with
-# readOnlyHint true except sync (the only tool that mutates the store). The
-# listing is SORTED BY NAME — one deterministic order for both protocol eras
-# (the modern tools/list pins sorted order).
+# Issue #32: every tool declares an outputSchema and carries annotations
+# with readOnlyHint true except sync (the only tool that mutates the store).
+# Since issue #72 C17 the outputSchema is PER-TOOL, derived from the shape
+# registry above (_output_schema_for) — it names the envelope keys, the
+# tool's data keys and row fields, and stays permissive (additionalProperties
+# true) at every level. The listing is SORTED BY NAME — one deterministic
+# order for both protocol eras (the modern tools/list pins sorted order).
+if {tool["name"] for tool in _TOOLS} != set(_TOOL_SHAPES):
+    raise RuntimeError(
+        "shape registry drift: _TOOL_SHAPES must describe exactly the"
+        " advertised tools ("
+        + ", ".join(sorted(
+            {tool["name"] for tool in _TOOLS} ^ set(_TOOL_SHAPES)
+        ))
+        + ")"
+    )
 for _tool in _TOOLS:
-    _tool["outputSchema"] = {"type": "object", "additionalProperties": True}
+    _tool["outputSchema"] = _output_schema_for(_tool["name"])
     _tool["annotations"] = {"readOnlyHint": _tool["name"] != "sync"}
 _TOOLS.sort(key=lambda entry: entry["name"])
 
@@ -1375,9 +2605,18 @@ _TOOL_HANDLERS = {
 
 
 def _send(stdout, obj: dict) -> None:
-    stdout.write(json.dumps(obj, ensure_ascii=False))
-    stdout.write("\n")
-    stdout.flush()
+    try:
+        stdout.write(json.dumps(obj, ensure_ascii=False))
+        stdout.write("\n")
+        stdout.flush()
+    except OSError as exc:
+        # Same translation as cli._write_stdout (FB-007): a dead client on
+        # Windows raises plain OSError(EINVAL) that main()'s
+        # BrokenPipeError catch would never see, turning the documented
+        # quiet exit into a traceback + exit 1.
+        if exc.errno in (errno.EINVAL, errno.EPIPE):
+            raise BrokenPipeError(str(exc)) from exc
+        raise
 
 
 def _result(stdout, req_id, result: dict) -> None:
@@ -1404,6 +2643,7 @@ class _Context:
         "default_repo",
         "default_db",
         "modern",
+        "roots_declared",
     )
 
     def __init__(
@@ -1429,6 +2669,12 @@ class _Context:
         #: processes and overwritten by the next one — modern is a property
         #: of a request, never of a session.
         self.modern = False
+        #: Whether this session's client DECLARED ClientCapabilities.roots
+        #: at initialize (issue #71 C4 / plan CF-C): recorded once at the
+        #: initialize handshake, never per-request. Only a declared
+        #: session is ever asked roots/list; undeclared sessions fall
+        #: through to the server pin/cwd during resolution.
+        self.roots_declared = False
 
 
 def serve(
@@ -1567,6 +2813,11 @@ def _process(msg: dict, ctx: "_Context") -> None:
                 "content": [{"type": "text", "text": _InputRequired().hint_text()}],
             },
         )
+    except BrokenPipeError:
+        # The translated dead-pipe signal (FB-007): leave quietly
+        # via the main() handler -- a traceback here re-breaks the
+        # quiet exit.
+        raise
     except ToolError as exc:
         if method == "tools/call":
             env = _error_envelope(exc.code_key, exc.message, exc.hint, exc.slug, exc.db_path)
@@ -1651,7 +2902,17 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
     if method == "initialize":
         if not has_id:
             return
-        requested = (msg.get("params") or {}).get("protocolVersion")
+        init_params = msg.get("params") or {}
+        # Per-session roots capability (plan CF-C): recorded AT
+        # INITIALIZE. A well-formed declaration (the roots entry is an
+        # object per the ClientCapabilities schema) entitles the server
+        # to the roots/list round-trip later; absent or malformed means
+        # the client never declared it and must never be asked.
+        capabilities = init_params.get("capabilities")
+        ctx.roots_declared = isinstance(capabilities, dict) and isinstance(
+            capabilities.get("roots"), dict
+        )
+        requested = init_params.get("protocolVersion")
         version = requested if requested in _PROTOCOL_VERSIONS else _LATEST_PROTOCOL_VERSION
         _result(
             stdout,
