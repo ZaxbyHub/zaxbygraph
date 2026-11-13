@@ -462,7 +462,9 @@ def _contain_refresh_failure(db_path, slug: str, snapshot) -> None:
                 " skipped: the pre-run sync_state snapshot could not be"
                 " read; the store is left as the failed run left it"
             )
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError too (cubic round 2): a CLOSED stream raises
+            # ValueError ('I/O operation on closed file'), not OSError.
             pass
     else:
         try:
@@ -470,7 +472,7 @@ def _contain_refresh_failure(db_path, slug: str, snapshot) -> None:
         except Exception as exc:  # restoration is best-effort containment
             try:
                 _log(f"staleness refresh state restore for {slug} failed: {exc}")
-            except OSError:
+            except (OSError, ValueError):
                 pass
 
 

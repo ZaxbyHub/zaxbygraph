@@ -846,6 +846,11 @@ def item(
     exclude_bots: bool = False,
 ) -> dict | None:
     repo = _fold_repo(repo)
+    if exclude_bots:
+        # Gate BEFORE the lookup (cubic round 2): a missing item with
+        # exclude_bots on a pre-v12 store answers the same structured
+        # bad_request as search/brief, never a misleading not_found.
+        _require_bot_flags(conn)
     if repo:
         row = conn.execute(
             "SELECT * FROM items WHERE repo = ? AND number = ?", (repo, number)
@@ -862,8 +867,6 @@ def item(
     # IN THE QUERY, before any omission counting: the rows never reach the
     # payload, and bots_omitted counts exactly the excluded comment+review
     # rows. NOT EXISTS keeps NULL-author rows (not established bots — FB-005).
-    if exclude_bots:
-        _require_bot_flags(conn)
     comment_bots = _COMMENT_BOT_FILTER if exclude_bots else ""
     review_bots = _REVIEW_BOT_FILTER if exclude_bots else ""
     rec["labels"] = [

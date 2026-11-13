@@ -324,6 +324,19 @@ def _tail(b: bytes) -> str:
 #: rights"), never the whole noisy stream.
 _ACTIONABLE_LINE_LIMIT = 3
 
+#: Complete ANSI CSI/OSC sequences (cubic round 2): isprintable() strips the
+#: ESC bytes but leaves the printable FRAGMENTS ('[31m', ']0;title') behind,
+#: so complete sequences are removed first and the printable filter only
+#: mops up anything the grammar does not cover.
+_ANSI_CSI_RE = re.compile("\x1b\\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile("\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove complete ANSI CSI/OSC escape sequences before the
+    printable-character filter."""
+    return _ANSI_OSC_RE.sub("", _ANSI_CSI_RE.sub("", text))
+
 
 def _actionable_stderr(stderr: bytes) -> str:
     """The ACTIONABLE lines of git's stderr for the ``source_unreachable``
@@ -346,14 +359,14 @@ def _actionable_stderr(stderr: bytes) -> str:
         # message cannot carry terminal garbage (FB-024).
         cleaned = []
         for line in actionable:
-            line = "".join(ch for ch in line if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+            line = "".join(ch for ch in _strip_ansi(line) if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
             cleaned.append(line)
         return "; ".join(cleaned)
     # The fallback tail is remote-influenced too: the same bound + scrub
     # applies (Stage B ROOT-024 — the actionable branch was capped, the
     # tail was not).
     tail = _tail(stderr)
-    tail = "".join(ch for ch in tail if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
+    tail = "".join(ch for ch in _strip_ansi(tail) if ch.isprintable())[:_ACTIONABLE_LINE_CAP]
     return tail
 
 

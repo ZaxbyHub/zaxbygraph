@@ -22,6 +22,7 @@ family, hermetic (FakeGitHubSource / temp stores, no network):
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tempfile
 import time
@@ -309,10 +310,10 @@ class FeedbackRegressionTests(unittest.TestCase):
         conn.executemany(
             "INSERT INTO items (id, repo, number, kind, title, body, state, raw_json)"
             " VALUES (?, ?, ?, 'issue', 'massneedle pad', 'filler text', 'open', '{}')",
-            [(10000 + n, REPO, n) for n in range(1, 20011)],
+            [(10000 + n, REPO, n) for n in range(1, 10051)],
         )
         conn.execute(
-            "INSERT INTO sync_state (repo, last_full_sync_at, item_count) VALUES (?, '2026-01-01T00:00:00Z', 20010)",
+            "INSERT INTO sync_state (repo, last_full_sync_at, item_count) VALUES (?, '2026-01-01T00:00:00Z', 10050)",
             (REPO,),
         )
         conn.commit()
@@ -423,6 +424,29 @@ class FeedbackRegressionTests(unittest.TestCase):
             conn.close()
 
 
+    # ------------------------------------------------- cubic round 2: MCP sql
+    def test_mcp_sql_budget_wired(self) -> None:
+        # cubic round 2 (ext:506 analog): the MCP sql adapter must honor
+        # ZAXBYGRAPH_SQL_MAX_BYTES too -- an MCP path that ignores the env
+        # knob could ship unnoticed while the CLI leg alone stays green.
+        db_path = _seed(
+            self.root / "mcpsql.db",
+            lambda s: [s.add_issue(issue(n, title=f"wide {n}", body="y" * 900, state="open")) for n in range(1, 6)],
+        )
+        ctx = _Ctx()
+        ctx.default_db = db_path
+        ctx.root = str(self.root)
+        ctx.sync_runner = mcp_server._default_sync_runner
+        with mock.patch.dict(os.environ, {"ZAXBYGRAPH_SQL_MAX_BYTES": "2000"}):
+            env = mcp_server._TOOL_HANDLERS["sql"](
+                {"repo": REPO, "statement": "SELECT number, body FROM items ORDER BY number"}, ctx
+            )
+        self.assertIs(env.get("ok"), True, f"the MCP sql tool must succeed: {env.get('error')!r}")
+        data = env.get("data") or {}
+        self.assertIs(env.get("truncated"), True, "a 2000-byte budget over 5x900B rows must truncate")
+        self.assertEqual(data.get("total_rows"), 5, "the honest unfiltered total rides the MCP payload")
+        self.assertLess(len(data.get("rows") or []), 5, "truncation excludes over-budget rows")
+
     # ------------------------------------------------------------- ROOT-024
     def test_fetch_failure_sideband_and_stderr_scrub(self) -> None:
         # A remote-controlled sideband line must not classify as absent-ref.
@@ -441,9 +465,13 @@ class FeedbackRegressionTests(unittest.TestCase):
                                     "refs/heads/x", "rest")
         self.assertIsNotNone(r)
 
-        # Actionable stderr: ANSI/OSC scrubbed, printable-only, 200-char cap.
+        # Actionable stderr: complete ANSI/OSC sequences stripped FIRST
+        # (cubic round 2: isprintable alone left '[31m'/'0;title' fragments),
+        # then printable-only, 200-char cap.
         ansi_line = b"fatal: \x1b[31mboom\x1b[0m\x1b]0;title\x07 " + b"A" * 600 + b"\n"
         msg = snapshot._actionable_stderr(ansi_line)
+        self.assertNotIn("31m", msg, "the CSI fragment must be stripped")
+        self.assertNotIn("0;title", msg, "the OSC fragment must be stripped")
         self.assertTrue(all(ch.isprintable() for ch in msg), f"no control chars: {msg!r}")
         self.assertLessEqual(len(msg), 204, "actionable lines are capped")
 

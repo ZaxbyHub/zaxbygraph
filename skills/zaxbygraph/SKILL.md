@@ -219,9 +219,10 @@ usage error).
 `comment_snippet`; `index_stale` is true when the DB predates the schema —
 reads never migrate) · `item` → all item
 columns plus
-`labels[] comments[] reviews[] files[] edges[]` (comments/reviews default to
-the 5 most relevant; `--max-comments K` caps the comment list at K and `0`
-returns no comments; reviews keep the 5-entry cap with no CLI override; the body caps at
+`labels[] comments[] reviews[] files[] edges[]` (comments use the first/last/
+maintainer preference, survivors chronological, up to 5; reviews keep the
+first 5 in submitted order; `--max-comments K` caps the comment list at K and
+`0` returns no comments; the body caps at
 20 KiB; `comments_omitted`/`reviews_omitted` are always present) · `related` →
 `{number, repo, nodes[], edges[]}` · `path` → `{a, b, repo, path}` ·
 `export-graph` → `{nodes[], edges[]}` · `churn`/`open` → arrays of row
