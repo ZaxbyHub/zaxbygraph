@@ -355,7 +355,8 @@ def emit_result(
         ):
             # Single-number item under --fields: AC4 names item; the frozen
             # check pins the multi-number stream, this projects the one-item
-            # dict (no flag -> byte-identical, final-critic r1 f4).
+            # dict. WITHOUT the flag the payload is untouched byte-for-byte;
+            # WITH it the item projects (final-critic r1 f4, r2 pin).
             payload = _project(data, fields)
         elif (
             list_key is not None
@@ -427,19 +428,22 @@ def emit_result(
 
 
 def _emit_text(data: Any) -> None:
-    """The historical text-mode rendering: bare data, never envelope keys."""
+    """The historical text-mode rendering: bare data, never envelope keys.
+    Writes ride _write_stdout so a dead pipe mid-render (text mode on a
+    large payload) still reaches the quiet BrokenPipe exit (final-critic
+    r2 R2-1)."""
     if isinstance(data, dict):
         for key, val in data.items():
             if isinstance(val, (dict, list)):
-                print(f"{key}:")
-                print(json.dumps(val, indent=2, ensure_ascii=False, default=str))
+                _write_stdout(f"{key}:\n")
+                _write_stdout(json.dumps(val, indent=2, ensure_ascii=False, default=str) + "\n")
             else:
-                print(f"{key}: {val}")
+                _write_stdout(f"{key}: {val}\n")
         return
     if isinstance(data, list):
-        print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        _write_stdout(json.dumps(data, indent=2, ensure_ascii=False, default=str) + "\n")
         return
-    print(data)
+    _write_stdout(f"{data}\n")
 
 
 def emit_failure(
@@ -3179,7 +3183,13 @@ def _usage_envelope_exit(
     for i, tok in enumerate(argv):
         name, sep, value = tok.partition("=")
         if name == "--format" and (sep or i + 1 < len(argv)):
-            fmt = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+            # Keep only a REAL choice: an invalid value (argparse's error,
+            # which is what we are reporting) must fall through to the
+            # TTY/non-TTY default or a piped caller loses the envelope
+            # (final-critic r2 R2-2).
+            candidate = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
+            if candidate in ("json", "compact", "jsonl", "text"):
+                fmt = candidate
         elif name == "--db" and (sep or i + 1 < len(argv)):
             db = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
         elif name == "--repo" and (sep or i + 1 < len(argv)):

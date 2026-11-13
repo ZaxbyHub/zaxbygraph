@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -461,6 +463,68 @@ class SearchHonestyExtTests(unittest.TestCase):
         self.assertEqual(code, 2)
         env2 = json.loads(fake2.getvalue())
         self.assertEqual(env2.get("error", {}).get("code"), "bad_request", "the --format=json spelling is recognised by the pre-scan too")
+
+        # An INVALID --format value must fall through to the not-a-TTY json
+        # default so a PIPED caller keeps the envelope (final-critic r2 R2-2):
+        # the stdout here is a plain StringIO (isatty False), the pipe shape.
+        fake3 = _io.StringIO()
+        sys.stdout = fake3
+        sys.argv = [
+            "zaxbygraph", "status", "--format", "xml",
+            "--db", str(db_path), "--repo", REPO,
+        ]
+        try:
+            code = cli.main(None)
+        finally:
+            sys.stdout, sys.argv = real_out, real_argv
+        self.assertEqual(code, 2)
+        env3 = json.loads(fake3.getvalue())
+        self.assertEqual(env3.get("error", {}).get("code"), "bad_request", "an invalid --format value is argparse's error; the envelope default still applies")
+
+    def test_large_text_pipe_exits_quietly(self) -> None:
+        # Final-critic r2 R2-1: text mode on a payload larger than the pipe
+        # buffer must ride the same boundary wrapper (print() bypassed it).
+        def seed(src: FakeGitHubSource) -> None:
+            for number in range(30):
+                src.add_issue(issue(number, title=f"drain {number}", body="x" * 4000, state="open", comments=4))
+
+        db_path = _seed_scratch_db(self.root / "history.db", seed)
+        src_dir = str(Path(__file__).resolve().parents[1] / "src")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = src_dir + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["ZAXBYGRAPH_HOME"] = str(self.root / "zhome")
+        env["ZAXBYGRAPH_DB"] = str(db_path)
+        for fmt in ("text", "json"):
+            with tempfile.TemporaryFile() as err_file:
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "zaxbygraph", "open", "--limit", "50", "--format", fmt,
+                     "--repo", REPO, "--db", str(db_path)],
+                    stdout=subprocess.PIPE, stderr=err_file, stdin=subprocess.DEVNULL, env=env, cwd=str(self.root),
+                )
+                proc.stdout.close()
+                try:
+                    returncode = proc.wait(timeout=60)
+                except subprocess.TimeoutExpired:
+                    proc.kill(); proc.wait(timeout=10)
+                    self.fail(f"{fmt}: the CLI never exited after its stdout reader went away")
+                err_file.seek(0)
+                stderr_text = err_file.read().decode("utf-8", "replace")
+            self.assertEqual(returncode, 0, f"{fmt}: a broken pipe on a large payload exits 0; stderr: {stderr_text[:400]}")
+            self.assertNotIn("Traceback", stderr_text, f"{fmt}: no traceback on the boundary path")
+
+    def test_single_item_fields_projection(self) -> None:
+        # Final-critic r2 non-blocking: pin the single-number --fields
+        # projection (and the no-flag byte-identity).
+        db_path = _seed_scratch_db(self.root / "history.db", _schema_seed)
+        base = ["--repo", REPO, "--db", str(db_path)]
+        code, out, err = run_cli(["item", "1", "--fields", "number,title", "--format", "json", *base])
+        self.assertEqual(code, 0, err)
+        data = _env_of(out, "q4")["data"]
+        self.assertEqual(sorted(data.keys()), ["number", "title"], f"the single item projects to the requested keys; got {sorted(data.keys())}")
+        code_a, out_a, _ = run_cli(["item", "1", "--format", "json", *base])
+        code_b, out_b, _ = run_cli(["item", "1", "--format", "json", *base])
+        self.assertEqual(code_a, code_b, 0)
+        self.assertEqual(out_a, out_b, "no-flag output is deterministic (byte-identical across runs)")
 
 
 class BodyBoundSemanticsExtTests(unittest.TestCase):
