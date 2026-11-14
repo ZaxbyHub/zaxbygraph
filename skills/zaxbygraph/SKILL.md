@@ -125,8 +125,9 @@ registers it.
 | Which PRs collide with a given PR (shared files) | `overlap` |
 | Which PRs touched a file, and what they closed | `file-history` |
 | What closed an issue (PRs + commits, with provenance) | `what-closed` |
-| Which open issues are worth working next, and why | `triage` — ranked candidates with demand/leverage/risk/priority scores; gates name every exclusion — the vocabulary is exactly `blocked`, `assigned`, `linked_pr`, `linked_pr (append-only evidence; may be stale)`, `locked` (match on the literal strings) |
-| Small independent work packets for parallel agents | `bundle` — greedy bundles over the triage pool: members, file sets, co-changed tests, open-PR collisions, dependency order |
+| Which open issues are worth working next, and why | `triage` — ranked candidates with demand/leverage/risk/priority scores; gates name every exclusion — the vocabulary is exactly `blocked`, `assigned`, `linked_pr`, `linked_pr (append-only evidence; may be stale)`, `locked`, `tracking` (match on the literal strings); the payload reports the `gated` block (`{count, by_gate, numbers}`), `closeable_trackers` (evidence-complete tracking containers), and the per-row additive `hotspot_raw` diagnostic (the unnormalized recency sum behind the relative hotspot) |
+| Small independent work packets for parallel agents | `bundle` — greedy bundles over the triage pool (partner choice by mean pair affinity, per-pair floor + anchor admission, cohesion stop, hub files exempt from cross-bundle disjointness): members, per-pair `anchors` (strongest-first), file sets, co-changed tests, open-PR collisions, dependency order; pool members no bundle absorbs are explained in `unbundled: [{number, reason}]` |
+| The same answers at a past instant | `triage --as-of T` / `bundle --as-of T` — answer from a temp-table as-of snapshot view (items created at/before T, text at its revision-current state, undated label/assignee/field rows suppressed); the store file is never written |
 | One issue's complete work packet | `brief N` — triage features, budget-truncated body, top comments, implicated files, closest PR analog, linked PRs |
 | Anything the above don't shape | `sql "SELECT …"` |
 | Feed a graph viewer or join to a code graph | `export-graph` |
@@ -146,8 +147,15 @@ For "what should we fix next, and in what order" over a synced store:
 3. **triage** — read the ranked candidates and pick from them; the gates
    column explains every exclusion (the gate vocabulary is `blocked`,
    `assigned`, `linked_pr`, `linked_pr (append-only evidence; may be
-   stale)`, `locked`; gated rows are withheld from the ranking by default —
-   `--include-gated` shows them with `ranked: false`).
+   stale)`, `locked`, `tracking`; gated rows are withheld from the ranking
+   by default — `--include-gated` shows them with `ranked: false`). To ask
+   the same question at a past instant, add `--as-of T`. After a change,
+   `zaxbygraph eval bundle` / `eval triage` (CLI) re-measures selection
+   quality against the store's own fix history — read every metric beside
+   its same-geometry baseline (`random_same_size`,
+   `lowest_number_first`, `most_touched`, `random_recall_at_5`), and
+   expect the coded `no_ground_truth` error when a store carries no
+   eligible ground truth.
 4. **bundle** — split the chosen work into bundles; work ONE bundle per
    agent, in the bundle's `order` (in-pool blocked_by dependency order),
    respecting `open_pr_collisions`.
@@ -254,7 +262,7 @@ answers a bare list of item rows. Conditional keys (`next_cursor`,
 | command | data keys |
 | --- | --- |
 | brief | analog, body, comments, config_source, content_trust, derived, features, files, formula_version, linked_prs, number, repo, weights |
-| bundle | bundles, config_source, derived, dropped, excluded, formula_version, merge_candidates, pool, related_not_bundleable, repo, weights |
+| bundle | bundles, closeable_trackers, config_source, derived, dropped, excluded, formula_version, gated, merge_candidates, pool, related_not_bundleable, repo, unbundled, weights |
 | churn | additions, deletions, path, prs |
 | file-history | entries, index_stale |
 | item | additions, api_url, author, author_association, base_ref, body, branch_token, changed_files, closed_at, comment_count, comments, comments_omitted, commits, created_at, deletions, dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by, dependencies_total_blocking, draft, edges, files, head_ref, html_url, id, index_stale, item_type, kind, labels, labels_text, locked, merge_commit, merged_at, merged_by, milestone, node_id, number, paths_text, reactions_total, repo, reviews, reviews_omitted, state, state_reason, sub_issues_completed, sub_issues_total, title, updated_at |
@@ -266,7 +274,7 @@ answers a bare list of item rows. Conditional keys (`next_cursor`,
 | similar | candidates, capabilities, derived, ls_files_applied, ls_files_head, repo, resolved_path_count, target, weights |
 | sql | columns, rows |
 | status | counts, coverage, repos, snapshot |
-| triage | blocking_source, config_source, cursor, derived, formula_version, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
+| triage | blocking_source, closeable_trackers, config_source, cursor, derived, formula_version, gated, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
 | what-closed | commits, index_stale, keyword_closes, kind, number, prs |
 
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus

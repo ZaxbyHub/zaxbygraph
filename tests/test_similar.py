@@ -546,9 +546,14 @@ class EvalTests(DerivedTierTest):
         self.assertTrue(result["with_leakage"])
         for target, reasons in result["with_leakage"].items():
             self.assertIn("signature_origin_unknown", reasons)
+        # Migration (issues #68/#69): bundle is now the per-fix-PR backtest
+        # over full production derive (no eval-side signature suppression,
+        # so the signature_origin_unknown note no longer applies there);
+        # its disclosure surface is the per-case disclosures list.
         bundle_result = run_eval(self.conn, REPO, "bundle")
-        for target, reasons in bundle_result["with_leakage"].items():
-            self.assertIn("signature_origin_unknown", reasons)
+        self.assertTrue(bundle_result["per_fix_pr"])
+        for entry in bundle_result["per_fix_pr"]:
+            self.assertIsInstance(entry["disclosures"], list)
         # (f) unappliable controls label with_leakage: a duplicate target
         # whose created_at was lost cannot apply the candidate cutoff.
         wconn2 = connect(self.db_path)
@@ -557,20 +562,22 @@ class EvalTests(DerivedTierTest):
             wconn2.commit()
         finally:
             wconn2.close()
-        result = run_eval(self.conn, REPO, "similar")
+        # Migration (issue #68 AC6): with 102's created_at lost, NEITHER
+        # duplicate direction has an in-scope partner — zero eligible
+        # after controls now raises the coded no_ground_truth error (the
+        # exclusion of the undatable target IS the control coverage).
+        with self.assertRaises(ValueError) as caught:
+            run_eval(self.conn, REPO, "similar")
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
+        wconn2 = connect(self.db_path)
         try:
-            self.assertIn("102", result["with_leakage"])
-            self.assertIn("missing_created_at", result["with_leakage"]["102"])
+            wconn2.execute(
+                "UPDATE items SET created_at = '2026-06-05T01:00:00Z'"
+                " WHERE number = 102"
+            )
+            wconn2.commit()
         finally:
-            wconn2 = connect(self.db_path)
-            try:
-                wconn2.execute(
-                    "UPDATE items SET created_at = '2026-06-05T01:00:00Z'"
-                    " WHERE number = 102"
-                )
-                wconn2.commit()
-            finally:
-                wconn2.close()
+            wconn2.close()
 
     def test_eval_floors_synthetic(self) -> None:
         """AC7 (synthetic half): the hand-derived floors from the module
@@ -581,9 +588,16 @@ class EvalTests(DerivedTierTest):
         self.assertEqual(similar_eval["metrics"]["eligible_targets"], 1)
         localize_eval = run_eval(self.conn, REPO, "localize")
         self.assertEqual(localize_eval["metrics"]["acc_at_5"], 1.0)
+        # Migration (issues #68/#69, matrix row "test_eval_floors_real/
+        # synthetic: floors re-pinned on keyword GT / backtest"): bundle is
+        # now the per-fix-PR backtest (prepare_snapshot replay of the
+        # production bundler at the fix PR's created_at); measured post-fix
+        # on this store: recall 1.0 (the {101, 105} truth pair is
+        # proposed), precision 1/3 (the replay proposes all three
+        # co-member pairs of its one 3-member bundle).
         bundle_eval = run_eval(self.conn, REPO, "bundle")
         self.assertEqual(bundle_eval["metrics"]["pair_recall"], 1.0)
-        self.assertEqual(bundle_eval["metrics"]["pair_precision"], 0.5)
+        self.assertEqual(bundle_eval["metrics"]["pair_precision"], 1 / 3)
         shas = {
             similar_eval["corpus_sha256"],
             localize_eval["corpus_sha256"],
@@ -628,10 +642,13 @@ class EvalTests(DerivedTierTest):
             )
             self.assertEqual(bundle_eval["corpus_sha256"], REPLAYED_CORPUS_SHA256)
             # the real corpus carries zero duplicate_of ground truth; the
-            # similar mode reports that honestly instead of inventing zeros
-            similar_eval = run_eval(conn, "zaxbyhub/zaxbygraph", "similar")
-            self.assertEqual(similar_eval["metrics"]["targets_total"], 0)
-            self.assertIsNone(similar_eval["metrics"]["recall_at_5"])
+            # similar mode REFUSES that honestly (issue #68 AC6: zero
+            # eligible after controls raises the coded no_ground_truth
+            # error instead of inventing zeros — migration matrix row
+            # "test_eval_floors_real: floors re-pinned on keyword GT")
+            with self.assertRaises(ValueError) as caught:
+                run_eval(conn, "zaxbyhub/zaxbygraph", "similar")
+            self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
         finally:
             conn.close()
 
@@ -1105,14 +1122,16 @@ class RevisionControlTests(unittest.TestCase):
             wconn.close()
         ro = open_existing(broken)
         try:
-            # 102 is a duplicate-similar target only (localize/bundle target
-            # issues come from closes edges: 101 and 105)
-            result = run_eval(ro, REPO, "similar")
-            self.assertIn(
-                "created_at_unparseable", result["with_leakage"].get("102", [])
-            )
+            # Migration (issue #68 AC6): 102 is a duplicate-similar target
+            # only, and with its stamp unparseable NEITHER duplicate
+            # direction has an in-scope partner — the coded refusal
+            # replaces the label-only shape (the unparseable-stamp
+            # exclusion IS the control coverage).
+            with self.assertRaises(ValueError) as caught:
+                run_eval(ro, REPO, "similar")
         finally:
             ro.close()
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
 
 
 class ClosingPrexclusionTests(unittest.TestCase):
@@ -1194,13 +1213,14 @@ class ClosingPrexclusionTests(unittest.TestCase):
         anchors ONLY through the common closing-PR neighbor; the eval
         excludes that adjacency, so the partner must NOT rank (pre-fix this
         recalled 1.0 through the closing PR)."""
-        result = run_eval(self.conn, REPO, "similar")
-        # the partner never ranks, so NEITHER duplicate direction has an
-        # in-scope candidate: the metric is empty (pre-fix it recalled 1.0
-        # through the closing-PR adjacency)
-        self.assertIsNone(result["metrics"]["recall_at_5"])
-        self.assertEqual(result["metrics"]["eligible_targets"], 0)
-        self.assertIn("no_ground_truth", result["labels"])
+        # Migration (issue #68 AC6): the partner never ranks, so NEITHER
+        # duplicate direction has an in-scope candidate — zero eligible
+        # after controls now raises the coded no_ground_truth error
+        # (pre-fix it recalled 1.0 through the closing-PR adjacency; the
+        # adjacency exclusion IS the control coverage).
+        with self.assertRaises(ValueError) as caught:
+            run_eval(self.conn, REPO, "similar")
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
 
     def test_closing_pr_exclusion_is_the_only_toggle(self) -> None:
         # proving the isolation: WITHOUT the exclusion the pair anchors
@@ -1352,12 +1372,15 @@ class EvalDenominatorTests(unittest.TestCase):
         conn.commit()
         ro = open_existing(Path(conn.execute("PRAGMA database_list").fetchone()[2]))
         try:
-            result = run_eval(ro, REPO, "bundle")
+            # Migration (issue #68 AC6): an unmerged closer seeds no bundle
+            # truth, and zero eligible after controls now raises the coded
+            # no_ground_truth error instead of null metrics + a label (the
+            # unmerged-closer exclusion IS the control coverage).
+            with self.assertRaises(ValueError) as caught:
+                run_eval(ro, REPO, "bundle")
         finally:
             ro.close()
-        self.assertEqual(result["metrics"]["truth_pairs"], 0)
-        self.assertIsNone(result["metrics"]["pair_recall"])
-        self.assertIn("no_ground_truth", result["labels"])
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
 
     def test_all_targets_cutoff_excluded_yields_empty_bundle_metrics(self) -> None:
         """pr43 critic round 2 (executed probe): with every bundle target's
@@ -1397,13 +1420,15 @@ class EvalDenominatorTests(unittest.TestCase):
         conn.close()
         ro = open_existing(db_path)
         try:
-            result = run_eval(ro, REPO, "bundle")
+            # Migration (issue #68 AC6): with every endpoint's stamp lost,
+            # no truth pair is scoreable — the coded refusal replaces the
+            # null-metrics + label shape (the stamp exclusion IS the
+            # control coverage).
+            with self.assertRaises(ValueError) as caught:
+                run_eval(ro, REPO, "bundle")
         finally:
             ro.close()
-        self.assertIsNone(result["metrics"]["pair_recall"])
-        self.assertEqual(result["metrics"]["eligible_targets"], 0)
-        self.assertIn("no_ground_truth", result["labels"])
-        self.assertIn("801", result["with_leakage"])
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
 
     def test_half_excluded_bundle_yields_fully_empty_metrics(self) -> None:
         """pr43 round-2 gate probe: ONE excluded truth endpoint must null
@@ -1444,16 +1469,14 @@ class EvalDenominatorTests(unittest.TestCase):
         conn.close()
         ro = open_existing(db_path)
         try:
-            result = run_eval(ro, REPO, "bundle")
+            # Migration (issue #68 AC6): one endpoint lost -> no scoreable
+            # pair -> the coded refusal (a pair needs both endpoints; the
+            # half-exclusion IS the control coverage).
+            with self.assertRaises(ValueError) as caught:
+                run_eval(ro, REPO, "bundle")
         finally:
             ro.close()
-        self.assertIsNone(result["metrics"]["pair_recall"])
-        self.assertIsNone(result["metrics"]["pair_precision"])
-        self.assertEqual(result["metrics"]["eligible_targets"], 0)
-        self.assertIn("no_ground_truth", result["labels"])
-        # 821 was excluded before scoring; 822 was scored and disclosed
-        self.assertNotIn("signature_origin_unknown", result["with_leakage"].get("821", []))
-        self.assertIn("signature_origin_unknown", result["with_leakage"].get("822", []))
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
 
 
 class GitLsFilesTests(unittest.TestCase):
@@ -1700,13 +1723,15 @@ class EvalDegradationExtraTests(unittest.TestCase):
             wconn.close()
         ro = open_existing(empty)
         try:
-            result = run_eval(ro, REPO, "similar")
-            self.assertEqual(result["metrics"]["targets_total"], 0)
-            self.assertEqual(result["metrics"]["eligible_targets"], 0)
-            self.assertIsNone(result["metrics"]["recall_at_5"])
-            self.assertIn("no_ground_truth", result["labels"])
+            # Migration (issue #68 AC6, matrix row
+            # "test_eval_floors_synthetic: zero-eligible store now raises"):
+            # the coded refusal replaces the null-metrics + label shape.
+            with self.assertRaises(ValueError) as caught:
+                run_eval(ro, REPO, "similar")
         finally:
             ro.close()
+        self.assertEqual(getattr(caught.exception, "code", None), "no_ground_truth")
+        self.assertTrue(str(caught.exception).strip())
 
 
 if __name__ == "__main__":  # pragma: no cover

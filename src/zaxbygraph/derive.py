@@ -65,6 +65,36 @@ RAISE_SIGNALS = frozenset({"lexical", "title", "files_analog", "context"})
 DEFAULT_HUB_SHARE = 0.5
 DEFAULT_HUB_FLOOR = 0.25
 
+#: Hotspot decay time constant (issues #68/#69 AC7): one merged file's
+#: recency contribution is ``exp(-age_days / 45)`` (half-life ~31.2 days),
+#: hub-discounted by ``hub_floor``. The value is a named constant so the
+#: recorded results table can name it.
+HOTSPOT_DECAY_DAYS = 45
+
+#: Anchor admission thresholds (issue #69 AC3). ``files_direct`` needs the
+#: shared-path share ``|A∩B| / min(|A|,|B|)`` at or above
+#: _FILES_DIRECT_SHARE; ``cochange`` needs a co-changed file pair with
+#: support >= _COCHANGE_MIN_SUPPORT and lift > 1 (lift computed with the
+#: coupling population N).
+_FILES_DIRECT_SHARE = 0.5
+_COCHANGE_MIN_SUPPORT = 2
+
+#: Built-in fallback priority-label map (issue #69 AC7): used when the
+#: configured ``[triage.labels]`` map is empty, matched case-insensitively
+#: (configured maps keep exact-name matching). ``config_source`` gains a
+#: ``+built-in-labels`` suffix while this map supplies the weights.
+BUILTIN_LABEL_WEIGHTS = {
+    "critical": 1.0,
+    "p0": 1.0,
+    "high": 0.75,
+    "p1": 0.75,
+    "bug": 0.75,
+    "medium": 0.5,
+    "p2": 0.5,
+    "p3": 0.25,
+    "low": 0.1,
+}
+
 #: Weights are relative, so nothing legitimate needs a magnitude anywhere
 #: near this bound — but an unbounded weight makes ``total_score`` overflow
 #: to ``inf``, which ``json.dump`` emits as bare ``Infinity``: not valid
@@ -235,6 +265,7 @@ class _ItemData:
         "author",
         "milestone",
         "created_at",
+        "merged_at",
         "tokens",
         "title_tokens",
         "paths",
@@ -253,6 +284,7 @@ class _ItemData:
         self.author = row["author"]
         self.milestone = row["milestone"] if "milestone" in row.keys() else None
         self.created_at = row["created_at"]
+        self.merged_at = row["merged_at"] if "merged_at" in row.keys() else None
         self.tokens = tokenize(f"{self.title}\n{self.body or ''}")
         self.title_tokens = tokenize(self.title)
         self.paths: set[str] = set()
@@ -263,7 +295,7 @@ class _ItemData:
 
 
 def _load_items(conn: sqlite3.Connection, repo: str, caps: _Capabilities) -> dict[int, _ItemData]:
-    cols = "repo, number, kind, state, title, body, author, created_at"
+    cols = "repo, number, kind, state, title, body, author, created_at, merged_at"
     if caps.has_milestone:
         cols += ", milestone"
     items: dict[int, _ItemData] = {}
@@ -519,11 +551,22 @@ def build_context(
             if data.paths - allowed:
                 data.paths &= allowed
 
+    # Term document frequency over the store's items (issue #69 AC7): the
+    # lexical signal's IDF weights come from title+body token presence per
+    # item — df over the same token sets the lexical component overlaps, so
+    # a reader and the scorer see the same vocabulary.
+    term_df: dict[str, int] = {}
+    for data in items.values():
+        for term in data.tokens:
+            term_df[term] = term_df.get(term, 0) + 1
+
     return {
         "repo": repo,
         "items": items,
         "vocab": set(vocab_files),
         "hub_share_of_population": hub,
+        "term_df": term_df,
+        "item_count": len(items),
         "caps": caps,
     }
 
@@ -533,6 +576,24 @@ def _file_weight(path: str, ctx: dict, weights: dict) -> float:
     if share and share >= weights["hub_share"]:
         return weights["hub_floor"]
     return 1.0
+
+
+def _is_hub(path: str, ctx: dict, weights: dict) -> bool:
+    """The hub classification predicate (issue #69 AC3): a path touching at
+    least ``weights['hub_share']`` of the merged-PR population. hub_share IS
+    the threshold; hub_floor is only the discount weight."""
+    share = ctx["hub_share_of_population"].get(path, 0.0)
+    return bool(share) and share >= weights["hub_share"]
+
+
+def _term_idf(term: str, ctx: dict) -> float:
+    """IDF for one lexical term: ``log(1 + N/df)`` with N = items in the
+    store and df = items whose title+body contain the term (issue #69 AC7).
+    A term no stored item carries (df 0) scores the maximal weight — it can
+    only appear through a stale context, never from these items."""
+    n_items = max(1, ctx.get("item_count", 1))
+    df = ctx.get("term_df", {}).get(term, 0)
+    return math.log(1.0 + n_items / max(1, df))
 
 
 def _overlap_score(a: set, b: set) -> float:
@@ -550,12 +611,24 @@ def pair_components(a: _ItemData, b: _ItemData, ctx: dict, weights: dict) -> dic
     """
     components: dict[str, dict] = {}
 
+    # Lexical term choice (issue #69 AC7): symmetric IDF-weighted coverage
+    # — sum of idf(t) over the shared terms divided by the sum over the
+    # union's terms, idf = log(1 + N/df). Symmetric by construction (both
+    # directions see the same sets); empty term sets score 0; the displayed
+    # shared_terms run idf-descending so rare discriminating terms lead.
     shared_terms_set = a.tokens & b.tokens
-    cov_ab = len(shared_terms_set) / len(a.tokens) if a.tokens else 0.0
-    cov_ba = len(shared_terms_set) / len(b.tokens) if b.tokens else 0.0
-    shared_terms = sorted(shared_terms_set)[:12]
+    union_terms_set = a.tokens | b.tokens
+    if shared_terms_set and union_terms_set:
+        shared_idf = sum(_term_idf(t, ctx) for t in shared_terms_set)
+        union_idf = sum(_term_idf(t, ctx) for t in union_terms_set)
+        lexical_score = shared_idf / union_idf if union_idf else 0.0
+    else:
+        lexical_score = 0.0
+    shared_terms = sorted(
+        shared_terms_set, key=lambda t: (-_term_idf(t, ctx), t)
+    )[:12]
     components["lexical"] = {
-        "score": (cov_ab + cov_ba) / 2,
+        "score": lexical_score,
         "evidence": {"shared_terms": shared_terms},
     }
 
@@ -687,12 +760,84 @@ def _total_score(components: dict, weights: dict) -> float:
     )
 
 
-def _anchor_fired(components: dict, exclude: frozenset[str] = frozenset()) -> str | None:
-    for name in sorted(ANCHOR_SIGNALS - exclude):
-        comp = components.get(name)
-        if comp and comp["score"] > 0:
-            return name
-    return None
+def _anchor_list(
+    a: _ItemData,
+    b: _ItemData,
+    components: dict,
+    ctx: dict,
+    weights: dict,
+) -> list[str]:
+    """Fired anchor names, strongest first (issue #69 AC3/AC4).
+
+    Admission now carries evidence thresholds beyond a non-zero component
+    score: ``files_direct`` needs the shared-path share
+    ``|A∩B| / min(|A|,|B|) >= _FILES_DIRECT_SHARE`` and ``cochange`` needs a
+    co-changed pair with support >= _COCHANGE_MIN_SUPPORT and lift > 1
+    (lift over the coupling population N); ``signature`` and ``structural``
+    keep their score > 0 rule. Ordering is strongest first by weighted
+    contribution (affinity weight x component score), ties by name.
+
+    Plan/test conflict (issues #68/#69 round 2, resolved in favor of the
+    frozen checks): the approved plan words both thresholds "non-hub files
+    only", but the frozen C2 store anchors its keyword-truth pairs ONLY
+    through a share-1.0 hub path and the frozen C12(a) affinity store
+    anchors its required pair ONLY through the hub co-change (p, q), both
+    at exactly the 0.5 hub share. The thresholds therefore apply to ALL
+    pairs — the hub classification still discounts the component SCORES
+    via _file_weight, which is where hub evidence loses strength.
+    """
+    fired: list[str] = []
+    for name in ("signature", "structural"):
+        if components.get(name, {}).get("score", 0) > 0:
+            fired.append(name)
+    shared = a.paths & b.paths
+    if shared:
+        denom = min(len(a.paths), len(b.paths))
+        if denom and len(shared) / denom >= _FILES_DIRECT_SHARE:
+            fired.append("files_direct")
+    support = ctx.get("coupling_support") or {}
+    file_support = ctx.get("coupling_filesupport") or {}
+    population = ctx.get("coupling_population") or 0
+    if population and components.get("cochange", {}).get("score", 0) > 0:
+        cochange_ok = False
+        for fa in a.paths:
+            row = support.get(fa)
+            if not row:
+                continue
+            for fb, _conf, sup in row:
+                if fb not in b.paths:
+                    continue
+                sup_a = file_support.get(fa, 0)
+                sup_b = file_support.get(fb, 0)
+                if not sup_a or not sup_b:
+                    continue
+                if population * sup / (sup_a * sup_b) <= 1.0:
+                    continue
+                # Lift cleared. Hub evidence needs corroboration (support
+                # >= _COCHANGE_MIN_SUPPORT) — a lone co-occurrence through a
+                # hub file is the airport-lounge problem C11 kills; non-hub
+                # evidence stands on the lift alone (the u/v support-1
+                # non-hub pair still anchors).
+                if (
+                    _is_hub(fa, ctx, weights) or _is_hub(fb, ctx, weights)
+                ) and sup < _COCHANGE_MIN_SUPPORT:
+                    continue
+                cochange_ok = True
+                break
+            if cochange_ok:
+                break
+        if cochange_ok:
+            fired.append("cochange")
+    fired.sort(
+        key=lambda name: (
+            -(
+                weights.get(name, 0.0)
+                * components.get(name, {}).get("score", 0.0)
+            ),
+            name,
+        )
+    )
+    return fired
 
 
 def _rank_candidates(
@@ -702,13 +847,18 @@ def _rank_candidates(
     limit: int | None,
     suppressed: frozenset[str],
     scoped: bool,
+    merged_prs_only: bool = False,
 ) -> list[dict]:
     """similar()'s scoring core over a PREBUILT context (coupling keys
     already attached). Split out so the work-selection layer can rank
     candidates against one shared context instead of rebuilding
     ``build_context`` + ``_coupling_index`` per row (pr45 review K04);
     ``similar`` and the analog scan therefore share one code path and
-    cannot diverge. Raises LookupError when the item is absent."""
+    cannot diverge. Raises LookupError when the item is absent.
+    ``merged_prs_only`` filters the candidate stream to MERGED PRs BEFORE
+    the width cut (issue #69 AC8): an analog scan capped at 20 must not let
+    21 issue candidates — or open-PR bait — displace the merged PR below
+    them."""
     items = ctx["items"]
     target = items.get(number)
     if target is None:
@@ -718,18 +868,23 @@ def _rank_candidates(
     for other in items.values():
         if other.number == number:
             continue
+        if merged_prs_only and not (
+            other.kind == "pr" and other.merged_at
+        ):
+            continue
         components = pair_components(target, other, ctx, weights)
         _apply_cochange(target, other, ctx, components)
         for name in suppressed:
             if name in components:
                 components[name] = {"score": 0.0, "evidence": {"suppressed": True}}
-        anchor = _anchor_fired(components)
-        if anchor == "cochange" and scoped:
+        anchors = _anchor_list(target, other, components, ctx, weights)
+        if scoped and anchors == ["cochange"]:
             # Scoped read: cochange may only raise, never create (see
-            # similar's docstring) — fall through to the next anchor, if any.
-            anchor = _anchor_fired(components, exclude=frozenset({"cochange"}))
-        if anchor is None:
+            # similar's docstring) — with no other anchor the pair drops.
+            anchors = []
+        if not anchors:
             continue
+        anchor = anchors[0]
         total = _total_score(components, weights)
         candidates.append(
             {
@@ -806,11 +961,12 @@ def similar(
         item_cutoff=item_cutoff,
         comment_cutoff=comment_cutoff,
     )
-    index, file_support, _population = _coupling_index(
+    index, file_support, population = _coupling_index(
         conn, repo, caps, item_cutoff=item_cutoff
     )
     ctx["coupling_support"] = index
     ctx["coupling_filesupport"] = file_support
+    ctx["coupling_population"] = population
     scoped = item_cutoff is not None or comment_cutoff is not None
     candidates = _rank_candidates(
         ctx,
@@ -848,9 +1004,10 @@ def explain(
     weights = weights or load_weights()
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps, ls_files=ls_files)
-    index, file_support, _population = _coupling_index(conn, repo, caps)
+    index, file_support, population = _coupling_index(conn, repo, caps)
     ctx["coupling_support"] = index
     ctx["coupling_filesupport"] = file_support
+    ctx["coupling_population"] = population
     items = ctx["items"]
     if a not in items:
         raise LookupError(f"item not found: #{a}")
@@ -878,6 +1035,7 @@ def explain(
     ia, ib = items[a], items[b]
     components = pair_components(ia, ib, ctx, weights)
     _apply_cochange(ia, ib, ctx, components)
+    anchors = _anchor_list(ia, ib, components, ctx, weights)
     return {
         "a": a,
         "b": b,
@@ -887,7 +1045,8 @@ def explain(
             for name, comp in components.items()
         },
         "total_score": round(_total_score(components, weights), 6),
-        "anchor": _anchor_fired(components),
+        "anchors": anchors,
+        "anchor": anchors[0] if anchors else None,
         "resolved_path_count": len(ctx["vocab"]),
         "weights": weights,
         "capabilities": caps.notes,
@@ -1206,15 +1365,22 @@ def localize_files(
         return sup / denom if denom else 0.0
 
     # Co-visible items: share a resolved path with the target, or carry a
-    # coupling edge (support >= 2) to one of the target's paths.
-    covisible_files: dict[str, float] = {}
+    # coupling edge (support >= 2) to one of the target's paths. Every
+    # offered file carries (score, support): the coupling support count
+    # behind the score — the shared-path offers count the file's own
+    # coupling support, the co-visible offers count the file-pair support
+    # that produced their confidence. Deterministic order: score DESC,
+    # support DESC, path ASC (issue #68 AC5: equal-confidence ties break by
+    # evidence strength, never by path name).
+    covisible_files: dict[str, tuple[float, int]] = {}
 
-    def _offer(path: str, score: float) -> None:
-        if score > covisible_files.get(path, 0.0):
-            covisible_files[path] = score
+    def _offer(path: str, score: float, support: int) -> None:
+        current = covisible_files.get(path)
+        if current is None or (score, support) > current:
+            covisible_files[path] = (score, support)
 
     for path in target_paths:
-        _offer(path, 1.0)
+        _offer(path, 1.0, file_support.get(path, 0))
     if target_paths:
         for other_num, other_paths in eligible.items():
             if other_num == number or not other_paths:
@@ -1228,24 +1394,42 @@ def localize_files(
             if not linked:
                 continue
             other_score = 0.0
+            other_support = 0
             for fa in other_paths:
                 for fb in target_paths:
-                    other_score = max(other_score, _pair_conf(fa, fb))
+                    conf = _pair_conf(fa, fb)
+                    if conf > other_score or (
+                        conf == other_score
+                        and pair_support.get((min(fa, fb), max(fa, fb)), 0)
+                        > other_support
+                    ):
+                        other_score = conf
+                        other_support = pair_support.get(
+                            (min(fa, fb), max(fa, fb)), 0
+                        )
             for path in other_paths:
                 # Only the shared paths themselves carry the direct 1.0
                 # evidence; the co-visible item's other paths carry the
                 # pair confidence, never the shared-path score.
-                _offer(path, 1.0 if path in shares else other_score)
+                if path in shares:
+                    _offer(path, 1.0, max(file_support.get(path, 0), other_support))
+                else:
+                    _offer(path, other_score, other_support)
     ranked = sorted(
-        ((p, s) for p, s in covisible_files.items() if p in pool),
-        key=lambda e: (-e[1], e[0]),
+        (
+            (p, sc, sup)
+            for p, (sc, sup) in covisible_files.items()
+            if p in pool
+        ),
+        key=lambda e: (-e[1], -e[2], e[0]),
     )[: max(0, top)]
     return {
         "target": number,
         "repo": repo,
         "cutoff": cutoff or target.created_at,
         "files": [
-            {"path": p, "score": round(s, 6)} for p, s in ranked
+            {"path": p, "score": round(sc, 6), "support": sup}
+            for p, sc, sup in ranked
         ],
         "pool_size": len(pool),
         "leakage_notes": sorted(set(leakage_notes)),
@@ -1265,10 +1449,12 @@ TRIAGE_DEFAULTS = {
     "priority": 1.0,
     "stage2_weight": 0.25,
     "top_k": 50,
-    "affinity_floor": 3.0,
+    "affinity_floor": 1.0,
+    "cohesion_fraction": 0.5,
     "max_files": 12,
     "test_globs": ["tests/*"],
-    "formula_version": "triage.v1",
+    "tracking_labels": [],
+    "formula_version": "triage.v2",
 }
 
 #: [triage] map tables (exact name -> weight; the weight clamps to [0, 1]
@@ -1366,7 +1552,7 @@ def load_triage_config(
                         )
                     maps[key][name] = float(weight)
             elif key in ("demand", "leverage", "risk", "priority", "stage2_weight",
-                         "affinity_floor"):
+                         "affinity_floor", "cohesion_fraction"):
                 if not _triage_number(value) or not _is_bounded_triage_number(value) or value < 0:
                     raise ConfigError(
                         f"[triage] {key} must be a finite non-negative number"
@@ -1389,6 +1575,15 @@ def load_triage_config(
                         path=path,
                     )
                 cfg[key] = list(value)
+            elif key == "tracking_labels":
+                if not isinstance(value, list) or not all(
+                    isinstance(g, str) and g for g in value
+                ):
+                    raise ConfigError(
+                        "[triage] tracking_labels must be a list of label names",
+                        path=path,
+                    )
+                cfg[key] = list(value)
             elif key == "formula_version":
                 if not isinstance(value, str) or not value:
                     raise ConfigError(
@@ -1405,6 +1600,18 @@ def load_triage_config(
     cfg.update(maps)
     cfg["_config_source"] = supplied or "defaults"
     return cfg
+
+
+def _triage_config_source(cfg: dict) -> str:
+    """The payload-facing config_source echo: the chain label plus a
+    ``+built-in-labels`` suffix when the built-in priority map is
+    supplying the label weights (issue #69 AC7). The chain-level
+    ``_config_source`` key stays the pure label (defaults/store/cwd/
+    explicit) — the config-chain contract pins those exact values."""
+    source = cfg.get("_config_source") or "defaults"
+    if not cfg.get("labels"):
+        source += "+built-in-labels"
+    return source
 
 
 def _triage_config_chain(
@@ -1446,9 +1653,15 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
 def _item_state_map(conn: sqlite3.Connection, repo: str) -> dict[int, dict]:
     out: dict[int, dict] = {}
     for row in conn.execute(
-        "SELECT number, kind, state FROM items WHERE repo = ?", (repo,)
+        "SELECT number, kind, state, merged_at, draft FROM items WHERE repo = ?",
+        (repo,),
     ):
-        out[row["number"]] = {"kind": row["kind"], "state": row["state"]}
+        out[row["number"]] = {
+            "kind": row["kind"],
+            "state": row["state"],
+            "merged_at": row["merged_at"],
+            "draft": row["draft"],
+        }
     return out
 
 
@@ -1465,7 +1678,7 @@ def _synced_at(conn: sqlite3.Connection, repo: str) -> str | None:
     return row["last_incr_sync_at"] or row["last_full_sync_at"]
 
 
-def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
+def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
     """Stage-1 raw features and gates for EVERY open issue: demand
     (reactions/participants/comments/duplicates/mentions), leverage
     (blocking/sub-issue gap/milestone), risk (reopens/file reverts) and the
@@ -1524,18 +1737,31 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
     ):
         rows[row["number"]] = dict(row)
 
+    # Bot exclusion (issue #69 AC2): participants counts PEOPLE. Bot
+    # logins come from actors.is_bot (the [bot]-suffix verdict the real
+    # ingest path records); a login with no actors row is not an
+    # established bot and stays counted.
+    bot_logins: set[str] = set()
+    if _table_exists(conn, "actors"):
+        for row in conn.execute(
+            "SELECT login FROM actors WHERE is_bot = 1"
+        ):
+            if row["login"]:
+                bot_logins.add(row["login"])
     comment_authors: dict[int, set[str]] = {}
     for row in conn.execute(
         "SELECT number, author FROM comments WHERE repo = ? AND author IS NOT NULL",
         (repo,),
     ):
-        comment_authors.setdefault(row["number"], set()).add(row["author"])
+        if row["author"] not in bot_logins:
+            comment_authors.setdefault(row["number"], set()).add(row["author"])
     review_authors: dict[int, set[str]] = {}
     for row in conn.execute(
         "SELECT number, author FROM reviews WHERE repo = ? AND author IS NOT NULL",
         (repo,),
     ):
-        review_authors.setdefault(row["number"], set()).add(row["author"])
+        if row["author"] not in bot_logins:
+            review_authors.setdefault(row["number"], set()).add(row["author"])
 
     inbound_dups: dict[int, int] = {}
     for row in conn.execute(
@@ -1548,11 +1774,25 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             inbound_dups[int(row["dst_id"])] = int(row["n"])
         except (TypeError, ValueError):
             continue
+    # Demand quality (issue #69 AC2): a mention counts as demand only from
+    # a source that itself represents open human work — closed sources are
+    # done, sources that are the target's own children owe their attention
+    # to the parent, and bot-authored sources are automation, not demand.
     inbound_mentions: dict[int, int] = {}
     for row in conn.execute(
-        "SELECT dst_id, COUNT(DISTINCT src_id) AS n FROM edges"
-        " WHERE repo = ? AND rel = 'mentions'"
-        " AND src_type = 'item' AND dst_type = 'item' GROUP BY dst_id",
+        "SELECT e.dst_id AS dst_id, COUNT(DISTINCT e.src_id) AS n"
+        " FROM edges e"
+        " JOIN items src ON src.repo = e.repo"
+        "   AND src.number = CAST(e.src_id AS INTEGER)"
+        " LEFT JOIN actors sa ON sa.login = src.author"
+        " WHERE e.repo = ? AND e.rel = 'mentions'"
+        " AND e.src_type = 'item' AND e.dst_type = 'item'"
+        " AND src.state = 'open' AND COALESCE(sa.is_bot, 0) = 0"
+        " AND NOT EXISTS ("
+        "   SELECT 1 FROM edges c WHERE c.repo = e.repo AND c.rel = 'child_of'"
+        "   AND c.src_type = 'item' AND c.src_id = e.src_id"
+        "   AND c.dst_type = 'item' AND c.dst_id = e.dst_id)"
+        " GROUP BY e.dst_id",
         (repo,),
     ):
         try:
@@ -1634,6 +1874,21 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             continue
     # Keyword/closing-ref linked PRs, batched like the sibling lookups (one
     # grouped query over all open issues instead of one query per row).
+    # The gate keys on whether the closure ever MATERIALIZED: a PR the
+    # store knows merged never gates again (merged_at IS NULL check), in
+    # any view — an as-of replay shadows items with the REAL merge stamp
+    # under asof_real_merged_at (evaluate.prepare_snapshot), so a fix PR
+    # whose merge postdates the stamp still cannot gate its issues out of
+    # the replayed pool (C1's leak leg).
+    merged_gate_col = "i.merged_at"
+    try:
+        item_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(items)")
+        }
+        if "asof_real_merged_at" in item_columns:
+            merged_gate_col = "COALESCE(i.asof_real_merged_at, i.merged_at)"
+    except sqlite3.Error:
+        pass
     keyword_closers: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT CAST(e.dst_id AS INTEGER) AS issue, CAST(e.src_id AS INTEGER)"
@@ -1641,7 +1896,9 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
         " AND i.number = CAST(e.src_id AS INTEGER)"
         " WHERE e.repo = ? AND e.src_type = 'item' AND e.dst_type = 'item'"
         " AND e.rel IN ('closes', 'closes_keyword')"
-        " AND i.kind = 'pr' AND i.state = 'open'",
+        " AND i.kind = 'pr' AND i.state = 'open'"
+        f" AND {merged_gate_col} IS NULL AND NOT COALESCE(i.draft, 0)"
+        " AND e.evidence NOT LIKE 'comment:%'",
         (repo,),
     ):
         try:
@@ -1650,9 +1907,49 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             )
         except (TypeError, ValueError):
             continue
+    # Tracking-gate inputs (issue #69 AC1): the link-stream parentage map
+    # (child_of runs child -> parent, store.py's link stream) and the
+    # body-origin mention map keyed by the mentionER — src's body-origin
+    # outbound mentions are the items src's own body references (a task list
+    # lives in the item's own body; comment-origin mentions never count —
+    # their evidence names a comment).
+    child_of_children: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'child_of'"
+        " AND src_type = 'item' AND dst_type = 'item'",
+        (repo,),
+    ):
+        try:
+            child = int(row["src_id"])
+            parent = int(row["dst_id"])
+        except (TypeError, ValueError):
+            continue
+        child_of_children.setdefault(parent, set()).add(child)
+    body_mention_dsts: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'mentions'"
+        " AND src_type = 'item' AND dst_type = 'item'"
+        " AND evidence LIKE 'body@%'",
+        (repo,),
+    ):
+        try:
+            src = int(row["src_id"])
+            dst = int(row["dst_id"])
+        except (TypeError, ValueError):
+            continue
+        body_mention_dsts.setdefault(src, set()).add(dst)
+    tracking_label_rows: dict[int, set[str]] = {}
+    tracking_labels = {str(x) for x in (cfg.get("tracking_labels") or [])}
+    if tracking_labels and _table_exists(conn, "labels"):
+        for row in conn.execute(
+            "SELECT number, name FROM labels WHERE repo = ?", (repo,)
+        ):
+            tracking_label_rows.setdefault(row["number"], set()).add(row["name"])
+
     # Gates first (blocking_open needs to know which blocked items are
     # themselves ungated).
     gates_by: dict[int, list[str]] = {}
+    closeable_trackers: set[int] = set()
     for number, row in rows.items():
         gates: list[str] = []
         if any_blocked_by:
@@ -1670,6 +1967,8 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
         direct_linked = any(
             states.get(dst, {}).get("state") == "open"
             and states.get(dst, {}).get("kind") == "pr"
+            and states.get(dst, {}).get("merged_at") is None
+            and not states.get(dst, {}).get("draft")
             for dst in linked_pr_dsts.get(number, set())
         )
         keyword_linked = bool(keyword_closers.get(number))
@@ -1679,6 +1978,47 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
             gates.append("linked_pr (append-only evidence; may be stale)")
         if row["locked"]:
             gates.append("locked")
+        # Tracking gate (issue #69 AC1): a container whose tracked work is
+        # all done is closeable work, not rankable work. Every branch needs
+        # NON-EMPTY evidence, and unknown child states never satisfy a
+        # completeness branch (fail-closed: an unknown state is not
+        # "closed").
+        sub_total = row["sub_issues_total"]
+        sub_done = row["sub_issues_completed"]
+        tracking_columns = bool(
+            sub_total is not None
+            and int(sub_total) > 0
+            and sub_done is not None
+            and int(sub_done) == int(sub_total)
+        )
+        children = child_of_children.get(number, set())
+        tracking_children = bool(children) and all(
+            states.get(child, {}).get("state") == "closed" for child in children
+        )
+        # Branch (c) (final-critic F1): the container's OWN body-origin
+        # outbound mentions — a task list lives in the item's body, so the
+        # tracked children are the items THAT body references, restricted to
+        # issue-kind targets with known state (a body-referenced PR is not
+        # tracked child work; a repo's child -> parent "Tracking: #N"
+        # convention is inbound and never gates here — it would have to be a
+        # separate, explicitly bounded rule). Keying the map by the MENTIONED
+        # item inverted the rule into "every item whose body mentions N is
+        # closed", which gated ordinary work referenced by a closed item and
+        # missed real task-list epics; the direction, not the threshold, was
+        # the defect.
+        body_children = {
+            dst
+            for dst in body_mention_dsts.get(number, set())
+            if states.get(dst, {}).get("kind") == "issue"
+        }
+        tracking_mentions = bool(body_children) and all(
+            states.get(dst, {}).get("state") == "closed" for dst in body_children
+        )
+        tracking_label = bool(tracking_labels & tracking_label_rows.get(number, set()))
+        if tracking_columns or tracking_children or tracking_mentions or tracking_label:
+            gates.append("tracking")
+        if tracking_columns or tracking_children:
+            closeable_trackers.add(number)
         gates_by[number] = gates
 
     for src, dst in blocked_by_edges:
@@ -1788,6 +2128,7 @@ def _triage_features(conn: sqlite3.Connection, repo: str) -> dict:
         ),
         "blocked_by_out": blocked_by_out,
         "requires_notes": requires_notes,
+        "closeable_trackers": sorted(closeable_trackers),
     }
 
 
@@ -1903,25 +2244,28 @@ def _analog_for(
     ctx: dict | None = None,
     weights: dict | None = None,
 ) -> tuple[dict | None, int]:
-    """The issue's best PR analog: the top ``similar`` candidate of kind
-    'pr' under the effective [derive] weights (capped scan). Returns
-    ``(analog_evidence, regression_flag)`` — regression fires when the
-    analog PR has an inbound 'reverts' edge (a reverted fix). ``ctx`` is a
-    PREBUILT context (coupling keys attached) reused across the top-K rows
-    — the per-row ``similar`` rebuild cost top_k full context builds
-    (pr45 review K04); when absent one is built here, so a bare library
-    call behaves exactly like ``similar``."""
+    """The issue's best PR analog: the top ``similar`` MERGED-PR candidate
+    under the effective [derive] weights (capped scan, the candidate filter
+    applied BEFORE the cap — issue #69 AC8: open non-merged PRs are bait,
+    never analogs). Returns ``(analog_evidence, regression_flag)`` —
+    regression fires when the analog PR has an inbound 'reverts' edge (a
+    reverted fix). ``ctx`` is a PREBUILT context (coupling keys attached)
+    reused across the top-K rows — the per-row ``similar`` rebuild cost
+    top_k full context builds (pr45 review K04); when absent one is built
+    here, so a bare library call behaves exactly like ``similar``."""
     weights = weights or load_weights()
     if ctx is None or "coupling_support" not in ctx:
         caps = _Capabilities(conn)
         ctx = build_context(conn, repo, caps)
-        index, file_support, _population = _coupling_index(conn, repo, caps)
+        index, file_support, population = _coupling_index(conn, repo, caps)
         ctx["coupling_support"] = index
         ctx["coupling_filesupport"] = file_support
-    for cand in _rank_candidates(ctx, weights, number, 20, frozenset(), False):
-        if cand.get("kind") == "pr":
-            analog = {"number": cand["number"], "anchor": cand["anchor"]}
-            return analog, 1 if cand["number"] in reverted_prs else 0
+        ctx["coupling_population"] = population
+    for cand in _rank_candidates(
+        ctx, weights, number, 20, frozenset(), False, merged_prs_only=True
+    ):
+        analog = {"number": cand["number"], "anchor": cand["anchor"]}
+        return analog, 1 if cand["number"] in reverted_prs else 0
     return None, 0
 
 
@@ -1942,9 +2286,10 @@ def _triage_compute(
     defaults, preserving bare library-call behavior)."""
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
-    index, file_support, _population = _coupling_index(conn, repo, caps)
+    index, file_support, population = _coupling_index(conn, repo, caps)
     ctx["coupling_support"] = index
     ctx["coupling_filesupport"] = file_support
+    ctx["coupling_population"] = population
     analog_weights = weights or load_weights()
     asof = _synced_at(conn, repo)
     asof_dt = _parse_instant(asof)
@@ -1971,7 +2316,7 @@ def _triage_compute(
     ):
         merged_at[row["number"]] = row["merged_at"]
 
-    base = _triage_features(conn, repo)
+    base = _triage_features(conn, repo, cfg)
     features = base["features"]
     items = ctx["items"]
 
@@ -1986,8 +2331,15 @@ def _triage_compute(
             feat["issue_type_weight"] = None
         else:
             feat["issue_type_weight"] = cfg["types"].get(feat["item_type"], 0.0)
-        if not labels or not cfg["labels"]:
+        if not labels:
             feat["label_weight"] = None
+        elif not cfg["labels"]:
+            # Built-in fallback map (issue #69 AC7): case-insensitive
+            # matching; a configured map with no match stays a present 0.0.
+            feat["label_weight"] = max(
+                (BUILTIN_LABEL_WEIGHTS.get(name.lower(), 0.0) for name in labels),
+                default=0.0,
+            )
         else:
             feat["label_weight"] = max(
                 (cfg["labels"].get(name, 0.0) for name in labels), default=0.0
@@ -2025,23 +2377,42 @@ def _triage_compute(
     rows.sort(key=lambda r: (-r["stage1"], r["number"]))
     ungated = [r for r in rows if r["ranked"]]
 
-    # Stage 2 for the top-K UNGATED rows only.
-    for row in ungated[: max(1, top_k)]:
-        number = row["number"]
-        hotspot = 0.0
-        if asof_dt is not None:
-            seen_prs = {
-                pr
-                for path in row["resolved_paths"]
-                for pr in path_prs.get(path, set())
-            }
-            recency = 0.0
-            for pr in seen_prs:
+    # Hotspot phase 1 (issue #69 AC7, formula triage.v2): the RAW recency
+    # sum is computed for EVERY ungated row — that population is the
+    # normalization denominator, so an outside-top-K row can determine the
+    # max while its stage-2 fields stay uncomputed. Contribution: per
+    # (file, merge-event) exp(-age_days / HOTSPOT_DECAY_DAYS), hub files
+    # discounted by the affinity table's hub_floor.
+    hub_share_map = ctx["hub_share_of_population"]
+    hub_share_cut = analog_weights.get("hub_share", DEFAULT_HUB_SHARE)
+    hub_floor = analog_weights.get("hub_floor", DEFAULT_HUB_FLOOR)
+
+    def _hotspot_raw(resolved_paths: list[str]) -> float:
+        if asof_dt is None:
+            return 0.0
+        total = 0.0
+        for path in resolved_paths:
+            share = hub_share_map.get(path, 0.0)
+            discount = hub_floor if share and share >= hub_share_cut else 1.0
+            for pr in path_prs.get(path, set()):
                 merged = _parse_instant(merged_at.get(pr))
                 if merged is None:
                     continue
-                recency += 1.0 if (asof_dt - merged) <= timedelta(days=90) else 0.5
-            hotspot = min(1.0, recency / 10.0)
+                age_days = max(0.0, (asof_dt - merged).total_seconds() / 86400.0)
+                total += discount * math.exp(-age_days / HOTSPOT_DECAY_DAYS)
+        return total
+
+    for row in ungated:
+        raw = _hotspot_raw(row["resolved_paths"])
+        row["hotspot_raw"] = round(raw, 9)
+    max_raw = max((r["hotspot_raw"] for r in ungated), default=0.0)
+
+    # Stage 2 for the top-K UNGATED rows only (top-K contract preserved:
+    # analog/regression work and the stage-2 bonus stay top-K-only; only
+    # the cheap raw sums ran for everyone).
+    for row in ungated[: max(1, top_k)]:
+        number = row["number"]
+        hotspot = row["hotspot_raw"] / max_raw if max_raw > 0 else 0.0
         analog, regression = _analog_for(
             conn,
             repo,
@@ -2065,6 +2436,7 @@ def _triage_compute(
         row["total_score"] = row["stage1"]
     for row in rows:
         if not row["ranked"]:
+            row["hotspot_raw"] = None
             row["hotspot"] = None
             row["regression"] = None
             row["analog"] = None
@@ -2078,6 +2450,7 @@ def _triage_compute(
         "asof": asof,
         "blocking_source": base["blocking_source"],
         "blocked_by_out": base["blocked_by_out"],
+        "closeable_trackers": base["closeable_trackers"],
         "ctx": ctx,
         "caps": caps,
         "features": features,
@@ -2085,6 +2458,59 @@ def _triage_compute(
         "merged_at": merged_at,
         "analog_weights": analog_weights,
     }
+
+
+def _gated_block(rows: list[dict]) -> dict:
+    """The gated reporting block (issue #69 AC5): every gated open issue,
+    under its gate names, with the total count."""
+    gated_rows = [r for r in rows if not r["ranked"]]
+    by_gate: dict[str, list[int]] = {}
+    for r in gated_rows:
+        for gate in r["gates"]:
+            by_gate.setdefault(gate, []).append(r["number"])
+    return {
+        "count": len(gated_rows),
+        "by_gate": by_gate,
+        "numbers": sorted(r["number"] for r in gated_rows),
+    }
+
+
+def _asof_meta_echo(conn: sqlite3.Connection, repo: str) -> dict:
+    """As-of disclosure echo (issue #68 AC7, final-critic F2): when the
+    payload is answered from a prepared snapshot view (evaluate's
+    prepare_snapshot), ``temp.asof_meta`` carries the instant and the
+    snapshot's disclosure keys; echo them so a payload consumer can see the
+    answer is as-of-scoped — that labels/assignees/field values were
+    suppressed wholesale (undated current-state rows), that evidence edges
+    were suppressed by source, and whose text at T could not be certified.
+    Returns ``{}`` on a live (non-as-of) read — the keys do not appear."""
+    try:
+        rows = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM temp.asof_meta")
+        }
+    except sqlite3.Error:
+        return {}
+    # Every asof_meta value is stored JSON-encoded (prepare_snapshot writes
+    # json.dumps(v)), so the repo guard compares the DECODED value.
+    try:
+        meta_repo = json.loads(rows.get("repo", "null"))
+    except (TypeError, ValueError):
+        meta_repo = None
+    if meta_repo != repo or "as_of" not in rows:
+        return {}
+    try:
+        out: dict = {"as_of": json.loads(rows["as_of"])}
+    except (TypeError, ValueError):
+        return {}
+    for key in ("exclude_pr", "text_as_of_unknown", "disclosures"):
+        if key in rows:
+            try:
+                out[key] = json.loads(rows[key])
+            except (TypeError, ValueError):
+                # The raw value still discloses more than its absence would.
+                out[key] = rows[key]
+    return out
 
 
 def _triage_row_payload(row: dict) -> dict:
@@ -2103,6 +2529,7 @@ def _triage_row_payload(row: dict) -> dict:
         "total_score": row["total_score"],
         "stage2": row["stage2"],
         "hotspot": row["hotspot"],
+        "hotspot_raw": row.get("hotspot_raw"),
         "regression": row["regression"],
         "analog": row["analog"],
         "resolved_paths": row["resolved_paths"],
@@ -2123,6 +2550,7 @@ def triage(
     include_gated: bool = False,
     config: str | None = None,
     weights: dict | None = None,
+    as_of: str | None = None,
 ) -> dict:
     """Two-stage triage of every open issue (issue #30, 04-root-cause.md
     section 2). Read-only; ``config`` is an explicit ``[triage]`` TOML path
@@ -2140,11 +2568,40 @@ def triage(
     total_score DESC, number ASC. ``cursor`` is
     validated whole: an unknown number, or a total half that no longer
     matches that row's current total, restarts from the top (the README's
-    documented restart); a malformed cursor raises ``ValueError``."""
+    documented restart); a malformed cursor raises ``ValueError``.
+    ``as_of`` (issue #68 AC7) answers from a temp-table as-of snapshot
+    view built and torn down around the computation (evaluate's
+    prepare_snapshot owns the view; an unparseable stamp is a
+    ``bad_request`` ValueError)."""
     cfg = load_triage_config(*_triage_config_chain(conn, config))
     effective_top_k = top_k if top_k is not None else cfg["top_k"]
     if not isinstance(effective_top_k, int) or effective_top_k < 1:
         raise ValueError(f"top_k must be a positive integer, not {effective_top_k!r}")
+    if as_of is not None:
+        if _parse_instant(as_of) is None:
+            raise ValueError(f"bad_request: unparseable --as-of value: {as_of!r}")
+        from zaxbygraph.evaluate import prepare_snapshot, drop_snapshot
+
+        conn = prepare_snapshot(conn, repo, as_of=as_of, exclude_pr=None, reopen=True)
+        try:
+            return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
+                           include_gated, weights)
+        finally:
+            drop_snapshot(conn)
+    return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
+                   include_gated, weights)
+
+
+def _triage(
+    conn: sqlite3.Connection,
+    repo: str,
+    cfg: dict,
+    effective_top_k: int,
+    limit: int,
+    cursor: str | None,
+    include_gated: bool,
+    weights: dict | None,
+) -> dict:
     compute = _triage_compute(conn, repo, cfg, effective_top_k, weights=weights)
 
     def _sort_key(row: dict) -> tuple[float, int]:
@@ -2185,24 +2642,36 @@ def triage(
         if truncated and page
         else None
     )
-    return {
+    result = {
         "repo": repo,
         "rows": [_triage_row_payload(row) for row in page],
         "weights": {
             **{k: v for k, v in cfg.items() if k != "_config_source"},
             "affinity": dict(compute["analog_weights"]),
         },
-        "config_source": cfg["_config_source"],
+        "config_source": _triage_config_source(cfg),
         "top_k": effective_top_k,
         "stage2_weight": cfg["stage2_weight"],
         "formula_version": cfg["formula_version"],
         "triage_asof": compute["asof"],
         "hotspot_asof": compute["asof"],
         "blocking_source": compute["blocking_source"],
+        "gated": _gated_block(compute["rows"]),
+        "closeable_trackers": list(compute["closeable_trackers"]),
         "cursor": next_cursor,
         "truncated": truncated,
         "derived": True,
     }
+    # As-of echo (final-critic F2): a payload answered from a prepared
+    # snapshot view names the instant and carries the snapshot's disclosure
+    # keys; a live read carries neither key.
+    asof_echo = _asof_meta_echo(conn, repo)
+    if asof_echo:
+        result["as_of"] = asof_echo["as_of"]
+        result["asof_disclosures"] = {
+            k: v for k, v in asof_echo.items() if k != "as_of"
+        }
+    return result
 
 
 def _parse_size(size: str) -> tuple[int, int]:
@@ -2252,6 +2721,7 @@ def _pair_evidence(info: dict) -> dict:
         "evidence": {
             name: comp["evidence"] for name, comp in info["components"].items()
         },
+        "anchors": list(info["anchors"]),
         "anchor": info["anchor"],
         "title": {
             "similarity": round(info["title_sim"], 6),
@@ -2282,6 +2752,7 @@ def bundle(
     config: str | None = None,
     budget_tokens: int | None = None,
     weights: dict | None = None,
+    as_of: str | None = None,
 ) -> dict:
     """Greedy work bundles over the triage pool (issue #30, 04-root-cause.md
     section 3). Pool = the top-K UNGATED triage rows (or the named
@@ -2324,6 +2795,37 @@ def bundle(
         # silently-disabled cap (pr45 review K09).
         raise ValueError("budget-tokens must be a positive integer")
     cfg = load_triage_config(*_triage_config_chain(conn, config))
+    if as_of is not None:
+        if _parse_instant(as_of) is None:
+            raise ValueError(f"bad_request: unparseable --as-of value: {as_of!r}")
+        from zaxbygraph.evaluate import prepare_snapshot, drop_snapshot
+
+        conn = prepare_snapshot(conn, repo, as_of=as_of, exclude_pr=None, reopen=True)
+        try:
+            return _bundle(conn, repo, size, count, pool, exclude,
+                           allow_shared_files, max_files, config,
+                           budget_tokens, weights, cfg=cfg)
+        finally:
+            drop_snapshot(conn)
+    return _bundle(conn, repo, size, count, pool, exclude,
+                   allow_shared_files, max_files, config,
+                   budget_tokens, weights, cfg=cfg)
+
+
+def _bundle(
+    conn: sqlite3.Connection,
+    repo: str,
+    size: str,
+    count: int,
+    pool: list[int] | None,
+    exclude: list[int] | None,
+    allow_shared_files: bool,
+    max_files: int | None,
+    config: str | None,
+    budget_tokens: int | None,
+    weights: dict | None,
+    cfg: dict,
+) -> dict:
     compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
     size_min, size_max = _parse_size(size)
     file_cap = max_files if max_files is not None else cfg["max_files"]
@@ -2420,11 +2922,16 @@ def bundle(
         except (TypeError, ValueError):
             continue
 
-    def _pool_total(number: int) -> float:
+    def _pool_stage1(number: int) -> float:
+        # Seeds rank by the stage-1 triage total (issue #69 AC4): the
+        # stage-2 hotspot bonus is a per-row recency signal, and letting it
+        # break stage-1 ties flipped fixture seed orders under the v2
+        # continuous decay — the pool order is the demand ranking, ties
+        # broken by number ASC.
         row = ranked_map.get(number) or all_rows[number]
-        return row["total_score"]
+        return row["stage1"]
 
-    order = sorted(members, key=lambda n: (-_pool_total(n), n))
+    order = sorted(members, key=lambda n: (-_pool_stage1(n), n))
 
     pair_cache: dict[frozenset[int], dict] = {}
     merge_candidates: list[dict] = []
@@ -2438,7 +2945,8 @@ def bundle(
             components = pair_components(items[a], items[b], ctx, affinity_weights)
             _apply_cochange(items[a], items[b], ctx, components)
             total = _total_score(components, affinity_weights)
-            anchor = _anchor_fired(components)
+            anchors = _anchor_list(items[a], items[b], components, ctx, affinity_weights)
+            anchor = anchors[0] if anchors else None
             title_sim = components["title"]["score"]
             info = {
                 "a": a,
@@ -2446,6 +2954,7 @@ def bundle(
                 "components": components,
                 "total": total,
                 "anchor": anchor,
+                "anchors": anchors,
                 "title_sim": title_sim,
             }
             pair_cache[key] = info
@@ -2477,7 +2986,7 @@ def bundle(
                         "evidence": _pair_evidence(info),
                     }
                 )
-            elif total >= cfg["affinity_floor"] and anchor is not None:
+            elif total >= cfg["affinity_floor"] and anchors:
                 edge_weight[key] = total
             elif total >= cfg["affinity_floor"] and title_sim < 0.9:
                 related_not_bundleable.append(
@@ -2503,6 +3012,13 @@ def bundle(
     skipped: set[int] = set()
     used_files: set[str] = set()
     bundles_payload: list[dict] = []
+    unbundled_reason: dict[int, str] = {}
+
+    def _nonhub(paths: set[str]) -> set[str]:
+        # Hub files are exempt from cross-bundle disjointness (issue #69
+        # AC4/AC13): a path half the merged population touches is shared
+        # infrastructure, not a bundle's exclusive territory.
+        return {p for p in paths if not _is_hub(p, ctx, affinity_weights)}
 
     while (
         len(bundles_payload) < max(0, count)
@@ -2528,37 +3044,78 @@ def bundle(
             best_key = None
             blocked_by_shared = False
             blocked_by_cap = False
+            blocked_by_cohesion = False
             for cand in candidates:
-                affinities = [
-                    edge_weight.get(frozenset((member, cand)), 0.0)
+                # Per-pair floor admission (issue #69 AC4): EVERY
+                # (member, cand) pair must carry a qualified edge — above
+                # the affinity floor AND anchored. A pair that only clears
+                # the mean is not evidence for the group.
+                missing = [
+                    member
                     for member in group
+                    if frozenset((member, cand)) not in edge_weight
+                ]
+                if missing:
+                    unbundled_reason.setdefault(
+                        cand,
+                        "below affinity floor (no anchored pair with every"
+                        " member)",
+                    )
+                    continue
+                affinities = [
+                    edge_weight[frozenset((member, cand))] for member in group
                 ]
                 mean_affinity = (
                     sum(affinities) / len(affinities) if affinities else 0.0
                 )
                 if mean_affinity <= 0:
                     continue
+                # Cohesion stop (issue #69 AC4): growth stops when the next
+                # candidate's MEAN affinity falls below cohesion_fraction x
+                # the MIN over the CURRENT group's member-pair affinities
+                # (the seated members' coherence — not the candidate's own
+                # pairs).
+                seated = [
+                    edge_weight[frozenset((m1, m2))]
+                    for i, m1 in enumerate(group)
+                    for m2 in group[i + 1:]
+                ]
+                cohesion = min(seated) if seated else mean_affinity
+                if mean_affinity < cfg["cohesion_fraction"] * cohesion:
+                    blocked_by_cohesion = True
+                    unbundled_reason.setdefault(cand, "below cohesion threshold")
+                    continue
                 cand_files = _direct_paths(cand)
                 if len(group_files | cand_files) > file_cap:
                     blocked_by_cap = True
+                    unbundled_reason.setdefault(
+                        cand, f"file cap (max_files={file_cap})"
+                    )
                     continue
-                if not allow_shared_files and (cand_files & used_files):
+                if not allow_shared_files and (_nonhub(cand_files) & used_files):
                     blocked_by_shared = True
+                    unbundled_reason.setdefault(cand, "shared-file conflict")
                     continue
                 collisions = bool(cand_files & set(open_prs))
-                score = _pool_total(cand) * mean_affinity
-                key_tuple = (-round(score, 9), collisions, cand)
+                # Partner score is the affinity alone (issue #69 AC4): the
+                # triage total picked the seed; partners are chosen by how
+                # strongly the evidence binds them to the group.
+                key_tuple = (-round(mean_affinity, 9), collisions, cand)
                 if best_key is None or key_tuple < best_key:
                     best_key = key_tuple
                     best = (cand, cand_files)
             if best is None:
                 # Reason order: the file cap is the tighter constraint and
                 # names a size limit the caller controls, so it reports
-                # ahead of the shared-file conflict (pr45 review K06).
+                # ahead of the shared-file conflict (pr45 review K06); the
+                # cohesion stop follows, then duplicate collapse, then the
+                # affinity floor.
                 if blocked_by_cap:
                     why = f"file cap (max_files={file_cap})"
                 elif blocked_by_shared:
                     why = "shared-file conflict"
+                elif blocked_by_cohesion:
+                    why = "below cohesion threshold"
                 elif any(
                     frozenset((member, cand)) in dup_edge_pairs
                     or pair_cache.get(frozenset((member, cand)), {}).get(
@@ -2573,6 +3130,7 @@ def bundle(
                     why = "affinity floor"
                 break
             cand, cand_files = best
+            unbundled_reason.pop(cand, None)
             group.append(cand)
             group_files |= cand_files
         else:
@@ -2590,9 +3148,19 @@ def bundle(
                 )
             )
             used |= set(group)
-            used_files |= group_files
+            used_files |= _nonhub(group_files)
         else:
             skipped.add(current_seed)
+            unbundled_reason.setdefault(
+                current_seed, why or "no qualifying partner"
+            )
+
+    # Unbundled reporting (issue #69 AC5): every pool member no bundle
+    # absorbed, with the reason its last candidacy failed.
+    unbundled = [
+        {"number": n, "reason": unbundled_reason.get(n, "bundle count reached")}
+        for n in sorted(members - used)
+    ]
 
     payload = {
         "repo": repo,
@@ -2602,11 +3170,25 @@ def bundle(
         "excluded": excluded,
         "pool": sorted(members),
         "dropped": dropped,
+        "unbundled": unbundled,
+        "gated": _gated_block(compute["rows"]),
+        "closeable_trackers": list(compute["closeable_trackers"]),
         "weights": weights_echo,
-        "config_source": cfg["_config_source"],
+        "config_source": _triage_config_source(cfg),
         "formula_version": cfg["formula_version"],
         "derived": True,
     }
+    # As-of echo (final-critic F2): a payload answered from a prepared
+    # snapshot view names the instant and carries the snapshot's disclosure
+    # keys (undated tables suppressed, evidence suppressed by source, text
+    # uncertified at T); a live read carries neither key. The echo is a
+    # mandatory disclosure — budget shedding never touches it.
+    asof_echo = _asof_meta_echo(conn, repo)
+    if asof_echo:
+        payload["as_of"] = asof_echo["as_of"]
+        payload["asof_disclosures"] = {
+            k: v for k, v in asof_echo.items() if k != "as_of"
+        }
     if budget_tokens is not None:
         budget = budget_tokens * 4
 
@@ -2632,6 +3214,18 @@ def bundle(
                     payload[section].pop()
             if _size() > budget:
                 payload["pool"] = []
+            # The gated/unbundled audit sections participate in budget
+            # shedding too (issue #68/#69 budget contract): they are
+            # sheddable tails like the rest, never mandatory echoes.
+            while payload["unbundled"] and _size() > budget:
+                payload["unbundled"].pop()
+            if _size() > budget:
+                gated = payload["gated"]
+                payload["gated"] = {
+                    "count": gated.get("count", 0),
+                    "by_gate": {},
+                    "numbers": [],
+                }
     return payload
 
 
@@ -2746,6 +3340,7 @@ def _bundle_payload(
                     "a": a,
                     "b": b,
                     "affinity": round(weight, 6),
+                    "anchors": list(info["anchors"]),
                     "anchor": info["anchor"],
                     "components": {
                         name: {"score": round(comp["score"], 6)}
@@ -3294,7 +3889,7 @@ def brief(
             **{k: v for k, v in cfg.items() if k != "_config_source"},
             "affinity": dict(compute["analog_weights"]),
         },
-        "config_source": cfg["_config_source"],
+        "config_source": _triage_config_source(cfg),
         "formula_version": cfg["formula_version"],
     }
     if exclude_bots:

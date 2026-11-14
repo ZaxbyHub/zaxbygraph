@@ -1412,6 +1412,14 @@ def cmd_path(args: argparse.Namespace) -> int:
     return _run_read(args, path_between, args.a, args.b)
 
 
+def _no_ground_truth() -> type[ValueError]:
+    """evaluate.NoGroundTruthError, imported lazily (evaluate pulls derive
+    at module level; the CLI import graph stays one-way)."""
+    from zaxbygraph.evaluate import NoGroundTruthError
+
+    return NoGroundTruthError
+
+
 def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
     """Derived-tier read runner: same resolution and envelope as
     ``_run_read``, over the same ``mode=ro`` connection ``open_existing``
@@ -1459,6 +1467,18 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
         message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
         return emit_failure(
             args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
+        )
+    except _no_ground_truth() as exc:
+        # Dedicated handler BEFORE the generic ValueError branch: the
+        # error carries its own code (issue #68 AC6) and the generic arm
+        # would relabel it bad_request and mask it.
+        return emit_failure(
+            args,
+            2,
+            str(exc),
+            slug=repo,
+            db_path=db_path,
+            code_key=getattr(exc, "code", "no_ground_truth"),
         )
     except ValueError as exc:
         return emit_failure(args, 2, str(exc), slug=repo, db_path=db_path)
@@ -1673,7 +1693,8 @@ def _triage_query(
     top_k: int | None,
     include_gated: bool,
     config: str | None,
-    repo: str,
+    as_of: str | None = None,
+    repo: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
     from zaxbygraph import derive as _derive
@@ -1692,6 +1713,7 @@ def _triage_query(
         include_gated=include_gated,
         config=config,
         weights=weights,
+        as_of=as_of,
     )
 
 
@@ -1705,7 +1727,8 @@ def _bundle_query(
     max_files: int | None,
     budget_tokens: int | None,
     config: str | None,
-    repo: str,
+    as_of: str | None = None,
+    repo: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
     from zaxbygraph import derive as _derive
@@ -1729,6 +1752,7 @@ def _bundle_query(
         config=config,
         budget_tokens=budget_tokens,
         weights=weights,
+        as_of=as_of,
     )
 
 
@@ -1784,6 +1808,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
         args.top_k,
         bool(getattr(args, "include_gated", False)),
         args.config,
+        getattr(args, "as_of", None),
     )
 
 
@@ -1802,6 +1827,7 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         args.max_files,
         args.budget_tokens,
         args.config,
+        getattr(args, "as_of", None),
     )
 
 
@@ -2947,7 +2973,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Measure retrieval quality against GitHub-reported ground truth",
     )
     add_common(sp, max_age=True)
-    sp.add_argument("mode", choices=["similar", "localize", "bundle"])
+    sp.add_argument("mode", choices=["similar", "localize", "bundle", "triage"])
     sp.add_argument("--config", help="Explicit [derive] weights TOML (highest precedence)")
     sp.set_defaults(func=cmd_eval)
 
@@ -2965,6 +2991,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--include-gated", dest="include_gated", action="store_true",
         help="Keep gated rows in the response (ranked: false, gates named)",
+    )
+    sp.add_argument(
+        "--as-of", dest="as_of", default=None, metavar="T",
+        help="Answer from the as-of snapshot view at instant T (ISO-8601 Z)",
     )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_triage)
@@ -2989,6 +3019,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Bundle file-set cap (default: [triage] max_files)")
     sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
                     help="Cap the serialized payload at N tokens (chars/4; positive integer)")
+    sp.add_argument(
+        "--as-of", dest="as_of", default=None, metavar="T",
+        help="Answer from the as-of snapshot view at instant T (ISO-8601 Z)",
+    )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_bundle)
 

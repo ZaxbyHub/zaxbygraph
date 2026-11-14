@@ -33,14 +33,37 @@ def _seed(db_path: Path) -> None:
     conn = connect(db_path)
     init_schema(conn)
     src = FakeGitHubSource()
-    src.add_issue(issue(1, title="guardrail one", body="needle", state="open"))
-    src.add_issue(issue(2, title="guardrail two", body="other", state="open"))
+    # Both bodies reference the merged PR's file (migration, issues
+    # #68/#69): the eval-similar target pair must anchor on its OWN
+    # evidence (the duplicate_of edge itself is excluded from the target's
+    # adjacency by the eval controls).
+    # created AFTER the PR's merge stamp (migration, issues #68/#69): the
+    # eval's item cutoff scopes the vocabulary to PRs merged at/before the
+    # target's creation, so the pair's shared path must already be in it.
+    src.add_issue(issue(1, title="guardrail one",
+                        body="needle near src/store.py:1:1", state="open",
+                        created_at="2026-01-02T00:00:00Z"))
+    src.add_issue(issue(2, title="guardrail two",
+                        body="other spot src/store.py:2:1", state="open",
+                        created_at="2026-01-02T00:00:01Z"))
     src.add_pr(
         issue(10, title="guardrail pr", kind="pr", state="closed"),
         pull(10, changed_files=1, merged=True),
         files=[pr_file("src/store.py")],
     )
     sync_repo(conn, src, REPO)
+    # One duplicate_of pair (migration, issues #68/#69): every eval mode
+    # now REFUSES a store with zero eligible ground truth (the coded
+    # no_ground_truth error), and the envelope guardrail's success-path
+    # eval cell needs a measurable target.
+    conn.execute(
+        "INSERT INTO edges (repo, src_type, src_id, rel, dst_type, dst_id,"
+        " confidence, evidence, source)"
+        " VALUES (?, 'item', '2', 'duplicate_of', 'item', '1',"
+        " 'EXTRACTED', 'fixture-reported', 'link')",
+        (REPO,),
+    )
+    conn.commit()
     conn.close()
 
 
