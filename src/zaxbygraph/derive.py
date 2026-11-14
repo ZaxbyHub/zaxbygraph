@@ -1650,6 +1650,24 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _actors_has_bot(conn: sqlite3.Connection) -> bool:
+    """Whether ``actors.is_bot`` is readable on this store (swarm feedback
+    FB-001 / ASM-1). The column is v12-only: the bot-exclusion reads
+    (``SELECT ... WHERE is_bot = 1`` and the inbound-mentions ``sa.is_bot``
+    join) crash with OperationalError on a pre-v12 store. Reads never
+    migrate (the pr45 K01 rule — and _require_bot_flags is the
+    migration-forcing path this must NOT route through), so the probe is a
+    plain PRAGMA: absent table or absent column both answer False and the
+    callers degrade bot-free (no login counted as a bot)."""
+    try:
+        return any(
+            row[1] == "is_bot"
+            for row in conn.execute("PRAGMA table_info(actors)")
+        )
+    except sqlite3.Error:
+        return False
+
+
 def _item_state_map(conn: sqlite3.Connection, repo: str) -> dict[int, dict]:
     out: dict[int, dict] = {}
     for row in conn.execute(
@@ -1740,9 +1758,11 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
     # Bot exclusion (issue #69 AC2): participants counts PEOPLE. Bot
     # logins come from actors.is_bot (the [bot]-suffix verdict the real
     # ingest path records); a login with no actors row is not an
-    # established bot and stays counted.
+    # established bot and stays counted. is_bot is a v12 column: without
+    # it no login counts as a bot (FB-001's bot-free degradation), never
+    # an OperationalError on a pre-v12 store.
     bot_logins: set[str] = set()
-    if _table_exists(conn, "actors"):
+    if _actors_has_bot(conn):
         for row in conn.execute(
             "SELECT login FROM actors WHERE is_bot = 1"
         ):
@@ -1779,6 +1799,12 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
     # done, sources that are the target's own children owe their attention
     # to the parent, and bot-authored sources are automation, not demand.
     inbound_mentions: dict[int, int] = {}
+    # The bot leg of the demand-quality filter joins actors.is_bot — a
+    # v12-only column (FB-001): on a pre-v12 store the term is dropped and
+    # the filter degrades bot-free (every open non-child source counts).
+    bot_source_term = (
+        " AND COALESCE(sa.is_bot, 0) = 0" if _actors_has_bot(conn) else ""
+    )
     for row in conn.execute(
         "SELECT e.dst_id AS dst_id, COUNT(DISTINCT e.src_id) AS n"
         " FROM edges e"
@@ -1787,7 +1813,7 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         " LEFT JOIN actors sa ON sa.login = src.author"
         " WHERE e.repo = ? AND e.rel = 'mentions'"
         " AND e.src_type = 'item' AND e.dst_type = 'item'"
-        " AND src.state = 'open' AND COALESCE(sa.is_bot, 0) = 0"
+        " AND src.state = 'open'" + bot_source_term +
         " AND NOT EXISTS ("
         "   SELECT 1 FROM edges c WHERE c.repo = e.repo AND c.rel = 'child_of'"
         "   AND c.src_type = 'item' AND c.src_id = e.src_id"
@@ -1908,11 +1934,13 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         except (TypeError, ValueError):
             continue
     # Tracking-gate inputs (issue #69 AC1): the link-stream parentage map
-    # (child_of runs child -> parent, store.py's link stream) and the
-    # body-origin mention map keyed by the mentionER — src's body-origin
-    # outbound mentions are the items src's own body references (a task list
-    # lives in the item's own body; comment-origin mentions never count —
-    # their evidence names a comment).
+    # (child_of runs child -> parent, store.py's link stream). The former
+    # body-mention children branch is GONE (swarm feedback FB-003 / TF-1):
+    # it gated any issue whose body-mentions all resolved closed — ordinary
+    # citing issues (a bug report referencing closed work) hidden as
+    # "finished containers" — while true epics are already covered by the
+    # sub-issue columns and child_of branches, so the branch's only real
+    # effect was collateral gating.
     child_of_children: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'child_of'"
@@ -1925,19 +1953,6 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         except (TypeError, ValueError):
             continue
         child_of_children.setdefault(parent, set()).add(child)
-    body_mention_dsts: dict[int, set[int]] = {}
-    for row in conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'mentions'"
-        " AND src_type = 'item' AND dst_type = 'item'"
-        " AND evidence LIKE 'body@%'",
-        (repo,),
-    ):
-        try:
-            src = int(row["src_id"])
-            dst = int(row["dst_id"])
-        except (TypeError, ValueError):
-            continue
-        body_mention_dsts.setdefault(src, set()).add(dst)
     tracking_label_rows: dict[int, set[str]] = {}
     tracking_labels = {str(x) for x in (cfg.get("tracking_labels") or [])}
     if tracking_labels and _table_exists(conn, "labels"):
@@ -1995,27 +2010,12 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         tracking_children = bool(children) and all(
             states.get(child, {}).get("state") == "closed" for child in children
         )
-        # Branch (c) (final-critic F1): the container's OWN body-origin
-        # outbound mentions — a task list lives in the item's body, so the
-        # tracked children are the items THAT body references, restricted to
-        # issue-kind targets with known state (a body-referenced PR is not
-        # tracked child work; a repo's child -> parent "Tracking: #N"
-        # convention is inbound and never gates here — it would have to be a
-        # separate, explicitly bounded rule). Keying the map by the MENTIONED
-        # item inverted the rule into "every item whose body mentions N is
-        # closed", which gated ordinary work referenced by a closed item and
-        # missed real task-list epics; the direction, not the threshold, was
-        # the defect.
-        body_children = {
-            dst
-            for dst in body_mention_dsts.get(number, set())
-            if states.get(dst, {}).get("kind") == "issue"
-        }
-        tracking_mentions = bool(body_children) and all(
-            states.get(dst, {}).get("state") == "closed" for dst in body_children
-        )
+        # The former branch (c) — the container's own body-origin mentions
+        # all closed — is REMOVED (FB-003/TF-1): it gated ordinary citing
+        # issues, and real epics are already covered by the columns and
+        # child_of branches. Branch (d) stays configuration-driven.
         tracking_label = bool(tracking_labels & tracking_label_rows.get(number, set()))
-        if tracking_columns or tracking_children or tracking_mentions or tracking_label:
+        if tracking_columns or tracking_children or tracking_label:
             gates.append("tracking")
         if tracking_columns or tracking_children:
             closeable_trackers.add(number)

@@ -74,6 +74,22 @@ class NoGroundTruthError(ValueError):
         self.code = "no_ground_truth"
 
 
+class StoreTooOldError(ValueError):
+    """The store predates the snapshot floor (swarm feedback FB-005/ASM-2).
+
+    ``prepare_snapshot`` (and therefore every ``--as-of`` read and every
+    backtest replay) needs the v10+ floor tables; on an older store the
+    shadow builds used to die mid-flight on the first missing table with
+    a bare OperationalError. Carries ``code = 'store_too_old'`` — the same
+    code export-corpus and the snapshot transport raise — and the message
+    names sync as the remedy, so a caller keyed on the code gets the same
+    verdict and the same fix everywhere."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.code = "store_too_old"
+
+
 # ==== as-of snapshot view (issue #68 AC7) ====================================
 #
 # prepare_snapshot builds connection-local TEMP tables that SHADOW the real
@@ -164,7 +180,12 @@ def prepare_snapshot(
     - ``labels``/``assignees``/``issue_field_values``: EMPTY (undated
       current-state rows; disclosed as ``current_state_tables``) — a row
       whose arrival time the store cannot express must never change the
-      as-of answer.
+      as-of answer. The extracted items columns
+      (``sub_issues_total``/``sub_issues_completed``/
+      ``dependencies_blocked_by``/``dependencies_blocking``) are current-
+      state extractions too: NULLed per item once ``updated_at > T`` (the
+      same undatable rule as the raw_json payload fields) and disclosed
+      under the same key.
     - ``item_events``: occurred <= T.
     - ``item_path_refs``/``item_signatures``: comment/review-origin rows
       keep their visible origins; body-origin rows are RE-DERIVED from the
@@ -175,6 +196,21 @@ def prepare_snapshot(
     at = _parse_instant(as_of)
     if at is None:
         raise ValueError(f"bad_request: unparseable as_of value: {as_of!r}")
+    # Schema floor (FB-005/ASM-2): the snapshot shadows name v10+ tables
+    # (item_events first); without them the build died mid-flight on a
+    # bare OperationalError. Refuse up front with the store_too_old code
+    # (the export/snapshot floor shape) naming sync as the remedy.
+    has_events_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view')"
+        " AND name = 'item_events'"
+    ).fetchone() is not None
+    if not has_events_table:
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        raise StoreTooOldError(
+            f"store_too_old: store schema is v{version}; as-of snapshots"
+            " need the v10+ floor tables (item_events is absent);"
+            " re-run sync once against this database to migrate"
+        )
     stamp = as_of
     disclosures: dict[str, list] = {}
     reopen_set: set[int] = set()
@@ -310,15 +346,30 @@ def prepare_snapshot(
         # updated after T (reactions/sub-issue completion would otherwise
         # leak post-T state through raw_json).
         updated = rec.get("updated_at")
-        if rec.get("raw_json") and updated and _parse_instant(updated) > at:
-            try:
-                raw = json.loads(rec["raw_json"])
-            except (TypeError, ValueError):
-                raw = None
-            if isinstance(raw, dict):
-                for key in ("reactions", "milestone", "sub_issues_summary"):
-                    raw.pop(key, None)
-                rec["raw_json"] = json.dumps(raw)
+        if updated and _parse_instant(updated) > at:
+            # The EXTRACTED columns are just as undatable (FB-002/CS-2):
+            # sub_issues_* and dependencies_* are current-state extractions
+            # whose only timestamp is the item's updated_at — a container
+            # that completed AFTER T must not gate 'tracking' inside the
+            # as-of view at T. NULL them (missing-feature downstream) and
+            # disclose the class once, below, via current_state_tables.
+            for col in (
+                "sub_issues_total",
+                "sub_issues_completed",
+                "dependencies_blocked_by",
+                "dependencies_blocking",
+            ):
+                if col in rec:
+                    rec[col] = None
+            if rec.get("raw_json"):
+                try:
+                    raw = json.loads(rec["raw_json"])
+                except (TypeError, ValueError):
+                    raw = None
+                if isinstance(raw, dict):
+                    for key in ("reactions", "milestone", "sub_issues_summary"):
+                        raw.pop(key, None)
+                    rec["raw_json"] = json.dumps(raw)
         conn.execute(insert_sql, (*tuple(rec[c] for c in cols), real_merge))
 
     if text_unknown:
@@ -460,6 +511,14 @@ def prepare_snapshot(
         ]
     disclosures["current_state_tables"] = [
         "labels", "assignees", "issue_field_values",
+        # FB-002/CS-2: the four EXTRACTED items columns are current-state
+        # too — a row whose arrival time the store cannot express. They are
+        # NULLed per item once updated_at > T (not emptied wholesale like
+        # the tables above, because per-item updated_at DOES date them),
+        # and the class is disclosed here so the as-of payload never claims
+        # they were as-of-certifiable.
+        "sub_issues_total", "sub_issues_completed",
+        "dependencies_blocked_by", "dependencies_blocking",
     ]
 
     # comment_count is a derived current-state column: the as-of view
@@ -999,7 +1058,12 @@ def _eval_similar(
                 best = max(best, 1.0 / (ranked.index(partner) + 1))
         rr.append(best)
         rng = random.Random(_BASELINE_SEED)
-        pool = [c["number"] for c in visible if c["number"] not in partners]
+        # FB-004/CUB-9678: the random baseline draws from the FULL visible
+        # candidate set — the same geometry the real ranking ranks. The old
+        # pool excluded the partners, so a draw could never hit one and
+        # random_recall_at_5 was identically 0.0 — a baseline that cannot
+        # fire is not a floor, it is a vanity metric.
+        pool = [c["number"] for c in visible]
         draws = pool[:5] if len(pool) <= 5 else rng.sample(pool, 5)
         baseline_recalls.append(
             sum(1 for p in in_scope if p in draws) / len(in_scope)

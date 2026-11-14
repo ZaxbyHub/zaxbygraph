@@ -284,10 +284,9 @@ links and `linked_pr (append-only evidence; may be stale)` for
 keyword/closing-ref evidence — an OPEN PR only, never a draft and never
 one the store knows merged), locked, or `tracking` (a container whose
 tracked work is all done: sub-issues complete, every child_of child
-closed, every body-mentioned child closed, or a configured
-`tracking_labels` label — each branch needs non-empty evidence, and
-evidence-complete containers are also reported under
-`closeable_trackers`) are gated: withheld from the default ranking
+closed, or a configured `tracking_labels` label — each branch needs
+non-empty evidence, and evidence-complete containers are also reported
+under `closeable_trackers`) are gated: withheld from the default ranking
 (`ranked: false` under `--include-gated`), never enter stage 2, and are
 excluded from bundle pools by default (the bundle command's in-pool
 blocker relaxation can admit blocked-only rows, flagged `gate_relaxed`).

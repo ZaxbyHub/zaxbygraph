@@ -1,36 +1,26 @@
-"""Regression tests for the tracking gate's branch (c) direction and branch
-(d) (configured ``tracking_labels``) — the final critic's F1 findings
-(.agents/issue-traces/68-69-eval-selection-quality/09-final-critic.md).
+"""Regression tests for the tracking gate's body-mention behaviour and
+branch (d) (configured ``tracking_labels``) — the final critic's F1
+findings (.agents/issue-traces/68-69-eval-selection-quality/
+09-final-critic.md), AMENDED by swarm-pr-feedback round 1 (FB-003/TF-1).
 
-Branch (c) is the body-mention children branch of the tracking gate (issue
-#69 AC1): a task list lives in the ITEM'S OWN BODY, so the tracked children
-are the items THAT body references, restricted to issue-kind targets with
-known state. The defect this file pins: the gate's map was keyed by the
-MENTIONED item (``body_mention_srcs[dst] = {mentioners}``), so the gate
-fired on N when every item whose body mentions N was closed — the inverted
-reading "everyone who mentions N is done" — which gated ordinary work
-referenced by a closed item (the critic's live probe gated 7 of 9 open
-issues, including follow-ups whose only body mentioner was the merged fix
-PR) while a real finished task-list epic stayed ranked.
+History of the body-mention branch (c): the final critic's F1 found the
+gate's map keyed by the MENTIONED item — the inverted reading "everyone
+who mentions N is done" — which gated ordinary work referenced by a
+closed item. The r1 fix corrected the direction, but the PR-feedback
+round-1 critic then ruled the branch unsalvageable (TF-1): even
+direction-correct, it gates ANY issue whose body-mentions all resolve
+closed — an ordinary citing issue (a bug report referencing closed work)
+is hidden exactly like a finished container — while real epics are
+already covered by the sub-issue-columns and child_of branches. The
+critic's ruling: REMOVE branch (c) from the gate entirely; the gate is
+the three branches (sub-issues complete / child_of children closed /
+configured tracking_labels label). This file now pins the REMOVED
+behaviour: an epic whose body lists only closed children is RANKABLE
+(not gated) — body mentions alone never gate 'tracking' again.
 
-Two legs from the critic's synthetic probe (scratch store, real sync path):
-
-- open bug 600, referenced only by CLOSED issue 601 ("see #600"): an
-  inbound body mention from a closed item is not 600's tracked children
-  (600's own body references nothing), so 600 must NOT gate 'tracking' —
-  it is ordinary rankable work;
-- open epic 700 whose OWN body is a finished task list
-  ("- [x] #701 / - [x] #702") with both children CLOSED: the container's
-  own body-origin outbound mentions, all closed issue-kind children, so
-  700 MUST gate 'tracking' (ranked false, out of every bundle pool).
-
-Branch (d) (configured ``[triage] tracking_labels``) had no test at all:
-an open issue carrying a configured label must gate 'tracking' when (and
-only when) the label is configured.
-
-RED before the direction fix (both probe legs fail: 600 IS gated and 700
-is NOT), GREEN after; the branch (d) test passes before and after — it is
-coverage for the untested branch, not a defect pin.
+Branch (d) (configured ``[triage] tracking_labels``) had no test at all
+before this file: an open issue carrying a configured label must gate
+'tracking' when (and only when) the label is configured.
 
 Hermetic: FakeGitHubSource through the real sync path; no network, no
 credentials; unittest (also collectable by pytest). Sync stamps pinned so
@@ -95,14 +85,18 @@ class _StoreTestCase(unittest.TestCase):
         self.conn.close()
 
 
-# ==== branch (c): the container's OWN body mentions are the children ========
+# ==== body mentions never gate 'tracking' (branch (c) REMOVED, FB-003) ======
 
 
 class TrackingMentionDirectionTests(_StoreTestCase):
-    """The final critic's two-leg probe. RED at 09b4643 (the inverted
-    direction): the closed mentioner's inbound edge gates ordinary bug 600,
-    and epic 700 — whose own body lists only closed children — stays
-    ranked."""
+    """The final critic's two-leg probe, RE-PINNED at the PR-feedback r1
+    ruling (FB-003/TF-1): branch (c) is removed from the gate entirely, so
+    BOTH legs are ordinary rankable work — the closed mentioner's inbound
+    edge never gates bug 600, and the task-list epic 700 (body mentions
+    only, no sub-issue columns, no child_of links) is rankable too. Real
+    finished epics still gate through branches (a)/(b) — that is pinned by
+    tests/test_selection_quality.py C9, which populates the columns AND the
+    child_of edges."""
 
     @classmethod
     def _build(cls, conn) -> None:
@@ -120,7 +114,8 @@ class TrackingMentionDirectionTests(_StoreTestCase):
         ))
         # Leg 2: an open epic whose OWN body is a finished task list; the
         # ingest derives body-origin mentions edges 700 -> 701 and 700 -> 702
-        # from the epic's body.
+        # from the epic's body. Under the removed branch (c) this gated
+        # 'tracking'; under the r1 ruling body mentions alone gate nothing.
         src.add_issue(issue(
             700, title="Epic: task list all done",
             body="- [x] #701\n- [x] #702",
@@ -135,10 +130,11 @@ class TrackingMentionDirectionTests(_StoreTestCase):
         _pin_synced_at(conn)
 
     def test_two_leg_mention_direction_probe(self) -> None:
-        """RED before the direction fix, GREEN after. An inbound body
-        mention from a closed item must NOT gate the mentioned issue; a
-        container whose own body lists only closed issue-kind children MUST
-        gate 'tracking', stay unranked, and stay out of every bundle."""
+        """Both legs stay rankable: an inbound body mention from a closed
+        item must NOT gate the mentioned issue, and — the FB-003/TF-1
+        ruling — an epic whose own body lists only CLOSED children no
+        longer gates 'tracking' either (the branch is removed; only the
+        sub-issue columns, child_of children, or a configured label gate)."""
         out = derive.triage(self.conn, REPO, include_gated=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(600, rows)
@@ -149,8 +145,7 @@ class TrackingMentionDirectionTests(_StoreTestCase):
             "tracking", rows[600]["gates"],
             f"an ordinary open bug referenced only by a CLOSED item's body"
             f" must NOT gate 'tracking' — the mention points AT 600; 600's"
-            f" own body tracks nothing (the inverted direction gated"
-            f" exactly this shape); got {rows[600]['gates']!r}",
+            f" own body tracks nothing; got {rows[600]['gates']!r}",
         )
         self.assertIs(
             rows[600]["ranked"], True,
@@ -158,25 +153,28 @@ class TrackingMentionDirectionTests(_StoreTestCase):
             f"{rows[600]['ranked']!r} with gates {rows[600]['gates']!r}",
         )
 
-        # --- leg 2: the finished task-list epic gates --------------------
-        self.assertIn(
+        # --- leg 2: body mentions alone no longer gate (FB-003/TF-1) ----
+        self.assertNotIn(
             "tracking", rows[700]["gates"],
-            f"an open epic whose OWN body lists only CLOSED children (a"
-            f" finished task list) must gate 'tracking' — the tracked"
-            f" children are the items the epic's own body references; got"
+            f"an open epic whose OWN body lists only CLOSED children is no"
+            f" longer gated: branch (c) is removed (the PR-feedback r1"
+            f" ruling — it gated ordinary citing issues while real epics"
+            f" were already covered by the columns/child_of branches); got"
             f" {rows[700]['gates']!r}",
         )
         self.assertIs(
-            rows[700]["ranked"], False,
-            f"a tracking-gated epic must not be rankable work; got"
-            f" {rows[700]!r}",
+            rows[700]["ranked"], True,
+            f"with branch (c) removed the task-list epic is rankable work;"
+            f" got ranked={rows[700]['ranked']!r} with gates"
+            f" {rows[700]['gates']!r}",
         )
 
-        # --- the pool consequence: gated epic out, ordinary bug in -------
+        # --- the pool consequence: both stay in --------------------------
         payload = derive.bundle(self.conn, REPO)
-        self.assertNotIn(
+        self.assertIn(
             700, payload["pool"],
-            "a tracking-gated epic must not enter the bundle pool",
+            f"a body-mention-only epic is rankable and stays in the bundle"
+            f" pool; got {payload['pool']!r}",
         )
         self.assertIn(
             600, payload["pool"],
