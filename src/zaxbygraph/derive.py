@@ -760,14 +760,6 @@ def _total_score(components: dict, weights: dict) -> float:
     )
 
 
-def _anchor_fired(components: dict, exclude: frozenset[str] = frozenset()) -> str | None:
-    for name in sorted(ANCHOR_SIGNALS - exclude):
-        comp = components.get(name)
-        if comp and comp["score"] > 0:
-            return name
-    return None
-
-
 def _anchor_list(
     a: _ItemData,
     b: _ItemData,

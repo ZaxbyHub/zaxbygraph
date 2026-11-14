@@ -1513,11 +1513,18 @@ def _tool_triage(arguments: dict, ctx) -> dict:
             raise ToolError("bad_request", "top_k must be an integer", hint="pass top_k as an integer")
         top_k = min(top_k, _MAX_TOP_K)
     include_gated = _bool_arg(arguments, "include_gated")
+    # Validated symmetrically with _tool_bundle: the declared as_of argument
+    # is a string or absent, and it rides the same positional chain into
+    # _triage_query (derive.triage parses/validates the instant itself).
+    as_of = arguments.get("as_of")
+    if as_of is not None and not isinstance(as_of, str):
+        raise ToolError("bad_request", "as_of must be a string", hint="pass an ISO-8601 Z instant like 2027-01-05T00:00:00Z")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
         data = _translated_derive(
-            _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated, None
+            _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated,
+            None, as_of,
         )
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:

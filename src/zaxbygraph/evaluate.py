@@ -259,16 +259,21 @@ def prepare_snapshot(
         body = _asof_text(
             slots.get("item_body", []), rec.get("body"), rec.get("updated_at"), at
         )
-        if title is None and body is None and (
-            slots.get("item_title") or slots.get("item_body")
-        ):
-            # Slots exist but neither resolves: text at T is unknown.
+        if title is None or body is None:
+            # A slot _asof_text cannot certify (no covering revision and
+            # the live window starts after T) is disclosed and NULLed in
+            # the shadow — regardless of whether revision rows exist:
+            # the stored live title/body are post-T and must never reach
+            # derive's lexical/title tokenizers (store text is never NULL,
+            # so a None return is always the uncertifiable case).
             text_unknown.add(number)
-        elif title is None and slots.get("item_title"):
-            text_unknown.add(number)
-        if title is not None:
+        if title is None:
+            rec["title"] = None
+        else:
             rec["title"] = title
-        if body is not None:
+        if body is None:
+            rec["body"] = None
+        else:
             rec["body"] = body
             asof_bodies[number] = body
         # Temporal state: reopen issues closed after T / by the excluded
@@ -1355,7 +1360,7 @@ def _eval_bundle(
             conn, repo, as_of=stamp, exclude_pr=case["pr"], reopen=True
         )
         try:
-            snapshot = derive_bundle(prepared, repo)
+            snapshot = derive_bundle(prepared, repo, weights=weights)
         finally:
             drop_snapshot(prepared)
         proposed = _bundle_pair_numbers(snapshot)
@@ -1484,7 +1489,9 @@ def _eval_triage(
             conn, repo, as_of=stamp, exclude_pr=case["pr"], reopen=True
         )
         try:
-            out = derive_triage(prepared, repo, limit=1000, include_gated=False)
+            out = derive_triage(
+                prepared, repo, limit=1000, include_gated=False, weights=weights
+            )
         finally:
             drop_snapshot(prepared)
         pool = [r["number"] for r in out["rows"] if r.get("ranked")]
