@@ -1541,13 +1541,16 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
     budget_tokens = arguments.get("budget_tokens")
     if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
         raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
+    as_of = arguments.get("as_of")
+    if as_of is not None and not isinstance(as_of, str):
+        raise ToolError("bad_request", "as_of must be a string", hint="pass an ISO-8601 Z instant like 2027-01-05T00:00:00Z")
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
         data = _translated_derive(
             _bundle_query, conn, slug, db_path,
             size if size is not None else "2-3", count, pool, exclude,
-            allow_shared_files, max_files, budget_tokens, None,
+            allow_shared_files, max_files, budget_tokens, None, as_of,
         )
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
@@ -2089,22 +2092,23 @@ _TOOL_SHAPES: dict[str, dict] = {
         "description": "Open issues ranked workable by the documented"
         " formula, with gates naming every exclusion; pages via cursor"
         " (derived, read-only).",
-        "data_keys": ("blocking_source", "config_source", "cursor",
-                      "derived", "formula_version", "hotspot_asof", "repo",
-                      "rows", "stage2_weight", "top_k", "triage_asof",
-                      "truncated", "weights"),
+        "data_keys": ("blocking_source", "closeable_trackers",
+                      "config_source", "cursor", "derived", "formula_version",
+                      "gated", "hotspot_asof", "repo", "rows",
+                      "stage2_weight", "top_k", "triage_asof", "truncated",
+                      "weights"),
         "row_fields": {
-            "rows": ("analog", "gates", "hotspot", "note", "number",
-                     "ranked", "regression", "resolved_paths", "scores",
-                     "stage2", "title", "total_score"),
+            "rows": ("analog", "gates", "hotspot", "hotspot_raw", "note",
+                     "number", "ranked", "regression", "resolved_paths",
+                     "scores", "stage2", "title", "total_score"),
         },
         "data": _props(
             {
                 "repo": _STR,
                 "rows": _open_objects(
                     "{number, title, gates, ranked, scores, total_score,"
-                    " stage2, hotspot, regression, analog, resolved_paths,"
-                    " note?}"
+                    " stage2, hotspot, hotspot_raw, regression, analog,"
+                    " resolved_paths, note?}"
                 ),
                 "weights": dict(
                     _OPEN_OBJ, description="the effective weight table"
@@ -2116,14 +2120,26 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "triage_asof": _STR_NULL,
                 "hotspot_asof": _STR_NULL,
                 "blocking_source": _STR_NULL,
+                "gated": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "{count, by_gate, numbers}: every gated"
+                    " open issue under its gate names (issue #69 AC5)",
+                },
+                "closeable_trackers": {
+                    "type": "array",
+                    "items": {"type": ["integer", "object"]},
+                    "description": "tracking-gated containers whose tracked"
+                    " work is all done (issues #69 AC1)",
+                },
                 "cursor": _STR_NULL,
                 "truncated": _BOOL,
                 "derived": _BOOL,
             },
-            ("blocking_source", "config_source", "cursor", "derived",
-             "formula_version", "hotspot_asof", "repo", "rows",
-             "stage2_weight", "top_k", "triage_asof", "truncated",
-             "weights"),
+            ("blocking_source", "closeable_trackers", "config_source",
+             "cursor", "derived", "formula_version", "gated",
+             "hotspot_asof", "repo", "rows", "stage2_weight", "top_k",
+             "triage_asof", "truncated", "weights"),
         ),
     },
     "bundle": {
@@ -2131,9 +2147,11 @@ _TOOL_SHAPES: dict[str, dict] = {
         "description": "Evidence-backed 2-3-issue work bundles over the"
         " triage pool, with dropped pool members named (derived,"
         " read-only).",
-        "data_keys": ("bundles", "config_source", "derived", "dropped",
-                      "excluded", "formula_version", "merge_candidates",
-                      "pool", "related_not_bundleable", "repo", "weights"),
+        "data_keys": ("bundles", "closeable_trackers", "config_source",
+                      "derived", "dropped", "excluded", "formula_version",
+                      "gated", "merge_candidates", "pool",
+                      "related_not_bundleable", "repo", "unbundled",
+                      "weights"),
         "data": _props(
             {
                 "repo": _STR,
@@ -2161,6 +2179,23 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "dropped": _open_objects(
                     "{number, reason} for pool members that could not be used"
                 ),
+                "unbundled": _open_objects(
+                    "{number, reason} for pool members no bundle absorbed"
+                    " (below floor, no anchor, shared files, cohesion stop;"
+                    " issue #69 AC5)"
+                ),
+                "gated": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "{count, by_gate, numbers}: every gated"
+                    " open issue under its gate names (issue #69 AC5)",
+                },
+                "closeable_trackers": {
+                    "type": "array",
+                    "items": {"type": ["integer", "object"]},
+                    "description": "tracking-gated containers whose tracked"
+                    " work is all done (issues #69 AC1)",
+                },
                 "weights": dict(
                     _OPEN_OBJ, description="the effective weight table"
                 ),
@@ -2173,9 +2208,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                     " payload",
                 },
             },
-            ("bundles", "config_source", "derived", "dropped", "excluded",
-             "formula_version", "merge_candidates", "pool",
-             "related_not_bundleable", "repo", "weights"),
+            ("bundles", "closeable_trackers", "config_source", "derived",
+             "dropped", "excluded", "formula_version", "gated",
+             "merge_candidates", "pool", "related_not_bundleable", "repo",
+             "unbundled", "weights"),
         ),
     },
     "brief": {
@@ -2509,6 +2545,7 @@ _TOOLS: list[dict] = [
                 "cursor": _CURSOR,
                 "top_k": {"type": "integer", "minimum": 1, "maximum": _MAX_TOP_K, "description": f"Keep only the top K ranked rows (at most {_MAX_TOP_K})"},
                 "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
+                "as_of": {"type": "string", "description": "Answer from the as-of snapshot view at instant T (ISO-8601 Z)"},
                 **_REPO_DB,
             }
         ),
@@ -2525,6 +2562,7 @@ _TOOLS: list[dict] = [
                 "allow_shared_files": {"type": "boolean"},
                 "max_files": {"type": "integer", "minimum": 1},
                 "budget_tokens": {"type": "integer", "minimum": 1},
+                "as_of": {"type": "string", "description": "Answer from the as-of snapshot view at instant T (ISO-8601 Z)"},
                 **_REPO_DB,
             }
         ),

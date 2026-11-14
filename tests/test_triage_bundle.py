@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import atexit
 import os
 import shutil
@@ -442,7 +443,9 @@ class TriageFormulaTests(_StoreTestCase):
         self.assertEqual(data["stage2_weight"], 0.25)
         # the payload names the formula and the deterministic as-of stamp
         # (the fixture pins both sync_state stamps to PINNED_SYNCED_AT).
-        self.assertEqual(data.get("formula_version"), "triage.v1")
+        # Migration (issues #68/#69 matrix row: formula v1 -> v2 - demand
+        # filters, hotspot normalization, built-in label map).
+        self.assertEqual(data.get("formula_version"), "triage.v2")
         self.assertEqual(data.get("triage_asof"), PINNED_SYNCED_AT)
         self.assertFalse(data.get("truncated"))
         w = data["weights"]
@@ -491,15 +494,19 @@ class TriageFormulaTests(_StoreTestCase):
         # priority = (1.0 + 1.0) / 2 = 1.0        (field missing, excluded)
         # stage1   = 7/10 + 2/9 + 0 + 1 = (63 + 20 + 90)/90 = 173/90
         #          = 1.9222222222222222
-        # hotspot  = PRs touching resolved src/alpha.py = {PR 20}, merged
-        #            2027-06-10, within 90d of 2027-07-01 -> recency 1.0;
-        #            min(1, 1.0/10) = 0.1
+        # hotspot (triage.v2): raw recency = exp(-21/45) (PR 20 merged
+        #   2027-06-10, 21 days before PINNED_SYNCED_AT); the max raw over
+        #   all ungated rows is 202's exp(-11/45), so
+        #   hotspot = exp(-21/45)/exp(-11/45) = exp(-10/45) = 0.800769...
         # regression = 0 (analog PR 20 has no inbound reverts edge)
-        # stage2_bonus = 0.25 * (0.1 + 0)/2 = 0.0125
-        # total = 173/90 + 0.0125 = (1384 + 9)/720 = 1393/720
-        #       = 1.9347222222222222
+        # stage2_bonus = 0.25 * (exp(-10/45) + 0)/2 = 0.100096...
+        # total = 173/90 + 0.125*exp(-10/45) = 2.022318...
+        # (Migration issues #68/#69 matrix row: TriageFormulaTests
+        # re-derived under v2 - continuous decay + max normalization.)
         r201 = rows[201]
-        self.assertAlmostEqual(r201["total_score"], 1393 / 720, places=9)
+        self.assertAlmostEqual(
+            r201["total_score"], 173 / 90 + 0.125 * math.exp(-10 / 45), places=9
+        )
         self.assertAlmostEqual(r201["scores"]["stage1"], 173 / 90, places=9)
         g = r201["scores"]["groups"]
         self.assertAlmostEqual(g["demand"], 0.7, places=9)
@@ -532,9 +539,9 @@ class TriageFormulaTests(_StoreTestCase):
         self.assertAlmostEqual(fn["inbound_mentions"], 0.1, places=9)
         self.assertAlmostEqual(fn["sub_issue_gap"], 2 / 3, places=9)
         self.assertAlmostEqual(fn["milestone_due"], 0.0, places=9)
-        self.assertAlmostEqual(r201["hotspot"], 0.1, places=9)
+        self.assertAlmostEqual(r201["hotspot"], math.exp(-10 / 45), places=9)
         self.assertEqual(r201["regression"], 0)
-        self.assertAlmostEqual(r201["stage2"], 0.0125, places=9)
+        self.assertAlmostEqual(r201["stage2"], 0.125 * math.exp(-10 / 45), places=9)
         analog = r201.get("analog")
         self.assertTrue(
             isinstance(analog, dict) and analog.get("number") == 20,
@@ -554,13 +561,13 @@ class TriageFormulaTests(_StoreTestCase):
         #   item_type value, no labels rows, no [triage.fields] table) and a
         #   group with no present features contributes 0.
         # stage1 = 13/60 + 0 + 1.0 + 0 = 73/60 = 1.2166666666666667
-        # hotspot = 0.1 (PR 21 merged 2027-06-20, within 90d)
+        # hotspot (triage.v2) = 1.0 (202's beta merge, 11 days before the
+        #   stamp, IS the max raw over the ungated population)
         # regression = 1 (analog PR 21 is reverted by PR 25)
-        # stage2_bonus = 0.25 * (0.1 + 1)/2 = 0.1375
-        # total = 73/60 + 0.1375 = (292 + 33)/240 = 325/240 = 65/48
-        #       = 1.3541666666666667
+        # stage2_bonus = 0.25 * (1.0 + 1)/2 = 0.25
+        # total = 73/60 + 0.25 = 1.4666666666666668
         r202 = rows[202]
-        self.assertAlmostEqual(r202["total_score"], 65 / 48, places=9)
+        self.assertAlmostEqual(r202["total_score"], 73 / 60 + 0.25, places=9)
         self.assertAlmostEqual(r202["scores"]["stage1"], 73 / 60, places=9)
         g2 = r202["scores"]["groups"]
         self.assertAlmostEqual(g2["demand"], 13 / 60, places=9)
@@ -579,9 +586,9 @@ class TriageFormulaTests(_StoreTestCase):
         )
         self.assertAlmostEqual(fn2["reopens"], 1.0, places=9)
         self.assertAlmostEqual(fn2["file_reverts"], 1.0, places=9)
-        self.assertAlmostEqual(r202["hotspot"], 0.1, places=9)
+        self.assertAlmostEqual(r202["hotspot"], 1.0, places=9)
         self.assertEqual(r202["regression"], 1)
-        self.assertAlmostEqual(r202["stage2"], 0.1375, places=9)
+        self.assertAlmostEqual(r202["stage2"], 0.25, places=9)
         analog2 = r202.get("analog")
         self.assertTrue(
             isinstance(analog2, dict) and analog2.get("number") == 21,
@@ -687,6 +694,17 @@ class TriageGatesTests(_StoreTestCase):
             pull(309, merged=False),
             files=[pr_file("src/handlers.py")],
         )
+        # Tracking epic (migration, issues #68/#69 matrix row TriageGatesTests
+        # / AC10): sub_issues 2/2 complete AND child_of links from two CLOSED
+        # children - both stored parentage signals, so the gate can read
+        # either.
+        rec_epic = issue(310, title="Epic: finish the migration", body="tracking")
+        rec_epic["sub_issues_summary"] = {"total": 2, "completed": 2}
+        src.add_issue(rec_epic)
+        for n in (311, 312):
+            src.add_issue(issue(n, title=f"child {n}", body="child work",
+                                state="closed"))
+            src.links[n] = _links(parent=(_node(310),))
         sync_repo(conn, src, REPO)
 
     def test_triage_gates_named(self) -> None:
@@ -744,6 +762,29 @@ class TriageGatesTests(_StoreTestCase):
             any("append-only" in g for g in rows[308]["gates"]),
             f"308's gate must carry the append-only label, got {rows[308]['gates']!r}",
         )
+        # Tracking gate (migration, issues #68/#69 AC10): the finished epic
+        # is gated 'tracking' (ranked false), reported under
+        # closeable_trackers, and never a bundle pool member.
+        self.assertIn("tracking", rows[310]["gates"])
+        self.assertIs(rows[310]["ranked"], False)
+        trackers = [
+            int(t) if not isinstance(t, dict) else int(t["number"])
+            for t in env_ig["data"].get("closeable_trackers", [])
+        ]
+        self.assertIn(310, trackers)
+        bundle_env = _cli_json(
+            "bundle", "--db", str(self.db_path), "--repo", REPO,
+            "--format", "json",
+        )
+        self.assertTrue(bundle_env["ok"], bundle_env)
+        self.assertNotIn(310, bundle_env["data"]["pool"])
+        self.assertIn(
+            310,
+            [
+                int(t) if not isinstance(t, dict) else int(t["number"])
+                for t in bundle_env["data"].get("closeable_trackers", [])
+            ],
+        )
 
 
 # ==== C3: bundle sizing, disjointness, tie-break ============================
@@ -759,8 +800,15 @@ class BundleDisjointTests(_StoreTestCase):
       0.24 each); 406 has no reactions (demand 0.05 with the null excluded)
       so its total stays BELOW the family members even though its hotspot
       spans both families. All seeds tie -> broken by number ASC.
-    - PRs 420/421 are the only merged touchers (merged 2027-03-xx, OUTSIDE
-      the 90-day window of the pinned synced_at -> recency 0.5).
+    - PRs 420/421 merged 2027-03-01 (the SAME stamp: under formula v2's
+      continuous recency the two families' hotspot contributions tie, so
+      the stage-1 tie keeps breaking by number ASC), PLUS two independent
+      two-file filler PRs 422/423 (merged 2027-02-28, files no issue
+      references) lifting the merged population to 4 so both family files
+      sit at 1/4 hub share - non-hub in the post-fix anchor rules.
+      (Migration issues #68/#69 matrix row: BundleDisjointTests fixture
+      geometry corrected so disjointness coverage survives the hub
+      exemption; 406's exclusion preserved via the non-hub shared files.)
     """
 
     @classmethod
@@ -775,9 +823,19 @@ class BundleDisjointTests(_StoreTestCase):
         src.add_pr(
             issue(421, title="beta history", body="", kind="pr", state="closed",
                   created_at="2027-03-01T00:00:00Z"),
-            _merged_pull(421, "2027-03-02T00:00:00Z"),
+            _merged_pull(421, "2027-03-01T00:00:00Z"),
             files=[pr_file("src/beta.py")],
         )
+        # Fillers (migration): disjoint files no issue references, lifting
+        # the merged-PR population to 4 (hub shares 1/4).
+        for n, (fa, fb) in {422: ("src/f1.py", "src/f2.py"),
+                            423: ("src/f3.py", "src/f4.py")}.items():
+            src.add_pr(
+                issue(n, title=f"filler {n}", body="", kind="pr", state="closed",
+                      created_at="2027-02-20T00:00:00Z"),
+                _merged_pull(n, "2027-02-28T00:00:00Z"),
+                files=[pr_file(fa), pr_file(fb)],
+            )
         for n, body in (
             (401, "see src/alpha.py:1:1"),
             (402, "see src/alpha.py:2:2"),
@@ -932,7 +990,12 @@ class BundlePayloadTests(_StoreTestCase):
         )
         self.assertTrue(env["ok"], env)
         data = env["data"]
+        # Migration (issues #68/#69 matrix row: BundlePayloadTests payload
+        # keys): gated/unbundled/closeable_trackers join the completeness
+        # assert; bundle_id still recomputes from the (new-shape) weights
+        # echo below.
         for key in ("bundles", "merge_candidates", "related_not_bundleable",
+                    "unbundled", "gated", "closeable_trackers",
                     "weights", "config_source"):
             self.assertIn(key, data)
         bundle = self._bundle_of(env)
@@ -1684,6 +1747,11 @@ class EvalCutoffTests(_StoreTestCase):
             spy_calls.append((args, kwargs))
             return original_similar(*args, **kwargs)
 
+        # Migration (issues #68/#69 AC1): eval bundle no longer scores
+        # similar() candidates — it replays the production bundler over a
+        # prepared as-of snapshot — so the derive_similar spy covers the
+        # similar mode only; bundle's target coverage is asserted from its
+        # per-fix-PR backtest payload below.
         with mock.patch.object(
             evaluate_module, "derive_similar", side_effect=_recording_similar
         ):
@@ -1693,8 +1761,12 @@ class EvalCutoffTests(_StoreTestCase):
         self.assertEqual(similar_eval["metrics"]["mrr"], 1.0)
         self.assertEqual(similar_eval["metrics"]["eligible_targets"], 1)
         self.assertEqual(bundle_eval["metrics"]["pair_recall"], 1.0)
+        # Migration (issues #68/#69): bundle eval is the per-fix-PR
+        # backtest; on this store the replay proposes exactly the truth
+        # pair (the post-cutoff baits still never enter proposals), so the
+        # precision pin moves 0.5 -> 1.0.
         self.assertEqual(
-            bundle_eval["metrics"]["pair_precision"], 0.5,
+            bundle_eval["metrics"]["pair_precision"], 1.0,
             "post-cutoff baits (107 via docs/leak.md, 109 via the post-"
             "created_at comment) must not enter eval proposals",
         )
@@ -1716,10 +1788,16 @@ class EvalCutoffTests(_StoreTestCase):
                 f"target {target}: comment_cutoff must be min(closing PR"
                 f" created_at) with the created_at fallback",
             )
-        # similar mode targets 101/102; bundle mode targets 101/105 — the
-        # union must cover all three pinned targets across the two modes.
+        # similar mode targets 101/102; bundle mode's fix-PR case closes
+        # 101/105 — the union must cover all three pinned targets across
+        # the two modes.
         self.assertTrue({101, 102} <= seen_targets)
-        self.assertTrue({101, 105} <= seen_targets)
+        bundle_cases = {
+            n
+            for entry in bundle_eval["per_fix_pr"]
+            for n in entry["closed_issues"]
+        }
+        self.assertTrue({101, 105} <= bundle_cases)
 
 
 # ==== C11 (44-AC2): hub share over the merged-PR population ================

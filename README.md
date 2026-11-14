@@ -221,7 +221,7 @@ repository: with a resolvable store, `--repo ''` is refused with
 zaxbygraph similar 42 [--limit 20] [--ls-files] [--config WEIGHTS.toml]
 zaxbygraph explain 42 57 [--ls-files] [--config WEIGHTS.toml]
 zaxbygraph coupling "src/zaxbygraph/query.py" [--limit 20]
-zaxbygraph eval similar|localize|bundle [--config WEIGHTS.toml]
+zaxbygraph eval similar|localize|bundle|triage [--config WEIGHTS.toml]
 ```
 
 | Command | Meaning |
@@ -229,7 +229,7 @@ zaxbygraph eval similar|localize|bundle [--config WEIGHTS.toml]
 | `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, `resolved_path_count` (the vocabulary the pair scored against), capability degradation notes, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match in either direction (the mention is a tail of a stored path, or a stored path is a tail of the mention), and unresolved mentions can never anchor a pair. `--ls-files` intersects AFTER resolution — it only thins which paths can score, never what a mention resolves to — and echoes that checkout's HEAD sha plus `ls_files_applied` (false when the checkout could not be listed). Since issue #44 the hub denominator counts every merged PR in scope (formerly the item count), so `files_direct` weights shift on stores with many unmerged items. |
 | `explain A B` | The exact per-signal breakdown one pair scored — the same function `similar` slices, so the two cannot diverge. |
 | `coupling PATH` | Files that change together with PATH over merged PRs touching 2–50 files: `support` (co-occurrence count), `confidence` (support/support(PATH)), `lift` (N·support/(support(PATH)·support(other)), `null` instead of NaN when either file never appears in the population), `population_prs` (how many merged PRs are inside the 2–50 population). Unmerged PRs never count. An unknown path answers `reason: unknown_path`, a known path whose PRs all fall outside the population answers `reason: excluded_from_population`, and a repo with no qualifying PRs answers `reason: no_merged_prs` — never a silent empty list. |
-| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5), and the issue sets single merged PRs closed (bundle: pair recall/precision) — under leakage controls (candidates restricted to items that existed at the target's creation; the target's closing PRs and their edges excluded; post-cutoff PRs, post-fix comments and their rolled-up references excluded in ALL three modes — similar, localize and bundle alike scope post-cutoff path evidence to the target's cutoffs, issue #44 semantics; signature components suppressed because stored signatures carry no origin). Results whose controls could not be applied are disclosed under `with_leakage` with reasons (disclosure is label-only; the scored target stays scored); denominators count eligible targets only, and a mode with zero eligible targets adds a `no_ground_truth` label. Current stores print the `corpus_sha256` of the exact snapshot the metrics were computed on; stores below the export floor or ahead of this build return `corpus_sha256: null` with a `store_too_old` / `store_too_new` label. |
+| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5 + precision@5), the issue sets single merged PRs closed (bundle: a per-fix-PR backtest that replays the FULL production bundler over a temp-table as-of snapshot at each merged multi-issue fix PR's created_at, with the fix PR excluded, and scores micro-aggregate pair recall/precision with macro per-fix-PR averages, `per_fix_pr` audit entries, the distinct `proposed_pairs` union, per-case `disclosures` and an exclusive `ground_truth` label — 'github'/'keyword'/'mixed' — naming which stream supplied the truth: `closes` edges UNION admissible `closes_keyword` evidence (body@/commit, never comment-origin)), and how often the next issues fixed sit at the top of the ranking (triage: top1/top3 next-fix rates over the same per-fix-PR snapshots, with the `lowest_number_first` baseline). Every mode carries a same-geometry baseline (`random_recall_at_5`, `most_touched`, `random_same_size`, `lowest_number_first`); headline floors should be read against them. A mode whose controls leave zero eligible ground truth RAISES the coded `no_ground_truth` error (exit 2) instead of reporting empty metrics; per-target control notes ride `with_leakage`. Current stores print the `corpus_sha256` of the exact snapshot the metrics were computed on; stores below the export floor or ahead of this build return `corpus_sha256: null` with a `store_too_old` / `store_too_new` label. |
 
 Scale: everything here is computed at query time from the local store — a
 `similar` read measured ~0.93 s at ~4k items and extrapolates to ~2.3 s at
@@ -250,8 +250,8 @@ bytes unchanged) form the work-selection layer: they rank what is worth
 doing, group it, and hand one item's context to an agent.
 
 ```bash
-zaxbygraph triage [--limit 20] [--cursor T:N] [--top-k K] [--include-gated] [--config TRIAGE.toml]
-zaxbygraph bundle [--size 2-3] [--count 5] [--pool N,M] [--exclude N,M] [--allow-shared-files] [--max-files N] [--budget-tokens B] [--config TRIAGE.toml]
+zaxbygraph triage [--limit 20] [--cursor T:N] [--top-k K] [--include-gated] [--as-of T] [--config TRIAGE.toml]
+zaxbygraph bundle [--size 2-3] [--count 5] [--pool N,M] [--exclude N,M] [--allow-shared-files] [--max-files N] [--budget-tokens B] [--as-of T] [--config TRIAGE.toml]
 zaxbygraph brief N [--budget-tokens 4000] [--live] [--config TRIAGE.toml]
 ```
 
@@ -266,47 +266,84 @@ leverage (open items blocked, sub-issue gap, milestone window), risk
 mean over its present features. A feature whose source data is absent is
 `null` with a `requires` note and is excluded from the mean; only a
 configured map with no match scores 0. Stage 2 adds a hotspot/regression
-bonus (capped at `stage2_weight`) to the top-K rows only. Rows blocked by
-an open item, assigned, linked to an open PR (the gate value is `linked_pr`
-for timeline-verified links and `linked_pr (append-only evidence; may be
-stale)` for keyword/closing-ref evidence) or locked are
-gated: withheld from the default ranking (`ranked: false` under
-`--include-gated`), never enter stage 2, and are excluded from bundle
-pools by default (the bundle command's in-pool blocker relaxation can
-admit blocked-only rows, flagged `gate_relaxed`). Order is
-`total_score DESC, number ASC`; `triage_asof` (the store's latest sync
-stamp) anchors every time-window feature so ranking is deterministic per
-store state. `--cursor` is a hint, not a lease: an expired or unknown
-cursor (the ranking moved past it after a re-sync) simply restarts from
-the top. Scores are **candidates, not facts** — heuristics over stored
-evidence, never recorded anywhere.
+bonus (capped at `stage2_weight`) to the top-K rows only. The hotspot
+formula (v2) is RELATIVE: per resolved file and merge event the raw
+contribution is `exp(-age_days/45)` (a 45-day decay constant),
+hub-discounted by `hub_floor`; raw sums are computed for every ungated row
+(each row echoes the additive `hotspot_raw` diagnostic) and normalize by
+the population max, so one repository's freshest file always defines 1.0.
+Demand counts people, not automation: bot authors (actors flagged `is_bot`)
+never count as participants, and an inbound mention counts only from an
+open, non-bot source that is not the target's own child. Priority labels
+fall back to a built-in map (critical/p0 1.0, high/p1/bug 0.75, medium/p2
+0.5, p3 0.25, low 0.1, matched case-insensitively) whenever `[triage.labels]`
+is unset — the payload's `config_source` gains a `+built-in-labels` suffix
+while it supplies the weights. Rows blocked by an open item, assigned,
+linked to an open PR (the gate value is `linked_pr` for timeline-verified
+links and `linked_pr (append-only evidence; may be stale)` for
+keyword/closing-ref evidence — an OPEN PR only, never a draft and never
+one the store knows merged), locked, or `tracking` (a container whose
+tracked work is all done: sub-issues complete, every child_of child
+closed, every body-mentioned child closed, or a configured
+`tracking_labels` label — each branch needs non-empty evidence, and
+evidence-complete containers are also reported under
+`closeable_trackers`) are gated: withheld from the default ranking
+(`ranked: false` under `--include-gated`), never enter stage 2, and are
+excluded from bundle pools by default (the bundle command's in-pool
+blocker relaxation can admit blocked-only rows, flagged `gate_relaxed`).
+The payload reports the gated block `{count, by_gate, numbers}` for every
+gated open issue. Order is `total_score DESC, number ASC`; `triage_asof`
+(the store's latest sync stamp, or the explicit `--as-of T` instant)
+anchors every time-window feature so ranking is deterministic per store
+state — `--as-of` answers from a connection-local temp-table snapshot view
+(items created at/before T, text at its revision-current state, undated
+label/assignee/field rows suppressed) and tears it down after; the store
+file is never written. `--cursor` is a hint, not a lease: an expired or
+unknown cursor (the ranking moved past it after a re-sync) simply
+restarts from the top. Scores are **candidates, not facts** — heuristics
+over stored evidence, never recorded anywhere.
 
 `bundle` builds greedy work bundles over the top-K ungated triage rows:
-the highest unused total seeds (ties by number), then the member maximizing
-`triage_total × mean pair affinity` joins, where affinity runs the same
-signal pipeline as `similar` under the effective `[derive]` weights (an
-edge needs affinity ≥ `affinity_floor`
-AND a fired anchor signal). On exact score ties the join prefers
-collision-free candidates, then the lower number. Duplicate pairs
+the highest unused stage-1 total seeds (ties by number), then the member
+maximizing MEAN PAIR AFFINITY alone joins (the triage total picked the
+seed; partners are chosen by how strongly the evidence binds them).
+Admission is per-pair: EVERY (member, candidate) pair must carry a
+qualified edge — affinity ≥ `affinity_floor` AND a fired anchor — and
+growth stops when the next candidate's mean affinity falls below
+`cohesion_fraction` (default 0.5) × the minimum seated member-pair
+affinity (`why_not_bigger: "below cohesion threshold"`). Anchors carry
+evidence thresholds: `files_direct` needs the shared-path share
+|A∩B|/min(|A|,|B|) at or above 0.5, and `cochange` needs a co-changed pair
+with lift > 1 (corroborated by support ≥ 2 when the pair runs through a
+hub file); every pair reports its fired `anchors` strongest-first by
+weighted contribution, with `anchor` = the strongest. Hub files (paths
+touching at least `hub_share` of the merged population) are exempt from
+cross-bundle disjointness — shared infrastructure is nobody's exclusive
+territory — while non-hub disjointness still holds (lift with
+`--allow-shared-files` for everything). Duplicate pairs
 (`duplicate_of`/`duplicate_keyword` edges, or near-identical titles with
 no anchor) are offered as `merge_candidates` and never co-bundled;
 floor-passing anchor-less text pairs land in `related_not_bundleable`.
-Bundles respect the size range, and — over each member's DIRECT resolved
-file set only; `linked`/`analog` evidence paths are reported but never
-constrain selection — the file-set cap (`max_files`) and cross-bundle
-disjointness (lift with `--allow-shared-files`);
-`--exclude` removes numbers from the pool entirely, overriding `--pool`
-and the in-pool blocker relaxation; `--pool` members that cannot be used
-(unstored, PRs, closed) are reported in `dropped: [{number, reason}]` —
-every drop names its cause. Each bundle
-payload carries members, per-pair rationale, direct/linked/analog files,
-co-changed tests (`test_globs`-filtered coupling partners), open-PR
-collisions, the in-pool `blocked_by` order, a risk summary, cohesion,
-`why_not_bigger`, and a content-hashed `bundle_id`. `--budget-tokens`
-(a positive integer; `0`/negative values are `bad_request`) caps the whole
-serialized payload (chars/4): bundles drop first, then the
-tails of `merge_candidates`/`related_not_bundleable`, then the `pool`
-echo, with `truncated: true` marking any payload that needed it.
+Pool members no bundle absorbs are reported in `unbundled:
+[{number, reason}]` (below floor, no anchor, shared files, cohesion stop)
+— every exclusion names its cause. Bundles respect the size range and the
+file-set cap (`max_files`) over each member's DIRECT resolved file set
+only (`linked`/`analog` evidence paths are reported but never constrain
+selection); `--exclude` removes numbers from the pool entirely,
+overriding `--pool` and the in-pool blocker relaxation; `--pool` members
+that cannot be used (unstored, PRs, closed) are reported in `dropped`.
+Each bundle payload carries members, per-pair rationale (with the
+`anchors` list), direct/linked/analog files, co-changed tests
+(`test_globs`-filtered coupling partners), open-PR collisions, the in-pool
+`blocked_by` order, a risk summary, cohesion, `why_not_bigger`, and a
+content-hashed `bundle_id`; the top-level payload reports the `gated`
+block and `closeable_trackers` alongside the pool. `--as-of T` answers
+from the same temp-table snapshot view `triage --as-of` uses.
+`--budget-tokens` (a positive integer; `0`/negative values are
+`bad_request`) caps the whole serialized payload (chars/4): bundles drop
+first, then the tails of `merge_candidates`/`related_not_bundleable`,
+then the `pool` echo and the `unbundled`/`gated` audit tails, with
+`truncated: true` marking any payload that needed it.
 
 `brief N` is the work packet: the triage row for N, the body truncated
 under `--budget-tokens` (chars/4, a positive integer — `0`/negative values
@@ -347,7 +384,10 @@ carries the effective `[derive]` affinity weights under an `affinity` key
 — `bundle_id`'s config hash folds that whole echo in, so two different
 `[derive]` tables can never mint the same id. Stage-2 analog scans and
 bundle affinity resolve `[derive]` through the same store/cwd/`--config`
-chain as `similar`.
+chain as `similar`. The `[triage]` table's keys are the four group
+weights plus `stage2_weight`, `top_k`, `affinity_floor`,
+`cohesion_fraction`, `max_files`, `test_globs`, `tracking_labels` and the
+three per-name maps (`labels`/`types`/`fields`).
 
 Ambient configs are part of the trust boundary: `<store>/config.toml` and a
 cwd `.zaxbygraph.toml` are auto-loaded and treated as trusted operator input — a planted or hostile config reweights results, and its strings

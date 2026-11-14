@@ -822,12 +822,17 @@ class CochangeCutoffTests(_StoreTestCase):
             (c for c in direct["candidates"] if c["number"] == 982), None
         )
         self.assertIsNotNone(
-            cand, "the direct read must cochange-anchor 982 to 981"
+            cand, "the direct read must anchor 982 to 981"
         )
         self.assertAlmostEqual(
             cand["components"]["cochange"]["score"], 0.5, places=6
         )
-        self.assertEqual(cand["anchor"], "cochange")
+        # Migration (issues #68/#69 matrix row: anchors pin - the singular
+        # anchor is now the STRONGEST fired anchor, not the
+        # alphabetically-first): this pair fires both files_direct and
+        # cochange, and files_direct (affinity weight 4.0) outweighs
+        # cochange (3.0).
+        self.assertEqual(cand["anchor"], "files_direct")
         self.assertTrue(
             cand["components"]["cochange"]["evidence"]["pairs"],
             "the direct cochange evidence must carry the post-cutoff pair",
@@ -887,6 +892,8 @@ class CochangeCutoffTests(_StoreTestCase):
         self.assertAlmostEqual(
             cand_uv["components"]["cochange"]["score"], 0.5, places=6
         )
+        # cochange is this pair's ONLY anchor (no shared path), so the
+        # strongest-first rule keeps it (migration matrix row: anchors pin).
         self.assertEqual(cand_uv["anchor"], "cochange")
         scoped_uv = similar(
             conn, REPO, 983, limit=50,
@@ -1280,7 +1287,7 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
         Echo leg (AC9: the effective config is echoed in EVERY payload):
         the brief packet carries weights (a dict including the
         demand/leverage/risk/priority keys), config_source (a str), and
-        formula_version == "triage.v1" — the same echo triage/bundle
+        formula_version == "triage.v2" — the same echo triage/bundle
         carry. Live leg: with --live driven by a stub whose reviews
         payload is a >=40k-char body, the FINAL serialized packet still
         meets --budget-tokens 4000 (the enforcement runs AFTER the live
@@ -1313,9 +1320,11 @@ class BriefEchoAndLiveBudgetTests(_StoreTestCase):
             data.get("config_source"), str,
             "the brief packet must echo config_source (a str)",
         )
+        # Migration (issues #68/#69 matrix row: brief formula_version pin
+        # becomes triage.v2 with the formula bump).
         self.assertEqual(
-            data.get("formula_version"), "triage.v1",
-            "the brief packet must echo formula_version triage.v1",
+            data.get("formula_version"), "triage.v2",
+            "the brief packet must echo formula_version triage.v2",
         )
 
         # ---- live leg: the budget covers the attached live block --------
