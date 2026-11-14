@@ -1909,8 +1909,10 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
             continue
     # Tracking-gate inputs (issue #69 AC1): the link-stream parentage map
     # (child_of runs child -> parent, store.py's link stream) and the
-    # body-origin mention map (a task list lives in the body; comment-origin
-    # mentions never count — their evidence names a comment).
+    # body-origin mention map keyed by the mentionER — src's body-origin
+    # outbound mentions are the items src's own body references (a task list
+    # lives in the item's own body; comment-origin mentions never count —
+    # their evidence names a comment).
     child_of_children: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'child_of'"
@@ -1923,7 +1925,7 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         except (TypeError, ValueError):
             continue
         child_of_children.setdefault(parent, set()).add(child)
-    body_mention_srcs: dict[int, set[int]] = {}
+    body_mention_dsts: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'mentions'"
         " AND src_type = 'item' AND dst_type = 'item'"
@@ -1935,7 +1937,7 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
             dst = int(row["dst_id"])
         except (TypeError, ValueError):
             continue
-        body_mention_srcs.setdefault(dst, set()).add(src)
+        body_mention_dsts.setdefault(src, set()).add(dst)
     tracking_label_rows: dict[int, set[str]] = {}
     tracking_labels = {str(x) for x in (cfg.get("tracking_labels") or [])}
     if tracking_labels and _table_exists(conn, "labels"):
@@ -1993,9 +1995,24 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         tracking_children = bool(children) and all(
             states.get(child, {}).get("state") == "closed" for child in children
         )
-        mentioned = body_mention_srcs.get(number, set())
-        tracking_mentions = bool(mentioned) and all(
-            states.get(src, {}).get("state") == "closed" for src in mentioned
+        # Branch (c) (final-critic F1): the container's OWN body-origin
+        # outbound mentions — a task list lives in the item's body, so the
+        # tracked children are the items THAT body references, restricted to
+        # issue-kind targets with known state (a body-referenced PR is not
+        # tracked child work; a repo's child -> parent "Tracking: #N"
+        # convention is inbound and never gates here — it would have to be a
+        # separate, explicitly bounded rule). Keying the map by the MENTIONED
+        # item inverted the rule into "every item whose body mentions N is
+        # closed", which gated ordinary work referenced by a closed item and
+        # missed real task-list epics; the direction, not the threshold, was
+        # the defect.
+        body_children = {
+            dst
+            for dst in body_mention_dsts.get(number, set())
+            if states.get(dst, {}).get("kind") == "issue"
+        }
+        tracking_mentions = bool(body_children) and all(
+            states.get(dst, {}).get("state") == "closed" for dst in body_children
         )
         tracking_label = bool(tracking_labels & tracking_label_rows.get(number, set()))
         if tracking_columns or tracking_children or tracking_mentions or tracking_label:
@@ -2458,6 +2475,44 @@ def _gated_block(rows: list[dict]) -> dict:
     }
 
 
+def _asof_meta_echo(conn: sqlite3.Connection, repo: str) -> dict:
+    """As-of disclosure echo (issue #68 AC7, final-critic F2): when the
+    payload is answered from a prepared snapshot view (evaluate's
+    prepare_snapshot), ``temp.asof_meta`` carries the instant and the
+    snapshot's disclosure keys; echo them so a payload consumer can see the
+    answer is as-of-scoped — that labels/assignees/field values were
+    suppressed wholesale (undated current-state rows), that evidence edges
+    were suppressed by source, and whose text at T could not be certified.
+    Returns ``{}`` on a live (non-as-of) read — the keys do not appear."""
+    try:
+        rows = {
+            row["key"]: row["value"]
+            for row in conn.execute("SELECT key, value FROM temp.asof_meta")
+        }
+    except sqlite3.Error:
+        return {}
+    # Every asof_meta value is stored JSON-encoded (prepare_snapshot writes
+    # json.dumps(v)), so the repo guard compares the DECODED value.
+    try:
+        meta_repo = json.loads(rows.get("repo", "null"))
+    except (TypeError, ValueError):
+        meta_repo = None
+    if meta_repo != repo or "as_of" not in rows:
+        return {}
+    try:
+        out: dict = {"as_of": json.loads(rows["as_of"])}
+    except (TypeError, ValueError):
+        return {}
+    for key in ("exclude_pr", "text_as_of_unknown", "disclosures"):
+        if key in rows:
+            try:
+                out[key] = json.loads(rows[key])
+            except (TypeError, ValueError):
+                # The raw value still discloses more than its absence would.
+                out[key] = rows[key]
+    return out
+
+
 def _triage_row_payload(row: dict) -> dict:
     return {
         "number": row["number"],
@@ -2587,7 +2642,7 @@ def _triage(
         if truncated and page
         else None
     )
-    return {
+    result = {
         "repo": repo,
         "rows": [_triage_row_payload(row) for row in page],
         "weights": {
@@ -2607,6 +2662,16 @@ def _triage(
         "truncated": truncated,
         "derived": True,
     }
+    # As-of echo (final-critic F2): a payload answered from a prepared
+    # snapshot view names the instant and carries the snapshot's disclosure
+    # keys; a live read carries neither key.
+    asof_echo = _asof_meta_echo(conn, repo)
+    if asof_echo:
+        result["as_of"] = asof_echo["as_of"]
+        result["asof_disclosures"] = {
+            k: v for k, v in asof_echo.items() if k != "as_of"
+        }
+    return result
 
 
 def _parse_size(size: str) -> tuple[int, int]:
@@ -3113,6 +3178,17 @@ def _bundle(
         "formula_version": cfg["formula_version"],
         "derived": True,
     }
+    # As-of echo (final-critic F2): a payload answered from a prepared
+    # snapshot view names the instant and carries the snapshot's disclosure
+    # keys (undated tables suppressed, evidence suppressed by source, text
+    # uncertified at T); a live read carries neither key. The echo is a
+    # mandatory disclosure — budget shedding never touches it.
+    asof_echo = _asof_meta_echo(conn, repo)
+    if asof_echo:
+        payload["as_of"] = asof_echo["as_of"]
+        payload["asof_disclosures"] = {
+            k: v for k, v in asof_echo.items() if k != "as_of"
+        }
     if budget_tokens is not None:
         budget = budget_tokens * 4
 

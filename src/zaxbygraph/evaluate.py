@@ -1482,6 +1482,18 @@ def _eval_triage(
     base_top1: list[float] = []
     base_top3: list[float] = []
     per_fix: list[dict] = []
+    # Pool cap (final-critic F3): each case's replayed ranking is cut at
+    # ``pool_cap`` (1000) ranked rows — a bounded read, not the full pool
+    # (paging the cursor is out of scope for this fix round). Two biases
+    # follow and are disclosed, never hidden: a case whose truth target sits
+    # past the cut leaves the pool intersection and reads scoreable: False
+    # (it DROPS FROM THE DENOMINATOR rather than counting as a miss, biasing
+    # hit rates upward), and the lowest_number_first baseline ranks the same
+    # truncated pool. Per case the cap rides entry["disclosures"]
+    # ("eval_triage_pool_cap"); the payload's top-level pool_cap block fires
+    # whenever the cap bound at least one run.
+    pool_cap = 1000
+    cap_hit_cases: list[int] = []
     for case in cases:
         stamp = case["created_at"]
         info = _scoreable_case(conn, repo, case, leakage)
@@ -1490,21 +1502,30 @@ def _eval_triage(
         )
         try:
             out = derive_triage(
-                prepared, repo, limit=1000, include_gated=False, weights=weights
+                prepared, repo, limit=pool_cap, include_gated=False,
+                weights=weights,
             )
         finally:
             drop_snapshot(prepared)
         pool = [r["number"] for r in out["rows"] if r.get("ranked")]
         truth = {n for n in info["scoreable"] if n in set(pool)}
+        disclosures = [
+            f"excluded_endpoint:{n}" for n in info["excluded_endpoints"]
+        ]
+        if out.get("truncated"):
+            cap_hit_cases.append(case["pr"])
+            disclosures.append(
+                f"eval_triage_pool_cap: the ranked pool was truncated at"
+                f" {pool_cap} rows; a truth target past the cut reads"
+                f" scoreable: False and leaves the denominator"
+            )
         entry = {
             "pr": case["pr"],
             "created_at": stamp,
             "ground_truth": case["ground_truth"],
             "closed_issues": sorted(case["closed"]),
             "excluded_endpoints": info["excluded_endpoints"],
-            "disclosures": [
-                f"excluded_endpoint:{n}" for n in info["excluded_endpoints"]
-            ],
+            "disclosures": disclosures,
         }
         if not truth:
             entry.update({"top1": None, "top3": None, "scoreable": False})
@@ -1527,7 +1548,7 @@ def _eval_triage(
             "no_ground_truth: no fix PR whose closed issues sit in the"
             " replayed pool after controls in this store"
         )
-    return {
+    payload = {
         "metrics": {
             "top1_next_fix_rate": sum(top1) / len(top1),
             "top3_next_fix_rate": sum(top3) / len(top3),
@@ -1548,3 +1569,16 @@ def _eval_triage(
             }
         },
     }
+    if cap_hit_cases:
+        # The cap actually bound at least one run — disclose it once at the
+        # top level too, not only per case (final-critic F3).
+        payload["pool_cap"] = {
+            "limit": pool_cap,
+            "cases": cap_hit_cases,
+            "note": "the replayed ranked pool was truncated at the limit for"
+                    " the listed cases; a truth target past the cut reads"
+                    " scoreable: False and leaves the denominator (hit rates"
+                    " bias upward), and lowest_number_first ranks the same"
+                    " truncated pool",
+        }
+    return payload
