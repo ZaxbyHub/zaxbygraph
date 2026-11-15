@@ -1939,13 +1939,13 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         except (TypeError, ValueError):
             continue
     # Tracking-gate inputs (issue #69 AC1): the link-stream parentage map
-    # (child_of runs child -> parent, store.py's link stream). The former
-    # body-mention children branch is GONE (swarm feedback FB-003 / TF-1):
-    # it gated any issue whose body-mentions all resolved closed — ordinary
-    # citing issues (a bug report referencing closed work) hidden as
-    # "finished containers" — while true epics are already covered by the
-    # sub-issue columns and child_of branches, so the branch's only real
-    # effect was collateral gating.
+    # (child_of runs child -> parent, store.py's link stream), plus the
+    # checkbox-aware body map branch (c) needs. Round 1 removed the
+    # body-mention branch entirely (FB-003/TF-1: prose citations gated
+    # ordinary work); round 3 restores ONLY the task-list half — a body
+    # reference counts as tracked-child work when the container's own body
+    # shows it as a checkbox reference (a task list), never as a prose
+    # citation.
     child_of_children: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'child_of'"
@@ -1958,6 +1958,49 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         except (TypeError, ValueError):
             continue
         child_of_children.setdefault(parent, set()).add(child)
+    # Minimal body-mention map (the round-1 removal deleted its predecessor;
+    # restored scoped): open issues' body@-evidence outbound mentions of
+    # issue-kind targets. These are the candidates whose own bodies get the
+    # checkbox scan below — the scan, not the mention edge, decides whether
+    # a reference is task-list tracking.
+    body_mention_dsts: dict[int, set[int]] = {}
+    for row in conn.execute(
+        "SELECT src_id, dst_id FROM edges WHERE repo = ? AND rel = 'mentions'"
+        " AND src_type = 'item' AND dst_type = 'item'"
+        " AND evidence LIKE 'body@%'",
+        (repo,),
+    ):
+        try:
+            src = int(row["src_id"])
+            dst = int(row["dst_id"])
+        except (TypeError, ValueError):
+            continue
+        if src in rows and states.get(dst, {}).get("kind") == "issue":
+            body_mention_dsts.setdefault(src, set()).add(dst)
+    # Task-list references: scan each candidate's own body (the store row's
+    # body — as-of text under a replayed snapshot) for checkbox lines that
+    # reference an item — '- [x] #N' / '- [ ] #N'. The mark may be checked
+    # or unchecked: the mark is only the task-list marker, the CHILD STATE
+    # decides completeness at the gate below. A prose citation ('regression
+    # seen in #800') never matches the marker and stays rankable (TF-1's
+    # negative case stays fixed).
+    tasklist_children: dict[int, set[int]] = {}
+    if body_mention_dsts:
+        for row in conn.execute(
+            "SELECT number, body FROM items"
+            " WHERE repo = ? AND kind = 'issue' AND state = 'open'",
+            (repo,),
+        ):
+            if row["number"] not in body_mention_dsts or not row["body"]:
+                continue
+            found = {
+                int(match.group(1))
+                for match in re.finditer(
+                    r"(?m)^\s*[-*]\s+\[[ xX]\]\s+#(\d+)", row["body"]
+                )
+            }
+            if found:
+                tasklist_children[row["number"]] = found
     tracking_label_rows: dict[int, set[str]] = {}
     tracking_labels = {str(x) for x in (cfg.get("tracking_labels") or [])}
     if tracking_labels and _table_exists(conn, "labels"):
@@ -2015,14 +2058,29 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         tracking_children = bool(children) and all(
             states.get(child, {}).get("state") == "closed" for child in children
         )
-        # The former branch (c) — the container's own body-origin mentions
-        # all closed — is REMOVED (FB-003/TF-1): it gated ordinary citing
-        # issues, and real epics are already covered by the columns and
-        # child_of branches. Branch (d) stays configuration-driven.
+        # Branch (c), checkbox-aware (round 3): a COMPLETED task list in the
+        # container's own body — non-empty checkbox-referenced child set and
+        # every member an issue-kind item with known state 'closed' (an
+        # unknown state never satisfies a completeness branch, and neither
+        # does a non-issue member). Prose citations never enter the set
+        # (TF-1's negative case stays fixed); a completed task list IS
+        # evidence-complete, so it joins closeable_trackers below.
+        tasklist = tasklist_children.get(number, set())
+        tracking_tasklist = bool(tasklist) and all(
+            states.get(child, {}).get("kind") == "issue"
+            and states.get(child, {}).get("state") == "closed"
+            for child in tasklist
+        )
+        # Branch (d) stays configuration-driven.
         tracking_label = bool(tracking_labels & tracking_label_rows.get(number, set()))
-        if tracking_columns or tracking_children or tracking_label:
+        if (
+            tracking_columns
+            or tracking_children
+            or tracking_tasklist
+            or tracking_label
+        ):
             gates.append("tracking")
-        if tracking_columns or tracking_children:
+        if tracking_columns or tracking_children or tracking_tasklist:
             closeable_trackers.add(number)
         gates_by[number] = gates
 
@@ -2574,8 +2632,10 @@ def triage(
     ``linked_pr (append-only evidence; may be stale)``, ``locked`` and
     ``tracking`` (the fifth value marks keyword/closing-ref linked-PR
     evidence, which is append-only and may lag a re-sync; ``tracking``
-    fires on any of its three branches — sub-issues complete, every
-    child_of child closed, or a configured ``tracking_labels`` label — each
+    fires on any of its four branches — sub-issues complete, every
+    child_of child closed, every task-list (checkbox) reference in the
+    item's own body pointing at a closed issue, or a configured
+    ``tracking_labels`` label — each
     needing non-empty evidence). ORDER:
     total_score DESC, number ASC. ``cursor`` is
     validated whole: an unknown number, or a total half that no longer

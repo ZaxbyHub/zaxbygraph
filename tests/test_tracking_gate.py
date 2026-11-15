@@ -1,7 +1,8 @@
-"""Regression tests for the tracking gate's body-mention behaviour and
+"""Regression tests for the tracking gate's body-reference behaviour and
 branch (d) (configured ``tracking_labels``) — the final critic's F1
 findings (.agents/issue-traces/68-69-eval-selection-quality/
-09-final-critic.md), AMENDED by swarm-pr-feedback round 1 (FB-003/TF-1).
+09-final-critic.md), AMENDED by swarm-pr-feedback round 1 (FB-003/TF-1)
+and RE-AMENDED by swarm-pr-feedback round 3 (closeout item 1).
 
 History of the body-mention branch (c): the final critic's F1 found the
 gate's map keyed by the MENTIONED item — the inverted reading "everyone
@@ -10,13 +11,19 @@ closed item. The r1 fix corrected the direction, but the PR-feedback
 round-1 critic then ruled the branch unsalvageable (TF-1): even
 direction-correct, it gates ANY issue whose body-mentions all resolve
 closed — an ordinary citing issue (a bug report referencing closed work)
-is hidden exactly like a finished container — while real epics are
-already covered by the sub-issue-columns and child_of branches. The
-critic's ruling: REMOVE branch (c) from the gate entirely; the gate is
-the three branches (sub-issues complete / child_of children closed /
-configured tracking_labels label). This file now pins the REMOVED
-behaviour: an epic whose body lists only closed children is RANKABLE
-(not gated) — body mentions alone never gate 'tracking' again.
+is hidden exactly like a finished container. Round 1 removed the branch
+entirely, which also dropped #69 AC1's task-list case. Round 3 restores
+branch (c) CHECKBOX-AWARE: a body reference counts as tracked-child work
+only when the container's own body shows it as a TASK-LIST reference —
+a checkbox line ('- [x] #N' / '- [ ] #N') whose referenced item is a
+closed issue — with a non-empty set and every member known-closed (an
+unknown child state never satisfies a completeness branch). Prose
+citations ('regression seen in #800') never match the checkbox marker
+and stay rankable, so TF-1's negative case remains fixed (pinned here
+and by tests/test_feedback_r1.py TrackingCiteNegativeTests). The gate is
+four branches again: (a) sub-issues complete, (b) child_of children
+closed, (c) completed task-list references in the body, (d) configured
+tracking_labels; closeable_trackers = (a)+(b)+(c).
 
 Branch (d) (configured ``[triage] tracking_labels``) had no test at all
 before this file: an open issue carrying a configured label must gate
@@ -53,6 +60,16 @@ def _pin_synced_at(
         (stamp, stamp, repo),
     )
     conn.commit()
+
+
+def _tracker_numbers(entry) -> list[int]:
+    """closeable_trackers entries may be numbers or {number, ...} dicts
+    (the tests/test_selection_quality.py helper)."""
+    if entry is None:
+        return []
+    return [
+        int(e) if not isinstance(e, dict) else int(e["number"]) for e in entry
+    ]
 
 
 class _StoreTestCase(unittest.TestCase):
@@ -99,18 +116,18 @@ class _StoreTestCase(unittest.TestCase):
         self._hermetic_cwd.cleanup()
 
 
-# ==== body mentions never gate 'tracking' (branch (c) REMOVED, FB-003) ======
+# ==== branch (c) restored, checkbox-aware (round 3 / #69 AC1) ================
 
 
 class TrackingMentionDirectionTests(_StoreTestCase):
-    """The final critic's two-leg probe, RE-PINNED at the PR-feedback r1
-    ruling (FB-003/TF-1): branch (c) is removed from the gate entirely, so
-    BOTH legs are ordinary rankable work — the closed mentioner's inbound
-    edge never gates bug 600, and the task-list epic 700 (body mentions
-    only, no sub-issue columns, no child_of links) is rankable too. Real
-    finished epics still gate through branches (a)/(b) — that is pinned by
-    tests/test_selection_quality.py C9, which populates the columns AND the
-    child_of edges."""
+    """The final critic's two-leg probe, RE-PINNED at round 3: the closed
+    mentioner's inbound edge never gates bug 600 (the direction defect F1
+    named), while the task-list epic 700 (body mentions only, no sub-issue
+    columns, no child_of links) gates 'tracking' through the restored
+    CHECKBOX-AWARE branch (c) — its body is a completed task list whose
+    referenced children are closed issues (#69 AC1's "every task-list or
+    mentioned child closed" case, restored without re-admitting TF-1's
+    prose-citation gating)."""
 
     @classmethod
     def _build(cls, conn) -> None:
@@ -128,8 +145,9 @@ class TrackingMentionDirectionTests(_StoreTestCase):
         ))
         # Leg 2: an open epic whose OWN body is a finished task list; the
         # ingest derives body-origin mentions edges 700 -> 701 and 700 -> 702
-        # from the epic's body. Under the removed branch (c) this gated
-        # 'tracking'; under the r1 ruling body mentions alone gate nothing.
+        # from the epic's body. Under round 1 (branch removed) this stayed
+        # rankable; round 3 restores branch (c) checkbox-aware, so the
+        # completed task list gates 'tracking' again.
         src.add_issue(issue(
             700, title="Epic: task list all done",
             body="- [x] #701\n- [x] #702",
@@ -144,11 +162,11 @@ class TrackingMentionDirectionTests(_StoreTestCase):
         _pin_synced_at(conn)
 
     def test_two_leg_mention_direction_probe(self) -> None:
-        """Both legs stay rankable: an inbound body mention from a closed
-        item must NOT gate the mentioned issue, and — the FB-003/TF-1
-        ruling — an epic whose own body lists only CLOSED children no
-        longer gates 'tracking' either (the branch is removed; only the
-        sub-issue columns, child_of children, or a configured label gate)."""
+        """Leg 1 stays rankable (an inbound body mention from a closed item
+        never gates the mentioned issue); leg 2 gates through the restored
+        checkbox-aware branch (c) — a completed task list in the epic's own
+        body is closeable-container evidence, reported under
+        closeable_trackers and excluded from the bundle."""
         out = derive.triage(self.conn, REPO, include_gated=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(600, rows)
@@ -167,27 +185,31 @@ class TrackingMentionDirectionTests(_StoreTestCase):
             f"{rows[600]['ranked']!r} with gates {rows[600]['gates']!r}",
         )
 
-        # --- leg 2: body mentions alone no longer gate (FB-003/TF-1) ----
-        self.assertNotIn(
+        # --- leg 2: the completed task list gates (round-3 branch (c)) ---
+        self.assertIn(
             "tracking", rows[700]["gates"],
-            f"an open epic whose OWN body lists only CLOSED children is no"
-            f" longer gated: branch (c) is removed (the PR-feedback r1"
-            f" ruling — it gated ordinary citing issues while real epics"
-            f" were already covered by the columns/child_of branches); got"
+            f"an open epic whose OWN body is a task list of checkbox"
+            f" references to closed issues must gate 'tracking' (round-3"
+            f" checkbox-aware branch (c), #69 AC1); got"
             f" {rows[700]['gates']!r}",
         )
         self.assertIs(
-            rows[700]["ranked"], True,
-            f"with branch (c) removed the task-list epic is rankable work;"
-            f" got ranked={rows[700]['ranked']!r} with gates"
+            rows[700]["ranked"], False,
+            f"a completed task-list epic is closeable, not rankable; got"
+            f" ranked={rows[700]['ranked']!r} with gates"
             f" {rows[700]['gates']!r}",
         )
-
-        # --- the pool consequence: both stay in --------------------------
-        payload = derive.bundle(self.conn, REPO)
         self.assertIn(
+            700, _tracker_numbers(out.get("closeable_trackers")),
+            "a completed task-list epic is reported under closeable_trackers"
+            " (branch (c) joins (a) and (b))",
+        )
+
+        # --- the pool consequence: leg 1 in, leg 2 out --------------------
+        payload = derive.bundle(self.conn, REPO)
+        self.assertNotIn(
             700, payload["pool"],
-            f"a body-mention-only epic is rankable and stays in the bundle"
+            f"a tracking-gated task-list epic must not enter the bundle"
             f" pool; got {payload['pool']!r}",
         )
         self.assertIn(
@@ -195,6 +217,69 @@ class TrackingMentionDirectionTests(_StoreTestCase):
             f"the ungated ordinary bug stays in the bundle pool; got"
             f" {payload['pool']!r}",
         )
+
+
+class TrackingTasklistIncompleteTests(_StoreTestCase):
+    """The completeness legs of the checkbox-aware branch (c): the gate
+    needs EVERY checkbox-referenced child a known-closed ISSUE. An
+    unchecked box over an open child is incomplete work; a reference to a
+    number the store has no item for is an UNKNOWN state, and unknown
+    never satisfies a completeness branch (fail-closed)."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = FakeGitHubSource()
+        # 710's task list: one closed child plus one reference (#719) to an
+        # item the store never saw — unknown state, so the set is not
+        # all-closed and the gate must not fire.
+        src.add_issue(issue(
+            710, title="Epic: one child unknown",
+            body="- [x] #711\n- [x] #719",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            711, title="child 711", body="child work", state="closed",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        # 720's task list: an UNCHECKED box whose child is still open —
+        # incomplete by both the mark's meaning and the child's state.
+        src.add_issue(issue(
+            720, title="Epic: one child open",
+            body="- [ ] #721",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            721, title="child 721", body="child work",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        sync_repo(conn, src, REPO)
+        _pin_synced_at(conn)
+
+    def test_incomplete_tasklists_stay_rankable(self) -> None:
+        out = derive.triage(self.conn, REPO, include_gated=True)
+        rows = {r["number"]: r for r in out["rows"]}
+        self.assertIn(710, rows)
+        self.assertIn(720, rows)
+        self.assertNotIn(
+            "tracking", rows[710]["gates"],
+            f"a task list with one UNKNOWN-state child (#719 absent from the"
+            f" store) must not gate 'tracking' — unknown never satisfies a"
+            f" completeness branch; got {rows[710]['gates']!r}",
+        )
+        self.assertIs(rows[710]["ranked"], True)
+        self.assertNotIn(
+            "tracking", rows[720]["gates"],
+            f"an unchecked checkbox ('- [ ] #721') over an OPEN child is"
+            f" incomplete work and must not gate 'tracking'; got"
+            f" {rows[720]['gates']!r}",
+        )
+        self.assertIs(rows[720]["ranked"], True)
+        trackers = _tracker_numbers(out.get("closeable_trackers"))
+        self.assertNotIn(710, trackers)
+        self.assertNotIn(720, trackers)
+        payload = derive.bundle(self.conn, REPO)
+        self.assertIn(710, payload["pool"])
+        self.assertIn(720, payload["pool"])
 
 
 # ==== branch (d): configured tracking_labels gate ===========================

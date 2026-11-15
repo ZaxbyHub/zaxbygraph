@@ -326,6 +326,24 @@ class BundlePoolCapDisclosureTests(_StoreTestCase):
             f" eval_triage_pool_cap (the shared vocabulary); got"
             f" {entry['disclosures']!r}",
         )
+        # Round-3 wording pin: the cap names the INITIAL top-k ungated
+        # ranking cut and the blocker-relaxation admission beyond it — it
+        # must never claim rows past the cut "can never enter a bundle"
+        # (the bundler's in-pool blocker relaxation admits blocked-only
+        # rows past the cut, derive.py's fixpoint).
+        note = cap_notes[0]
+        self.assertIn(
+            "initial pool was the top-k ungated ranking cut", note,
+            f"the disclosure must describe the INITIAL top-k cut"
+            f" accurately; got {note!r}",
+        )
+        self.assertIn("blocker-relaxation", note)
+        self.assertIn("may still admit blocked-only rows beyond that cut", note)
+        self.assertNotIn(
+            "can never enter a bundle", note,
+            f"rows past the cut CAN enter a bundle via blocker relaxation;"
+            f" the old absolute wording was false; got {note!r}",
+        )
 
 
 # ==== CS-3/ST-5: review-origin keyword evidence never gates linked_pr ========

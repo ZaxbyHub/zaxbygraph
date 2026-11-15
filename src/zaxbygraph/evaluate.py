@@ -1463,10 +1463,14 @@ def _eval_bundle(
         try:
             snapshot = derive_bundle(prepared, repo, weights=weights)
             # IA-6 (disclosure vocabulary parity): the default bundle pool
-            # is cut at [triage] top_k — the SAME bounded-pool fact the
-            # triage mode discloses as eval_triage_pool_cap. Detect the
-            # cut from the replay itself (open ungated rows vs the echoed
-            # top_k) and disclose it per case when it bound.
+            # STARTS as the top-k ungated ranking — the SAME bounded-pool
+            # fact the triage mode discloses as eval_triage_pool_cap. The
+            # cut is the INITIAL pool only: the bundler's in-pool blocker
+            # relaxation can still admit blocked-only rows beyond it, so
+            # the disclosure must never claim otherwise (round-3 wording
+            # fix). Detect the cut from the replay itself (open ungated
+            # rows vs the echoed top_k) and disclose it per case when it
+            # bound.
             top_k_echo = (snapshot.get("weights") or {}).get("top_k")
             if isinstance(top_k_echo, int) and top_k_echo >= 1:
                 open_count = prepared.execute(
@@ -1479,10 +1483,12 @@ def _eval_bundle(
                 )
                 if ungated_count > top_k_echo:
                     disclosures.append(
-                        f"eval_triage_pool_cap: the bundle pool was cut at"
-                        f" [triage] top_k={top_k_echo}"
-                        f" ({ungated_count} ungated rows); rows past the"
-                        f" cut can never enter a bundle"
+                        f"eval_triage_pool_cap: the replayed bundler's"
+                        f" initial pool was the top-k ungated ranking cut"
+                        f" at [triage] top_k={top_k_echo}"
+                        f" ({ungated_count} ungated rows); the bundler's"
+                        f" blocker-relaxation path may still admit"
+                        f" blocked-only rows beyond that cut"
                     )
         finally:
             drop_snapshot(prepared)

@@ -285,10 +285,15 @@ linked to an open PR (the gate value is `linked_pr` for timeline-verified
 links and `linked_pr (append-only evidence; may be stale)` for
 keyword/closing-ref evidence — an OPEN PR only, never a draft and never
 one the store knows merged), locked, or `tracking` (a container whose
-tracked work is all done: sub-issues complete, every child_of child
-closed, or a configured `tracking_labels` label — each branch needs
-non-empty evidence; containers gated by the sub-issues-complete or
-all-children-closed branches are also reported under `closeable_trackers`
+tracked work is all done: (a) sub-issues complete, (b) every child_of
+child closed, (c) every task-list reference in the item's own body — a
+checkbox line (`- [x] #N` / `- [ ] #N`) whose referenced item is a known
+closed issue; prose citations never enter the task-list set — or (d) a
+configured `tracking_labels` label; each branch needs
+non-empty evidence, and an unknown child state never satisfies a
+completeness branch; containers gated by the sub-issues-complete,
+all-children-closed, or completed-task-list branches are also reported
+under `closeable_trackers`
 — their tracked work is observably finished, so they are closeable rather
 than rankable — while the label branch gates without closeability
 evidence) are gated: withheld from the default ranking
