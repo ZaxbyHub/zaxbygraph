@@ -40,6 +40,7 @@ import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
+from zaxbygraph.extract import _MAX_REF_DIGITS
 from zaxbygraph.query import _clamp_limit
 
 #: Default per-signal weights. Overrides live in ``[derive]`` tables of
@@ -1993,12 +1994,20 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         ):
             if row["number"] not in body_mention_dsts or not row["body"]:
                 continue
-            found = {
-                int(match.group(1))
+            found: set[int] = set()
+            for line in row["body"].split("\n"):
+                stripped = line.lstrip()
+                if not re.match(r"[-*]\s+\[[ xX]\]", stripped):
+                    continue
+                # Every issue reference on a checkbox line is a task-list
+                # child; a digit run past the reference cap is not a
+                # reference at all (the same bound and semantics the
+                # keyword extractor applies — the (?!\d) guard keeps a
+                # longer run from matching as its 10-digit prefix).
                 for match in re.finditer(
-                    r"(?m)^\s*[-*]\s+\[[ xX]\]\s+#(\d+)", row["body"]
-                )
-            }
+                    r"#(\d{1,%d})(?!\d)" % _MAX_REF_DIGITS, line
+                ):
+                    found.add(int(match.group(1)))
             if found:
                 tasklist_children[row["number"]] = found
     tracking_label_rows: dict[int, set[str]] = {}

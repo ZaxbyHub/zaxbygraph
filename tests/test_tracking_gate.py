@@ -282,6 +282,77 @@ class TrackingTasklistIncompleteTests(_StoreTestCase):
         self.assertIn(720, payload["pool"])
 
 
+class TrackingTasklistMixedLineTests(_StoreTestCase):
+    """Every issue reference on a checkbox line is a task-list child, not
+    just the first one: a line '- [x] #731 and #732' with 731 closed and
+    732 open is INCOMPLETE — the gate must not fire (a first-ref-only
+    scanner would wrongly gate and declare the container closeable)."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = FakeGitHubSource()
+        # 730's task list: one checkbox line naming TWO children — the
+        # first closed, the second open.
+        src.add_issue(issue(
+            730, title="Epic: mixed refs on one line",
+            body="- [x] #731 and #732",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            731, title="child 731", body="child work", state="closed",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            732, title="child 732", body="child work",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        sync_repo(conn, src, REPO)
+        _pin_synced_at(conn)
+
+    def test_mixed_line_is_incomplete(self) -> None:
+        out = derive.triage(self.conn, REPO, include_gated=True)
+        rows = {r["number"]: r for r in out["rows"]}
+        self.assertIn(730, rows)
+        self.assertNotIn(
+            "tracking", rows[730]["gates"],
+            f"an open second reference on the same checkbox line means the"
+            f" list is incomplete; got {rows[730]['gates']!r}",
+        )
+        self.assertIs(rows[730]["ranked"], True)
+        trackers = _tracker_numbers(out.get("closeable_trackers"))
+        self.assertNotIn(730, trackers)
+
+
+class TrackingTasklistOversizedRefTests(_StoreTestCase):
+    """A checkbox line whose digit run exceeds the reference cap matches
+    nothing (the same bound the keyword extractor applies) — triage must
+    answer, not crash with an int()-conversion ValueError."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = FakeGitHubSource()
+        oversized = "9" * 5000
+        src.add_issue(issue(
+            740, title="Epic: oversized checkbox ref",
+            body=f"- [x] #{oversized}\n- [x] #741",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            741, title="child 741", body="child work", state="closed",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        sync_repo(conn, src, REPO)
+        _pin_synced_at(conn)
+
+    def test_oversized_ref_is_skipped_not_crashing(self) -> None:
+        # The oversized token is not a reference; the remaining checkbox
+        # child (#741) is closed, so the gate fires on 741 alone.
+        out = derive.triage(self.conn, REPO, include_gated=True)
+        rows = {r["number"]: r for r in out["rows"]}
+        self.assertIn(740, rows)
+        self.assertIn("tracking", rows[740]["gates"])
+
+
 # ==== branch (d): configured tracking_labels gate ===========================
 
 
