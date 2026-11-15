@@ -74,8 +74,9 @@ HOTSPOT_DECAY_DAYS = 45
 #: Anchor admission thresholds (issue #69 AC3). ``files_direct`` needs the
 #: shared-path share ``|A∩B| / min(|A|,|B|)`` at or above
 #: _FILES_DIRECT_SHARE; ``cochange`` needs a co-changed file pair with
-#: support >= _COCHANGE_MIN_SUPPORT and lift > 1 (lift computed with the
-#: coupling population N).
+#: lift > 1 (lift computed with the coupling population N) — and, when the
+#: pair runs through a HUB file, support >= _COCHANGE_MIN_SUPPORT as well
+#: (a lone hub co-occurrence never anchors; non-hub pairs stand on lift).
 _FILES_DIRECT_SHARE = 0.5
 _COCHANGE_MIN_SUPPORT = 2
 
@@ -772,10 +773,13 @@ def _anchor_list(
     Admission now carries evidence thresholds beyond a non-zero component
     score: ``files_direct`` needs the shared-path share
     ``|A∩B| / min(|A|,|B|) >= _FILES_DIRECT_SHARE`` and ``cochange`` needs a
-    co-changed pair with support >= _COCHANGE_MIN_SUPPORT and lift > 1
-    (lift over the coupling population N); ``signature`` and ``structural``
-    keep their score > 0 rule. Ordering is strongest first by weighted
-    contribution (affinity weight x component score), ties by name.
+    co-changed pair with lift > 1 (lift over the coupling population N) —
+    plus support >= _COCHANGE_MIN_SUPPORT only when the pair runs through a
+    HUB file (the implemented rule: every cochange anchor clears lift, hub
+    evidence additionally needs corroboration); ``signature`` and
+    ``structural`` keep their score > 0 rule. Ordering is strongest first
+    by weighted contribution (affinity weight x component score), ties by
+    name.
 
     Plan/test conflict (issues #68/#69 round 2, resolved in favor of the
     frozen checks): the approved plan words both thresholds "non-hub files
@@ -1924,7 +1928,8 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         " AND e.rel IN ('closes', 'closes_keyword')"
         " AND i.kind = 'pr' AND i.state = 'open'"
         f" AND {merged_gate_col} IS NULL AND NOT COALESCE(i.draft, 0)"
-        " AND e.evidence NOT LIKE 'comment:%'",
+        " AND e.evidence NOT LIKE 'comment:%'"
+        " AND e.evidence NOT LIKE 'review:%'",
         (repo,),
     ):
         try:
@@ -2055,7 +2060,11 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
 
         participants = set(comment_authors.get(number, set()))
         participants |= review_authors.get(number, set())
-        if row["author"]:
+        # The item's own author is subject to the same bot exclusion as the
+        # comment/review authors (IA-2/CUB-9702): a bot-filed issue adds no
+        # human participant. bot_logins is empty on a pre-v12 store, so the
+        # degradation is bot-free exactly like the sibling reads.
+        if row["author"] and row["author"] not in bot_logins:
             participants.add(row["author"])
 
         blocking_open: int | None
@@ -2558,13 +2567,16 @@ def triage(
     effective ``[derive]`` table for the stage-2 analog scans (None ->
     ``load_weights()`` defaults, preserving bare library-call behavior).
     Gated rows (blocked by an open item, assigned, linked to an open PR,
-    locked) are excluded from the default ranking — the observable
-    default-exclusion contract — and return with ``ranked: false`` under
-    ``include_gated``. The gate vocabulary is exactly ``blocked``,
-    ``assigned``, ``linked_pr``,
-    ``linked_pr (append-only evidence; may be stale)`` and ``locked`` (the
-    fifth value marks keyword/closing-ref linked-PR evidence, which is
-    append-only and may lag a re-sync). ORDER:
+    locked, or a tracking container) are excluded from the default ranking
+    — the observable default-exclusion contract — and return with
+    ``ranked: false`` under ``include_gated``. The gate vocabulary is
+    exactly ``blocked``, ``assigned``, ``linked_pr``,
+    ``linked_pr (append-only evidence; may be stale)``, ``locked`` and
+    ``tracking`` (the fifth value marks keyword/closing-ref linked-PR
+    evidence, which is append-only and may lag a re-sync; ``tracking``
+    fires on any of its three branches — sub-issues complete, every
+    child_of child closed, or a configured ``tracking_labels`` label — each
+    needing non-empty evidence). ORDER:
     total_score DESC, number ASC. ``cursor`` is
     validated whole: an unknown number, or a total half that no longer
     matches that row's current total, restarts from the top (the README's
@@ -3056,10 +3068,13 @@ def _bundle(
                     if frozenset((member, cand)) not in edge_weight
                 ]
                 if missing:
-                    unbundled_reason.setdefault(
-                        cand,
+                    # Last-failure-wins (CSX-1): an item the loop rejects
+                    # again under a later seed reports the failure that most
+                    # recently kept it out, never a stale first-round reason
+                    # that may no longer describe the pool.
+                    unbundled_reason[cand] = (
                         "below affinity floor (no anchored pair with every"
-                        " member)",
+                        " member)"
                     )
                     continue
                 affinities = [
@@ -3083,18 +3098,16 @@ def _bundle(
                 cohesion = min(seated) if seated else mean_affinity
                 if mean_affinity < cfg["cohesion_fraction"] * cohesion:
                     blocked_by_cohesion = True
-                    unbundled_reason.setdefault(cand, "below cohesion threshold")
+                    unbundled_reason[cand] = "below cohesion threshold"
                     continue
                 cand_files = _direct_paths(cand)
                 if len(group_files | cand_files) > file_cap:
                     blocked_by_cap = True
-                    unbundled_reason.setdefault(
-                        cand, f"file cap (max_files={file_cap})"
-                    )
+                    unbundled_reason[cand] = f"file cap (max_files={file_cap})"
                     continue
                 if not allow_shared_files and (_nonhub(cand_files) & used_files):
                     blocked_by_shared = True
-                    unbundled_reason.setdefault(cand, "shared-file conflict")
+                    unbundled_reason[cand] = "shared-file conflict"
                     continue
                 collisions = bool(cand_files & set(open_prs))
                 # Partner score is the affinity alone (issue #69 AC4): the
@@ -3151,9 +3164,19 @@ def _bundle(
             used_files |= _nonhub(group_files)
         else:
             skipped.add(current_seed)
-            unbundled_reason.setdefault(
-                current_seed, why or "no qualifying partner"
-            )
+            # CSX-1 last-failure-wins, seed path: a seed that genuinely
+            # failed a constraint (floor/cap/shared-files/cohesion/
+            # duplicate collapse) reports ITS seed failure, overwriting any
+            # earlier candidate-stage reason. The one exception is the
+            # degenerate "pool exhausted" — nothing was left to try, so the
+            # seed never actually failed a constraint and an earlier
+            # candidate-stage reason (e.g. the per-pair floor) stays the
+            # more informative verdict; it is the fallback only.
+            seed_why = why or "no qualifying partner"
+            if seed_why == "pool exhausted":
+                unbundled_reason.setdefault(current_seed, seed_why)
+            else:
+                unbundled_reason[current_seed] = seed_why
 
     # Unbundled reporting (issue #69 AC5): every pool member no bundle
     # absorbed, with the reason its last candidacy failed.

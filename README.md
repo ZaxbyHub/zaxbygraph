@@ -226,10 +226,10 @@ zaxbygraph eval similar|localize|bundle|triage [--config WEIGHTS.toml]
 
 | Command | Meaning |
 | --- | --- |
-| `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, `resolved_path_count` (the vocabulary the pair scored against), capability degradation notes, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match in either direction (the mention is a tail of a stored path, or a stored path is a tail of the mention), and unresolved mentions can never anchor a pair. `--ls-files` intersects AFTER resolution — it only thins which paths can score, never what a mention resolves to — and echoes that checkout's HEAD sha plus `ls_files_applied` (false when the checkout could not be listed). Since issue #44 the hub denominator counts every merged PR in scope (formerly the item count), so `files_direct` weights shift on stores with many unmerged items. |
+| `similar N` | Rank related items with per-signal components, evidence (shared resolved paths, terms, signatures, co-change route, adjacent items), weights, `resolved_path_count` (the vocabulary the pair scored against), capability degradation notes, and the anchor that created each pair. Paths are resolved at read time: the vocabulary is merged-PR paths minus removed; raw path mentions from issues/comments resolve against it by exact or unique-suffix match in either direction (the mention is a tail of a stored path, or a stored path is a tail of the mention), and unresolved mentions can never anchor a pair. `--ls-files` intersects AFTER resolution — it only thins which paths can score, never what a mention resolves to — and echoes that checkout's HEAD sha plus `ls_files_applied` (false when the checkout could not be listed). The `lexical`/`title` components are IDF-weighted: each shared term contributes `log(1 + N/df)` over the union's terms (symmetric coverage, so rare discriminating terms lead). Anchors carry admission thresholds: only `signature`, `files_direct`, `structural` and `cochange` may CREATE a pair, `files_direct` needs the shared-path share |A∩B|/min(|A|,|B|) at or above 0.5, and `cochange` needs a co-changed pair with lift > 1 (support ≥ 2 additionally, when the pair runs through a hub file). Since issue #44 the hub denominator counts every merged PR in scope (formerly the item count), so `files_direct` weights shift on stores with many unmerged items. |
 | `explain A B` | The exact per-signal breakdown one pair scored — the same function `similar` slices, so the two cannot diverge. |
 | `coupling PATH` | Files that change together with PATH over merged PRs touching 2–50 files: `support` (co-occurrence count), `confidence` (support/support(PATH)), `lift` (N·support/(support(PATH)·support(other)), `null` instead of NaN when either file never appears in the population), `population_prs` (how many merged PRs are inside the 2–50 population). Unmerged PRs never count. An unknown path answers `reason: unknown_path`, a known path whose PRs all fall outside the population answers `reason: excluded_from_population`, and a repo with no qualifying PRs answers `reason: no_merged_prs` — never a silent empty list. |
-| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5 + precision@5), the issue sets single merged PRs closed (bundle: a per-fix-PR backtest that replays the FULL production bundler over a temp-table as-of snapshot at each merged multi-issue fix PR's created_at, with the fix PR excluded, and scores micro-aggregate pair recall/precision with macro per-fix-PR averages, `per_fix_pr` audit entries, the distinct `proposed_pairs` union, per-case `disclosures` and an exclusive `ground_truth` label — 'github'/'keyword'/'mixed' — naming which stream supplied the truth: `closes` edges UNION admissible `closes_keyword` evidence (body@/commit, never comment-origin)), and how often the next issues fixed sit at the top of the ranking (triage: top1/top3 next-fix rates over the same per-fix-PR snapshots, with the `lowest_number_first` baseline). Every mode carries a same-geometry baseline (`random_recall_at_5`, `most_touched`, `random_same_size`, `lowest_number_first`); headline floors should be read against them. A mode whose controls leave zero eligible ground truth RAISES the coded `no_ground_truth` error (exit 2) instead of reporting empty metrics; per-target control notes ride `with_leakage`. Current stores print the `corpus_sha256` of the exact snapshot the metrics were computed on; stores below the export floor or ahead of this build return `corpus_sha256: null` with a `store_too_old` / `store_too_new` label. |
+| `eval MODE` | Measure the derived tier against GitHub's own ground truth — `duplicate_of` pairs (similar: recall@5 / MRR), files a merged fix PR touched (localize: Acc@5 + precision@5), the issue sets single merged PRs closed (bundle: a per-fix-PR backtest that replays the FULL production bundler over a temp-table as-of snapshot at each merged multi-issue fix PR's created_at, with the fix PR excluded, and scores micro-aggregate pair recall/precision with macro per-fix-PR averages, `per_fix_pr` audit entries, the distinct `proposed_pairs` union, per-case `disclosures` and a `ground_truth` label naming which stream supplied the truth: `closes` edges UNION admissible `closes_keyword` evidence (body@/commit, never comment-origin). The values differ by level: each `per_fix_pr` case's own `ground_truth` is 'closes' or 'keyword' (whether that case's threshold was met by the GitHub-reported stream alone), while the top-level `ground_truth` is the exclusive 'github'/'keyword'/'mixed' summary over the cases)), and how often the next issues fixed sit at the top of the ranking (triage: top1/top3 next-fix rates over the same per-fix-PR snapshots, with the `lowest_number_first` baseline). Every mode carries a same-geometry baseline (`random_recall_at_5`, `most_touched`, `random_same_size`, `lowest_number_first`); headline floors should be read against them. A mode whose controls leave zero eligible ground truth RAISES the coded `no_ground_truth` error (exit 2) instead of reporting empty metrics; per-target control notes ride `with_leakage`. Current stores print the `corpus_sha256` of the exact snapshot the metrics were computed on; stores below the export floor or ahead of this build return `corpus_sha256: null` with a `store_too_old` / `store_too_new` label. |
 
 Scale: everything here is computed at query time from the local store — a
 `similar` read measured ~0.93 s at ~4k items and extrapolates to ~2.3 s at
@@ -271,7 +271,9 @@ formula (v2) is RELATIVE: per resolved file and merge event the raw
 contribution is `exp(-age_days/45)` (a 45-day decay constant),
 hub-discounted by `hub_floor`; raw sums are computed for every ungated row
 (each row echoes the additive `hotspot_raw` diagnostic) and normalize by
-the population max, so one repository's freshest file always defines 1.0.
+the population max, so the row with the maximum raw sum defines 1.0 — not
+necessarily a row touching the single freshest file (several moderately
+recent merges can out-accumulate one very fresh one).
 Demand counts people, not automation: bot authors (actors flagged `is_bot`)
 never count as participants, and an inbound mention counts only from an
 open, non-bot source that is not the target's own child. Priority labels
@@ -285,8 +287,11 @@ keyword/closing-ref evidence — an OPEN PR only, never a draft and never
 one the store knows merged), locked, or `tracking` (a container whose
 tracked work is all done: sub-issues complete, every child_of child
 closed, or a configured `tracking_labels` label — each branch needs
-non-empty evidence, and evidence-complete containers are also reported
-under `closeable_trackers`) are gated: withheld from the default ranking
+non-empty evidence; containers gated by the sub-issues-complete or
+all-children-closed branches are also reported under `closeable_trackers`
+— their tracked work is observably finished, so they are closeable rather
+than rankable — while the label branch gates without closeability
+evidence) are gated: withheld from the default ranking
 (`ranked: false` under `--include-gated`), never enter stage 2, and are
 excluded from bundle pools by default (the bundle command's in-pool
 blocker relaxation can admit blocked-only rows, flagged `gate_relaxed`).
@@ -385,8 +390,9 @@ carries the effective `[derive]` affinity weights under an `affinity` key
 bundle affinity resolve `[derive]` through the same store/cwd/`--config`
 chain as `similar`. The `[triage]` table's keys are the four group
 weights plus `stage2_weight`, `top_k`, `affinity_floor`,
-`cohesion_fraction`, `max_files`, `test_globs`, `tracking_labels` and the
-three per-name maps (`labels`/`types`/`fields`).
+`cohesion_fraction`, `max_files`, `test_globs`, `tracking_labels`,
+`formula_version` (a settable non-empty string echoed in every payload)
+and the three per-name maps (`labels`/`types`/`fields`).
 
 Ambient configs are part of the trust boundary: `<store>/config.toml` and a
 cwd `.zaxbygraph.toml` are auto-loaded and treated as trusted operator input — a planted or hostile config reweights results, and its strings
@@ -1015,7 +1021,9 @@ Machine-readable rules, worth knowing before scripting against this:
   `bad_request`, `bad_as_of`, `bad_flags`, `bad_sql`, `runtime`; export-corpus
   additionally emits `repo_required`, `bad_include`, `out_is_database`,
   `store_too_old`, `store_too_new`, `incomplete_store`; the derived reads add
-  `config_error` for `[derive]` weight problems, and every store-opening read
+  `config_error` for `[derive]` weight problems, `eval` adds `no_ground_truth`
+  (a mode whose controls leave zero eligible ground truth; exit 2), and every
+  store-opening read
   emits `store_unreadable` or `environment_guard` (SQLite floor / FTS5
 rejected the open; exit 2) when the store cannot be opened, and a
 `--max-age` read emits `refresh_failed` (exit 1) when its refresh fails, to

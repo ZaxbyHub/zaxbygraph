@@ -270,6 +270,21 @@ class _StoreTestCase(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls._td.cleanup()
 
+    def setUp(self) -> None:
+        # TI-1/CUB-9739/CUB-9647 (r2): the in-process run_eval/derive legs
+        # resolve the [triage]/[derive] config chain from the CWD — the
+        # subprocess legs already run under cwd=_LEG_CWD; these run in an
+        # empty temp cwd for the same hermeticity.
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
+
+    def tearDown(self) -> None:
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
+
     @classmethod
     def _build(cls, conn) -> None:  # pragma: no cover - overridden
         raise AssertionError("_build must be overridden")

@@ -2970,7 +2970,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "eval",
-        help="Measure retrieval quality against GitHub-reported ground truth",
+        help=(
+            "Measure derived-tier quality against GitHub-reported and"
+            " keyword-derived ground truth"
+        ),
     )
     add_common(sp, max_age=True)
     sp.add_argument("mode", choices=["similar", "localize", "bundle", "triage"])

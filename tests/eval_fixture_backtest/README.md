@@ -22,9 +22,11 @@ an older, whole-repo recording.
 3. **Open-at-the-time pool** - every issue that was OPEN at some fix PR's
    creation (`kind='issue'`, `created_at <= that PR's created_at`, and
    either still open now or closed at/after that PR's creation): 35
-   issues (the 22 closed ones plus still-open 8, 21, 28, 29, 31, 64, 68,
-   69, 70, 73, 74, 75, 77). These are the candidates the per-fix-PR
-   snapshots may legitimately rank.
+   issues. That is the 22 closed-by-fix-PRs set, plus 28, 29, 31
+   (recorded CLOSED - each closed at/after a fix PR's creation, so open
+   at that PR's creation but no longer open now), plus the still-open
+   8, 21, 64, 68, 69, 70, 73, 74, 75, 77. These are the candidates the
+   per-fix-PR snapshots may legitimately rank.
 4. **Children and actors** - the recorded items' comments, review
    comments, reviews and pr_files ride the `item_bundle` records
    (`tests/fixtures_eval._bundle_for_item`); actors repopulate from the
@@ -51,7 +53,16 @@ an older, whole-repo recording.
 
 Total: 45 item bundles + 1 revisions record (3.15 MB).
 `recording_manifest.json` records the neighborhood sets, the revisions
-counts, and the `events.jsonl` sha256 at record time.
+counts, and the `events.jsonl` sha256 at record time. The committed
+manifest PREDATES two provenance fields the recorder now writes
+(`recorded_at`, `store` - the recording instant and the store path it was
+read from); it was not re-recorded just to add them, because re-recording
+changes bytes and sha. Regenerated manifests carry both.
+
+`events.jsonl` is byte-addressed (the manifest pins its sha256), so the
+directory's `.gitattributes` marks it `-text`: checkouts must keep the
+recorded LF line endings everywhere, and the recorder writes LF
+explicitly.
 
 ## Disclosed recording limitations
 
@@ -66,8 +77,9 @@ cuts:
   `linked_pr`), `item_events`, and any PR outside the fix-PR set are not
   recorded; open PRs of the source repo therefore cannot gate replayed
   pool issues, and the co-change population is exactly the ten fix PRs.
-- Per-section `children_complete` is re-emitted conservatively (present
-  sections True, absent False), as in `tests/eval_fixture/`.
+- Per-section `children_complete` is re-emitted conservatively (a present
+  non-empty section True, a present-empty or absent section False), as in
+  `tests/eval_fixture/`.
 - **Revisions coverage is partial by construction**: pre-images exist
   only for text edits the source store's sync OBSERVED (an edit inside a
   sync gap leaves no row). On this recording, 3 of the 22 truth

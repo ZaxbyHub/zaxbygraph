@@ -213,6 +213,7 @@ def prepare_snapshot(
         )
     stamp = as_of
     disclosures: dict[str, list] = {}
+    unparseable: set[int] = set()
     reopen_set: set[int] = set()
     if reopen is not None and not isinstance(reopen, bool):
         reopen_set = {int(n) for n in reopen}
@@ -284,7 +285,14 @@ def prepare_snapshot(
         if number == exclude_pr:
             continue
         created = rec.get("created_at")
-        if not created or (at and _parse_instant(created) > at):
+        created_dt = _parse_instant(created)
+        if created and created_dt is None:
+            # CS-1: a present-but-unparseable created_at is disclosed and
+            # the row is discarded (invisible at T, like a post-T row) —
+            # never a None-comparison TypeError.
+            unparseable.add(number)
+            continue
+        if not created or created_dt > at:
             continue
         real_merge = rec.get("merged_at")
         visible.add(number)
@@ -346,7 +354,15 @@ def prepare_snapshot(
         # updated after T (reactions/sub-issue completion would otherwise
         # leak post-T state through raw_json).
         updated = rec.get("updated_at")
-        if updated and _parse_instant(updated) > at:
+        updated_dt = _parse_instant(updated) if updated else None
+        strip_payload = updated_dt is not None and updated_dt > at
+        if updated and updated_dt is None:
+            # CS-1: an unparseable updated_at is unknowable — fail closed
+            # (treat it as post-T: the payload fields stop contributing)
+            # and disclose the row instead of raising TypeError.
+            unparseable.add(number)
+            strip_payload = True
+        if strip_payload:
             # The EXTRACTED columns are just as undatable (FB-002/CS-2):
             # sub_issues_* and dependencies_* are current-state extractions
             # whose only timestamp is the item's updated_at — a container
@@ -374,6 +390,11 @@ def prepare_snapshot(
 
     if text_unknown:
         disclosures["text_as_of_unknown"] = sorted(text_unknown)
+    if unparseable:
+        # CS-1: rows whose stored stamps could not be parsed (created_at,
+        # updated_at) — each was handled fail-closed and disclosed here,
+        # never a TypeError.
+        disclosures["unparseable_timestamps"] = sorted(unparseable)
 
     # ---- comments / reviews -------------------------------------------------
     conn.execute(
@@ -460,7 +481,13 @@ def prepare_snapshot(
                 # pre-image keeps the reference; an unresolvable state
                 # suppresses it.
                 updated = item_updated.get(src)
-                if updated and _parse_instant(updated) <= at:
+                updated_dt = _parse_instant(updated) if updated else None
+                if updated and updated_dt is None:
+                    # CS-1: unparseable updated_at — the text state cannot
+                    # be proven pre-T, so the stricter revision-covered
+                    # branch decides; disclose the row, never TypeError.
+                    unparseable.add(src)
+                if updated_dt is not None and updated_dt <= at:
                     keep = src not in text_unknown
                 else:
                     keep = bool(
@@ -1385,13 +1412,23 @@ def _eval_bundle(
     exact_sets: list[float] = []
     scoreable_cases = 0
     for case in cases:
+        stamp = case["created_at"]
+        # CUB-9686: a case whose fix PR carries no parseable created_at is
+        # SKIPPED with the _eval_similar disclosure discipline — there is no
+        # instant to replay, and prepare_snapshot would abort the whole eval
+        # with a bad_request ValueError.
+        if stamp is None:
+            leakage.setdefault(case["pr"], []).append("missing_created_at")
+            continue
+        if _parse_instant(stamp) is None:
+            leakage.setdefault(case["pr"], []).append("created_at_unparseable")
+            continue
         info = _scoreable_case(conn, repo, case, leakage)
         truth = _pairs_of(info["scoreable"])
         truth_pairs_audit |= _pairs_of(case["closed"])
         disclosures: list[str] = []
         for n in info["excluded_endpoints"]:
             disclosures.append(f"excluded_endpoint:{n}")
-        stamp = case["created_at"]
         if info["at"] is not None:
             for n in sorted(case["closed"]):
                 if not _text_chain_reaches_before(conn, repo, n, info["at"]):
@@ -1425,6 +1462,28 @@ def _eval_bundle(
         )
         try:
             snapshot = derive_bundle(prepared, repo, weights=weights)
+            # IA-6 (disclosure vocabulary parity): the default bundle pool
+            # is cut at [triage] top_k — the SAME bounded-pool fact the
+            # triage mode discloses as eval_triage_pool_cap. Detect the
+            # cut from the replay itself (open ungated rows vs the echoed
+            # top_k) and disclose it per case when it bound.
+            top_k_echo = (snapshot.get("weights") or {}).get("top_k")
+            if isinstance(top_k_echo, int) and top_k_echo >= 1:
+                open_count = prepared.execute(
+                    "SELECT COUNT(*) FROM items WHERE repo = ?"
+                    " AND kind = 'issue' AND state = 'open'",
+                    (repo,),
+                ).fetchone()[0]
+                ungated_count = open_count - int(
+                    (snapshot.get("gated") or {}).get("count", 0)
+                )
+                if ungated_count > top_k_echo:
+                    disclosures.append(
+                        f"eval_triage_pool_cap: the bundle pool was cut at"
+                        f" [triage] top_k={top_k_echo}"
+                        f" ({ungated_count} ungated rows); rows past the"
+                        f" cut can never enter a bundle"
+                    )
         finally:
             drop_snapshot(prepared)
         proposed = _bundle_pair_numbers(snapshot)
@@ -1560,6 +1619,15 @@ def _eval_triage(
     cap_hit_cases: list[int] = []
     for case in cases:
         stamp = case["created_at"]
+        # CUB-9686: same skip discipline as _eval_bundle — a fix PR without
+        # a parseable created_at cannot be replayed; disclose and skip the
+        # case instead of aborting the eval.
+        if stamp is None:
+            leakage.setdefault(case["pr"], []).append("missing_created_at")
+            continue
+        if _parse_instant(stamp) is None:
+            leakage.setdefault(case["pr"], []).append("created_at_unparseable")
+            continue
         info = _scoreable_case(conn, repo, case, leakage)
         prepared = prepare_snapshot(
             conn, repo, as_of=stamp, exclude_pr=case["pr"], reopen=True
@@ -1576,6 +1644,15 @@ def _eval_triage(
         disclosures = [
             f"excluded_endpoint:{n}" for n in info["excluded_endpoints"]
         ]
+        # IA-6 (disclosure vocabulary parity): the bundle mode discloses
+        # text_as_of_unknown when a truth endpoint's as-of text cannot be
+        # certified from the store; the triage mode replays the same
+        # snapshots over the same text, so it fires under the same rule.
+        if info["at"] is not None:
+            for n in sorted(case["closed"]):
+                if not _text_chain_reaches_before(conn, repo, n, info["at"]):
+                    disclosures.append("text_as_of_unknown")
+                    break
         if out.get("truncated"):
             cap_hit_cases.append(case["pr"])
             disclosures.append(

@@ -51,6 +51,7 @@ they stay honest by construction.
 import hashlib
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -63,20 +64,27 @@ from zaxbygraph.db import open_existing  # noqa: E402
 REPO = "zaxbyhub/zaxbygraph"
 
 
-def _neighborhood(conn) -> tuple[dict[int, set[int]], set[int], set[int], set[int]]:
-    """(fix_pr_closed_map, fix_prs, closed_issues, open_pool)."""
+def _neighborhood(conn, repo: str) -> tuple[dict[int, set[int]], set[int], set[int], set[int]]:
+    """(fix_pr_closed_map, fix_prs, closed_issues, open_pool).
+
+    Every query is scoped to ``repo`` (GP-4/ST-8/UR-4/CUB-9663): a
+    consolidated multi-repo store must not leak other repos' closing edges
+    or issues into this neighborhood."""
     # created_at per merged PR with any closing edge (closes OR closes_keyword)
     fix_created: dict[int, str] = {}
     closed_map: dict[int, set[int]] = {}
     for row in conn.execute(
         "SELECT DISTINCT e.src_id, i.created_at FROM edges e"
         " JOIN items i ON i.repo = e.repo AND i.number = CAST(e.src_id AS INTEGER)"
-        " WHERE e.rel IN ('closes', 'closes_keyword')"
+        " WHERE e.repo = ? AND e.rel IN ('closes', 'closes_keyword')"
         " AND i.kind = 'pr' AND i.merged_at IS NOT NULL",
+        (repo,),
     ):
         fix_created[int(row["src_id"])] = row["created_at"]
     for row in conn.execute(
-        "SELECT src_id, dst_id FROM edges WHERE rel IN ('closes', 'closes_keyword')"
+        "SELECT src_id, dst_id FROM edges WHERE repo = ?"
+        " AND rel IN ('closes', 'closes_keyword')",
+        (repo,),
     ):
         pr = int(row["src_id"])
         if pr in fix_created:
@@ -89,10 +97,10 @@ def _neighborhood(conn) -> tuple[dict[int, set[int]], set[int], set[int], set[in
     for pr in sorted(fix_prs):
         created = fix_created[pr]
         for row in conn.execute(
-            "SELECT number FROM items WHERE kind = 'issue'"
+            "SELECT number FROM items WHERE repo = ? AND kind = 'issue'"
             " AND created_at <= ?"
             " AND (state = 'open' OR (closed_at IS NOT NULL AND closed_at >= ?))",
-            (created, created),
+            (repo, created, created),
         ):
             open_pool.add(int(row["number"]))
     return (
@@ -105,23 +113,40 @@ def _neighborhood(conn) -> tuple[dict[int, set[int]], set[int], set[int], set[in
 
 def main() -> int:
     store_arg = sys.argv[1] if len(sys.argv) > 1 else None
+    store_source: str | None = None
     if store_arg:
+        store_source = str(Path(store_arg))
         conn = open_existing(Path(store_arg))
     else:
-        candidate = (
-            Path.home() / "AppData" / "Local" / "zaxbygraph" / "github.com"
-            / "zaxbyhub" / "zaxbygraph" / "history.db"
-        )
+        # Default store resolution through zaxbygraph.paths (SP-1/TI-3/
+        # CUB-9657 — mirrors tests/eval_fixture/record_real_corpus.py): the
+        # ZAXBYGRAPH_HOME / XDG overrides and the platform data dir are
+        # honored, not just the hard-coded Windows path.
+        from zaxbygraph.paths import store_db_path
+
+        candidate = store_db_path("github.com", REPO)
         if not candidate.exists():
             print(f"no user-level store found at {candidate}; pass a store path",
                   file=sys.stderr)
             return 2
+        store_source = str(candidate)
         conn = open_existing(candidate)
 
     out_dir = Path(__file__).resolve().parent
     try:
-        closed_map, fix_prs, closed_issues, open_pool = _neighborhood(conn)
+        closed_map, fix_prs, closed_issues, open_pool = _neighborhood(conn, REPO)
         neighborhood = sorted(fix_prs | closed_issues | open_pool)
+        if not neighborhood:
+            # GP-1: an empty neighborhood means the store carries no
+            # multi-issue fix PR truth for this repo (or the wrong store
+            # was opened) — refuse rather than overwrite the committed
+            # fixture with a corpus that has no C17 ground truth.
+            print(
+                "refusing to record: the neighborhood is empty (no merged PR"
+                " closes >= 2 issues in this store); no files written",
+                file=sys.stderr,
+            )
+            return 1
 
         lines: list[str] = []
         for number in neighborhood:
@@ -201,6 +226,14 @@ def main() -> int:
         ).hexdigest()
         manifest = {
             "repo": REPO,
+            # GP-3: provenance fields every FUTURE recording carries — the
+            # committed manifest predates them (recorded 2026-11, before
+            # this field existed) and is NOT re-recorded just to add them;
+            # the fixture README says so.
+            "recorded_at": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "store": store_source,
             "recorded_items": item_bundle_lines,
             "fix_prs": {str(pr): sorted(closed_map[pr]) for pr in sorted(fix_prs)},
             "closed_issues": sorted(closed_issues),

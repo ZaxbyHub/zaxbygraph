@@ -43,6 +43,7 @@ import sqlite3
 from pathlib import Path
 
 from replay import JsonlReplaySource
+from zaxbygraph.repo import validate_slug
 from zaxbygraph.sync import sync_repo
 
 #: Column order of a recorded revisions row (matches the recorder's SELECT
@@ -104,6 +105,11 @@ def replay_backtest_store(
     are inserted in recorded order (the table has no unique key beyond its
     SQLite-assigned id, so a fixed row order is a fixed store).
     """
+    # CUB-9652: canonicalize exactly like sync_repo does — the revisions
+    # INSERT below keys on ``repo`` directly, so a caller passing display
+    # case ("ZaxbyHub/zaxbygraph") would otherwise file the rows under a
+    # DIFFERENT repo key than the synced items (every table keys on repo).
+    repo = validate_slug(repo)
     source = BacktestReplaySource(events_path)
     sync_repo(conn, source, repo)
     applied = 0

@@ -29,6 +29,7 @@ stage-2 arithmetic never depends on the wall clock.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,10 +80,23 @@ class _StoreTestCase(unittest.TestCase):
         raise AssertionError("_build must be overridden")
 
     def setUp(self) -> None:
+        # TI-1/CUB-9739/CUB-9647: the [triage]/[derive] config chain
+        # resolves .zaxbygraph.toml from the CWD, and these checks call
+        # triage/bundle in-process without an explicit config — run them
+        # in an empty temp cwd so an operator's repo-root config can never
+        # reweight a gate assertion (the tests/test_triage_bundle.py
+        # _LEG_CWD pattern, applied to in-process calls).
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
         self.conn = open_existing(self.db_path)
 
     def tearDown(self) -> None:
         self.conn.close()
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
 
 
 # ==== body mentions never gate 'tracking' (branch (c) REMOVED, FB-003) ======

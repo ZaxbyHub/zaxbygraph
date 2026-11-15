@@ -2142,6 +2142,20 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "cursor": _STR_NULL,
                 "truncated": _BOOL,
                 "derived": _BOOL,
+                "as_of": {
+                    "type": "string",
+                    "description": "present when answered from a prepared"
+                    " as-of snapshot view; names the instant (issue #68"
+                    " AC7)",
+                },
+                "asof_disclosures": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "present with as_of: the snapshot's"
+                    " disclosure keys (text_as_of_unknown,"
+                    " suppressed_evidence, current_state_tables,"
+                    " unparseable_timestamps, ...)",
+                },
             },
             ("blocking_source", "closeable_trackers", "config_source",
              "cursor", "derived", "formula_version", "gated",
@@ -2213,6 +2227,20 @@ _TOOL_SHAPES: dict[str, dict] = {
                     "type": "boolean",
                     "description": "present when budget_tokens cut the"
                     " payload",
+                },
+                "as_of": {
+                    "type": "string",
+                    "description": "present when answered from a prepared"
+                    " as-of snapshot view; names the instant (issue #68"
+                    " AC7)",
+                },
+                "asof_disclosures": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "present with as_of: the snapshot's"
+                    " disclosure keys (text_as_of_unknown,"
+                    " suppressed_evidence, current_state_tables,"
+                    " unparseable_timestamps, ...)",
                 },
             },
             ("bundles", "closeable_trackers", "config_source", "derived",

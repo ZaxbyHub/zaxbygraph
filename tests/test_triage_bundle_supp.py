@@ -813,8 +813,10 @@ class CochangeCutoffTests(_StoreTestCase):
         self.addCleanup(conn.close)
 
         # (b) RAISE path — the anchored pair. Direct read (no cutoffs): 982
-        # anchors to 981 through cochange (the sorted anchor order checks
-        # cochange first), with the hand-derived symmetric confidence
+        # anchors to 981 with cochange among its fired anchors (the anchors
+        # list is strongest-first by weighted contribution — files_direct
+        # outweighs cochange here, as pinned below), with the hand-derived
+        # symmetric confidence
         # 1/max(2,2) = 0.5, and the shared body-ref paths fire files_direct
         # as the second, scoping-proof anchor.
         direct = similar(conn, REPO, 981, limit=50)

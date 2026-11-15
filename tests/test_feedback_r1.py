@@ -36,6 +36,7 @@ where stage-2 arithmetic runs so nothing depends on the wall clock.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -87,10 +88,20 @@ class _StoreTestCase(unittest.TestCase):
         raise AssertionError("_build must be overridden")
 
     def setUp(self) -> None:
+        # TI-1/CUB-9739/CUB-9647: in-process triage/bundle/eval calls
+        # resolve .zaxbygraph.toml from the CWD — run inside an empty temp
+        # cwd so an ambient config can never reweight a check.
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
         self.conn = open_existing(self.db_path)
 
     def tearDown(self) -> None:
         self.conn.close()
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
 
 
 # ==== FB-001/ASM-1: pre-v12 stores degrade bot-free ==========================
@@ -101,6 +112,20 @@ class PreV12BotColumnTests(unittest.TestCase):
     triage and bundle — the two crash sites of FB-001 — with the bot
     exclusion degrading to bot-free (no login counted as a bot), never an
     OperationalError and never a silent migration."""
+
+    def setUp(self) -> None:
+        # TI-1/CUB-9739/CUB-9647: in-process triage/bundle calls resolve
+        # .zaxbygraph.toml from the CWD — empty temp cwd, never the
+        # operator's repo root.
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
+
+    def tearDown(self) -> None:
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
 
     def test_triage_and_bundle_succeed_without_is_bot(self) -> None:
         td = tempfile.TemporaryDirectory()
@@ -375,6 +400,19 @@ class SnapshotFloorTests(unittest.TestCase):
     the coded ``store_too_old`` refusal at prepare_snapshot entry — never
     a mid-build OperationalError — naming sync as the remedy. RED
     pre-fix: OperationalError('no such table: main.item_events')."""
+
+    def setUp(self) -> None:
+        # TI-1/CUB-9739/CUB-9647: the as-of refusal leg resolves the
+        # config chain from the CWD — empty temp cwd.
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
+
+    def tearDown(self) -> None:
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
 
     def test_v9_shaped_store_gets_coded_refusal(self) -> None:
         td = tempfile.TemporaryDirectory()
