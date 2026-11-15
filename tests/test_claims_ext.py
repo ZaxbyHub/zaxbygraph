@@ -37,6 +37,7 @@ import random
 import re
 import tempfile
 import unittest
+import contextlib
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,6 +63,24 @@ ASOF = ts(0)
 
 def _h(hours: float) -> str:
     return ts(-int(hours * 3600))
+
+
+@contextlib.contextmanager
+def _frozen_claims_clock(instant: str):
+    """Freeze the LIVE classification clock (``claims._now``) alongside
+    fixed comment stamps: the live claim commands classify window fitness
+    against ``_now()``, so a live-path pin with absolute timestamps MUST
+    pin that clock too or it becomes a wall-clock time bomb (F9 -- before
+    the stamps' instant the claims are future-dated and inactive; past the
+    72h window the earliest competitor expires). Derived-tier pins are
+    safe by construction: their asof comes from the store's pinned sync
+    stamp."""
+    saved = claims_mod._now
+    claims_mod._now = lambda: claims_mod._parse_instant(instant)
+    try:
+        yield
+    finally:
+        claims_mod._now = saved
 
 
 def _claim_body(token: str | None = None, named: str = "") -> str:
@@ -764,7 +783,8 @@ class TokenArbitrationTests(_LiveCmdTest):
                 )
             ]
         }
-        with _patched_gh(self, "EXT-F1-EARLIER", fake):
+        with _frozen_claims_clock("2026-11-15T12:06:00Z"), \
+                _patched_gh(self, "EXT-F1-EARLIER", fake):
             code, out, _err = _run_cli(
                 ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
             )
@@ -793,7 +813,8 @@ class TokenArbitrationTests(_LiveCmdTest):
                 )
             ]
         }
-        with _patched_gh(self, "EXT-F1-LATER", fake):
+        with _frozen_claims_clock("2026-11-15T12:06:00Z"), \
+                _patched_gh(self, "EXT-F1-LATER", fake):
             code, out, _err = _run_cli(
                 ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
             )
@@ -840,7 +861,8 @@ class RetryArbitrationTests(_LiveCmdTest):
                 (2, 30.0, [_competitor(9_000_015, "BETWEEN-WAVES-TOKEN-1", "2026-11-15T12:02:00Z")]),
             ]
         }
-        with _patched_gh(self, "EXT-F7", fake):
+        with _frozen_claims_clock("2026-11-15T12:06:00Z"), \
+                _patched_gh(self, "EXT-F7", fake):
             code, out, _err = _run_cli(
                 ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
             )
