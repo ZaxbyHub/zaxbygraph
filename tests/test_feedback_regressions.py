@@ -65,10 +65,21 @@ def _seed(path: Path, seeder) -> Path:
 class FeedbackRegressionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="fbreg_"))
+        # TI-1/CUB-9739/CUB-9647: the brief/triage legs resolve the
+        # [triage]/[derive] config chain from the CWD — run them in an
+        # empty temp cwd so an ambient .zaxbygraph.toml can never reweight
+        # a check (the test_triage_bundle _LEG_CWD pattern, in-process).
+        self._prior_cwd = os.getcwd()
+        self._hermetic_cwd = tempfile.TemporaryDirectory(
+            prefix="zaxbygraph-hermetic-"
+        )
+        os.chdir(self._hermetic_cwd.name)
 
     def tearDown(self) -> None:
         import shutil
 
+        os.chdir(self._prior_cwd)
+        self._hermetic_cwd.cleanup()
         shutil.rmtree(self.root, ignore_errors=True)
 
     # ------------------------------------------------------------- ROOT-001

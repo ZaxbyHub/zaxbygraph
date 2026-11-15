@@ -1,0 +1,5 @@
+# GP-2/TI-2: the recorded corpus is byte-addressed — recording_manifest.json
+# pins events.jsonl's sha256 — so checkouts must never translate line endings.
+# -text disables all eol/autocrlf handling for this file everywhere.
+events.jsonl -text
+recording_manifest.json -text

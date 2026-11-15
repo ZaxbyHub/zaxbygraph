@@ -98,12 +98,17 @@ class BudgetCapPins(unittest.TestCase):
         self.assertIs(data.get("truncated"), True)
 
     def test_below_floor_full_shed(self) -> None:
+        """Migration (issues #68/#69 matrix row: budget pins re-derived -
+        the gated/unbundled audit sections join the budget shedding)."""
         chars, data = self._run("100")
         self.assertIs(data.get("truncated"), True)
         self.assertEqual(data.get("bundles"), [])
         self.assertEqual(data.get("merge_candidates"), [])
         self.assertEqual(data.get("related_not_bundleable"), [])
         self.assertEqual(data.get("pool"), [])
+        # the new audit sections shed with the rest under a binding budget
+        self.assertEqual(data.get("unbundled"), [])
+        self.assertEqual(data.get("gated", {}).get("numbers"), [])
 
     def test_above_floor_bound_reachable(self) -> None:
         chars, data = self._run("100000")
