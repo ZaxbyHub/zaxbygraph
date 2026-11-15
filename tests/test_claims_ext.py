@@ -42,6 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fixtures import REPO, FakeGitHubSource, comment, issue, ts
+import test_claim_cmd as _tcc
 from test_claim_cmd import (
     FakeGh,
     _LiveCmdTest,
@@ -77,6 +78,7 @@ def _env_of(out: str) -> dict:
 # FakeGh subclasses (probe legs)
 
 
+# ---------------------------------------------------------------------------
 class _CollabGh(FakeGh):
     """Routes the repository-collaborator probe the base fake cannot."""
 
@@ -702,6 +704,309 @@ class LivePrCommentFilterTests(_LiveCmdTest):
         tokens = {c.get("token") for c in claims}
         self.assertNotIn(token, tokens, "a PR conversation comment is not an issue claim")
         self.assertIn("ISSUEFEED-TOKEN-12345", tokens, "the issue claim is listed")
+
+
+# Round-1 review pins (F1-F4): token arbitration, explicit config,
+# subprocess faults, live candidate-read failure
+
+
+class _FixedPostStampGh(FakeGh):
+    """Posts get a FIXED created_at so race arbitration is deterministic:
+    the competitor's (created_at, comment_id) ordering against our own post
+    is then fully controlled by the test."""
+
+    post_stamp = "2026-11-15T12:00:00Z"
+
+    def __call__(self, cmd):
+        argv = [str(a) for a in cmd]
+        if self._post_body(argv) is not None:
+            saved = _tcc._iso_hours_ago
+            _tcc._iso_hours_ago = (
+                lambda h: self.post_stamp if h == 0.0 else saved(h)
+            )
+            try:
+                return super().__call__(argv)
+            finally:
+                _tcc._iso_hours_ago = saved
+        return super().__call__(argv)
+
+
+class TokenArbitrationTests(_LiveCmdTest):
+    """F1: race arbitration is BY SESSION TOKEN, never by login -- every
+    session posts as one login, so a same-login different-token claim must
+    be evaluated. The earliest active claim per (created_at, comment_id)
+    wins; if it is not our own post we lose the issue."""
+
+    def _same_login_competitor(self, cid: int, token: str, created: str) -> dict:
+        return {
+            "id": cid,
+            "body": f"**Agent claim:** session={token} working this issue now.",
+            "user": {"login": "me"},  # the SESSION LOGIN, different token
+            "author_association": "MEMBER",
+            "created_at": created,
+            "updated_at": created,
+            "html_url": f"https://github.com/{REPO}/issues/5#issuecomment-{cid}",
+        }
+
+    def test_same_login_earlier_token_beats_us(self) -> None:
+        fake = _FixedPostStampGh()
+        fake.reveal_after_post = {
+            5: [
+                self._same_login_competitor(
+                    800_001, "SAMELOGIN-EARLIER-TOKEN", "2026-11-15T11:00:00Z"
+                )
+            ]
+        }
+        with _patched_gh(self, "EXT-F1-EARLIER", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
+            )
+        env = _env_of(out)
+        self.assertEqual(code, 5, "the earlier same-login claim wins the race")
+        data = env.get("data") or {}
+        self.assertEqual(data.get("outcome"), "lost_race")
+        details = data.get("details") or {}
+        self.assertEqual(
+            (details.get("winner") or {}).get("token"),
+            "SAMELOGIN-EARLIER-TOKEN",
+            "the same-login competitor is named the winner (no login skip)",
+        )
+        releases = [(n, b) for n, b in fake.posts if "**Claim released" in b]
+        self.assertEqual([n for n, _ in releases], [5], "our losing wave is released")
+
+    def test_same_login_later_token_loses_to_us(self) -> None:
+        fake = _FixedPostStampGh()
+        # Same stamp as our own post (the subclass pins it) but a HIGHER
+        # comment id: our own post is the earliest active claim, so the
+        # session KEEPS the issue -- no rollback, outcome claimed.
+        fake.reveal_after_post = {
+            5: [
+                self._same_login_competitor(
+                    999_999, "SAMELOGIN-LATER-TOKEN", _FixedPostStampGh.post_stamp
+                )
+            ]
+        }
+        with _patched_gh(self, "EXT-F1-LATER", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
+            )
+        env = _env_of(out)
+        self.assertEqual(code, 0, f"the later same-login claim loses; env {json.dumps(env)[:300]}")
+        data = env.get("data") or {}
+        self.assertEqual(data.get("outcome"), "claimed")
+        fake_posts = [(n, b) for n, b in fake.posts if "**Claim released" in b]
+        self.assertEqual(fake_posts, [], "no rollback when our own post is earliest")
+
+
+class ExplicitConfigGateTests(_StoreTest):
+    """F2: the explicit --config path threads into the [claims] loader --
+    `triage --config f.toml` with `[claims] enabled = false` disables the
+    claimed gate end-to-end."""
+
+    def test_explicit_config_disables_claimed_gate(self) -> None:
+        token = "EXPLICIT-CFG-TOKEN-1"
+
+        def seed(src):
+            src.add_issue(issue(80, title="explicit config target", state="open"))
+            self._comment_on(src, 80, 8001, _claim_body(token), created=_h(1))
+
+        self.seed(seed)
+        cfgf = self.root / "no-claims.toml"
+        cfgf.write_text("[claims]\nenabled = false\n", encoding="utf-8")
+
+        def _gates(extra: list[str]) -> dict:
+            out = io.StringIO()
+            with redirect_stdout(out), redirect_stderr(io.StringIO()):
+                main(
+                    ["triage", "--include-gated", "--limit", "50",
+                     *extra, "--repo", REPO, "--format", "json"]
+                )
+            data = _env_of(out.getvalue()).get("data") or {}
+            row = next(r for r in data["rows"] if r.get("number") == 80)
+            return {"gates": row.get("gates") or [], "echo": data.get("claims_config")}
+
+        with_flag = _gates(["--config", str(cfgf)])
+        self.assertEqual(
+            with_flag["gates"], [], "the explicit [claims] enabled=false disables the gate"
+        )
+        self.assertIs(with_flag["echo"].get("enabled"), False)
+        self.assertEqual(with_flag["echo"].get("config_source"), "explicit")
+        without_flag = _gates([])
+        self.assertIn(
+            "claimed", without_flag["gates"], "without the flag the gate fires"
+        )
+        self.assertIs(without_flag["echo"].get("enabled"), True)
+
+
+class _Completed:
+    def __init__(self, rc: int, out: str, err: str) -> None:
+        self.returncode = rc
+        self.stdout = out
+        self.stderr = err
+
+
+class SubprocessFaultTests(_LiveCmdTest):
+    """F3: subprocess faults (missing gh binary, timeout) translate to the
+    github_unreachable path -- never a traceback -- and a timeout during
+    the post-settle verification still rolls the posted wave back and
+    reports it."""
+
+    def test_missing_gh_binary_is_unreachable_not_traceback(self) -> None:
+        import subprocess as _sp
+
+        real_run = claims_mod.subprocess.run
+
+        def _missing(*_a, **_k):
+            raise FileNotFoundError("[WinError 2] gh: command not found")
+
+        claims_mod.subprocess.run = _missing
+        try:
+            code, out, err = _run_cli(
+                ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
+            )
+        finally:
+            claims_mod.subprocess.run = real_run
+        self.assertEqual(code, 6, f"missing gh exits unreachable; stderr {err.strip()[:200]!r}")
+        env = _env_of(out)
+        self.assertEqual((env.get("data") or {}).get("outcome"), "github_unreachable")
+        self.assertEqual((env.get("error") or {}).get("code"), "github_unreachable")
+        self.assertNotIn("Traceback", err)
+
+    def test_timeout_during_verification_rolls_back(self) -> None:
+        import subprocess as _sp
+
+        fake = FakeGh()
+        real_run = claims_mod.subprocess.run
+        real_run_gh = claims_mod.run_gh
+
+        def _exec(argv, **_k):
+            joined = " ".join(str(a) for a in argv)
+            has_claim_post = any("**Agent claim" in b for _n, b in fake.posts)
+            if "comments?page=" in joined and has_claim_post:
+                # The post-settle verification read times out AFTER our
+                # claim post landed.
+                raise _sp.TimeoutExpired(cmd=joined, timeout=30)
+            rc, out, err = fake(list(argv))
+            return _Completed(rc, out, err)
+
+        claims_mod.subprocess.run = _exec
+        try:
+            code, out, err = _run_cli(
+                ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
+            )
+        finally:
+            claims_mod.subprocess.run = real_run
+            claims_mod.run_gh = real_run_gh
+        self.assertEqual(code, 6, f"timeout exits unreachable; stderr {err.strip()[:200]!r}")
+        self.assertNotIn("Traceback", err)
+        env = _env_of(out)
+        data = env.get("data") or {}
+        self.assertEqual(data.get("outcome"), "github_unreachable")
+        details = data.get("details") or {}
+        released = details.get("released") or []
+        self.assertTrue(
+            any("issues/5#issuecomment-" in url for url in released),
+            f"the rollback release is reported: {json.dumps(details)[:300]}",
+        )
+        self.assertNotIn("unreleased_comments", details, "the release post itself succeeded")
+        releases = [(n, b) for n, b in fake.posts if "**Claim released" in b]
+        self.assertEqual([n for n, _ in releases], [5], "the posted wave was rolled back")
+
+
+class PostedVocabularyTests(unittest.TestCase):
+    """F5: the posted bodies are built from the CONFIGURED vocabulary and
+    are recognized by the EFFECTIVE parser (the tool is self-consistent
+    under overrides); the default table posts the documented canonical
+    forms byte-for-byte."""
+
+    def test_posted_bodies_parse_under_effective_config(self) -> None:
+        over = claims_mod.load_claims_config(
+            explicit_config={
+                "patterns": ["Staking this"],
+                "release_prefix": "**Abandoned",
+                "token_prefix": "run=",
+                "window_hours": 48,
+                "settle_seconds": 1,
+            }
+        )
+        token = "POSTED-TOKEN-1234567890"
+        claim_body = claims_mod._claim_body(token, [9, 3], over)
+        parsed = claims_mod.parse_claim(claim_body, over)
+        self.assertIsNotNone(parsed, "the posted claim parses under the override")
+        self.assertEqual(parsed["token"], token)
+        self.assertEqual(parsed["named_issues"], [3, 9])
+        self.assertIn("**Staking this:**", claim_body, "the configured lead is used")
+        self.assertIn(f"run={token}", claim_body, "the configured token form is used")
+
+        release_body = claims_mod._release_body(token, over)
+        self.assertTrue(
+            release_body.startswith("**Abandoned"),
+            "the configured release prefix LEADS (anchored parse)",
+        )
+        prel = claims_mod.parse_release(release_body, over)
+        self.assertEqual((prel or {}).get("token"), token)
+        self.assertIn("**Claim released", release_body, "the canonical marker rides along")
+
+        tokenless = claims_mod._release_body(None, over)
+        self.assertNotIn("run=", tokenless, "the tokenless form carries no token segment")
+        self.assertIsNone(
+            (claims_mod.parse_release(tokenless, over) or {}).get("token")
+        )
+
+    def test_default_config_posts_canonical_forms(self) -> None:
+        cfg = claims_mod.load_claims_config()
+        token = "CANONICAL-TOKEN-1234567"
+        self.assertTrue(
+            claims_mod._claim_body(token, [5, 6], cfg).startswith(
+                f"**Agent claim:** session={token} issues=#5,#6"
+            ),
+            "the default claim body is the Design-1 form",
+        )
+        self.assertTrue(
+            claims_mod._release_body(token, cfg).startswith(
+                f"**Claim released:** session={token}"
+            ),
+            "the default tokened release body is the Design-2 form",
+        )
+        self.assertTrue(
+            claims_mod._release_body(None, cfg).startswith("**Claim released:**"),
+            "the default tokenless release body is the Design-2 form",
+        )
+
+
+class _CandidateReadFailGh(FakeGh):
+    """The issue-record read for issue 6 fails with a transport error."""
+
+    def __call__(self, cmd):
+        joined = " ".join(str(a) for a in cmd)
+        if re.search(r"issues/6$", joined):
+            return (1, "", "gh: HTTP 502 bad gateway")
+        return super().__call__(cmd)
+
+
+class LiveListingFailClosedTests(_LiveCmdTest):
+    """F4: a candidate's issue-read failure fails the WHOLE live listing
+    (github_unreachable) -- a silently omitted claim would make a partial
+    list look complete."""
+
+    def test_candidate_read_failure_fails_the_listing(self) -> None:
+        fake = _CandidateReadFailGh()
+        fake.add_repo_comment(5, claim_body("LIVE-OK-TOKEN-1234567890"))
+        fake.add_repo_comment(6, claim_body("LIVE-BROKEN-TOKEN-12345"))
+        with _patched_gh(self, "EXT-F4", fake):
+            code, out, _err = _run_cli(
+                ["claims", "--live", "--repo", REPO, "--format", "json"]
+            )
+        self.assertEqual(code, 6, "a candidate-read failure is unreachable, not partial success")
+        env = _env_of(out)
+        self.assertIs(env.get("ok"), False)
+        self.assertEqual((env.get("data") or {}).get("outcome"), "github_unreachable")
+        claims = (env.get("data") or {}).get("claims")
+        self.assertNotIsInstance(
+            claims, list, "no partial claims list is fabricated from a failed read"
+        )
+
+
 
 
 if __name__ == "__main__":

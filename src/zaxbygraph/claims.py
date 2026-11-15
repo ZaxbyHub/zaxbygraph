@@ -614,19 +614,32 @@ def run_gh(argv: list[str]) -> tuple[int, str, str]:
     """One ``gh`` subprocess call: argv list, no shell. The subprocess
     timeout rides ``ZAXBYGRAPH_CLAIM_GH_TIMEOUT_S`` (default 30 s). Tests
     replace this module attribute to redirect the surface offline; the
-    command functions late-bind it at CALL time."""
+    command functions late-bind it at CALL time.
+
+    Subprocess faults never escape as tracebacks: a missing/unrunnable gh
+    binary (FileNotFoundError/OSError) and a timed-out call both translate
+    to a failed-result tuple so every caller's _GhFailure path
+    (github_unreachable, with rollback when posts already landed) holds.
+    """
     try:
         timeout = float(os.environ.get("ZAXBYGRAPH_CLAIM_GH_TIMEOUT_S", ""))
     except ValueError:
         timeout = _GH_TIMEOUT_S_DEFAULT
-    proc = subprocess.run(
-        [str(a) for a in argv],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=max(timeout, _GH_TIMEOUT_S_DEFAULT) if timeout else _GH_TIMEOUT_S_DEFAULT,
-    )
+    budget = max(timeout, _GH_TIMEOUT_S_DEFAULT) if timeout else _GH_TIMEOUT_S_DEFAULT
+    rendered = " ".join(str(a) for a in argv)
+    try:
+        proc = subprocess.run(
+            [str(a) for a in argv],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=budget,
+        )
+    except subprocess.TimeoutExpired:
+        return (124, "", f"gh timed out after {budget:g}s: {rendered[:200]}")
+    except (FileNotFoundError, OSError) as exc:
+        return (1, "", f"gh could not run: {exc}")
     return (proc.returncode, proc.stdout or "", proc.stderr or "")
 
 
@@ -838,10 +851,49 @@ def _issue_record(runner: Callable, repo: str, number: int) -> dict:
     return rec
 
 
+def _same_repo_ref(node: dict, repo: str) -> bool:
+    """Whether one closingIssuesReferences element names an issue of THIS
+    repo. Real gh answers a flat array whose elements carry a
+    ``repository`` object and an ``html_url`` (captured 2026-11-15 on
+    ZaxbyHub/zaxbygraph: ``{"id", "number", "repository": {"name", "owner":
+    {"login"}}, "url": "https://github.com/O/R/issues/N"}``); a cross-repo
+    ref there must never attach to a same-numbered local issue. Elements
+    that carry NO repository information (the offline fakes' bare
+    ``{"number": N}``) are same-repo by construction."""
+    slug = repo.lower()
+    url = str(node.get("url") or node.get("html_url") or "").lower()
+    if url:
+        if f"github.com/{slug}/issues/" in url or f"/repos/{slug}/issues/" in url:
+            return True
+        if "/issues/" in url or "/pulls/" in url:
+            return False  # an url naming a DIFFERENT repo
+    repository = node.get("repository")
+    if isinstance(repository, dict):
+        owner = repository.get("owner")
+        owner_login = (
+            owner.get("login") if isinstance(owner, dict) else repository.get("login")
+        )
+        name = repository.get("name") or repository.get("full_name")
+        if isinstance(name, str) and "/" in name:
+            full = str(name)
+        elif isinstance(owner_login, str) and isinstance(name, str):
+            full = f"{owner_login}/{name}"
+        else:
+            full = str(repository.get("full_name") or "")
+        if full:
+            return full.lower() == slug
+    return True  # no repo information: same-repo by construction
+
+
 def _open_closing_prs(runner: Callable, repo: str) -> list[dict]:
     """The repo's open PRs with their closing references (a safety read for
     claim/pr-guard decisions). ``-R O/R`` appears ONLY here -- ``gh api``
-    rejects it and every api route is explicit."""
+    rejects it and every api route is explicit. The closing references are
+    accepted in BOTH real shapes -- a FLAT array of element objects (the
+    live gh shape, captured 2026-11-15) and a ``{"nodes": [...]}`` wrapper
+    -- plus the offline fakes' bare int list; every element is filtered to
+    THIS repo (cross-repo same-number refs are dropped, never localized).
+    """
     argv = [
         "gh", "pr", "list", "-R", repo, "--state", "open",
         "--limit", str(_PR_LIST_LIMIT), "--json",
@@ -866,18 +918,24 @@ def _open_closing_prs(runner: Callable, repo: str) -> list[dict]:
         if str(entry.get("state") or "open").lower() != "open":
             continue
         closes: set[int] = set()
-        refs = entry.get("closingIssueReferences") or entry.get(
-            "closingIssuesReferences"
-        )
-        nodes = refs.get("nodes") if isinstance(refs, dict) else None
-        if isinstance(nodes, list):
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                try:
-                    closes.add(int(node.get("number")))
-                except (TypeError, ValueError):
-                    continue
+        refs = entry.get("closingIssueReferences")
+        if refs is None:
+            refs = entry.get("closingIssuesReferences")
+        elements: list = []
+        if isinstance(refs, list):
+            elements = refs  # the real flat-array shape
+        elif isinstance(refs, dict):
+            nodes = refs.get("nodes")
+            elements = nodes if isinstance(nodes, list) else []
+        for node in elements:
+            if not isinstance(node, dict):
+                continue
+            try:
+                number = int(node.get("number"))
+            except (TypeError, ValueError):
+                continue
+            if _same_repo_ref(node, repo):
+                closes.add(number)
         raw = entry.get("closing_issues")
         if isinstance(raw, list):
             for value in raw:
@@ -978,11 +1036,11 @@ def list_claims_live(repo: str, cfg: dict, run_gh: Callable | None = None) -> di
         comments = by_issue[number]
         # PR-conversation comments are not issue claims: the per-candidate
         # issue read tells issue from PR (a pull_request key) and supplies
-        # the open/closed state.
-        try:
-            record = _issue_record(runner, repo, number)
-        except _GhFailure:
-            continue
+        # the open/closed state. The read is a SAFETY read: a candidate
+        # whose issue record cannot be fetched fails the WHOLE listing
+        # (github_unreachable) -- a silently omitted claim would make a
+        # partial list look complete.
+        record = _issue_record(runner, repo, number)
         if isinstance(record.get("pull_request"), dict):
             continue  # a PR conversation thread, not an issue claim
         issue_open = str(record.get("state") or "").lower() == "open"
@@ -1045,18 +1103,57 @@ def _mint_token() -> str:
     return str(uuid.uuid4())
 
 
+#: The canonical Design-1 lead: the built-in patterns' first entry.
+_CANONICAL_CLAIM_LEAD = "Agent claim"
+
+#: The canonical Design-2 release prefix (the built-in [claims] default).
+_CANONICAL_RELEASE_PREFIX = "**Claim released"
+
+
 def _claim_body(token: str, numbers: list[int], cfg: dict) -> str:
+    """The posted claim body, built from the CONFIGURED vocabulary: the
+    lead is the effective patterns[0] and the token rides the effective
+    token_prefix, so the tool's own parser recognizes its own posts under
+    overrides. With the default table the body is byte-identical to the
+    canonical Design-1 form. When the configured lead is NOT the built-in
+    one, the canonical marker is appended after the configured-form body:
+    the frozen C13 contract pins that a claim posted under a patterns
+    override still carries the ``**Agent claim`` marker readers (and the
+    offline fakes' post routing) look for."""
+    patterns = [str(p) for p in (cfg.get("patterns") or [])]
+    lead = patterns[0] if patterns else _CANONICAL_CLAIM_LEAD
     prefix = str(cfg.get("token_prefix", "session="))
     named = ",".join(f"#{n}" for n in numbers)
-    return f"**Agent claim:** {prefix}{token} issues={named} working this issue now."
+    canonical = (
+        f"**{_CANONICAL_CLAIM_LEAD}:** {prefix}{token} issues={named}"
+        " working this issue now."
+    )
+    if lead.lower() == _CANONICAL_CLAIM_LEAD.lower():
+        return canonical
+    configured = f"**{lead}:** {prefix}{token} issues={named} working this issue now."
+    return f"{configured} {canonical}"
 
 
 def _release_body(token: str | None, cfg: dict) -> str:
-    if token is None:
-        # Tokenless release: NO session= segment anywhere in the body.
-        return "**Claim released:** scope handed back."
+    """The posted release body from the CONFIGURED vocabulary: the
+    effective release_prefix (anchored, so the configured form LEADS --
+    the parser only matches bodies that START WITH the configured prefix)
+    and token_prefix. With the default table the body is byte-identical to
+    the Design-2 form. Under a release_prefix override the canonical
+    ``**Claim released`` marker is appended after the configured form (the
+    same frozen-contract compromise the claim body makes). The tokenless
+    form carries NO token segment anywhere in the body."""
+    release_prefix = str(cfg.get("release_prefix") or _CANONICAL_RELEASE_PREFIX)
     prefix = str(cfg.get("token_prefix", "session="))
-    return f"**Claim released:** {prefix}{token} done."
+    if token is None:
+        configured = f"{release_prefix}:** scope handed back."
+        canonical = f"{_CANONICAL_RELEASE_PREFIX}:** scope handed back."
+    else:
+        configured = f"{release_prefix}:** {prefix}{token} done."
+        canonical = f"{_CANONICAL_RELEASE_PREFIX}:** {prefix}{token} done."
+    if release_prefix == _CANONICAL_RELEASE_PREFIX:
+        return canonical
+    return f"{configured} {canonical}"
 
 
 def _post_comment(
@@ -1288,6 +1385,7 @@ def take_claims(
                         "url": created.get("html_url")
                         or f"https://github.com/{repo}/issues/{number}",
                         "comment_id": created.get("id"),
+                        "created_at": created.get("created_at"),
                     }
                 )
             posted.extend(wave)
@@ -1301,31 +1399,55 @@ def take_claims(
         # the post-settle verification read.
         sleep(settle)
 
+        def _claim_key(entry: dict) -> tuple[str, int]:
+            return (
+                str(entry.get("created_at") or ""),
+                int(entry.get("comment_id") or 0),
+            )
+
+        def _own_key(number: int, mine: dict | None) -> tuple[str, int]:
+            """The session's own side of the arbitration: the posted
+            comment's REAL id and creation time from the post response
+            (falling back to the re-read entry when the response carried
+            neither)."""
+            meta = next(
+                (e for e in posted if e["number"] == number and "created_at" in e),
+                None,
+            )
+            created = (meta or {}).get("created_at") or (mine or {}).get(
+                "created_at"
+            )
+            cid = (meta or {}).get("comment_id") or (mine or {}).get("comment_id")
+            return (str(created or ""), int(cid or 0))
+
         def _settle_read() -> dict[int, dict]:
-            """Re-read every named issue; map number -> earliest EARLIER
-            foreign active claim (the race loser's evidence)."""
+            """Re-read every named issue and ARBITRATE BY SESSION TOKEN
+            (issue #77 claim 5: every session posts as one login, so
+            authorship cannot separate sessions). A competing claim is any
+            ACTIVE claim whose token differs from ours -- including
+            tokenless foreign claims and same-login different-token
+            claims. The earliest active claim per issue by (created_at,
+            comment_id) wins; when the earliest is not our own post, the
+            session loses that issue."""
             losers: dict[int, dict] = {}
             for number in ordered:
                 comments = _issue_comments(runner, repo, number)
                 entries = _live_claims_for_issue(
                     comments, number, cfg, issue_open=True, closing_prs=[]
                 )
-                for entry in entries:
-                    if not entry.get("active"):
-                        continue
-                    if entry.get("token") == token:
-                        continue
-                    if entry.get("author") == probes.get("login"):
-                        continue
-                    current = losers.get(number)
-                    if current is None or (
-                        str(entry.get("created_at") or ""),
-                        entry.get("comment_id") or 0,
-                    ) < (
-                        str(current.get("created_at") or ""),
-                        current.get("comment_id") or 0,
-                    ):
-                        losers[number] = entry
+                active = [e for e in entries if e.get("active")]
+                if not active:
+                    continue
+                mine = next(
+                    (e for e in active if e.get("token") == token), None
+                )
+                competitors = [e for e in active if e.get("token") != token]
+                if not competitors:
+                    continue  # our own post is the only active claim
+                own = _own_key(number, mine)
+                earliest = min(competitors, key=_claim_key)
+                if _claim_key(earliest) < own:
+                    losers[number] = earliest
             return losers
 
         def _still_taken() -> dict[int, list[dict]]:
@@ -1421,15 +1543,29 @@ def take_claims(
             None,
         )
     except _GhFailure as exc:
+        rollback: dict = {}
         if posted:
-            # A read failed after posts landed: best-effort rollback of
-            # everything this command posted (never leave unverifiable
-            # claims behind), then the unreachable outcome.
-            try:
-                _release_wave(posted[:])
-            except _GhFailure:
-                pass
+            # A read failed after posts landed (timeout, transport): roll
+            # back everything this command posted (never leave
+            # unverifiable claims behind) and REPORT the rollback -- which
+            # comments were released and which could not be.
+            released_ok: list[str] = []
+            unreleased: list[str] = []
+            for entry in posted[:]:
+                try:
+                    _post_comment(
+                        runner, repo, entry["number"], _release_body(token, cfg)
+                    )
+                    released_ok.append(entry["url"])
+                except _GhFailure:
+                    unreleased.append(entry["url"])
+            rollback = {"released": released_ok}
+            if unreleased:
+                rollback["unreleased_comments"] = unreleased
         outcome, data, message = _gh_unreachable(exc)
+        details = dict((data.get("details") or {}))
+        details.update(rollback)
+        data = {**data, "details": details}
         return outcome, {**base_data, **data}, message
 
 

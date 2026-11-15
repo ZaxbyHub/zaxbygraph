@@ -1702,7 +1702,12 @@ def _synced_at(conn: sqlite3.Connection, repo: str) -> str | None:
     return row["last_incr_sync_at"] or row["last_full_sync_at"]
 
 
-def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
+def _triage_features(
+    conn: sqlite3.Connection,
+    repo: str,
+    cfg: dict,
+    claims_explicit: str | None = None,
+) -> dict:
     """Stage-1 raw features and gates for EVERY open issue: demand
     (reactions/participants/comments/duplicates/mentions), leverage
     (blocking/sub-issue gap/milestone), risk (reopens/file reverts) and the
@@ -2027,11 +2032,16 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
     # The claimed gate (issues #74/#77): an active trusted work-claim
     # comment on an open issue (or NAMING it) gates the issue out of the
     # ranking. The [claims] values ride the same store/cwd/explicit chain
-    # as [triage] (the explicit --config may carry both tables); the gate
+    # as [triage] -- INCLUDING the explicit --config path the caller gave
+    # load_triage_config (a file may carry both [triage] and [claims] --
+    # `triage --config f.toml` with `[claims] enabled = false` must
+    # actually disable the gate); the gate
     # map is DERIVED from the canonical claim list in claims.py, and the
     # effective table rides the payload as the separate claims_config echo
     # (the top-level config_source stays the [triage] chain, untouched).
-    claims_cfg = _claims.load_claims_config(*_triage_config_chain(conn, None))
+    claims_cfg = _claims.load_claims_config(
+        *_triage_config_chain(conn, claims_explicit)
+    )
     claims_gate: dict[int, dict] = _claims.claims_gate_by_number(
         conn, repo, claims_cfg
     )
@@ -2373,6 +2383,7 @@ def _triage_compute(
     cfg: dict,
     top_k: int,
     weights: dict | None = None,
+    claims_explicit: str | None = None,
 ) -> dict:
     """The full two-stage triage computation shared by triage/bundle/brief:
     stage-1 features + gates for every open issue, stage-2 (hotspot,
@@ -2381,7 +2392,10 @@ def _triage_compute(
     shared by every stage-2 analog scan (the per-row ``similar`` rebuild
     cost one full context per row — pr45 review K04); ``weights`` is the
     effective [derive] table for those scans (None -> load_weights()
-    defaults, preserving bare library-call behavior)."""
+    defaults, preserving bare library-call behavior).
+    ``claims_explicit`` is the caller's explicit --config path, threaded to
+    the [claims] chain so the claimed gate honours the same file the
+    [triage] table came from."""
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
     index, file_support, population = _coupling_index(conn, repo, caps)
@@ -2414,7 +2428,7 @@ def _triage_compute(
     ):
         merged_at[row["number"]] = row["merged_at"]
 
-    base = _triage_features(conn, repo, cfg)
+    base = _triage_features(conn, repo, cfg, claims_explicit=claims_explicit)
     features = base["features"]
     items = ctx["items"]
 
@@ -2705,11 +2719,11 @@ def triage(
         conn = prepare_snapshot(conn, repo, as_of=as_of, exclude_pr=None, reopen=True)
         try:
             return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                           include_gated, weights)
+                           include_gated, weights, claims_explicit=config)
         finally:
             drop_snapshot(conn)
     return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                   include_gated, weights)
+                   include_gated, weights, claims_explicit=config)
 
 
 def _triage(
@@ -2721,8 +2735,12 @@ def _triage(
     cursor: str | None,
     include_gated: bool,
     weights: dict | None,
+    claims_explicit: str | None = None,
 ) -> dict:
-    compute = _triage_compute(conn, repo, cfg, effective_top_k, weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, effective_top_k, weights=weights,
+        claims_explicit=claims_explicit,
+    )
 
     def _sort_key(row: dict) -> tuple[float, int]:
         return (-row["total_score"], row["number"])
@@ -2951,7 +2969,9 @@ def _bundle(
     weights: dict | None,
     cfg: dict,
 ) -> dict:
-    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
+    )
     size_min, size_max = _parse_size(size)
     file_cap = max_files if max_files is not None else cfg["max_files"]
     excluded = sorted({int(n) for n in (exclude or [])})
@@ -3809,7 +3829,9 @@ def brief(
         # silently-disabled cap (pr45 review K09).
         raise ValueError("budget-tokens must be a positive integer")
     cfg = load_triage_config(*_triage_config_chain(conn, config))
-    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
+    )
     all_rows = {r["number"]: r for r in compute["rows"]}
     row = all_rows.get(number)
     if row is None:
