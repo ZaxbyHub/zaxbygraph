@@ -928,14 +928,21 @@ def _open_closing_prs(runner: Callable, repo: str) -> list[dict]:
             nodes = refs.get("nodes")
             elements = nodes if isinstance(nodes, list) else []
         for node in elements:
-            if not isinstance(node, dict):
-                continue
-            try:
-                number = int(node.get("number"))
-            except (TypeError, ValueError):
-                continue
-            if _same_repo_ref(node, repo):
-                closes.add(number)
+            if isinstance(node, dict):
+                try:
+                    number = int(node.get("number"))
+                except (TypeError, ValueError):
+                    continue
+                if _same_repo_ref(node, repo):
+                    closes.add(number)
+            else:
+                # A bare INTEGER element (the shape the offline fakes use
+                # for closing_issues, accepted in every refs container): a
+                # same-repo issue number by construction -- never dropped.
+                try:
+                    closes.add(int(node))
+                except (TypeError, ValueError):
+                    continue
         raw = entry.get("closing_issues")
         if isinstance(raw, list):
             for value in raw:
@@ -1409,11 +1416,15 @@ def take_claims(
             """The session's own side of the arbitration: the posted
             comment's REAL id and creation time from the post response
             (falling back to the re-read entry when the response carried
-            neither)."""
-            meta = next(
-                (e for e in posted if e["number"] == number and "created_at" in e),
-                None,
-            )
+            neither). The entry used is the CURRENT wave's post -- the LAST
+            matching entry in posted order -- never a RELEASED earlier
+            wave's post: a competitor that appeared between the first-wave
+            release and the retry post must be arbitrated against the
+            retry's key, or the retry would wrongly answer claimed."""
+            meta = None
+            for entry in posted:
+                if entry["number"] == number:
+                    meta = entry  # posted order is chronological: last = current wave
             created = (meta or {}).get("created_at") or (mine or {}).get(
                 "created_at"
             )

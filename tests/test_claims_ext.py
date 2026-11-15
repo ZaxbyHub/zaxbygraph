@@ -711,19 +711,26 @@ class LivePrCommentFilterTests(_LiveCmdTest):
 
 
 class _FixedPostStampGh(FakeGh):
-    """Posts get a FIXED created_at so race arbitration is deterministic:
-    the competitor's (created_at, comment_id) ordering against our own post
-    is then fully controlled by the test."""
+    """Posts get FIXED created_at stamps so race arbitration is
+    deterministic: the first claim wave posts at ``post_stamp`` and the
+    retry wave at ``retry_stamp``, so a competitor's (created_at,
+    comment_id) ordering against our own posts is fully controlled by the
+    test."""
 
     post_stamp = "2026-11-15T12:00:00Z"
+    retry_stamp = "2026-11-15T12:05:00Z"
 
     def __call__(self, cmd):
         argv = [str(a) for a in cmd]
-        if self._post_body(argv) is not None:
+        body = self._post_body(argv)
+        if body is not None:
+            if "**Agent claim" in body:
+                wave = sum(1 for _n, b in self.posts if "**Agent claim" in b)
+                stamp = self.post_stamp if wave == 0 else self.retry_stamp
+            else:
+                stamp = self.post_stamp
             saved = _tcc._iso_hours_ago
-            _tcc._iso_hours_ago = (
-                lambda h: self.post_stamp if h == 0.0 else saved(h)
-            )
+            _tcc._iso_hours_ago = lambda h: stamp if h == 0.0 else saved(h)
             try:
                 return super().__call__(argv)
             finally:
@@ -796,6 +803,150 @@ class TokenArbitrationTests(_LiveCmdTest):
         self.assertEqual(data.get("outcome"), "claimed")
         fake_posts = [(n, b) for n, b in fake.posts if "**Claim released" in b]
         self.assertEqual(fake_posts, [], "no rollback when our own post is earliest")
+
+
+class RetryArbitrationTests(_LiveCmdTest):
+    """F7 (round 2): the retry's arbitration must compare competitors
+    against the RETRY wave's post, never the RELEASED first wave's post.
+    A competitor that appears only after the first-wave release but before
+    the retry post has a key between the two waves: it is EARLIER than the
+    retry's post (lost_race), not later than the released first wave's
+    (which the stale-key bug wrongly answered `claimed`)."""
+
+    def test_competitor_between_release_and_retry_wins_the_retry(self) -> None:
+        fake = _FixedPostStampGh()
+        # Wave-1 posts at 12:00:00 (post_stamp), the retry at 12:05:00
+        # (retry_stamp). The between-waves competitor Y is created at
+        # 12:02:00: LATER than the released wave-1 post, EARLIER than the
+        # retry post -- arbitration must use the RETRY's key.
+        def _competitor(cid: int, token: str, created: str) -> dict:
+            return {
+                "id": cid,
+                "body": f"**Agent claim:** session={token} working this issue now.",
+                "user": {"login": "me"},
+                "author_association": "MEMBER",
+                "created_at": created,
+                "updated_at": created,
+                "html_url": f"https://github.com/{REPO}/issues/5#issuecomment-{cid}",
+            }
+
+        fake.reveal_timed = {
+            5: [
+                # X: visible at the first settle read (within 1.0s of the
+                # FIRST claim post), gone before the retry's fresh read.
+                (1, 1.0, [_competitor(9_100_001, "WAVE1-LOSER-TOKEN-0001", "2026-11-15T11:00:00Z")]),
+                # Y: appears only once the RETRY post exists (2nd claim
+                # post), created BETWEEN the two waves.
+                (2, 30.0, [_competitor(9_000_015, "BETWEEN-WAVES-TOKEN-1", "2026-11-15T12:02:00Z")]),
+            ]
+        }
+        with _patched_gh(self, "EXT-F7", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--settle-seconds", "0.05", "--repo", REPO, "--format", "json"]
+            )
+        env = _env_of(out)
+        data = env.get("data") or {}
+        self.assertEqual(
+            data.get("outcome"),
+            "lost_race",
+            f"the between-waves competitor is EARLIER than the retry post"
+            f" (the stale first-wave key would wrongly answer claimed):"
+            f" {json.dumps(env)[:400]}",
+        )
+        self.assertEqual(code, 5)
+        winner = ((data.get("details") or {}).get("winner") or {}).get("token")
+        self.assertEqual(winner, "BETWEEN-WAVES-TOKEN-1")
+        claim_posts = [(n, b) for n, b in fake.posts if "**Agent claim" in b]
+        release_posts = [(n, b) for n, b in fake.posts if "**Claim released" in b]
+        self.assertEqual(
+            [n for n, _ in claim_posts], [5, 5], "exactly one retry wave"
+        )
+        self.assertEqual(
+            [n for n, _ in release_posts], [5, 5], "both waves were released"
+        )
+
+
+class ClosingRefShapesTests(_LiveCmdTest):
+    """F8 (round 2): no closing-reference shape loses a reference -- bare
+    INTEGER elements are accepted inside every refs container (flat array
+    and nodes wrapper alike) as same-repo issue numbers, beside the dict
+    elements (real flat-array shape, url/repository-filtered)."""
+
+    def test_every_shape_yields_its_references(self) -> None:
+        fake = FakeGh()
+        fake.open_prs = [
+            {  # flat INT array under closingIssuesReferences
+                "number": 30, "state": "open", "title": "int flat",
+                "url": f"https://github.com/{REPO}/pull/30",
+                "closingIssuesReferences": [5],
+            },
+            {  # INT inside a nodes wrapper under closingIssueReferences
+                "number": 31, "state": "open", "title": "int nodes",
+                "url": f"https://github.com/{REPO}/pull/31",
+                "closingIssueReferences": {"nodes": [6]},
+            },
+            {  # real flat DICT array: one same-repo ref kept, one
+               # cross-repo same-number ref rejected
+                "number": 32, "state": "open", "title": "dict flat",
+                "url": f"https://github.com/{REPO}/pull/32",
+                "closingIssuesReferences": [
+                    {
+                        "number": 7,
+                        "url": f"https://github.com/{REPO}/issues/7",
+                        "repository": {"name": REPO.split("/")[1],
+                                       "owner": {"login": REPO.split("/")[0]}},
+                    },
+                    {
+                        "number": 8,
+                        "url": "https://github.com/other/repo/issues/8",
+                        "repository": {"name": "repo",
+                                       "owner": {"login": "other"}},
+                    },
+                ],
+            },
+        ]
+        with _patched_gh(self, "EXT-F8", fake):
+            code, out, _err = _run_cli(
+                ["pr-guard", "5", "6", "7", "--repo", REPO, "--format", "json"]
+            )
+        self.assertEqual(code, 4, "every shape's reference collides")
+        env = _env_of(out)
+        collisions = (env.get("data") or {}).get("collisions") or []
+        self.assertEqual(
+            sorted(pr.get("number") for pr in collisions),
+            [30, 31, 32],
+            f"no shape lost its reference: {json.dumps(collisions)[:300]}",
+        )
+        by_pr = {pr.get("number"): pr for pr in collisions}
+        self.assertEqual(by_pr[30].get("closes"), [5], "flat int array")
+        self.assertEqual(by_pr[31].get("closes"), [6], "int inside nodes")
+        self.assertEqual(
+            by_pr[32].get("closes"), [7], "same-repo dict kept, cross-repo rejected"
+        )
+
+    def test_cross_repo_int_never_flags_local_number(self) -> None:
+        # The cross-repo DICT ref on issue 8 does not collide; 8 stays free.
+        fake = FakeGh()
+        fake.open_prs = [
+            {
+                "number": 32, "state": "open", "title": "dict flat",
+                "url": f"https://github.com/{REPO}/pull/32",
+                "closingIssuesReferences": [
+                    {
+                        "number": 8,
+                        "url": "https://github.com/other/repo/issues/8",
+                        "repository": {"name": "repo", "owner": {"login": "other"}},
+                    }
+                ],
+            }
+        ]
+        with _patched_gh(self, "EXT-F8-CLEAN", fake):
+            code, out, _err = _run_cli(
+                ["pr-guard", "8", "--repo", REPO, "--format", "json"]
+            )
+        self.assertEqual(code, 0, "a cross-repo same-number ref never collides")
+        data = _env_of(out).get("data") or {}
+        self.assertEqual(data.get("collisions"), [])
 
 
 class ExplicitConfigGateTests(_StoreTest):
