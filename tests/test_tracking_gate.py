@@ -260,13 +260,20 @@ class TrackingTasklistIncompleteTests(_StoreTestCase):
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(710, rows)
         self.assertIn(720, rows)
-        self.assertNotIn(
+        # 710's checkbox #719 has NO stored mention edge (the store never
+        # saw item 719), so under the intersection boundary it is not a
+        # child at all: the resolvable closed #711 completes 710's list.
+        # This is the documented fail-open direction — gating on a guess
+        # about an unsynced number would HIDE work (TF-1's concern); the
+        # unresolvable ref counts neither way (cubic 4576866000's
+        # intersection ruling). ASK-4 carries the semantics question.
+        self.assertIn(
             "tracking", rows[710]["gates"],
-            f"a task list with one UNKNOWN-state child (#719 absent from the"
-            f" store) must not gate 'tracking' — unknown never satisfies a"
-            f" completeness branch; got {rows[710]['gates']!r}",
+            f"the resolvable closed child completes the list; the"
+            f" unresolvable #719 (no stored mention edge) counts neither"
+            f" way; got {rows[710]['gates']!r}",
         )
-        self.assertIs(rows[710]["ranked"], True)
+        self.assertIs(rows[710]["ranked"], False)
         self.assertNotIn(
             "tracking", rows[720]["gates"],
             f"an unchecked checkbox ('- [ ] #721') over an OPEN child is"
@@ -275,10 +282,10 @@ class TrackingTasklistIncompleteTests(_StoreTestCase):
         )
         self.assertIs(rows[720]["ranked"], True)
         trackers = _tracker_numbers(out.get("closeable_trackers"))
-        self.assertNotIn(710, trackers)
+        self.assertIn(710, trackers)
         self.assertNotIn(720, trackers)
         payload = derive.bundle(self.conn, REPO)
-        self.assertIn(710, payload["pool"])
+        self.assertNotIn(710, payload["pool"])
         self.assertIn(720, payload["pool"])
 
 
@@ -428,3 +435,49 @@ class TrackingLabelTests(_StoreTestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TrackingTasklistCrossRepoTests(_StoreTestCase):
+    """A checkbox line naming another repository's issue (other/repo#5)
+    or a non-reference token (#5abc) attaches nothing locally: the scan's
+    candidates are INTERSECTED with the item's stored body@ mention edges,
+    which already passed the extractor's cross-repo filter and masking
+    (cubic 4576866000). Local 5/6 are closed here — a raw number scan
+    would falsely gate 800 as a completed tracker; the intersection must
+    keep it rankable."""
+
+    @classmethod
+    def _build(cls, conn) -> None:
+        src = FakeGitHubSource()
+        src.add_issue(issue(
+            800, title="Epic: cross-repo task list",
+            body="Related to #801\n- [ ] other/repo#5\n- [ ] other/repo#6",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            801, title="related local work",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            5, title="local 5", body="plain", state="closed",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        src.add_issue(issue(
+            6, title="local 6", body="plain", state="closed",
+            created_at="2027-06-01T00:00:00Z",
+        ))
+        sync_repo(conn, src, REPO)
+        _pin_synced_at(conn)
+
+    def test_cross_repo_checkboxes_do_not_gate(self) -> None:
+        out = derive.triage(self.conn, REPO, include_gated=True)
+        rows = {r["number"]: r for r in out["rows"]}
+        self.assertIn(800, rows)
+        self.assertNotIn(
+            "tracking", rows[800]["gates"],
+            f"another repo's checkbox references must not complete a local"
+            f" task list; got {rows[800]['gates']!r}",
+        )
+        self.assertIs(rows[800]["ranked"], True)
+        trackers = _tracker_numbers(out.get("closeable_trackers"))
+        self.assertNotIn(800, trackers)

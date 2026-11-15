@@ -1420,6 +1420,17 @@ def _no_ground_truth() -> type[ValueError]:
     return NoGroundTruthError
 
 
+def _coded_value_error() -> tuple[type[ValueError], ...]:
+    """Every evaluate error type that carries its own ``code`` attribute
+    (imported lazily; the CLI import graph stays one-way). The shared
+    handler below emits ``error.code`` verbatim for any of these instead
+    of letting the generic ValueError arm relabel them ``bad_request``
+    (cubic 4576304784: StoreTooOldError was surfacing as bad_request)."""
+    from zaxbygraph.evaluate import NoGroundTruthError, StoreTooOldError
+
+    return (NoGroundTruthError, StoreTooOldError)
+
+
 def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
     """Derived-tier read runner: same resolution and envelope as
     ``_run_read``, over the same ``mode=ro`` connection ``open_existing``
@@ -1468,17 +1479,17 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
         return emit_failure(
             args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
         )
-    except _no_ground_truth() as exc:
-        # Dedicated handler BEFORE the generic ValueError branch: the
-        # error carries its own code (issue #68 AC6) and the generic arm
-        # would relabel it bad_request and mask it.
+    except _coded_value_error() as exc:
+        # Dedicated handler BEFORE the generic ValueError branch: these
+        # errors carry their own code (issue #68 AC6; cubic 4576304784)
+        # and the generic arm would relabel them bad_request and mask it.
         return emit_failure(
             args,
             2,
             str(exc),
             slug=repo,
             db_path=db_path,
-            code_key=getattr(exc, "code", "no_ground_truth"),
+            code_key=getattr(exc, "code", "bad_request"),
         )
     except ValueError as exc:
         return emit_failure(args, 2, str(exc), slug=repo, db_path=db_path)

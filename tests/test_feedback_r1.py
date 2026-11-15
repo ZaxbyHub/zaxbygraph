@@ -282,10 +282,10 @@ class AsOfExtractedColumnsTests(_StoreTestCase):
 
 
 class TrackingCiteNegativeTests(_StoreTestCase):
-    """The negative leg the critic named when removing branch (c): an
-    ordinary open issue whose body cites ONE closed issue must stay
-    rankable — under the (even direction-corrected) body-mention branch
-    this exact shape gated 'tracking'."""
+    """The negative leg TF-1 named: an ordinary open issue whose body
+    cites ONE closed issue in PROSE must stay rankable — a prose citation
+    is not a task-list reference, so the checkbox-aware branch (c) never
+    sees it (the original any-mention branch gated this exact shape)."""
 
     @classmethod
     def _build(cls, conn) -> None:

@@ -2001,13 +2001,18 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
                     continue
                 # Every issue reference on a checkbox line is a task-list
                 # child; a digit run past the reference cap is not a
-                # reference at all (the same bound and semantics the
-                # keyword extractor applies — the (?!\d) guard keeps a
-                # longer run from matching as its 10-digit prefix).
+                # reference (the same digit bound the keyword extractor
+                # applies — the (?!\d) guard keeps a longer run from
+                # matching as its 10-digit prefix). The found set is then
+                # INTERSECTED with the item's stored body@ mention edges,
+                # which already passed the extractor's cross-repo filter
+                # and masking, so `other/repo#5` or `#5abc` in a checkbox
+                # never attaches to local item 5 (unlike a raw scan).
                 for match in re.finditer(
                     r"#(\d{1,%d})(?!\d)" % _MAX_REF_DIGITS, line
                 ):
                     found.add(int(match.group(1)))
+            found &= body_mention_dsts[row["number"]]
             if found:
                 tasklist_children[row["number"]] = found
     tracking_label_rows: dict[int, set[str]] = {}
