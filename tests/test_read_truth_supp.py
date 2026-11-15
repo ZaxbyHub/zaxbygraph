@@ -605,6 +605,11 @@ class ParserSurfacePinTests(unittest.TestCase):
             "status", "search", "item", "related", "churn", "open", "path",
             "overlap", "file-history", "what-closed", "similar", "explain",
             "coupling", "eval", "triage", "bundle", "brief", "schema",
+            # The derived claims listing is a standard read (issue #74:
+            # refresh with --max-age before trusting an empty answer). The
+            # live claim commands (claim/release/pr-guard) drive gh and
+            # correctly stay WITHOUT the flag.
+            "claims",
         }
         expect_without = {"sync", "sql", "export-graph", "export-corpus",
                           "where", "doctor", "mcp"}

@@ -78,7 +78,13 @@ def _guardrail_commands() -> list[list[str]]:
     `store_too_old`, `store_too_new`, `incomplete_store`) are pinned by
     tests/test_export_corpus.py. `snapshot` is excluded too: publish/pull
     are write-transport workflow commands whose envelopes are pinned by
-    tests/test_snapshot.py (CLI envelope legs)."""
+    tests/test_snapshot.py (CLI envelope legs). The live claim commands
+    (issues #77/#74) are excluded the same way: `claim`/`release`/
+    `pr-guard` drive gh (a network write path whose outcome envelopes --
+    claimed/not_applicable/taken/lost_race/github_unreachable, data
+    preserved -- are pinned by tests/test_claim_cmd.py and
+    tests/test_claims_ext.py); the derived `claims` listing stays covered
+    here."""
     return [
         ["status"],
         ["search", "needle"],
@@ -109,6 +115,8 @@ def _guardrail_commands() -> list[list[str]]:
         ["triage"],
         ["bundle"],
         ["brief", "1"],
+        # issue #74 derived claims listing over the same seed corpus.
+        ["claims"],
     ]
 
 
@@ -413,7 +421,12 @@ class EnvelopeContractTests(unittest.TestCase):
             missing = [k for k in required if k not in payload]
             if missing:
                 problems.append(f"{name} missing {','.join(missing)}")
-        uncovered = registered - seen - {"sync", "mcp", "export-corpus", "snapshot"}
+        uncovered = registered - seen - {
+            "sync", "mcp", "export-corpus", "snapshot",
+            # Live gh-writing claim commands (issues #77/#74): outcome
+            # envelopes pinned by test_claim_cmd.py / test_claims_ext.py.
+            "claim", "release", "pr-guard",
+        }
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"
         )
