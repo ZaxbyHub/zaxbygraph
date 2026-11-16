@@ -485,18 +485,18 @@ is stale, so refresh with `--max-age` (or re-sync) before trusting it.
 `claims --live` reads the repo-wide comment feed from GitHub at call time
 (`live: true`, `derived: false`, wall-clock ages, each candidate
 re-validated through its own issue read plus the open-PR list); the store
-file is byte-identical after every claims command — the claim workflow
-writes GitHub comments only, and the store is written by `sync` (and
-`doctor --consolidate`).
+file is byte-identical when no refresh is requested; the claim workflow
+writes GitHub comments only, while `claims --max-age` may write it via
+`sync` (and `doctor --consolidate` can write it directly).
 
 Safety reads fail CLOSED, and their caps surface as `github_unreachable`
 with the reason in `details`: the repo-wide comment feed is paged to 40
-pages x 100 (a repository with more issue comments than that cannot be
-listed live), and so is each named issue's own comment history (read by
-`claim` and `release`), and the open-PR list is capped at 500 (a repository
-with more open PRs than that cannot pass `claim`, `pr-guard` or
-`claims --live`; `release` reads only the named issues' own histories and has
-no PR-list cap). A cap is a refusal, not a verdict that the work is free.
+pages x 100 (a feed that FILLS all 40 pages — 4000 comments — cannot be
+listed live, because a full page cannot prove there is no next one), and so
+is each named issue's own comment history (read by `claim` and `release`),
+and the open-PR list is capped at 500 (a repository with 500 or more open
+PRs cannot pass `claim`, `pr-guard` or `claims --live`; `release` reads only
+the named issues' own histories and has no PR-list cap). A cap is a refusal, not a verdict that the work is free.
 
 A release needs no trusted author: the claim token is public in the claim
 comment (it is an identifier, not a secret), so any commenter whose comment

@@ -1604,17 +1604,21 @@ class LiveFailureShapeParityTests(_LiveCmdTest):
         session.initialize()
         saved = claims_mod.run_gh
         claims_mod.run_gh = _DeadGh()
+        # The seam stays active through BOTH calls (cubic's re-review): the
+        # CLI half must not fall back to the ambient `gh`, or the test stops
+        # being hermetic and its verdict depends on the machine's GitHub
+        # access rather than on the code under test.
         try:
             _res, mcp_env = tool_envelope(
                 self,
                 session.call_tool("claims", {"repo": REPO, "live": True}),
                 "FB-024-mcp",
             )
+            code, out, _err = _run_cli(
+                ["claims", "--live", "--repo", REPO, "--format", "json"]
+            )
         finally:
             claims_mod.run_gh = saved
-        code, out, _err = _run_cli(
-            ["claims", "--live", "--repo", REPO, "--format", "json"]
-        )
         cli_env = _env_of(out)
         self.assertEqual(code, 6, "a dead gh is github_unreachable on the CLI")
         for name, env in (("mcp", mcp_env), ("cli", cli_env)):

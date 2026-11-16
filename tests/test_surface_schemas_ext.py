@@ -42,6 +42,7 @@ import unittest
 from pathlib import Path
 
 from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull, review
+from test_claims_ext import FakeGh
 from zaxbygraph import cli
 from test_mcp import McpSession, pin_env_for, run_cli, tool_envelope
 from zaxbygraph.db import connect, init_schema
@@ -210,6 +211,31 @@ _ALL_TOOLS = sorted(_SUCCESS_CALLS)
 _LIVE_GH_TOOLS = frozenset({"claim", "release", "pr_guard", "claims"})
 
 
+def _live_success_seam(name: str) -> FakeGh:
+    """A seeded SUCCESSFUL gh for one live tool's success leg (cubic's
+    re-review of c9b8359): the dead seam answers github_unreachable, which
+    validates the failure envelope but never the SUCCESS payload -- and a leg
+    that cannot fail is not coverage. Each leg gets its OWN fake, so one
+    tool's seeding (a claim for `release` to end) cannot change another
+    tool's outcome (a pre-existing claim would make `claim` answer
+    already-claimed)."""
+    fake = FakeGh()
+    if name == "release":
+        # releasing needs a claim to end; the sweep's token is fixed, so the
+        # seeded claim carries exactly that token.
+        fake.add_claim(1, "RELEASE-TOKEN-1234567890", hours_ago=2.0)
+    elif name == "claims":
+        # an empty repo-wide feed would validate an empty listing only; seed
+        # one claim so the row shape is exercised too.
+        fake.add_repo_comment(
+            5,
+            "**Agent claim:** session=SWEEPTOKEN1234567890 issues=#5"
+            " Working this issue now.",
+            hours_ago=1.0,
+        )
+    return fake
+
+
 class _NoopRunner:
     """Injected sync seam: the sync tool's success shape without any real
     fetch (offline, instant)."""
@@ -260,17 +286,27 @@ class OutputSchemaExtTests(unittest.TestCase):
                 self.assertIsInstance(tool, dict, f"tools/list must advertise {name}; got {sorted(self.tools)}")
                 schema = (tool or {}).get("outputSchema")
                 self.assertIsInstance(schema, dict, f"{name} must declare an outputSchema")
-                result, env = tool_envelope(self, self.session.call_tool(name, _SUCCESS_CALLS[name]), f"ext:{name}")
+                seam = None
                 if name in _LIVE_GH_TOOLS:
-                    # A live tool cannot succeed without GitHub: with the
-                    # dead seam it answers github_unreachable, and THAT
-                    # envelope must validate against the success schema.
-                    self.assertIs(env.get("ok"), False, f"{name}: a dead gh must answer ok:false; got {json.dumps(env)[:160]!r}")
-                    self.assertEqual(
-                        (env.get("error") or {}).get("code"),
-                        "github_unreachable",
-                        f"{name}: the dead-gh code; got {env.get('error')!r}",
-                    )
+                    # A live tool cannot succeed against the DEAD seam, so the
+                    # success leg swaps in a seeded successful gh (cubic's
+                    # re-review): otherwise this leg validates only the
+                    # failure envelope while its name claims the success one.
+                    # The dead seam is restored immediately afterwards, so the
+                    # error leg below still runs against it.
+                    from zaxbygraph import claims as _claims_mod
+
+                    seam = _live_success_seam(name)
+                    _saved = _claims_mod.run_gh
+                    _claims_mod.run_gh = seam
+                try:
+                    result, env = tool_envelope(self, self.session.call_tool(name, _SUCCESS_CALLS[name]), f"ext:{name}")
+                finally:
+                    if seam is not None:
+                        _claims_mod.run_gh = _saved
+                if name in _LIVE_GH_TOOLS:
+                    self.assertIs(result.get("isError"), False, f"{name}: a successful call must not be flagged isError; got {result.get('isError')!r}")
+                    self.assertIs(env.get("ok"), True, f"{name}: the success call must succeed; got {env.get('error')!r}")
                 else:
                     self.assertIs(result.get("isError"), False, f"{name}: a successful call must not be flagged isError; got {result.get('isError')!r}")
                     self.assertIs(env.get("ok"), True, f"{name}: the success call must succeed; got {env.get('error')!r}")
