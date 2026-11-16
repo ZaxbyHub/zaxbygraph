@@ -15,8 +15,10 @@ CONTRACT PINNED (issue #32):
 AC1 tools/list: every tool dict declares an `outputSchema` dict
 (permissive: additionalProperties may be true) and an `annotations`
 dict whose `readOnlyHint` is a boolean - True for every read tool, and
-not True for "sync" (the one writing tool; absent-on-sync reads as
-False). The registry is exactly the 16 tools of the extended surface.
+not True for the writing tools ("sync" mutates the store; "claim" and
+"release", since issues #77/#74, write GitHub comments through gh —
+absent-on-a-writing-tool reads as False). The registry is exactly the 20
+tools of the extended surface (16 plus claim/release/pr_guard/claims).
 
 AC2 tools/call: every result carries `structuredContent` equal to
 json.loads(content[0]["text"]) - the CLI JSON envelope
@@ -57,7 +59,8 @@ from zaxbygraph.sync import sync_repo
 
 import zaxbygraph.mcp_server as mcp_server  # noqa: F401  (base-leg guard)
 
-#: AC1: the exact extended typed-tool surface tools/list must advertise.
+#: AC1: the exact extended typed-tool surface tools/list must advertise
+#: (16 tools through issue #32; +4 for the claim lifecycle, issues #77/#74).
 EXPECTED_TOOLS = {
     "graph_status",
     "search",
@@ -75,7 +78,17 @@ EXPECTED_TOOLS = {
     "bundle",
     "brief",
     "churn",
+    "claim",
+    "release",
+    "pr_guard",
+    "claims",
 }
+
+#: AC1 (issues #77/#74): the per-tool readOnlyHint map. Every tool not
+#: listed here declares readOnlyHint TRUE. The writing tools are False:
+#: sync mutates the store; claim/release write GitHub comments (never the
+#: store). A name-derived rule would regress this — the map is explicit.
+WRITE_HINT_TOOLS = {"sync", "claim", "release"}
 
 #: AC4: the five CLI-derived tools joining the registry.
 NEW_TOOLS = {"similar_items", "triage", "bundle", "brief", "churn"}
@@ -158,7 +171,8 @@ class TestMcpTypedToolSurface(unittest.TestCase):
 
     def test_tools_declare_schema_and_annotations(self) -> None:
         """AC1: every tool declares an outputSchema dict and annotations
-        with a correct readOnlyHint; the registry is exactly 16 tools.
+        with a correct readOnlyHint; the registry is exactly 20 tools
+        (16 through issue #32, +4 claim tools with issues #77/#74).
 
         RED at base (no outputSchema, no annotations, 11 tools); GREEN
         after the fix pins the typed surface."""
@@ -173,15 +187,15 @@ class TestMcpTypedToolSurface(unittest.TestCase):
             # broken list (pr49 review PRR-026).
             self.assertEqual(
                 len(tools),
-                16,
-                "AC1 registry cardinality: tools/list must advertise exactly 16 "
+                20,
+                "AC1 registry cardinality: tools/list must advertise exactly 20 "
                 f"tool entries (a duplicate entry would inflate the list); got "
                 f"{len(tools)}: {names}",
             )
             self.assertEqual(
                 names,
                 EXPECTED_TOOLS,
-                "AC1 registry drift: tools/list must advertise exactly the 16-tool "
+                "AC1 registry drift: tools/list must advertise exactly the 20-tool "
                 f"registry; missing={sorted(EXPECTED_TOOLS - names)} "
                 f"extra={sorted(names - EXPECTED_TOOLS)}",
             )
@@ -235,16 +249,16 @@ class TestMcpTypedToolSurface(unittest.TestCase):
                 name = tool.get("name")
                 annotations = tool.get("annotations")
                 hint = annotations.get("readOnlyHint") if isinstance(annotations, dict) else None
-                if name == "sync":
+                if name in WRITE_HINT_TOOLS:
                     self.assertIsNot(
                         hint,
                         True,
-                        "AC1 readOnlyHint wrong: sync is the one writing tool; its "
+                        f"AC1 readOnlyHint wrong: {name} is a writing tool; its "
                         "readOnlyHint must be False (or absent)",
                     )
                     self.assertTrue(
                         hint is None or isinstance(hint, bool),
-                        f"AC1 readOnlyHint wrong: sync readOnlyHint must be a boolean "
+                        f"AC1 readOnlyHint wrong: {name} readOnlyHint must be a boolean "
                         f"or absent, got {hint!r}",
                     )
                 else:

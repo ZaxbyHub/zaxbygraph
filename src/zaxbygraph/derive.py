@@ -40,6 +40,7 @@ import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
+from zaxbygraph import claims as _claims
 from zaxbygraph.extract import _MAX_REF_DIGITS
 from zaxbygraph.query import _clamp_limit
 
@@ -1701,7 +1702,12 @@ def _synced_at(conn: sqlite3.Connection, repo: str) -> str | None:
     return row["last_incr_sync_at"] or row["last_full_sync_at"]
 
 
-def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
+def _triage_features(
+    conn: sqlite3.Connection,
+    repo: str,
+    cfg: dict,
+    claims_explicit: str | None = None,
+) -> dict:
     """Stage-1 raw features and gates for EVERY open issue: demand
     (reactions/participants/comments/duplicates/mentions), leverage
     (blocking/sub-issue gap/milestone), risk (reopens/file reverts) and the
@@ -2023,12 +2029,31 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         ):
             tracking_label_rows.setdefault(row["number"], set()).add(row["name"])
 
+    # The claimed gate (issues #74/#77): an active trusted work-claim
+    # comment on an open issue (or NAMING it) gates the issue out of the
+    # ranking. The [claims] values ride the same store/cwd/explicit chain
+    # as [triage] -- INCLUDING the explicit --config path the caller gave
+    # load_triage_config (a file may carry both [triage] and [claims] --
+    # `triage --config f.toml` with `[claims] enabled = false` must
+    # actually disable the gate); the gate
+    # map is DERIVED from the canonical claim list in claims.py, and the
+    # effective table rides the payload as the separate claims_config echo
+    # (the top-level config_source stays the [triage] chain, untouched).
+    claims_cfg = _claims.load_claims_config(
+        *_triage_config_chain(conn, claims_explicit)
+    )
+    claims_gate: dict[int, dict] = _claims.claims_gate_by_number(
+        conn, repo, claims_cfg
+    )
+
     # Gates first (blocking_open needs to know which blocked items are
     # themselves ungated).
     gates_by: dict[int, list[str]] = {}
     closeable_trackers: set[int] = set()
     for number, row in rows.items():
         gates: list[str] = []
+        if number in claims_gate:
+            gates.append("claimed")
         if any_blocked_by:
             is_blocked = any(
                 states.get(dst, {}).get("state") == "open"
@@ -2210,6 +2235,8 @@ def _triage_features(conn: sqlite3.Connection, repo: str, cfg: dict) -> dict:
         "blocked_by_out": blocked_by_out,
         "requires_notes": requires_notes,
         "closeable_trackers": sorted(closeable_trackers),
+        "claims_gate": claims_gate,
+        "claims_config": claims_cfg,
     }
 
 
@@ -2356,6 +2383,7 @@ def _triage_compute(
     cfg: dict,
     top_k: int,
     weights: dict | None = None,
+    claims_explicit: str | None = None,
 ) -> dict:
     """The full two-stage triage computation shared by triage/bundle/brief:
     stage-1 features + gates for every open issue, stage-2 (hotspot,
@@ -2364,7 +2392,10 @@ def _triage_compute(
     shared by every stage-2 analog scan (the per-row ``similar`` rebuild
     cost one full context per row — pr45 review K04); ``weights`` is the
     effective [derive] table for those scans (None -> load_weights()
-    defaults, preserving bare library-call behavior)."""
+    defaults, preserving bare library-call behavior).
+    ``claims_explicit`` is the caller's explicit --config path, threaded to
+    the [claims] chain so the claimed gate honours the same file the
+    [triage] table came from."""
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
     index, file_support, population = _coupling_index(conn, repo, caps)
@@ -2397,7 +2428,7 @@ def _triage_compute(
     ):
         merged_at[row["number"]] = row["merged_at"]
 
-    base = _triage_features(conn, repo, cfg)
+    base = _triage_features(conn, repo, cfg, claims_explicit=claims_explicit)
     features = base["features"]
     items = ctx["items"]
 
@@ -2444,17 +2475,21 @@ def _triage_compute(
         scores = _triage_row_scores(
             feat, cfg, asof_dt, requires_overrides=base["requires_notes"]
         )
-        rows.append(
-            {
-                "number": number,
-                "title": feat["title"],
-                "gates": list(feat["gates"]),
-                "ranked": not feat["gates"],
-                "scores": scores,
-                "resolved_paths": sorted(resolved),
-                "stage1": scores["stage1"],
-            }
-        )
+        row_out = {
+            "number": number,
+            "title": feat["title"],
+            "gates": list(feat["gates"]),
+            "ranked": not feat["gates"],
+            "scores": scores,
+            "resolved_paths": sorted(resolved),
+            "stage1": scores["stage1"],
+        }
+        claim_evidence = base["claims_gate"].get(number)
+        if claim_evidence is not None:
+            # Parsed evidence for the claimed gate (author, token, time,
+            # URL; the comment text stays untrusted_text-wrapped).
+            row_out["claim_evidence"] = claim_evidence
+        rows.append(row_out)
     rows.sort(key=lambda r: (-r["stage1"], r["number"]))
     ungated = [r for r in rows if r["ranked"]]
 
@@ -2532,6 +2567,8 @@ def _triage_compute(
         "blocking_source": base["blocking_source"],
         "blocked_by_out": base["blocked_by_out"],
         "closeable_trackers": base["closeable_trackers"],
+        "claims_gate": base["claims_gate"],
+        "claims_config": base["claims_config"],
         "ctx": ctx,
         "caps": caps,
         "features": features,
@@ -2543,16 +2580,24 @@ def _triage_compute(
 
 def _gated_block(rows: list[dict]) -> dict:
     """The gated reporting block (issue #69 AC5): every gated open issue,
-    under its gate names, with the total count."""
+    under its gate names, with the total count. The claimed gate's parsed
+    evidence (author, token, time, url, untrusted_text text) rides under
+    ``claims`` (issues #74/#77)."""
     gated_rows = [r for r in rows if not r["ranked"]]
     by_gate: dict[str, list[int]] = {}
     for r in gated_rows:
         for gate in r["gates"]:
             by_gate.setdefault(gate, []).append(r["number"])
+    claims_evidence = [
+        dict(r["claim_evidence"], number=r["number"])
+        for r in gated_rows
+        if "claim_evidence" in r
+    ]
     return {
         "count": len(gated_rows),
         "by_gate": by_gate,
         "numbers": sorted(r["number"] for r in gated_rows),
+        "claims": claims_evidence,
     }
 
 
@@ -2614,6 +2659,9 @@ def _triage_row_payload(row: dict) -> dict:
         "regression": row["regression"],
         "analog": row["analog"],
         "resolved_paths": row["resolved_paths"],
+        # The claimed gate's parsed evidence rides the row (issues #74/#77);
+        # brief strips it per its budget contract below.
+        **({"claim_evidence": row["claim_evidence"]} if "claim_evidence" in row else {}),
         **({"note": row["note"]} if "note" in row else {}),
     }
 
@@ -2671,11 +2719,11 @@ def triage(
         conn = prepare_snapshot(conn, repo, as_of=as_of, exclude_pr=None, reopen=True)
         try:
             return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                           include_gated, weights)
+                           include_gated, weights, claims_explicit=config)
         finally:
             drop_snapshot(conn)
     return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                   include_gated, weights)
+                   include_gated, weights, claims_explicit=config)
 
 
 def _triage(
@@ -2687,8 +2735,12 @@ def _triage(
     cursor: str | None,
     include_gated: bool,
     weights: dict | None,
+    claims_explicit: str | None = None,
 ) -> dict:
-    compute = _triage_compute(conn, repo, cfg, effective_top_k, weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, effective_top_k, weights=weights,
+        claims_explicit=claims_explicit,
+    )
 
     def _sort_key(row: dict) -> tuple[float, int]:
         return (-row["total_score"], row["number"])
@@ -2736,6 +2788,11 @@ def _triage(
             "affinity": dict(compute["analog_weights"]),
         },
         "config_source": _triage_config_source(cfg),
+        # The [claims] values in effect for the claimed gate, echoed as a
+        # SEPARATE object with its own nested config_source (issue #74
+        # AC4/#77 AC22): the top-level config_source above stays the
+        # [triage] chain, untouched.
+        "claims_config": _claims.claims_config_echo(compute["claims_config"]),
         "top_k": effective_top_k,
         "stage2_weight": cfg["stage2_weight"],
         "formula_version": cfg["formula_version"],
@@ -2912,7 +2969,9 @@ def _bundle(
     weights: dict | None,
     cfg: dict,
 ) -> dict:
-    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
+    )
     size_min, size_max = _parse_size(size)
     file_cap = max_files if max_files is not None else cfg["max_files"]
     excluded = sorted({int(n) for n in (exclude or [])})
@@ -3272,6 +3331,9 @@ def _bundle(
         "closeable_trackers": list(compute["closeable_trackers"]),
         "weights": weights_echo,
         "config_source": _triage_config_source(cfg),
+        # The [claims] values in effect beside the [triage] echo (the
+        # claimed gate keeps claimed issues out of every bundle pool).
+        "claims_config": _claims.claims_config_echo(compute["claims_config"]),
         "formula_version": cfg["formula_version"],
         "derived": True,
     }
@@ -3767,7 +3829,9 @@ def brief(
         # silently-disabled cap (pr45 review K09).
         raise ValueError("budget-tokens must be a positive integer")
     cfg = load_triage_config(*_triage_config_chain(conn, config))
-    compute = _triage_compute(conn, repo, cfg, cfg["top_k"], weights=weights)
+    compute = _triage_compute(
+        conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
+    )
     all_rows = {r["number"]: r for r in compute["rows"]}
     row = all_rows.get(number)
     if row is None:
@@ -3960,6 +4024,13 @@ def brief(
 
     features = _triage_row_payload(row)
     features["title"] = _untrusted(features["title"])
+    # Brief budget contract (issues #74/#77): the packet is budget-sensitive,
+    # so the ADDITIVE claims fields are deliberately STRIPPED from its
+    # payload -- claim_evidence here (the gated report block and the
+    # claims_config echo never join the packet), while features.gates
+    # legitimately keeps `claimed` via this shared row serializer. The
+    # suppressed-field list is pinned by tests/test_claims_ext.py.
+    features.pop("claim_evidence", None)
 
     packet: dict = {
         "repo": repo,

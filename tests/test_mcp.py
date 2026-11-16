@@ -98,6 +98,12 @@ EXPECTED_TOOLS = {
     "bundle",
     "brief",
     "churn",
+    # Claim lifecycle (issues #77/#74): claim/release write GitHub
+    # comments; pr_guard and claims are reads.
+    "claim",
+    "release",
+    "pr_guard",
+    "claims",
 }
 
 OTHER_SLUG = "acme/other"

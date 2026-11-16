@@ -281,6 +281,10 @@ fall back to a built-in map (critical/p0 1.0, high/p1/bug 0.75, medium/p2
 0.5, p3 0.25, low 0.1, matched case-insensitively) whenever `[triage.labels]`
 is unset — the payload's `config_source` gains a `+built-in-labels` suffix
 while it supplies the weights. Rows blocked by an open item, assigned,
+`claimed` (an active trusted work-claim comment on the issue or naming it
+— see the work-claims section; gated rows carry its parsed
+`claim_evidence`, and the `gated` block lists the evidence under
+`claims`),
 linked to an open PR (the gate value is `linked_pr` for timeline-verified
 links and `linked_pr (append-only evidence; may be stale)` for
 keyword/closing-ref evidence — an OPEN PR only, never a draft and never
@@ -388,7 +392,12 @@ chain as `[derive]`: defaults, then `<store>/config.toml`, then
 per name; unknown keys are `config_error`s; weights are capped at 1e9 so a
 runaway table can never mint a non-RFC-8259 `Infinity` score). The
 effective table (`weights`), `config_source` and `formula_version` echo in
-every `triage`/`bundle`/`brief` payload, and `bundle`'s echo additionally
+every `triage`/`bundle`/`brief` payload, and `triage`/`bundle` additionally
+carry a SEPARATE `claims_config` object (the `[claims]` values in effect
+for the claimed gate, plus their own nested `config_source`; `brief`'s
+budget-sensitive packet deliberately omits the additive claims fields
+while its `features.gates` still names `claimed`).
+`bundle`'s echo additionally
 carries the effective `[derive]` affinity weights under an `affinity` key
 — `bundle_id`'s config hash folds that whole echo in, so two different
 `[derive]` tables can never mint the same id. Stage-2 analog scans and
@@ -408,6 +417,110 @@ the way you treat shell profiles.
 `brief` addresses open issues only: a stored-but-closed issue (or a PR)
 answers `not_found` with "item #N is not an open issue" rather than a
 packet.
+
+### Work claims — `claim`, `release`, `pr-guard`, `claims`
+
+Multiple agent sessions share one repo; work claims keep two sessions off
+the same issue. A claim is one GitHub comment matched by the built-in
+patterns (`Agent claim` / `Working this issue`, case-insensitive, outside
+code fences and quoted lines). The canonical tokened form:
+
+```text
+**Agent claim:** session=<token> issues=#12,#13 working this issue now.
+```
+
+`<token>` is a per-session id (`[A-Za-z0-9-]{16,64}`); every post of one
+claim carries the same token. The tokenless recorded form is the prose
+pattern alone ("Working this issue now ..."), held by no token.
+
+```bash
+zaxbygraph claim N... [--settle-seconds S]        # post a claim (live GitHub write)
+zaxbygraph release N... --token TOK | --tokenless # end matching claims
+zaxbygraph pr-guard N...                          # open PRs closing a named issue
+zaxbygraph claims [--live]                        # active + stale claim listing
+```
+
+`claim` validates the login (trusted claim authors: the repo owner, org
+members, repository collaborators — including read-only outside
+collaborators — or viewerPermission ADMIN/MAINTAIN/WRITE), then live-reads
+each named issue's FULL comment history plus the open-PR list before
+posting one comment per issue in ascending order. Outcomes, one per
+command, with distinct exit codes: `claimed` (exit 0, the envelope prints
+the token and every comment URL), `not_applicable` (exit 0, nothing
+posted — claims disabled by `[claims] enabled = false`, or an untrusted
+login whose posted comments every reader would ignore), `taken` (exit 4 —
+a pre-held issue, an invalid/closed/PR item, an open closing PR, or a
+partial post rolled back with every posted claim released and any
+unreleasable comment listed by URL), `lost_race` (exit 5 — a competitor's
+claim landed between the pre-read and the post-settle read; every posted
+wave is released carrying the session's own token, the winner is named,
+one random-delay retry at most), and `github_unreachable` (exit 6 — gh
+failed; when the failure happened after claim comments were already posted, every
+posted wave was released first and `data.details` names the released URLs — and
+`unreleased_comments` any release that could not be posted, so exit 6 does NOT
+mean "nothing was written": inspect the details before retrying). The refusal
+envelope keeps its data:
+`error.code` is the outcome name and `data.details` carries the evidence.
+
+`release --token TOK` posts `**Claim released:** session=<token> done.` on
+every named issue whose ACTIVE claim carries that token — including
+ANOTHER session's token, which is how work whose session has ended is
+taken over (release by token, then claim afresh). `--tokenless` posts the
+tokenless form (`**Claim released:` with no `session=` segment) and ends
+only tokenless claims: a token release never ends a tokenless claim, and a
+tokenless release never ends a tokened one. No matching active claim is
+`taken` (exit 4), nothing posted.
+
+`pr-guard` is the required pre-flight before `gh pr create`: it lists
+every open PR whose closing references name one of the given issues
+(collisions → `taken`, exit 4; clean → exit 0) and posts nothing.
+
+`claims` lists every claim on open issues — active and stale, newest
+first, untrusted claims included with `trusted: false` (they never gate) —
+derived from stored comments with ages measured from the store's last sync
+time (`derived: true`); the claimed gate in `triage` withholds exactly the
+active trusted claims' issues from the ranking. Read `claims` instead of
+sweeping the comments table with SQL; an empty answer can mean the store
+is stale, so refresh with `--max-age` (or re-sync) before trusting it.
+`claims --live` reads the repo-wide comment feed from GitHub at call time
+(`live: true`, `derived: false`, wall-clock ages, each candidate
+re-validated through its own issue read plus the open-PR list); the store
+file is byte-identical when no refresh is requested; the claim workflow
+writes GitHub comments only, while `claims --max-age` may write it via
+`sync` (and `doctor --consolidate` can write it directly).
+
+Safety reads fail CLOSED, and their caps surface as `github_unreachable`
+with the reason in `details`: the repo-wide comment feed is paged to 40
+pages x 100 (a feed that FILLS all 40 pages — 4000 comments — cannot be
+listed live, because a full page cannot prove there is no next one), and so
+is each named issue's own comment history (read by `claim` and `release`),
+and the open-PR list is capped at 500 (a repository with 500 or more open
+PRs cannot pass `claim`, `pr-guard` or `claims --live`; `release` reads only
+the named issues' own histories and has no PR-list cap). A cap is a refusal, not a verdict that the work is free.
+
+A release needs no trusted author: the claim token is public in the claim
+comment (it is an identifier, not a secret), so any commenter whose comment
+matches the token shape can end a claim. That is the documented cooperative
+takeover path for a claim whose session has ended — holding a claim requires
+a trusted author, releasing one does not.
+
+The live pre-read reads the REQUESTED issues' own threads; a claim posted
+solely on an issue outside the request set that names a requested one is
+invisible to the live path (the derived `claimed` gate still covers it once
+the store is synced) — the two tiers differ by design, the live path
+trading that breadth for freshness.
+
+A claim is active for 72 hours (`[claims] window_hours`) from its comment
+time unless a later release matching its token shape ends it. The `[claims]`
+table (`enabled`, `patterns`, `release_prefix`, `token_prefix`,
+`window_hours`, `settle_seconds`) resolves through the same chain as
+`[triage]` (defaults → `<store>/config.toml` → `.zaxbygraph.toml` →
+`--config`, later wins per key; unknown keys are `config_error`s, and a `patterns`
+entry contained in `release_prefix` is refused — the release form is anchored
+and the claim form is a substring test, so that overlap would let a claim
+pattern swallow a release) and
+echoes in every claim payload as `claims_config` + `config_source`, beside
+the `claims_config` object `triage`/`bundle` carry for the gate.
 
 ### `sync` — fetch into the graph
 
@@ -806,18 +919,25 @@ envelope inside the tool result text, structured errors included.
 zaxbygraph mcp [--stale-seconds N]
 ```
 
-- **Tools** (16, sorted): `brief`, `bundle`, `churn`, `file_history`, `get_item`,
-  `graph_status`, `open_items`, `path`, `pr_overlap`, `related`,
-  `search`, `similar_items`, `sql`, `sync`, `triage`, `what_closed`.
+- **Tools** (20, sorted): `brief`, `bundle`, `churn`, `claim`, `claims`,
+  `file_history`, `get_item`, `graph_status`, `open_items`, `path`,
+  `pr_guard`, `pr_overlap`, `related`, `release`, `search`,
+  `similar_items`, `sql`, `sync`, `triage`, `what_closed`.
   Every tool declares a permissive `outputSchema` and `annotations`
-  (`readOnlyHint: true` on all but `sync`), and every COMPLETE tool result
+  (`readOnlyHint: true` everywhere except the writing tools — `sync`
+  mutates the store; `claim` and `release` write GitHub comments through
+  gh, never the store), and every COMPLETE tool result
   carries `structuredContent` — the parsed envelope — alongside the text
   block (issue #32). The one exception is the modern (2026-07-28)
   `input_required` answer, whose shape is `{resultType, requestState,
-  content}` — no structuredContent, by protocol design. The five work-selection/derived tools call the same query
+  content}` — no structuredContent, by protocol design. The work-selection/derived tools call the same query
   layer as their CLI commands, so data payloads match the CLI exactly on the
   same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
   it returns a job id and `graph_status` reports progress. The `sync` tool accepts the same `source` (`graphql`/`rest`) argument the CLI flag takes and honors the store's recorded profile when it is omitted.
+  The claim tools mirror their CLI commands: `claim`/`release` write
+  GitHub comments (readOnlyHint false), `pr_guard` and `claims`
+  (`live: bool` for the live view) are reads, and a nonzero claim outcome
+  answers `isError: true` with the FULL outcome envelope — data preserved.
 - **Protocol eras**: the server speaks legacy revisions (`2025-11-25`,
   `2025-06-18`, `2025-03-26`, `2024-11-05`, negotiated by `initialize`,
   latest answered 2025-11-25) and the stateless 2026-07-28 revision
@@ -989,6 +1109,16 @@ Machine-readable rules, worth knowing before scripting against this:
   names the path and the exact `sync` command. The distinction matters for
   retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
   request, or sync first), while a `1` sometimes will.
+  The claim commands add three of their own, one per nonzero outcome
+  (issues #77/#74): **`4`** — `taken` (the issue is held by an active
+  claim, is not an open issue, an open PR already closes it, a partial
+  claim post was rolled back, a release matched no active claim, or
+  `pr-guard` found collisions; the envelope keeps its data — the holder,
+  the PR numbers, the unreleased comment URLs); **`5`** — `lost_race` (a
+  competitor's claim landed between the pre-read and the post-settle read
+  and survived the one retry; the winner is named); **`6`** —
+  `github_unreachable` (gh failed; if claim comments were already posted they
+  were released first — see `data.details.released` / `unreleased_comments`).
   **The inspection and source-reachability refusals that answer `1` are
   narrow, not a general rule.** `snapshot pull`'s `dest_uninspectable`,
   `snapshot pull`'s `source_unreachable` (git could not reach the snapshot

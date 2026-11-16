@@ -50,8 +50,10 @@ from zaxbygraph import __version__
 from zaxbygraph.cli import (
     _brief_query,
     _bundle_query,
+    _claims_query,
     _freshness,
     _item_count,
+    _resolve_weight_config,
     _similar_query,
     _triage_query,
     _truncate_bodies,
@@ -60,6 +62,7 @@ from zaxbygraph.cli import (
 )
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
 from zaxbygraph.derive import ConfigError as DeriveConfigError
+from zaxbygraph.claims import ConfigError as ClaimsConfigError
 from zaxbygraph.github import GhApiSource as GhRestSource
 from zaxbygraph.graphql import GraphQLSource as GhApiSource
 from zaxbygraph.paths import resolve_db
@@ -1425,6 +1428,14 @@ def _translated_derive(fn, conn, slug: str, db_path: Path, /, *args) -> dict:
             "config_error", message, hint="fix the derive weight configuration",
             slug=slug, db_path=db_path,
         ) from exc
+    except ClaimsConfigError as exc:
+        # The [claims] chain reports exactly like [derive]/[triage] here
+        # (issues #77/#74): a coded config_error, never a runtime relabel.
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        raise ToolError(
+            "config_error", message, hint="fix the [claims] configuration",
+            slug=slug, db_path=db_path,
+        ) from exc
     except ValueError as exc:
         raise ToolError(
             "bad_request", str(exc), hint="fix the tool arguments",
@@ -1603,6 +1614,243 @@ def _tool_churn(arguments: dict, ctx) -> dict:
                 "bad_request", str(exc), hint="fix the tool arguments",
                 slug=slug, db_path=db_path,
             ) from exc
+        return _read_envelope(conn, slug, db_path, data, False, ctx)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Claim lifecycle tools (issues #77/#74). claim/release WRITE GitHub
+# comments (never the store); pr_guard and claims are reads. The LIVE paths
+# bypass the store/freshness machinery entirely -- no stale-refresh sync,
+# the store stays byte-identical -- while the derived `claims` tool keeps
+# normal read semantics. Nonzero outcomes return the FULL envelope
+# (ok:false, error.code = outcome name, data with the outcome details) --
+# the outcome IS the answer, so the data payload survives the failure.
+
+
+def _claim_numbers(arguments: dict, tool: str) -> list[int]:
+    """A required non-empty int-array `numbers` argument (the claim
+    commands' issue list), validated BEFORE resolution."""
+    values = arguments.get("numbers")
+    if not isinstance(values, list) or not values:
+        raise ToolError(
+            "bad_request", f"{tool} needs a non-empty numbers array",
+            hint=f'try {tool} {{"numbers": [12]}}',
+        )
+    if any(isinstance(v, bool) or not isinstance(v, int) for v in values):
+        raise ToolError(
+            "bad_request", f"{tool} numbers must be integers",
+            hint="pass numbers as an array of issue numbers",
+        )
+    if len(values) > _MAX_NUMBERS:
+        raise ToolError(
+            "bad_request",
+            f"{tool} numbers is capped at {_MAX_NUMBERS}",
+            hint=f"pass at most {_MAX_NUMBERS} issue numbers",
+        )
+    if any(v < 1 or v > 2**63 - 1 for v in values):
+        raise ToolError(
+            "bad_request", f"{tool} numbers are out of range",
+            hint="pass item numbers as positive integers",
+        )
+    return [int(v) for v in values]
+
+
+def _claims_cfg_for(db_path: Path) -> dict:
+    from zaxbygraph import claims as claims_mod
+
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, None)
+    return claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
+
+
+def _claims_tool_error(exc, *, slug=None, db_path=None) -> ToolError:
+    from zaxbygraph import claims as claims_mod
+
+    # FB-011: carry the resolved identity (the ToolError convention every
+    # other MCP path honours) so the error envelope is not null-blind.
+    if isinstance(exc, claims_mod.ConfigError):
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        return ToolError(
+            "config_error",
+            message,
+            hint="fix the [claims] configuration",
+            slug=slug,
+            db_path=db_path,
+        )
+    return ToolError(
+        "runtime",
+        str(exc),
+        hint="internal error; the server log has details",
+        slug=slug,
+        db_path=db_path,
+    )
+
+
+def _claims_schema_defaults(tool: str) -> dict:
+    """Empty values for the tool's own outputSchema-required data keys
+    (FB-008): a FAILURE envelope preserves its outcome data, and that data
+    must still validate against the advertised schema -- a strict MCP
+    client rejects the whole result otherwise, losing the coded outcome at
+    exactly the moment it matters."""
+    schema = _output_schema_for(tool)
+    props = (schema.get("properties") or {}).get("data") or {}
+    required = props.get("required") or []
+    types = props.get("properties") or {}
+    defaults: dict = {}
+    for key in required:
+        kind = (types.get(key) or {}).get("type")
+        if isinstance(kind, list):
+            kind = next((k for k in kind if k != "null"), None)
+        if kind == "array":
+            defaults[key] = []
+        elif kind == "boolean":
+            defaults[key] = False
+        elif kind == "object":
+            defaults[key] = {}
+        elif kind == "string":
+            defaults[key] = ""
+        else:
+            defaults[key] = None
+    return defaults
+
+
+def _live_claims_envelope(slug: str, db_path: Path, flow, *, tool: str) -> dict:
+    """Run one live claims flow and answer the outcome envelope (data
+    preserved on nonzero outcomes -- isError: true comes from the error
+    object the envelope carries)."""
+    from zaxbygraph.cli import claims_command_envelope
+
+    try:
+        cfg = _claims_cfg_for(db_path)
+    except Exception as exc:
+        raise _claims_tool_error(exc, slug=slug, db_path=db_path) from exc
+    env, _exit_code = claims_command_envelope(slug, db_path, cfg, flow)
+    if env.get("ok") is False:
+        data = env.get("data")
+        if isinstance(data, dict):
+            if tool == "claims":
+                # A live listing that failed IS a live attempt: do not let the
+                # schema filler write live:false over it (FB-008 closeout).
+                data.setdefault("live", True)
+                data.setdefault("derived", False)
+            for key, value in _claims_schema_defaults(tool).items():
+                data.setdefault(key, value)
+            env["data"] = data
+    return env
+
+
+def _tool_claim(arguments: dict, ctx) -> dict:
+    numbers = _claim_numbers(arguments, "claim")
+    # Resolve the identity BEFORE the settle pre-check (FB-011 + the closeout
+    # critic): the pre-check raises a coded bad_request, and a refusal that
+    # cannot name the repository it refused is the null-blind envelope the
+    # ToolError slug/db_path convention exists to remove.
+    slug, db_path = _resolve_target(arguments, ctx)
+    settle = arguments.get("settle_seconds")
+    if settle is not None:
+        # FB-001: the ONE shared validator (finite, non-negative, <=300) the
+        # config chain and the CLI flag apply. Its ConfigError becomes a
+        # coded bad_request that CARRIES the resolved identity.
+        from zaxbygraph import claims as _claims_mod
+
+        try:
+            _claims_mod._coerce_settle(settle, "the settle_seconds argument")
+        except _claims_mod.ConfigError as exc:
+            raise ToolError(
+                "bad_request",
+                str(exc),
+                hint="pass settle_seconds as seconds (default [claims] settle_seconds)",
+                slug=slug,
+                db_path=db_path,
+            ) from exc
+        except (OverflowError, ValueError) as exc:
+            # A guard, not a reachable path: _coerce_settle converts every
+            # range fault to ConfigError today. It stays so a future change
+            # inside that validator degrades to a coded refusal with identity
+            # rather than to the dispatcher's identity-less generic handler.
+            raise ToolError(
+                "bad_request",
+                f"settle_seconds is outside the representable range: {exc}",
+                hint="pass settle_seconds as seconds (default [claims] settle_seconds)",
+                slug=slug,
+                db_path=db_path,
+            ) from exc
+
+    def _flow(repo: str, cfg: dict):
+        from zaxbygraph import claims as claims_mod
+
+        return claims_mod.take_claims(
+            repo, numbers, cfg, settle_seconds=float(settle) if settle is not None else None
+        )
+
+    return _live_claims_envelope(slug, db_path, _flow, tool="claim")
+
+
+def _tool_release(arguments: dict, ctx) -> dict:
+    numbers = _claim_numbers(arguments, "release")
+    token = arguments.get("token")
+    if token is not None and not isinstance(token, str):
+        raise ToolError(
+            "bad_request", "token must be a string",
+            hint="pass the session token whose claims are released",
+        )
+    tokenless = _bool_arg(arguments, "tokenless")
+    if not tokenless and not token:
+        raise ToolError(
+            "bad_request", "release needs token or tokenless",
+            hint='try release {"numbers": [12], "token": "..."}'
+            ' or {"numbers": [12], "tokenless": true}',
+        )
+    slug, db_path = _resolve_target(arguments, ctx)
+
+    def _flow(repo: str, cfg: dict):
+        from zaxbygraph import claims as claims_mod
+
+        return claims_mod.release_claims(
+            repo, numbers, cfg, None if tokenless else token
+        )
+
+    return _live_claims_envelope(slug, db_path, _flow, tool="release")
+
+
+def _tool_pr_guard(arguments: dict, ctx) -> dict:
+    numbers = _claim_numbers(arguments, "pr_guard")
+    slug, db_path = _resolve_target(arguments, ctx)
+
+    def _flow(repo: str, cfg: dict):
+        from zaxbygraph import claims as claims_mod
+
+        return claims_mod.pr_guard(repo, numbers, cfg)
+
+    return _live_claims_envelope(slug, db_path, _flow, tool="pr_guard")
+
+
+def _tool_claims(arguments: dict, ctx) -> dict:
+    live = _bool_arg(arguments, "live")
+    slug, db_path = _resolve_target(arguments, ctx)
+    if live:
+        def _flow(repo: str, cfg: dict):
+            from zaxbygraph import claims as claims_mod
+
+            try:
+                return "claimed", claims_mod.list_claims_live(repo, cfg), None
+            except claims_mod.GhFailure as exc:
+                return (
+                    "github_unreachable",
+                    {
+                        "outcome": "github_unreachable",
+                        "details": {"reason": exc.message},
+                        "claims_config": claims_mod.claims_config_echo(cfg),
+                        "config_source": cfg.get("_config_source") or "built-ins",
+                    },
+                    f"GitHub could not be reached: {exc.message}",
+                )
+
+        return _live_claims_envelope(slug, db_path, _flow, tool="claims")
+    conn = _open_corpus(slug, db_path)
+    try:
+        data = _translated_derive(_claims_query, conn, slug, db_path, None)
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
         conn.close()
@@ -2099,15 +2347,16 @@ _TOOL_SHAPES: dict[str, dict] = {
         "description": "Open issues ranked workable by the documented"
         " formula, with gates naming every exclusion; pages via cursor"
         " (derived, read-only).",
-        "data_keys": ("blocking_source", "closeable_trackers",
-                      "config_source", "cursor", "derived", "formula_version",
-                      "gated", "hotspot_asof", "repo", "rows",
-                      "stage2_weight", "top_k", "triage_asof", "truncated",
-                      "weights"),
+        "data_keys": ("blocking_source", "claims_config",
+                      "closeable_trackers", "config_source", "cursor",
+                      "derived", "formula_version", "gated", "hotspot_asof",
+                      "repo", "rows", "stage2_weight", "top_k",
+                      "triage_asof", "truncated", "weights"),
         "row_fields": {
-            "rows": ("analog", "gates", "hotspot", "hotspot_raw", "note",
-                     "number", "ranked", "regression", "resolved_paths",
-                     "scores", "stage2", "title", "total_score"),
+            "rows": ("analog", "claim_evidence", "gates", "hotspot",
+                     "hotspot_raw", "note", "number", "ranked", "regression",
+                     "resolved_paths", "scores", "stage2", "title",
+                     "total_score"),
         },
         "data": _props(
             {
@@ -2115,12 +2364,18 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "rows": _open_objects(
                     "{number, title, gates, ranked, scores, total_score,"
                     " stage2, hotspot, hotspot_raw, regression, analog,"
-                    " resolved_paths, note?}"
+                    " resolved_paths, note?, claim_evidence?}"
                 ),
                 "weights": dict(
                     _OPEN_OBJ, description="the effective weight table"
                 ),
                 "config_source": _STR,
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect for the"
+                    " claimed gate, plus their nested config_source"
+                    " (issues #74/#77)",
+                ),
                 "top_k": _INT_NULL,
                 "stage2_weight": _NUM_NULL,
                 "formula_version": _STR,
@@ -2130,8 +2385,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "gated": {
                     "type": "object",
                     "additionalProperties": True,
-                    "description": "{count, by_gate, numbers}: every gated"
-                    " open issue under its gate names (issue #69 AC5)",
+                    "description": "{count, by_gate, numbers, claims}: every"
+                    " gated open issue under its gate names, the claimed"
+                    " gate's evidence under claims (issue #69 AC5;"
+                    " issues #74/#77)",
                 },
                 "closeable_trackers": {
                     "type": "array",
@@ -2157,10 +2414,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                     " unparseable_timestamps, ...)",
                 },
             },
-            ("blocking_source", "closeable_trackers", "config_source",
-             "cursor", "derived", "formula_version", "gated",
-             "hotspot_asof", "repo", "rows", "stage2_weight", "top_k",
-             "triage_asof", "truncated", "weights"),
+            ("blocking_source", "claims_config", "closeable_trackers",
+             "config_source", "cursor", "derived", "formula_version",
+             "gated", "hotspot_asof", "repo", "rows", "stage2_weight",
+             "top_k", "triage_asof", "truncated", "weights"),
         ),
     },
     "bundle": {
@@ -2168,9 +2425,9 @@ _TOOL_SHAPES: dict[str, dict] = {
         "description": "Evidence-backed 2-3-issue work bundles over the"
         " triage pool, with dropped pool members named (derived,"
         " read-only).",
-        "data_keys": ("bundles", "closeable_trackers", "config_source",
-                      "derived", "dropped", "excluded", "formula_version",
-                      "gated", "merge_candidates", "pool",
+        "data_keys": ("bundles", "claims_config", "closeable_trackers",
+                      "config_source", "derived", "dropped", "excluded",
+                      "formula_version", "gated", "merge_candidates", "pool",
                       "related_not_bundleable", "repo", "unbundled",
                       "weights"),
         "data": _props(
@@ -2221,6 +2478,13 @@ _TOOL_SHAPES: dict[str, dict] = {
                     _OPEN_OBJ, description="the effective weight table"
                 ),
                 "config_source": _STR,
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect for the"
+                    " claimed gate (claimed issues are gated and never"
+                    " bundleable), plus their nested config_source"
+                    " (issues #74/#77)",
+                ),
                 "formula_version": _STR,
                 "derived": _BOOL,
                 "truncated": {
@@ -2243,10 +2507,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                     " unparseable_timestamps, ...)",
                 },
             },
-            ("bundles", "closeable_trackers", "config_source", "derived",
-             "dropped", "excluded", "formula_version", "gated",
-             "merge_candidates", "pool", "related_not_bundleable", "repo",
-             "unbundled", "weights"),
+            ("bundles", "claims_config", "closeable_trackers",
+             "config_source", "derived", "dropped", "excluded",
+             "formula_version", "gated", "merge_candidates", "pool",
+             "related_not_bundleable", "repo", "unbundled", "weights"),
         ),
     },
     "brief": {
@@ -2351,6 +2615,170 @@ _TOOL_SHAPES: dict[str, dict] = {
             ),
             "description": "bare list of per-path rows",
         },
+    },
+    "claim": {
+        "cli": "claim",
+        "description": "Post an Agent claim comment on every named issue"
+        " (live GitHub write through gh; never the store). One session"
+        " token across all posts, ascending issue order, one retry wave at"
+        " most; a lost race releases every wave it posted.",
+        "data_keys": ("claims_config", "config_source", "outcome"),
+        "data": _props(
+            {
+                "outcome": {
+                    "type": "string",
+                    "description": "claimed | not_applicable | taken |"
+                    " lost_race | github_unreachable; the nonzero outcomes"
+                    " answer ok:false with error.code = outcome and the"
+                    " data payload preserved",
+                },
+                "token": {
+                    "type": ["string", "null"],
+                    "description": "the session token (present once a claim"
+                    " wave was attempted)",
+                },
+                "posts": _open_objects(
+                    "{number, url, comment_id} for each posted claim"
+                ),
+                "reason": {
+                    "type": "string",
+                    "description": "present on not_applicable (claims"
+                    " disabled or an untrusted login)",
+                },
+                "details": dict(
+                    _OPEN_OBJ,
+                    description="outcome evidence: held_by_active_claim /"
+                    " open_closing_prs / invalid_issues / winner /"
+                    " released / unreleased_comments",
+                ),
+                "login_probes": dict(
+                    _OPEN_OBJ,
+                    description="the login-trust probe answers",
+                ),
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect plus their"
+                    " nested config_source",
+                ),
+                "config_source": _STR,
+            },
+            ("claims_config", "config_source", "outcome"),
+        ),
+    },
+    "release": {
+        "cli": "release",
+        "description": "Post a claim release for a session token (live"
+        " GitHub write; a token release never ends a tokenless claim and"
+        " --tokenless ends only tokenless claims).",
+        "data_keys": ("claims_config", "config_source", "outcome"),
+        "data": _props(
+            {
+                "outcome": {
+                    "type": "string",
+                    "description": "claimed | taken | github_unreachable"
+                    " (taken = no named issue carries a matching active"
+                    " claim)",
+                },
+                "released": _open_objects(
+                    "{number, url} for each posted release"
+                ),
+                "details": dict(
+                    _OPEN_OBJ,
+                    description="outcome evidence (matching_issues,"
+                    " released, unreleased)"
+                ),
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect plus their"
+                    " nested config_source",
+                ),
+                "config_source": _STR,
+            },
+            ("claims_config", "config_source", "outcome"),
+        ),
+    },
+    "pr_guard": {
+        "cli": "pr-guard",
+        "description": "List every open PR that closes a named issue (the"
+        " collision check before gh pr create; posts nothing).",
+        "data_keys": ("claims_config", "collisions", "config_source",
+                      "outcome"),
+        "data": _props(
+            {
+                "outcome": {
+                    "type": "string",
+                    "description": "claimed (clean) | taken (collisions) |"
+                    " github_unreachable",
+                },
+                "collisions": _open_objects(
+                    "{number, title, url, closes} for each open PR closing"
+                    " a named issue"
+                ),
+                "open_prs_checked": _INT,
+                "named": {
+                    "type": "array",
+                    "items": _INT,
+                    "description": "the issue numbers checked",
+                },
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect plus their"
+                    " nested config_source",
+                ),
+                "config_source": _STR,
+            },
+            ("claims_config", "collisions", "config_source", "outcome"),
+        ),
+    },
+    "claims": {
+        "cli": "claims",
+        "description": "Active and stale work-claim comments over the repo's"
+        " open issues, newest first, with parsed evidence (token, author,"
+        " association, age, named issues) and the matched text wrapped as"
+        " untrusted_text. Derived from stored comments by default (ages from"
+        " the store's last sync time); live=true reads the repo-wide"
+        " comments feed from GitHub with wall-clock ages.",
+        # FB-024: `claims`/`stale_claims` are CONDITIONAL, not
+        # always-present. A live read that FAILED must not fabricate an empty
+        # listing out of a read that never happened (the rule
+        # LiveListingFailClosedTests pins on the CLI), so the always-present
+        # set stops at the keys a failed live attempt still answers. The
+        # listings stay declared properties for the success payload.
+        "data_keys": ("claims_config", "config_source", "derived", "live"),
+        "row_fields": {
+            "claims": (
+                "active", "age_hours", "author", "author_association",
+                "comment_id", "created_at", "ended_by_release", "named_issues",
+                "number", "text", "title", "token", "trusted", "url",
+            ),
+        },
+        "data": _props(
+            {
+                "claims": _open_objects(
+                    "claim rows newest first: {number, title, comment_id,"
+                    " author, author_association, trusted, token,"
+                    " created_at, age_hours, named_issues, url, text"
+                    " {untrusted_text}, active}"
+                ),
+                "stale_claims": _open_objects(
+                    "the window-expired subset, newest first, with ages"
+                ),
+                "derived": _BOOL,
+                "live": _BOOL,
+                "truncated": {
+                    "type": "boolean",
+                    "description": "present when the live presentation cap"
+                    " cut the listing (after complete collection)",
+                },
+                "claims_config": dict(
+                    _OPEN_OBJ,
+                    description="the [claims] values in effect plus their"
+                    " nested config_source",
+                ),
+                "config_source": _STR,
+            },
+            ("claims_config", "config_source", "derived", "live"),
+        ),
     },
 }
 
@@ -2630,15 +3058,90 @@ _TOOLS: list[dict] = [
             }
         ),
     },
+    {
+        "name": "claim",
+        "description": "Post an Agent claim comment on every named issue (the CLI claim command; live GitHub write through gh, never the store) — claim BEFORE starting work on an issue",
+        "inputSchema": _schema(
+            {
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "minItems": 1,
+                    "maxItems": _MAX_NUMBERS,
+                    "description": "Issue numbers to claim (posted in ascending order)",
+                },
+                "settle_seconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Override the post-settle read delay (default: [claims] settle_seconds, 2s)",
+                },
+                **_REPO_DB,
+            },
+            ["numbers"],
+        ),
+    },
+    {
+        "name": "release",
+        "description": "Post a claim release for a session token (the CLI release command; live GitHub write; a token release never ends a tokenless claim)",
+        "inputSchema": _schema(
+            {
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "minItems": 1,
+                    "maxItems": _MAX_NUMBERS,
+                    "description": "Issue numbers whose active claim carries the token",
+                },
+                "token": {"type": "string", "description": "The session token whose active claims are released"},
+                "tokenless": {"type": "boolean", "description": "Release the TOKENLESS claim form (never ends a tokened claim)"},
+                **_REPO_DB,
+            },
+            ["numbers"],
+        ),
+    },
+    {
+        "name": "pr_guard",
+        "description": "List every open PR that closes a named issue — the collision check to run before gh pr create (the CLI pr-guard command; posts nothing)",
+        "inputSchema": _schema(
+            {
+                "numbers": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1},
+                    "minItems": 1,
+                    "maxItems": _MAX_NUMBERS,
+                    "description": "Issue numbers to check for an open closing PR",
+                },
+                **_REPO_DB,
+            },
+            ["numbers"],
+        ),
+    },
+    {
+        "name": "claims",
+        "description": "Active and stale work-claim comments with parsed evidence (the CLI claims command; derived from stored comments by default, live=true reads GitHub with wall-clock ages)",
+        "inputSchema": _schema(
+            {
+                "live": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Read the repo-wide comment feed from GitHub at call time (live: true, derived: false; the store is never written)",
+                },
+                **_REPO_DB,
+            }
+        ),
+    },
 ]
 
 # Issue #32: every tool declares an outputSchema and carries annotations
-# with readOnlyHint true except sync (the only tool that mutates the store).
+# with readOnlyHint true except the WRITING tools. Since issue #77 that is
+# a per-tool map, not a name rule: `sync` mutates the store; `claim` and
+# `release` write GitHub comments (never the store); everything else reads.
 # Since issue #72 C17 the outputSchema is PER-TOOL, derived from the shape
 # registry above (_output_schema_for) — it names the envelope keys, the
 # tool's data keys and row fields, and stays permissive (additionalProperties
 # true) at every level. The listing is SORTED BY NAME — one deterministic
 # order for both protocol eras (the modern tools/list pins sorted order).
+_WRITE_HINT_TOOLS = frozenset({"sync", "claim", "release"})
 if {tool["name"] for tool in _TOOLS} != set(_TOOL_SHAPES):
     raise RuntimeError(
         "shape registry drift: _TOOL_SHAPES must describe exactly the"
@@ -2650,7 +3153,9 @@ if {tool["name"] for tool in _TOOLS} != set(_TOOL_SHAPES):
     )
 for _tool in _TOOLS:
     _tool["outputSchema"] = _output_schema_for(_tool["name"])
-    _tool["annotations"] = {"readOnlyHint": _tool["name"] != "sync"}
+    _tool["annotations"] = {
+        "readOnlyHint": _tool["name"] not in _WRITE_HINT_TOOLS
+    }
 _TOOLS.sort(key=lambda entry: entry["name"])
 
 _TOOL_HANDLERS = {
@@ -2670,6 +3175,10 @@ _TOOL_HANDLERS = {
     "bundle": _tool_bundle,
     "brief": _tool_brief,
     "churn": _tool_churn,
+    "claim": _tool_claim,
+    "release": _tool_release,
+    "pr_guard": _tool_pr_guard,
+    "claims": _tool_claims,
 }
 
 

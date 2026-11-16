@@ -54,6 +54,12 @@ CLI_TO_SURFACE = {
     "bundle": "bundle",
     "brief": "brief",
     "sync": "sync",
+    # Claim lifecycle (issues #77/#74): claim/release write GitHub
+    # comments through gh (never the store); pr-guard and claims are reads.
+    "claim": "claim",
+    "release": "release",
+    "pr-guard": "pr_guard",
+    "claims": "claims",
     # Snapshot transport (issue #34): a human-workflow surface (moves a
     # store between machines), not an agent read - the MCP gap is recorded.
     "snapshot": "documented-gap: snapshot transport (issue #34); MCP surfacing is a future lane",
@@ -78,6 +84,11 @@ TOOL_TO_CLI = {
     "bundle": "bundle",
     "brief": "brief",
     "churn": "churn",
+    # Claim lifecycle (issues #77/#74).
+    "claim": "claim",
+    "release": "release",
+    "pr_guard": "pr-guard",
+    "claims": "claims",
 }
 
 

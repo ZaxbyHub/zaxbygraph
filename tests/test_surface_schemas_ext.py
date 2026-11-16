@@ -42,6 +42,7 @@ import unittest
 from pathlib import Path
 
 from fixtures import REPO, FakeGitHubSource, issue, pr_file, pull, review
+from test_claims_ext import FakeGh
 from zaxbygraph import cli
 from test_mcp import McpSession, pin_env_for, run_cli, tool_envelope
 from zaxbygraph.db import connect, init_schema
@@ -164,6 +165,16 @@ _ERROR_CALLS = {
     "bundle": ({"repo": REPO, "count": "x"}, "bad_request"),
     "brief": ({"repo": REPO, "number": 99999}, "not_found"),
     "churn": ({"repo": REPO, "limit": "x"}, "bad_request"),
+    # FB-008: the four live claims tools. Every leg for them runs against a
+    # dead gh seam (installed class-wide in setUp), so what gets validated is
+    # the github_unreachable envelope -- data preserved, required keys filled.
+    "claim": ({"repo": REPO, "numbers": [1]}, "github_unreachable"),
+    "release": (
+        {"repo": REPO, "numbers": [1], "token": "RELEASE-TOKEN-1234567890"},
+        "github_unreachable",
+    ),
+    "pr_guard": ({"repo": REPO, "numbers": [1]}, "github_unreachable"),
+    "claims": ({"repo": REPO, "live": True}, "github_unreachable"),
 }
 
 _SUCCESS_CALLS = {
@@ -185,9 +196,44 @@ _SUCCESS_CALLS = {
     "bundle": {"repo": REPO},
     "brief": {"repo": REPO, "number": 1},
     "churn": {"repo": REPO},
+    "claim": {"repo": REPO, "numbers": [1]},
+    "release": {"repo": REPO, "numbers": [1], "token": "RELEASE-TOKEN-1234567890"},
+    "pr_guard": {"repo": REPO, "numbers": [1]},
+    "claims": {"repo": REPO, "live": True},
 }
 
 _ALL_TOOLS = sorted(_SUCCESS_CALLS)
+
+#: The four live claims tools (FB-008): they call GitHub through
+#: ``zaxbygraph.claims.run_gh``, so the sweep runs their legs against a dead
+#: seam and validates the github_unreachable envelope against the SAME
+#: outputSchema the success result declares.
+_LIVE_GH_TOOLS = frozenset({"claim", "release", "pr_guard", "claims"})
+
+
+def _live_success_seam(name: str) -> FakeGh:
+    """A seeded SUCCESSFUL gh for one live tool's success leg (cubic's
+    re-review of c9b8359): the dead seam answers github_unreachable, which
+    validates the failure envelope but never the SUCCESS payload -- and a leg
+    that cannot fail is not coverage. Each leg gets its OWN fake, so one
+    tool's seeding (a claim for `release` to end) cannot change another
+    tool's outcome (a pre-existing claim would make `claim` answer
+    already-claimed)."""
+    fake = FakeGh()
+    if name == "release":
+        # releasing needs a claim to end; the sweep's token is fixed, so the
+        # seeded claim carries exactly that token.
+        fake.add_claim(1, "RELEASE-TOKEN-1234567890", hours_ago=2.0)
+    elif name == "claims":
+        # an empty repo-wide feed would validate an empty listing only; seed
+        # one claim so the row shape is exercised too.
+        fake.add_repo_comment(
+            5,
+            "**Agent claim:** session=SWEEPTOKEN1234567890 issues=#5"
+            " Working this issue now.",
+            hours_ago=1.0,
+        )
+    return fake
 
 
 class _NoopRunner:
@@ -211,11 +257,28 @@ class OutputSchemaExtTests(unittest.TestCase):
         pin_env_for(self, self.root, db=self.db_path)
         self.session = McpSession(self, cwd=str(self.root), repo=REPO, db=str(self.db_path), stale_after_s=_NO_REFRESH_S, sync_runner=_NoopRunner())
         self.addCleanup(self.session.stop)
+        # FB-008: a dead gh seam for the live claims tools' legs. No other
+        # swept tool calls gh, so one class-wide seam is enough.
+        from zaxbygraph import claims as _claims_mod
+
+        class _DeadGh:
+            def __call__(self, cmd):
+                return (1, "", "gh: sweep seam is dead (no network in tests)")
+
+        self._saved_run_gh = _claims_mod.run_gh
+        _claims_mod.run_gh = _DeadGh()
+        self.addCleanup(self._restore_run_gh, _claims_mod)
         self.session.initialize()
         listing = self.session.wait_response(self.session.request("tools/list", {})).get("result") or {}
         self.tools = {t.get("name"): t for t in listing.get("tools") or [] if isinstance(t, dict)}
 
-    def test_all_sixteen_tools_success_and_error_validate(self) -> None:
+    def _restore_run_gh(self, mod) -> None:
+        mod.run_gh = self._saved_run_gh
+
+    def test_all_tools_success_and_error_validate(self) -> None:
+        """Every ADVERTISED tool's real success and error results must
+        validate against its declared outputSchema (renamed from
+        ...sixteen... when the four live claims tools joined, FB-008)."""
         problems = _Problems()
         for name in _ALL_TOOLS:
             with problems.leg(f"{name} success"):
@@ -223,9 +286,30 @@ class OutputSchemaExtTests(unittest.TestCase):
                 self.assertIsInstance(tool, dict, f"tools/list must advertise {name}; got {sorted(self.tools)}")
                 schema = (tool or {}).get("outputSchema")
                 self.assertIsInstance(schema, dict, f"{name} must declare an outputSchema")
-                result, env = tool_envelope(self, self.session.call_tool(name, _SUCCESS_CALLS[name]), f"ext:{name}")
-                self.assertIs(result.get("isError"), False, f"{name}: a successful call must not be flagged isError; got {result.get('isError')!r}")
-                self.assertIs(env.get("ok"), True, f"{name}: the success call must succeed; got {env.get('error')!r}")
+                seam = None
+                if name in _LIVE_GH_TOOLS:
+                    # A live tool cannot succeed against the DEAD seam, so the
+                    # success leg swaps in a seeded successful gh (cubic's
+                    # re-review): otherwise this leg validates only the
+                    # failure envelope while its name claims the success one.
+                    # The dead seam is restored immediately afterwards, so the
+                    # error leg below still runs against it.
+                    from zaxbygraph import claims as _claims_mod
+
+                    seam = _live_success_seam(name)
+                    _saved = _claims_mod.run_gh
+                    _claims_mod.run_gh = seam
+                try:
+                    result, env = tool_envelope(self, self.session.call_tool(name, _SUCCESS_CALLS[name]), f"ext:{name}")
+                finally:
+                    if seam is not None:
+                        _claims_mod.run_gh = _saved
+                if name in _LIVE_GH_TOOLS:
+                    self.assertIs(result.get("isError"), False, f"{name}: a successful call must not be flagged isError; got {result.get('isError')!r}")
+                    self.assertIs(env.get("ok"), True, f"{name}: the success call must succeed; got {env.get('error')!r}")
+                else:
+                    self.assertIs(result.get("isError"), False, f"{name}: a successful call must not be flagged isError; got {result.get('isError')!r}")
+                    self.assertIs(env.get("ok"), True, f"{name}: the success call must succeed; got {env.get('error')!r}")
                 errors: list = []
                 _validate(schema, env, name, errors)
                 self.assertFalse(errors, f"{name}: the REAL success result must validate against its declared outputSchema: {errors}")
@@ -236,7 +320,13 @@ class OutputSchemaExtTests(unittest.TestCase):
                 result, env = tool_envelope(self, self.session.call_tool(name, arguments), f"ext:{name}")
                 self.assertIs(result.get("isError"), True, f"{name}: the error call must be flagged isError; got isError={result.get('isError')!r} env={json.dumps(env)[:160]}")
                 self.assertIs(env.get("ok"), False, f"{name}: the error call must answer ok:false; got {json.dumps(env)[:160]}")
-                self.assertIsNone(env.get("data"), f"{name}: an error envelope carries data:null; got {env.get('data')!r}")
+                if name in _LIVE_GH_TOOLS:
+                    # The claims design PRESERVES data on a nonzero outcome
+                    # (the outcome IS the answer); the filled required keys
+                    # are what make that envelope schema-valid (FB-008).
+                    self.assertIsInstance(env.get("data"), dict, f"{name}: a claims failure envelope keeps its data; got {env.get('data')!r}")
+                else:
+                    self.assertIsNone(env.get("data"), f"{name}: an error envelope carries data:null; got {env.get('data')!r}")
                 error = env.get("error") or {}
                 self.assertEqual(error.get("code"), want_code, f"{name}: the representative error must answer {want_code}; got {error!r}")
                 errors = []

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from zaxbygraph import __version__
+from zaxbygraph import claims as claims_mod
 from zaxbygraph import derive
 from zaxbygraph import export
 from zaxbygraph.db import connect, connect_readonly_query, init_schema, open_existing
@@ -213,7 +214,29 @@ def _identity_line(
     )
 
 
-_ERROR_CODES = {3: "no_corpus", 2: "bad_request", 1: "runtime"}
+_ERROR_CODES = {
+    3: "no_corpus",
+    2: "bad_request",
+    1: "runtime",
+    # The claim lifecycle outcomes (issues #77/#74): taken (pre-held issue,
+    # invalid issue, partial-post rollback, pr-guard collisions), lost_race
+    # (the read-after-post race lost twice) and github_unreachable (gh
+    # failed before anything was posted) each exit with their OWN code so
+    # retry logic can tell them apart.
+    4: "taken",
+    5: "lost_race",
+    6: "github_unreachable",
+}
+
+#: The claim commands' outcome -> exit table. claimed/not_applicable are
+#: quiet successes (exit 0); every other outcome is a failure envelope.
+_CLAIM_OUTCOME_EXIT = {
+    "claimed": 0,
+    "not_applicable": 0,
+    "taken": 4,
+    "lost_race": 5,
+    "github_unreachable": 6,
+}
 
 
 def _error_for(code_key: str, message: str, hint: str | None = None) -> dict:
@@ -251,6 +274,7 @@ _LIST_KEY_BY_COMMAND = {
     "similar": "candidates",
     "triage": "rows",
     "bundle": "bundles",
+    "claims": "claims",
 }
 
 
@@ -1479,6 +1503,13 @@ def _run_derived_read(args: argparse.Namespace, query_fn, *extra) -> int:
         return emit_failure(
             args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
         )
+    except claims_mod.ConfigError as exc:
+        # The [claims] chain reports exactly like the [derive]/[triage]
+        # chains (issues #77/#74): a coded config_error, never a traceback.
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        return emit_failure(
+            args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
+        )
     except _coded_value_error() as exc:
         # Dedicated handler BEFORE the generic ValueError branch: these
         # errors carry their own code (issue #68 AC6; cubic 4576304784)
@@ -1852,6 +1883,301 @@ def cmd_brief(args: argparse.Namespace) -> int:
         bool(getattr(args, "no_bots", False)),
         args.config,
     )
+
+
+# ---------------------------------------------------------------------------
+# The claim lifecycle commands (issues #77/#74): claim / release / pr-guard /
+# claims [--live]. The live commands talk to GitHub through the
+# zaxbygraph.claims run_gh seam and never write the store; the derived
+# `claims` listing is a normal store read.
+
+
+def _emit_claims_envelope(
+    args: argparse.Namespace,
+    data,
+    *,
+    slug: str | None,
+    db_path: Path | str | None,
+    freshness: dict | None,
+    error: dict | None = None,
+) -> None:
+    """The claims commands' DATA-PRESERVING emitter: unlike emit_failure
+    (which nulls data on every failure), a nonzero claim outcome keeps its
+    data payload -- the outcome, its details, the winner/rollback evidence
+    and the claims_config echo -- beside error{code: <outcome>, message},
+    because the outcome IS the answer, not an excuse to drop it. Supports
+    the same --fields/--format handling as the read emitter over the
+    claims row list."""
+    fields = _fields_of(args)
+    payload = data
+    if fields and error is None:
+        claims_list = data.get("claims") if isinstance(data, dict) else None
+        if isinstance(claims_list, list):
+            payload = dict(data)
+            payload["claims"] = [_project(row, fields) for row in claims_list]
+    env = build_envelope(
+        payload,
+        conn=None,
+        slug=slug,
+        db_path=db_path,
+        error=error,
+        freshness=freshness,
+        # FB-007: promote the payload's truncation flag here too -- this
+        # emitter REBUILDS the envelope, so the promotion done inside
+        # claims_command_envelope would otherwise be dropped.
+        truncated=bool(isinstance(payload, dict) and payload.get("truncated")),
+    )
+    if error is not None:
+        # The data-preserving override (see claims_command_envelope): the
+        # claim outcome's data survives the failure envelope.
+        env["data"] = payload
+        print(f"error: {error.get('message', '')}", file=sys.stderr)
+    fmt = _format_of(args)
+    if fmt == "text":
+        if error is None:
+            _emit_text(payload)
+    elif fmt == "jsonl":
+        claims_list = (
+            payload.get("claims")
+            if isinstance(payload, dict) and error is None
+            else None
+        )
+        if isinstance(claims_list, list):
+            for row in claims_list:
+                _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        else:
+            _render_json(env, indent=None)
+    elif fmt == "compact":
+        _render_json(env, indent=None)
+    else:
+        _render_json(env, indent=2)
+
+
+def _claims_config_for(args: argparse.Namespace, db_path: Path | None) -> dict:
+    """The effective [claims] table through the same 3-level chain the
+    [derive]/[triage] tables use (store config.toml -> cwd
+    .zaxbygraph.toml -> --config), with --settle-seconds as the
+    highest-precedence settle override (it changes the value IN EFFECT and
+    therefore the echo)."""
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(
+        db_path, getattr(args, "config", None)
+    )
+    cfg = claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
+    settle = getattr(args, "settle_seconds", None)
+    if settle is not None:
+        # The shared validator (FB-001): a negative/NaN/inf override is
+        # refused BEFORE the flow posts anything, not raised from sleep()
+        # after the claim wave is already on GitHub.
+        cfg["settle_seconds"] = claims_mod._coerce_settle(
+            settle, "--settle-seconds"
+        )
+    return cfg
+
+
+def _claims_freshness(
+    db_path: Path | None, slug: str
+) -> tuple[dict, sqlite3.Connection | None]:
+    """Best-effort freshness for the live claim commands: the resolved
+    store is opened read-only when it exists (identity only -- no corpus
+    guard, no stale-refresh; these commands never sync)."""
+    if db_path is None or not db_path.exists():
+        return {"synced_at": None, "age_s": None, "complete": False}, None
+    try:
+        conn = open_existing(db_path)
+    except (RuntimeError, sqlite3.Error, FileNotFoundError):
+        return {"synced_at": None, "age_s": None, "complete": False}, None
+    return _freshness(conn, slug), conn
+
+
+def claims_command_envelope(
+    repo: str,
+    db_path: Path | None,
+    cfg: dict,
+    flow,
+) -> tuple[dict, int]:
+    """Shared outcome->envelope assembly for the LIVE claim commands (used
+    by the CLI runner and the MCP handlers alike): best-effort freshness on
+    a read-only open (never a stale-refresh, never a sync), the flow
+    through the module gh seam, and the outcome envelope with data
+    PRESERVED on failure. Returns (envelope, exit code)."""
+    fresh, conn = _claims_freshness(db_path, repo)
+    try:
+        outcome, data, message = flow(repo, cfg)
+    finally:
+        if conn is not None:
+            conn.close()
+    exit_code = _CLAIM_OUTCOME_EXIT.get(outcome, 1)
+    error = None
+    if exit_code != 0:
+        error = _error_for(outcome, message or outcome)
+    env = build_envelope(
+        data,
+        conn=None,
+        slug=repo,
+        db_path=db_path,
+        error=error,
+        freshness=fresh,
+        # FB-007: a capped live listing must report truncated at the
+        # ENVELOPE level (the convention every other read command
+        # follows), not only inside data.
+        truncated=bool(isinstance(data, dict) and data.get("truncated")),
+    )
+    if error is not None:
+        # The data-preserving override: build_envelope nulls data on every
+        # failure (the read contract), but a claim outcome's data IS the
+        # answer -- outcome, details, winner/rollback evidence and the
+        # claims_config echo ride beside the error object.
+        env["data"] = data
+    return env, exit_code
+
+
+def _run_claims_live(
+    args: argparse.Namespace,
+    flow,
+    *,
+    fallback_slug: str | None = None,
+) -> int:
+    """Shared runner for claim/release/pr-guard and `claims --live`:
+    resolve the repo and the store PATH (never creating or requiring a
+    corpus), load the [claims] chain, run the flow through the module gh
+    seam, and emit the outcome envelope -- data preserved on failure, the
+    outcome's exit code returned."""
+    repo: str | None = None
+    host: str | None = None
+    try:
+        repo, host = _resolved_repo(args)
+    except RepoError as exc:
+        return emit_failure(
+            args,
+            2,
+            f"could not determine repo ({exc}); pass --repo OWNER/REPO",
+            slug=getattr(args, "repo", None) or fallback_slug,
+        )
+    if not repo:
+        return emit_failure(
+            args,
+            2,
+            "repo_required: the claim commands need a resolved repository"
+            " (pass --repo OWNER/REPO)",
+            slug=None,
+            code_key="repo_required",
+        )
+    explicit = getattr(args, "db", None)
+    try:
+        db_path, _chain = resolve_db(repo, explicit=explicit, host=host)
+    except RepoError as exc:
+        return emit_failure(args, 2, str(exc), slug=repo)
+    try:
+        cfg = _claims_config_for(args, db_path)
+    except claims_mod.ConfigError as exc:
+        message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
+        return emit_failure(
+            args, 2, message, slug=repo, db_path=db_path, code_key="config_error"
+        )
+    env, exit_code = claims_command_envelope(repo, db_path, cfg, flow)
+    _emit_claims_envelope(
+        args,
+        env.get("data"),
+        slug=repo,
+        db_path=db_path,
+        freshness=env.get("freshness"),
+        error=env.get("error"),
+    )
+    return exit_code
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    numbers = [int(n) for n in args.numbers]
+
+    def _flow(repo: str, cfg: dict):
+        return claims_mod.take_claims(
+            repo,
+            numbers,
+            cfg,
+            settle_seconds=(
+                float(args.settle_seconds)
+                if getattr(args, "settle_seconds", None) is not None
+                else None
+            ),
+        )
+
+    return _run_claims_live(args, _flow)
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    numbers = [int(n) for n in args.numbers]
+    token = getattr(args, "token", None)
+    tokenless = bool(getattr(args, "tokenless", False))
+    if tokenless:
+        token = None
+    elif not token:
+        return emit_failure(
+            args,
+            2,
+            "release needs --token TOK or --tokenless",
+            slug=getattr(args, "repo", None) or None,
+            code_key="bad_request",
+            hint="pass the session token to release, or --tokenless for the"
+            " tokenless claim form",
+        )
+
+    def _flow(repo: str, cfg: dict):
+        return claims_mod.release_claims(repo, numbers, cfg, token)
+
+    return _run_claims_live(args, _flow)
+
+
+def cmd_pr_guard(args: argparse.Namespace) -> int:
+    numbers = [int(n) for n in args.numbers]
+
+    def _flow(repo: str, cfg: dict):
+        return claims_mod.pr_guard(repo, numbers, cfg)
+
+    return _run_claims_live(args, _flow)
+
+
+def _claims_query(
+    conn: sqlite3.Connection,
+    config: str | None,
+    repo: str,
+    db_path: Path | None = None,
+) -> dict:
+    """The derived `claims` listing: stored comments of the repo's open
+    issues, classified under the [claims] values in effect, ages measured
+    from the store's last sync time (never the wall clock)."""
+    store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
+    cfg = claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
+    return claims_mod.claims_listing(conn, repo, cfg)
+
+
+def cmd_claims(args: argparse.Namespace) -> int:
+    if bool(getattr(args, "live", False)):
+
+        def _flow(repo: str, cfg: dict):
+            try:
+                return "claimed", claims_mod.list_claims_live(repo, cfg), None
+            except claims_mod.GhFailure as exc:
+                return (
+                    "github_unreachable",
+                    {
+                        "outcome": "github_unreachable",
+                        "details": {"reason": exc.message},
+                        "claims_config": claims_mod.claims_config_echo(cfg),
+                        "config_source": cfg.get("_config_source") or "built-ins",
+                        # FB-024: the listing's always-present keys. A live
+                        # read that failed IS a live attempt, so the payload
+                        # names its liveness (the MCP surface does the same,
+                        # so both answer one shape). The claims and
+                        # stale_claims listings stay ABSENT rather than
+                        # fabricated empty from a read that never happened.
+                        "live": True,
+                        "derived": False,
+                    },
+                    f"GitHub could not be reached: {exc.message}",
+                )
+
+        return _run_claims_live(args, _flow)
+    return _run_derived_read(args, _claims_query, getattr(args, "config", None))
 
 
 def _run_read_promote_truncated(
@@ -3064,6 +3390,68 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_brief)
+
+    sp = sub.add_parser(
+        "claim",
+        help="Post an Agent claim on every named issue (live GitHub write; never the store)",
+    )
+    add_common(sp, repo=True)
+    sp.add_argument(
+        "numbers", type=int, nargs="+", metavar="N",
+        help="Issue numbers to claim (posted in ascending order)",
+    )
+    sp.add_argument(
+        "--settle-seconds", dest="settle_seconds", type=float, default=None,
+        metavar="S",
+        help="Override the post-settle read delay (default: [claims] settle_seconds, 2s)",
+    )
+    sp.add_argument("--config", help="Explicit [claims] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_claim)
+
+    sp = sub.add_parser(
+        "release",
+        help="Post a claim release for the given session token (live GitHub write)",
+    )
+    add_common(sp, repo=True)
+    sp.add_argument(
+        "numbers", type=int, nargs="+", metavar="N",
+        help="Issue numbers whose active claim carries the token",
+    )
+    sp.add_argument(
+        "--token", default=None, metavar="TOK",
+        help="The session token whose active claims are released",
+    )
+    sp.add_argument(
+        "--tokenless", action="store_true",
+        help="Release the TOKENLESS claim form (never ends a tokened claim)",
+    )
+    sp.add_argument("--config", help="Explicit [claims] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_release)
+
+    sp = sub.add_parser(
+        "pr-guard",
+        help="List open PRs that close a named issue (run before gh pr create)",
+    )
+    add_common(sp, repo=True)
+    sp.add_argument(
+        "numbers", type=int, nargs="+", metavar="N",
+        help="Issue numbers to check for an open closing PR",
+    )
+    sp.add_argument("--config", help="Explicit [claims] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_pr_guard)
+
+    sp = sub.add_parser(
+        "claims",
+        help="Active and stale work-claim comments (derived from the store; --live reads GitHub)",
+    )
+    add_common(sp, max_age=True)
+    sp.add_argument(
+        "--live", action="store_true",
+        help="Read the repo-wide comment feed from GitHub at call time"
+        " (live: true, derived: false; the store is never written)",
+    )
+    sp.add_argument("--config", help="Explicit [claims] TOML (highest precedence)")
+    sp.set_defaults(func=cmd_claims)
 
     sp = sub.add_parser("sql", help="Read-only SQL (SELECT/WITH/EXPLAIN)")
     add_common(sp)
