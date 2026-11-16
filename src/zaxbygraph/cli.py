@@ -1922,6 +1922,10 @@ def _emit_claims_envelope(
         db_path=db_path,
         error=error,
         freshness=freshness,
+        # FB-007: promote the payload's truncation flag here too -- this
+        # emitter REBUILDS the envelope, so the promotion done inside
+        # claims_command_envelope would otherwise be dropped.
+        truncated=bool(isinstance(payload, dict) and payload.get("truncated")),
     )
     if error is not None:
         # The data-preserving override (see claims_command_envelope): the
@@ -1961,7 +1965,12 @@ def _claims_config_for(args: argparse.Namespace, db_path: Path | None) -> dict:
     cfg = claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
     settle = getattr(args, "settle_seconds", None)
     if settle is not None:
-        cfg["settle_seconds"] = float(settle)
+        # The shared validator (FB-001): a negative/NaN/inf override is
+        # refused BEFORE the flow posts anything, not raised from sleep()
+        # after the claim wave is already on GitHub.
+        cfg["settle_seconds"] = claims_mod._coerce_settle(
+            settle, "--settle-seconds"
+        )
     return cfg
 
 
@@ -2008,6 +2017,10 @@ def claims_command_envelope(
         db_path=db_path,
         error=error,
         freshness=fresh,
+        # FB-007: a capped live listing must report truncated at the
+        # ENVELOPE level (the convention every other read command
+        # follows), not only inside data.
+        truncated=bool(isinstance(data, dict) and data.get("truncated")),
     )
     if error is not None:
         # The data-preserving override: build_envelope nulls data on every
@@ -2151,6 +2164,14 @@ def cmd_claims(args: argparse.Namespace) -> int:
                         "details": {"reason": exc.message},
                         "claims_config": claims_mod.claims_config_echo(cfg),
                         "config_source": cfg.get("_config_source") or "built-ins",
+                        # FB-024: the listing's always-present keys. A live
+                        # read that failed IS a live attempt, so the payload
+                        # names its liveness (the MCP surface does the same,
+                        # so both answer one shape). The claims and
+                        # stale_claims listings stay ABSENT rather than
+                        # fabricated empty from a read that never happened.
+                        "live": True,
+                        "derived": False,
                     },
                     f"GitHub could not be reached: {exc.message}",
                 )

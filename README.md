@@ -455,7 +455,11 @@ unreleasable comment listed by URL), `lost_race` (exit 5 — a competitor's
 claim landed between the pre-read and the post-settle read; every posted
 wave is released carrying the session's own token, the winner is named,
 one random-delay retry at most), and `github_unreachable` (exit 6 — gh
-failed before anything was posted). The refusal envelope keeps its data:
+failed; when the failure happened after claim comments were already posted, every
+posted wave was released first and `data.details` names the released URLs — and
+`unreleased_comments` any release that could not be posted, so exit 6 does NOT
+mean "nothing was written": inspect the details before retrying). The refusal
+envelope keeps its data:
 `error.code` is the outcome name and `data.details` carries the evidence.
 
 `release --token TOK` posts `**Claim released:** session=<token> done.` on
@@ -481,15 +485,40 @@ is stale, so refresh with `--max-age` (or re-sync) before trusting it.
 `claims --live` reads the repo-wide comment feed from GitHub at call time
 (`live: true`, `derived: false`, wall-clock ages, each candidate
 re-validated through its own issue read plus the open-PR list); the store
-file is byte-identical after every claims command — the store is only
-ever written by sync, and claim/release write GitHub comments only.
+file is byte-identical after every claims command — the claim workflow
+writes GitHub comments only, and the store is written by `sync` (and
+`doctor --consolidate`).
+
+Safety reads fail CLOSED, and their caps surface as `github_unreachable`
+with the reason in `details`: the repo-wide comment feed is paged to 40
+pages x 100 (a repository with more issue comments than that cannot be
+listed live), and so is each named issue's own comment history (read by
+`claim` and `release`), and the open-PR list is capped at 500 (a repository
+with more open PRs than that cannot pass `claim`, `pr-guard` or
+`claims --live`; `release` reads only the named issues' own histories and has
+no PR-list cap). A cap is a refusal, not a verdict that the work is free.
+
+A release needs no trusted author: the claim token is public in the claim
+comment (it is an identifier, not a secret), so any commenter whose comment
+matches the token shape can end a claim. That is the documented cooperative
+takeover path for a claim whose session has ended — holding a claim requires
+a trusted author, releasing one does not.
+
+The live pre-read reads the REQUESTED issues' own threads; a claim posted
+solely on an issue outside the request set that names a requested one is
+invisible to the live path (the derived `claimed` gate still covers it once
+the store is synced) — the two tiers differ by design, the live path
+trading that breadth for freshness.
 
 A claim is active for 72 hours (`[claims] window_hours`) from its comment
 time unless a later release matching its token shape ends it. The `[claims]`
 table (`enabled`, `patterns`, `release_prefix`, `token_prefix`,
 `window_hours`, `settle_seconds`) resolves through the same chain as
 `[triage]` (defaults → `<store>/config.toml` → `.zaxbygraph.toml` →
-`--config`, later wins per key; unknown keys are `config_error`s) and
+`--config`, later wins per key; unknown keys are `config_error`s, and a `patterns`
+entry contained in `release_prefix` is refused — the release form is anchored
+and the claim form is a substring test, so that overlap would let a claim
+pattern swallow a release) and
 echoes in every claim payload as `claims_config` + `config_source`, beside
 the `claims_config` object `triage`/`bundle` carry for the gate.
 
@@ -1088,7 +1117,8 @@ Machine-readable rules, worth knowing before scripting against this:
   the PR numbers, the unreleased comment URLs); **`5`** — `lost_race` (a
   competitor's claim landed between the pre-read and the post-settle read
   and survived the one retry; the winner is named); **`6`** —
-  `github_unreachable` (gh failed before anything was posted).
+  `github_unreachable` (gh failed; if claim comments were already posted they
+  were released first — see `data.details.released` / `unreleased_comments`).
   **The inspection and source-reachability refusals that answer `1` are
   narrow, not a general rule.** `snapshot pull`'s `dest_uninspectable`,
   `snapshot pull`'s `source_unreachable` (git could not reach the snapshot

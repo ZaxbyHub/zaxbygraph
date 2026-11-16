@@ -164,11 +164,15 @@ For "what should we fix next, and in what order" over a synced store:
    `lowest_number_first`, `most_touched`, `random_recall_at_5`), and
    expect the coded `no_ground_truth` error when a store carries no
    eligible ground truth.
-4. **claim** — posting a work claim before starting work on a chosen issue is REQUIRED (see the next
-   section); it is what keeps a second session from duplicating yours.
-5. **bundle** — split the chosen work into bundles; work ONE bundle per
+4. **bundle** — split the chosen work into bundles; work ONE bundle per
    agent, in the bundle's `order` (in-pool blocked_by dependency order),
    respecting `open_pr_collisions`.
+5. **claim** — posting a work claim before starting work is REQUIRED (see the
+   next section); it is what keeps a second session from duplicating yours.
+   Claim AFTER selecting the bundle: `bundle` builds its pool from ungated
+   rows, so an issue you claimed first is excluded from every bundle once the
+   store reflects the claim (it then appears under the triage `gated` block's
+   `claims` evidence instead).
 6. **brief N** — pull the work packet for each member before starting:
    features, truncated body, top comments, implicated files, closest PR
    analog, linked PRs.
@@ -181,8 +185,10 @@ For "what should we fix next, and in what order" over a synced store:
 Everything this workflow returns is **candidates, not facts**: scores are
 heuristics over stored evidence (reactions, participants, blocking,
 re-opens, reverts, co-change), and the store
-never records a ranking decision. The store is only ever written by sync —
-claim and release write GitHub comments, never the store. Missing features
+never records a ranking decision. The claim workflow writes GitHub comments
+only: the store file is written by `sync` (and by `doctor --consolidate`); the
+claim and
+release commands never write it. Missing features
 are reported as `null`
 with a `requires` note instead of being silently scored as zero. Brief
 packets wrap GitHub-authored titles, body text, comment bodies, and live gh
@@ -218,7 +224,10 @@ pre-held / invalid issue / open closing PR / a partial post rolled back /
 pr-guard collisions), `lost_race` (exit 5: a competitor's claim landed
 between the pre-read and the post-settle read — every posted wave is
 released, the winner is named, at most one retry), and
-`github_unreachable` (exit 6: gh failed before anything was posted).
+`github_unreachable` (exit 6: gh failed — if claim comments were already posted,
+every posted wave was released first and `details.released` names the URLs;
+`details.unreleased_comments` names any release that could not be posted, so exit 6
+does not mean nothing was written).
 
 A release ends a claim:
 
@@ -244,7 +253,19 @@ live in one place. An empty answer can mean the store is stale: refresh
 with `claims --max-age 1h` (or re-sync) before trusting it. `claims
 --live` re-reads the repo-wide comment feed from GitHub at call time
 (`live: true`, `derived: false`, wall-clock ages); the store is never
-written. A claim is active for 72 hours (the `[claims] window_hours`
+written. Safety reads fail CLOSED with the cap named in `details`: the repo-wide
+comment feed used by `claims --live` and each named issue's own comment
+history (read by `claim` and `release`) are paged to 40x100 comments, and the
+open-PR list used by `claim`, `pr-guard` and `claims --live` is capped at 500
+(`release` reads only the named issues' own histories and has no PR-list cap).
+Over its cap a read answers `github_unreachable`, never a partial verdict
+(a repository past either cap cannot be listed or guarded live). A release
+needs no trusted author (the token is public in the claim comment — the
+cooperative takeover path); holding a claim does. The live pre-read reads the
+REQUESTED issues' own threads; a claim posted solely on an issue outside the
+request set that names a requested one is invisible to the live path (the
+derived `claimed` gate still covers it once the store is synced) — the two
+tiers differ by design, the live path trading that breadth for freshness. A claim is active for 72 hours (the `[claims] window_hours`
 override) from its comment time unless a matching release ends it earlier;
 triage's `claimed` gate withholds claimed issues from the ranking under
 exactly these rules.
@@ -336,7 +357,10 @@ prints the live declaration plus the payload kind and a description; the
 sets are exact by construction). `churn` and `open` answer a BARE list of
 row objects, so their cells are the row fields; `item N1 N2 ...` likewise
 answers a bare list of item rows. Conditional keys (`next_cursor`,
-`bots_omitted`, `warnings`, ...) are not listed — only always-present keys are.
+`bots_omitted`, `warnings`, and the `claims` command's
+`claims`/`stale_claims` listings — a live read that fails keeps its outcome
+payload and never fabricates an empty listing) are not listed; only
+always-present keys are.
 
 | command | data keys |
 | --- | --- |
@@ -344,7 +368,7 @@ answers a bare list of item rows. Conditional keys (`next_cursor`,
 | bundle | bundles, claims_config, closeable_trackers, config_source, derived, dropped, excluded, formula_version, gated, merge_candidates, pool, related_not_bundleable, repo, unbundled, weights |
 | churn | additions, deletions, path, prs |
 | claim | claims_config, config_source, outcome |
-| claims | claims, claims_config, config_source, derived, live, stale_claims |
+| claims | claims_config, config_source, derived, live |
 | file-history | entries, index_stale |
 | item | additions, api_url, author, author_association, base_ref, body, branch_token, changed_files, closed_at, comment_count, comments, comments_omitted, commits, created_at, deletions, dependencies_blocked_by, dependencies_blocking, dependencies_total_blocked_by, dependencies_total_blocking, draft, edges, files, head_ref, html_url, id, index_stale, item_type, kind, labels, labels_text, locked, merge_commit, merged_at, merged_by, milestone, node_id, number, paths_text, reactions_total, repo, reviews, reviews_omitted, state, state_reason, sub_issues_completed, sub_issues_total, title, updated_at |
 | open | assignees, author, html_url, kind, labels, linked_open_prs, number, repo, title, updated_at |
@@ -377,7 +401,7 @@ answers from the database you are querying.
 | `3` | No corpus for the resolved repo: zero items and no completed full sync (a failed first sync is still no corpus) | Run the printed `zaxbygraph sync --repo <slug>` — a retry without syncing cannot succeed |
 | `4` | `taken` (the claim commands): the issue is held by an active claim, is not an open issue, an open PR already closes it, a partial claim post was rolled back, a release matched no active claim, or `pr-guard` found collisions | Read `data.details` — the holder (token null when tokenless), the PR numbers, or the unreleased comment URLs; refresh the stored view with the printed `sync --numbers` line, and pick different work |
 | `5` | `lost_race`: a competitor's claim landed between the pre-read and the post-settle read and survived the one retry | The winner is named in `data.details.winner`; re-claim only after that claim expires or is released |
-| `6` | `github_unreachable`: gh failed (network, auth, transport) before anything was posted | Fix gh auth/connectivity (`gh auth status`) and retry |
+| `6` | `github_unreachable`: gh failed (network, auth, transport) — posted waves are released first; see `details.released` / `details.unreleased_comments` before retrying | Fix gh auth/connectivity (`gh auth status`), inspect the rollback evidence, then retry |
 
 Errors print `error: MESSAGE` to stderr and answer with the structured
 `{ok: false, error: {code, message, hint?}}` envelope on stdout (exit codes

@@ -1182,5 +1182,665 @@ class LiveListingFailClosedTests(_LiveCmdTest):
 
 
 
+# ---------------------------------------------------------------------------
+# swarm-pr-feedback round (PR #80 review run pr80-20261115): regression pins
+# ---------------------------------------------------------------------------
+class SettleValidationTests(_LiveCmdTest):
+    """FB-001: the settle value is validated BEFORE any post."""
+
+    def test_cli_flag_rejects_invalid_settle_before_posting(self):
+        for bad in ("-1", "nan", "inf"):
+            fake = FakeGh()
+            with _patched_gh(self, f"FB-001-{bad}", fake):
+                code, out, _err = _run_cli(
+                    ["claim", "5", "--repo", REPO, "--settle-seconds", bad,
+                     "--format", "json"]
+                )
+            self.assertEqual(code, 2, f"settle {bad}: a coded refusal, not a crash")
+            env = _env_of(out)
+            self.assertIs(env.get("ok"), False)
+            self.assertEqual(
+                (env.get("error") or {}).get("code"),
+                "config_error",
+                f"settle {bad}: the shared validator's coded envelope",
+            )
+            self.assertEqual(fake.posts, [], f"settle {bad}: nothing may be posted")
+
+    def test_absurd_finite_settle_is_refused_before_posting(self):
+        """A finite-but-absurd value still raises OverflowError inside sleep()
+        AFTER the wave is posted -- the orphan path in another guise, so the
+        validator carries an upper bound (closeout FB-001)."""
+        fake = FakeGh()
+        with _patched_gh(self, "FB-001-huge", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--repo", REPO, "--settle-seconds", "1e308",
+                 "--format", "json"]
+            )
+        self.assertEqual(code, 2, "an absurd settle is refused, not slept on")
+        self.assertIs(_env_of(out).get("ok"), False)
+        self.assertEqual(fake.posts, [], "nothing may be posted")
+
+    def test_config_file_rejects_non_finite_settle(self):
+        cfg = self.root / ".zaxbygraph.toml"
+        cfg.write_text("[claims]\nsettle_seconds = nan\n", encoding="utf-8")
+        with self.assertRaises(claims_mod.ConfigError):
+            claims_mod.load_claims_config(None, str(cfg), None)
+
+    def test_mcp_settle_argument_is_range_checked(self):
+        session = McpSession(self, cwd=str(self.root), repo=REPO,
+                             db=str(self.db_path), stale_after_s=10**9)
+        self.addCleanup(session.stop)
+        session.initialize()
+        for bad in (-1, float("nan"), float("inf"), 1000, 10**400):
+            _res, env = tool_envelope(
+                self,
+                session.call_tool("claim", {"repo": REPO, "numbers": [5],
+                                            "settle_seconds": bad}),
+                f"FB-001-mcp-{bad}",
+            )
+            self.assertIs(env.get("ok"), False, f"MCP settle {bad} must refuse")
+            self.assertEqual(
+                (env.get("error") or {}).get("code"), "bad_request",
+                f"MCP settle {bad}: the coded refusal",
+            )
+            # The closeout critic: the pre-check raised before the target was
+            # resolved, so the envelope answered db:null/repo:null while the
+            # comment claimed FB-011's identity path handled it.
+            self.assertEqual(
+                env.get("repo"), REPO,
+                f"MCP settle {bad}: the refusal must name its repository",
+            )
+            self.assertTrue(
+                env.get("db"),
+                f"MCP settle {bad}: the refusal must name its store",
+            )
+
+
+class TrustProbeFailureTests(_LiveCmdTest):
+    """FB-002: a failed viewerPermission probe is github_unreachable, never
+    a folded untrusted verdict."""
+
+    def _miss_then_fail_graphql(self, mode):
+        class _GraphqlLegGh(FakeGh):
+            def __call__(self, cmd):
+                joined = " ".join(str(a) for a in cmd)
+                if "graphql" in joined:
+                    if mode == "fail":
+                        return (1, "", "gh: could not connect")
+                    return (
+                        0,
+                        __import__("json").dumps(
+                            {"data": {"repository": None},
+                             "errors": [{"message": "boom"}]}
+                        ),
+                        "",
+                    )
+                return super().__call__(cmd)
+
+        fake = _GraphqlLegGh()
+        fake.org_member_status = 404
+        return fake
+
+    def test_network_failure_is_unreachable_not_not_applicable(self):
+        fake = self._miss_then_fail_graphql("fail")
+        with _patched_gh(self, "FB-002-net", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--repo", REPO, "--format", "json"]
+            )
+        self.assertEqual(code, 6, "a failed trust probe is github_unreachable (exit 6)")
+        env = _env_of(out)
+        self.assertEqual(
+            (env.get("data") or {}).get("outcome"), "github_unreachable"
+        )
+        self.assertEqual(fake.posts, [], "nothing is posted on an unreachable probe")
+
+    def test_graphql_errors_array_is_unreachable(self):
+        fake = self._miss_then_fail_graphql("errors")
+        with _patched_gh(self, "FB-002-errors", fake):
+            code, out, _err = _run_cli(
+                ["claim", "5", "--repo", REPO, "--format", "json"]
+            )
+        self.assertEqual(code, 6, "an errors-only GraphQL payload is a probe failure")
+        self.assertEqual(
+            (_env_of(out).get("data") or {}).get("outcome"), "github_unreachable"
+        )
+
+
+class ReleasePrecedenceTests(_LiveCmdTest):
+    """FB-004: the anchored release form is parsed first, and a claim pattern
+    contained in the release prefix is refused at load time."""
+
+    def test_overlapping_vocabulary_is_refused_at_load(self):
+        cfg = self.root / ".zaxbygraph.toml"
+        cfg.write_text(
+            '[claims]\npatterns = ["Working this issue"]\n'
+            'release_prefix = "**Working this issue released"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(claims_mod.ConfigError):
+            claims_mod.load_claims_config(None, str(cfg), None)
+
+    def test_release_body_ends_its_claim_under_default_config(self):
+        cfg = claims_mod.load_claims_config()
+        token = "PRECEDENCE-TOKEN-1234567"
+        rows = [
+            (5, "alice", "MEMBER", _h(2), _tcc.claim_body(token), "https://x/1", 1),
+            (5, "alice", "MEMBER", _h(1), release_body(token), "https://x/2", 2),
+        ]
+        listed = claims_mod.collect_claims(
+            None, REPO, rows, cfg, ASOF
+        )
+        actives = [c for c in listed if c.get("active")]
+        self.assertEqual(
+            len(actives), 0, "the release must end the claim it names"
+        )
+
+
+class UnicodeRefTests(unittest.TestCase):
+    """FB-005: issue references are ASCII digits only."""
+
+    def test_non_ascii_digits_name_nothing(self):
+        cfg = claims_mod.load_claims_config()
+        body = (
+            "Agent claim: session=abcdefghijklmnopqrst working this issue"
+            " now. #\u0665"
+        )
+        parsed = claims_mod.parse_claim(body, cfg)
+        self.assertIsNotNone(
+            parsed, "the body is still a claim (the pattern matched)"
+        )
+        self.assertEqual(
+            parsed["named_issues"], [],
+            "a Unicode digit run is not an issue reference",
+        )
+
+    def test_ascii_reference_still_parses(self):
+        cfg = claims_mod.load_claims_config()
+        parsed = claims_mod.parse_claim(
+            "Agent claim: session=abcdefghijklmnopqrst working this issue now. #5",
+            cfg,
+        )
+        self.assertIsNotNone(parsed)
+        self.assertIn(5, parsed["named_issues"])
+
+
+class ConfigEncodingTests(_LiveCmdTest):
+    """FB-010: a non-UTF-8 config file is a coded config_error."""
+
+    def test_non_utf8_config_is_coded_not_a_traceback(self):
+        cfg = self.root / "bad-encoding.toml"
+        cfg.write_bytes(b"\xff\xfe[\x00c\x00l\x00a\x00i\x00m\x00s\x00]\x00")
+        code, out, err = _run_cli(
+            ["claim", "5", "--repo", REPO, "--config", str(cfg),
+             "--format", "json"]
+        )
+        self.assertEqual(code, 2, "a coded config_error, not a traceback (exit 1)")
+        self.assertIs(_env_of(out).get("ok"), False)
+        self.assertNotIn("Traceback", err)
+
+
+class PagerCompletenessTests(unittest.TestCase):
+    """FB-018: a safety page carrying a malformed entry FAILS CLOSED — the
+    entry's content is unknown, and a claim-bearing comment hidden inside one
+    must never be silently dropped from a hold decision."""
+
+    def test_malformed_page_entry_fails_the_read_closed(self):
+        from zaxbygraph import claims as claims_mod
+
+        page1 = [{"id": i, "body": "x"} for i in range(99)] + ["not-an-object"]
+        page2 = [{"id": 100 + i, "body": "y"} for i in range(3)]
+        calls = {"n": 0}
+
+        def runner(argv):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return (0, __import__("json").dumps(page1), "")
+            return (0, __import__("json").dumps(page2), "")
+
+        with self.assertRaises(claims_mod._GhFailure) as ctx:
+            claims_mod._read_page_stream(
+                runner,
+                lambda page: [
+                    "gh", "api",
+                    f"repos/{REPO}/issues/5/comments?page={page}&per_page=100",
+                ],
+                max_pages=5,
+                what="probe",
+            )
+        self.assertIn("malformed", str(ctx.exception))
+        self.assertEqual(
+            calls["n"], 1, "the malformed page refuses instead of being filtered"
+        )
+
+    def test_all_well_formed_pages_still_stream(self):
+        """The fail-closed rule must not break an ordinary paged read."""
+        from zaxbygraph import claims as claims_mod
+
+        page1 = [{"id": i, "body": "x"} for i in range(100)]
+        page2 = [{"id": 100 + i, "body": "y"} for i in range(3)]
+
+        def runner(argv):
+            n = getattr(runner, "n", 0) + 1
+            runner.n = n
+            return (0, __import__("json").dumps(page1 if n == 1 else page2), "")
+
+        out = claims_mod._read_page_stream(
+            runner,
+            lambda page: [
+                "gh", "api",
+                f"repos/{REPO}/issues/5/comments?page={page}&per_page=100",
+            ],
+            max_pages=5,
+            what="probe",
+        )
+        self.assertEqual(len(out), 103, "both well-formed pages are kept")
+
+
+class ConfigChainPinTests(_LiveCmdTest):
+    """FB-019: the --settle-seconds echo and the store config layer."""
+
+    def test_settle_override_is_echoed(self):
+        fake = FakeGh()
+        with _patched_gh(self, "FB-019-echo", fake):
+            _code, out, _err = _run_cli(
+                ["claim", "5", "--repo", REPO, "--settle-seconds", "0.5",
+                 "--format", "json"]
+            )
+        echo = (_env_of(out).get("data") or {}).get("claims_config") or {}
+        self.assertEqual(
+            echo.get("settle_seconds"), 0.5,
+            "the echo reports the value in effect",
+        )
+
+    def test_store_level_config_layer_is_honoured(self):
+        store_cfg = self.db_path.parent / "config.toml"
+        store_cfg.write_text("[claims]\nwindow_hours = 5\n", encoding="utf-8")
+        cfg = claims_mod.load_claims_config(str(store_cfg), None, None)
+        self.assertEqual(cfg["window_hours"], 5)
+        self.assertEqual(cfg["_config_source"], "store")
+
+
+class RetryOrderDeterministicTests(_LiveCmdTest):
+    """FB-020: the retry-order behaviour under a controlled clock and a
+    controlled retry wait (the frozen C17 legs depend on a real 1-second
+    monotonic window and a real RNG wait, so a slow host can flip them)."""
+
+    def _run_with(self, *, lifetime: float, wait: float):
+        import zaxbygraph.claims as claims_mod
+
+        fake = FakeGh()
+        fake.reveal_timed = {
+            20: [(1, lifetime, [_tcc._foreign_claim(879_002, "VANISH-TOKEN-00000001")])]
+        }
+        clock = {"t": 1000.0}
+        saved_mono = claims_mod.time.monotonic
+        saved_sleep = claims_mod.sleep
+        saved_wait = claims_mod._retry_wait_seconds
+        claims_mod.time.monotonic = lambda: clock["t"]
+        claims_mod.sleep = lambda s: clock.__setitem__("t", clock["t"] + max(float(s), 0.0))
+        claims_mod._retry_wait_seconds = lambda: wait
+        try:
+            with _patched_gh(self, "FB-020", fake):
+                code, out, _err = _run_cli(
+                    ["claim", "10", "20", "30", "--repo", REPO,
+                     "--settle-seconds", "0.05", "--format", "json"]
+                )
+        finally:
+            claims_mod.time.monotonic = saved_mono
+            claims_mod.sleep = saved_sleep
+            claims_mod._retry_wait_seconds = saved_wait
+        env = _env_of(out)
+        posted = [n for n, b in fake.posts if "**Agent claim" in b]
+        released = [n for n, b in fake.posts if "**Claim released" in b]
+        return code, (env.get("data") or {}).get("outcome"), posted, released
+
+    def test_competitor_gone_before_retry_wins_after_two_waves(self):
+        code, outcome, posted, released = self._run_with(lifetime=1.0, wait=2.0)
+        self.assertEqual(code, 0, "the competitor vanished: the retry wave wins")
+        self.assertEqual(outcome, "claimed")
+        self.assertEqual(posted, [10, 20, 30, 10, 20, 30], "exactly one retry wave")
+        self.assertEqual(released, [10, 20, 30], "the lost first wave was released")
+
+    def test_competitor_still_there_loses_before_the_retry(self):
+        """The frozen C17 leg-2 shape, deterministic: a competitor that
+        outlasts the retry wait is still visible at the fresh read, so the
+        command refuses to post a second wave and exits lost_race with the
+        first wave released."""
+        code, outcome, posted, released = self._run_with(lifetime=30.0, wait=0.5)
+        self.assertEqual(code, 5, "the competitor outlasts the wait: lost_race")
+        self.assertEqual(outcome, "lost_race")
+        self.assertEqual(posted, [10, 20, 30], "no second wave is posted")
+        self.assertEqual(released, [10, 20, 30], "the lost wave is released")
+
+
+class LiveTruncationEnvelopeTests(_LiveCmdTest):
+    """FB-007: the live listing's truncation reaches the envelope flag."""
+
+    def test_envelope_truncated_reflects_the_cap(self):
+        fake = FakeGh()
+        for i in range(600):
+            fake.add_repo_comment(
+                5,
+                f"**Agent claim:** session=CAPTOKEN{i:017d} issues=#5"
+                " Working this issue now.",
+                hours_ago=1.0,
+            )
+        with _patched_gh(self, "FB-007", fake):
+            code, out, _err = _run_cli(
+                ["claims", "--live", "--repo", REPO, "--format", "json"]
+            )
+        env = _env_of(out)
+        self.assertIs(env.get("truncated"), True, "the envelope flag is promoted")
+        self.assertIs((env.get("data") or {}).get("truncated"), True)
+        self.assertEqual(len((env.get("data") or {}).get("claims") or []), 500)
+
+
+class McpFailureSchemaTests(_LiveCmdTest):
+    """FB-008: the live tools' failure envelopes satisfy their own schema."""
+
+    def test_failure_envelope_validates_against_output_schema(self):
+        from zaxbygraph import mcp_server
+
+        class _DeadGh:
+            def __call__(self, cmd):
+                return (1, "", "gh: network unreachable")
+
+        session = McpSession(self, cwd=str(self.root), repo=REPO,
+                             db=str(self.db_path), stale_after_s=10**9)
+        self.addCleanup(session.stop)
+        session.initialize()
+        saved = claims_mod.run_gh
+        claims_mod.run_gh = _DeadGh()
+        try:
+            for tool, args in (
+                ("pr_guard", {"repo": REPO, "numbers": [5]}),
+                ("claims", {"repo": REPO, "live": True}),
+            ):
+                _res, env = tool_envelope(
+                    self, session.call_tool(tool, args), f"FB-008-{tool}"
+                )
+                self.assertIs(env.get("ok"), False)
+                data = env.get("data") or {}
+                # FB-025: read the REAL declared schema. The registry
+                # entry carries no "outputSchema" key -- the schema is BUILT
+                # from the entry by _output_schema_for -- so the previous
+                # lookup answered {} -> required [] and this assertion
+                # compared [] against [] without asserting anything.
+                schema = mcp_server._output_schema_for(tool)
+                props = (schema.get("properties") or {}).get("data") or {}
+                required = props.get("required") or []
+                missing = [k for k in required if k not in data]
+                self.assertEqual(
+                    missing, [],
+                    f"{tool}: the failure envelope carries every required key",
+                )
+        finally:
+            claims_mod.run_gh = saved
+
+
+class LiveFailureShapeParityTests(_LiveCmdTest):
+    """FB-024: the CLI and the MCP surface of the SAME command answered
+    differently-shaped failure payloads for a failed live listing. Executed
+    side by side before the fix:
+
+        MCP  data keys -> claims, claims_config, config_source, derived,
+                          details, live, outcome, stale_claims (claims == [])
+        CLI  data keys -> claims_config, config_source, details, outcome
+
+    The MCP envelope fabricated an empty claims list out of a read that never
+    happened (what LiveListingFailClosedTests forbids on the CLI) and the CLI
+    omitted live/derived altogether. Both now answer one shape."""
+
+    def test_both_surfaces_answer_one_shape_and_fabricate_nothing(self):
+        from zaxbygraph import mcp_server
+
+        class _DeadGh:
+            def __call__(self, cmd):
+                return (1, "", "gh: network unreachable")
+
+        session = McpSession(self, cwd=str(self.root), repo=REPO,
+                             db=str(self.db_path), stale_after_s=10**9)
+        self.addCleanup(session.stop)
+        session.initialize()
+        saved = claims_mod.run_gh
+        claims_mod.run_gh = _DeadGh()
+        try:
+            _res, mcp_env = tool_envelope(
+                self,
+                session.call_tool("claims", {"repo": REPO, "live": True}),
+                "FB-024-mcp",
+            )
+        finally:
+            claims_mod.run_gh = saved
+        code, out, _err = _run_cli(
+            ["claims", "--live", "--repo", REPO, "--format", "json"]
+        )
+        cli_env = _env_of(out)
+        self.assertEqual(code, 6, "a dead gh is github_unreachable on the CLI")
+        for name, env in (("mcp", mcp_env), ("cli", cli_env)):
+            data = env.get("data") or {}
+            self.assertIs(env.get("ok"), False, f"{name}: the failure is reported")
+            self.assertIs(
+                data.get("live"), True,
+                f"{name}: a live attempt that failed is still a live attempt",
+            )
+            self.assertIs(data.get("derived"), False, f"{name}: never derived")
+            self.assertNotIn(
+                "claims", data,
+                f"{name}: no empty claims list is fabricated from a failed read",
+            )
+            self.assertNotIn(
+                "stale_claims", data,
+                f"{name}: no empty stale_claims list is fabricated",
+            )
+            self.assertEqual(
+                sorted(data),
+                ["claims_config", "config_source", "derived", "details",
+                 "live", "outcome"],
+                f"{name}: both surfaces answer the same failure shape",
+            )
+
+    def test_declared_keys_are_the_always_present_ones(self):
+        """The registry's declaration must match the shape the surfaces
+        actually answer, or the schema sweep validates a fiction."""
+        from zaxbygraph import mcp_server
+
+        shape = mcp_server._TOOL_SHAPES["claims"]
+        self.assertNotIn("claims", shape["data_keys"])
+        self.assertNotIn("stale_claims", shape["data_keys"])
+        self.assertIn("live", shape["data_keys"])
+        self.assertIn("derived", shape["data_keys"])
+        for key in ("claims", "stale_claims"):
+            self.assertIn(
+                key, shape["data"].get("properties") or {},
+                f"{key} stays a declared (conditional) property",
+            )
+            self.assertNotIn(
+                key, shape["data"].get("required") or [],
+                f"{key} must not be required on the failure path",
+            )
+
+
+class ExitCodeEnvelopeCouplingTests(_LiveCmdTest):
+    """cubic (tests/test_claims.py:214): the frozen `run_claims` helper accepts
+    an `ok: false` envelope whenever the process exits zero, so a CLI
+    acceptance test could pass on a failed response.
+
+    The frozen bytes cannot change (they are the published checkpoint
+    evidence), and the coupling is STRUCTURAL today:
+    `claims_command_envelope` derives `error` from the exit code, so
+    `ok == (exit_code == 0)` by construction -- verified here on all three
+    paths a caller can take. This additive pin makes that structural fact
+    load-bearing: a future change that decouples the exit code from the
+    envelope turns THIS red instead of letting the frozen helper pass on a
+    failure."""
+
+    def test_exit_zero_iff_ok_on_every_claims_path(self):
+        # a derived listing over a store whose only issue carries no claim
+        code, out, _err = _run_cli(["claims", "--repo", REPO, "--format", "json"])
+        env = _env_of(out)
+        self.assertEqual(code, 0, "a derived listing succeeds")
+        self.assertIs(env.get("ok"), True, "exit 0 must mean ok")
+        self.assertIsNone(env.get("error"), "exit 0 carries no error object")
+
+        # a config fault (a name that is NOT the chain's .zaxbygraph.toml)
+        cfg = self.root / "coupling-refusal.toml"
+        cfg.write_text("[claims]\nsettle_seconds = -1\n", encoding="utf-8")
+        code, out, _err = _run_cli(
+            ["claims", "--live", "--repo", REPO, "--config", str(cfg),
+             "--format", "json"]
+        )
+        env = _env_of(out)
+        self.assertEqual(code, 2, "a config fault is a coded caller error")
+        self.assertIs(env.get("ok"), False, "exit 2 must mean ok:false")
+        self.assertIsInstance(env.get("error"), dict)
+
+        # a live read that cannot reach GitHub
+        class _DeadGh:
+            def __call__(self, cmd):
+                return (1, "", "gh: the coupling seam is dead")
+
+        saved = claims_mod.run_gh
+        claims_mod.run_gh = _DeadGh()
+        try:
+            code, out, _err = _run_cli(
+                ["claims", "--live", "--repo", REPO, "--format", "json"]
+            )
+        finally:
+            claims_mod.run_gh = saved
+        env = _env_of(out)
+        self.assertEqual(code, 6, "an unreachable GitHub is exit 6")
+        self.assertIs(env.get("ok"), False, "exit 6 must mean ok:false")
+        self.assertEqual((env.get("error") or {}).get("code"), "github_unreachable")
+
+
+class BundleControlPinTests(_StoreTest):
+    """FB-012 / cubic S13: the frozen bundle test asserts only that the
+    CLAIMED issue is absent from the pool; it never asserts the UNCLAIMED
+    sibling is present, so it cannot tell exclusion from wholesale exclusion
+    (an empty pool also satisfies it). This additive pin supplies the control;
+    the frozen bytes stay untouched."""
+
+    def test_unclaimed_sibling_stays_bundleable(self) -> None:
+        token = "CONTROL-TOKEN-1234567890"
+
+        def seed(src):
+            for n in (61, 62):
+                src.add_issue(issue(n, title=f"bundle {n}", state="open"))
+            self._comment_on(src, 61, 6102, _claim_body(token), created=_h(1))
+
+        self.seed(seed)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = main(["bundle", "--repo", REPO, "--format", "json"])
+        self.assertEqual(code, 0)
+        pool = (_env_of(out.getvalue()).get("data") or {}).get("pool") or []
+        self.assertNotIn(61, pool, "the claimed issue is gated out")
+        self.assertIn(
+            62, pool,
+            "the UNCLAIMED sibling must stay in the pool (the control that"
+            " distinguishes exclusion from an empty pool)",
+        )
+
+
+class VacuousAssertionCorrectivePins(unittest.TestCase):
+    """FB-012: the frozen file carries two assertions that are true by
+    construction (a quoted-string search over int-serialized JSON, and a
+    reason echo satisfied by the always-present login_probes block). The
+    frozen bytes are the published checkpoint evidence and stay untouched;
+    these ADDITIVE pins assert the real behaviour so a regression is caught
+    either way."""
+
+    def test_pr_guard_collisions_are_the_structured_list(self):
+        """A collision entry serializes as {"number": 30, ...} -- the frozen
+        negative check searches for the QUOTED "30", which can never occur.
+        This pin asserts the structured list directly."""
+        import zaxbygraph.claims as claims_mod
+
+        class _PrGh:
+            def __call__(self, cmd):
+                joined = " ".join(str(a) for a in cmd)
+                if "pr list" in joined or "pulls" in joined:
+                    return (
+                        0,
+                        __import__("json").dumps(
+                            [{"number": 30,
+                              "closingIssuesReferences": [
+                                  {"number": 8,
+                                   "url": f"https://github.com/{REPO}/issues/8"}]}]
+                        ),
+                        "",
+                    )
+                if "user" in joined:
+                    return (0, __import__("json").dumps({"login": "viewer"}), "")
+                m = __import__("re").search(r"issues/(\d+)", joined)
+                if m:
+                    n = int(m.group(1))
+                    return (
+                        0,
+                        __import__("json").dumps(
+                            {"number": n, "state": "open",
+                             "html_url": f"https://github.com/{REPO}/issues/{n}"}
+                        ),
+                        "",
+                    )
+                return (1, "", "gh: fake cannot route")
+
+        saved = claims_mod.run_gh
+        claims_mod.run_gh = _PrGh()
+        try:
+            outcome, data, _msg = claims_mod.pr_guard(REPO, [8], claims_mod.load_claims_config())
+        finally:
+            claims_mod.run_gh = saved
+        self.assertEqual(outcome, "taken")
+        numbers = [c.get("number") for c in (data.get("collisions") or [])]
+        self.assertEqual(numbers, [30], "the closing PR is the structured collision")
+
+    def test_untrusted_login_payload_carries_a_reason(self):
+        """The frozen echo check is satisfied by login_probes alone; this pin
+        requires the actual reason field."""
+        import zaxbygraph.claims as claims_mod
+
+        class _UntrustedGh:
+            def __call__(self, cmd):
+                joined = " ".join(str(a) for a in cmd)
+                if "user" in joined:
+                    return (0, __import__("json").dumps({"login": "outsider"}), "")
+                if "graphql" in joined:
+                    return (
+                        0,
+                        __import__("json").dumps(
+                            {"data": {"repository": {"viewerPermission": "READ"}}}
+                        ),
+                        "",
+                    )
+                m = __import__("re").search(r"orgs/[\w.-]+/members/", joined)
+                if m:
+                    return (404, "", "Not Found")
+                m = __import__("re").search(r"repos/([\w.-]+)/([\w.-]+)$", joined.strip())
+                if m:
+                    return (
+                        0,
+                        __import__("json").dumps(
+                            {"owner": {"login": "someoneelse"},
+                             "full_name": f"{m.group(1)}/{m.group(2)}"}
+                        ),
+                        "",
+                    )
+                return (1, "", "gh: fake cannot route")
+
+        saved = claims_mod.run_gh
+        claims_mod.run_gh = _UntrustedGh()
+        try:
+            outcome, data, _msg = claims_mod.take_claims(
+                REPO, [5], claims_mod.load_claims_config()
+            )
+        finally:
+            claims_mod.run_gh = saved
+        self.assertEqual(outcome, "not_applicable")
+        reason = data.get("reason") or ""
+        self.assertIn("trust", reason.lower(), "the payload names why it refused")
+
+
 if __name__ == "__main__":
     unittest.main()

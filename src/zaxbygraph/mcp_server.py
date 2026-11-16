@@ -1664,18 +1664,58 @@ def _claims_cfg_for(db_path: Path) -> dict:
     return claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
 
 
-def _claims_tool_error(exc) -> ToolError:
+def _claims_tool_error(exc, *, slug=None, db_path=None) -> ToolError:
     from zaxbygraph import claims as claims_mod
 
+    # FB-011: carry the resolved identity (the ToolError convention every
+    # other MCP path honours) so the error envelope is not null-blind.
     if isinstance(exc, claims_mod.ConfigError):
         message = str(exc) + (f" (config file: {exc.path})" if exc.path else "")
-        return ToolError("config_error", message, hint="fix the [claims] configuration")
+        return ToolError(
+            "config_error",
+            message,
+            hint="fix the [claims] configuration",
+            slug=slug,
+            db_path=db_path,
+        )
     return ToolError(
-        "runtime", str(exc), hint="internal error; the server log has details"
+        "runtime",
+        str(exc),
+        hint="internal error; the server log has details",
+        slug=slug,
+        db_path=db_path,
     )
 
 
-def _live_claims_envelope(slug: str, db_path: Path, flow) -> dict:
+def _claims_schema_defaults(tool: str) -> dict:
+    """Empty values for the tool's own outputSchema-required data keys
+    (FB-008): a FAILURE envelope preserves its outcome data, and that data
+    must still validate against the advertised schema -- a strict MCP
+    client rejects the whole result otherwise, losing the coded outcome at
+    exactly the moment it matters."""
+    schema = _output_schema_for(tool)
+    props = (schema.get("properties") or {}).get("data") or {}
+    required = props.get("required") or []
+    types = props.get("properties") or {}
+    defaults: dict = {}
+    for key in required:
+        kind = (types.get(key) or {}).get("type")
+        if isinstance(kind, list):
+            kind = next((k for k in kind if k != "null"), None)
+        if kind == "array":
+            defaults[key] = []
+        elif kind == "boolean":
+            defaults[key] = False
+        elif kind == "object":
+            defaults[key] = {}
+        elif kind == "string":
+            defaults[key] = ""
+        else:
+            defaults[key] = None
+    return defaults
+
+
+def _live_claims_envelope(slug: str, db_path: Path, flow, *, tool: str) -> dict:
     """Run one live claims flow and answer the outcome envelope (data
     preserved on nonzero outcomes -- isError: true comes from the error
     object the envelope carries)."""
@@ -1684,22 +1724,58 @@ def _live_claims_envelope(slug: str, db_path: Path, flow) -> dict:
     try:
         cfg = _claims_cfg_for(db_path)
     except Exception as exc:
-        raise _claims_tool_error(exc) from exc
+        raise _claims_tool_error(exc, slug=slug, db_path=db_path) from exc
     env, _exit_code = claims_command_envelope(slug, db_path, cfg, flow)
+    if env.get("ok") is False:
+        data = env.get("data")
+        if isinstance(data, dict):
+            if tool == "claims":
+                # A live listing that failed IS a live attempt: do not let the
+                # schema filler write live:false over it (FB-008 closeout).
+                data.setdefault("live", True)
+                data.setdefault("derived", False)
+            for key, value in _claims_schema_defaults(tool).items():
+                data.setdefault(key, value)
+            env["data"] = data
     return env
 
 
 def _tool_claim(arguments: dict, ctx) -> dict:
     numbers = _claim_numbers(arguments, "claim")
-    settle = arguments.get("settle_seconds")
-    if settle is not None and (
-        isinstance(settle, bool) or not isinstance(settle, (int, float))
-    ):
-        raise ToolError(
-            "bad_request", "settle_seconds must be a number",
-            hint="pass settle_seconds as seconds (default [claims] settle_seconds)",
-        )
+    # Resolve the identity BEFORE the settle pre-check (FB-011 + the closeout
+    # critic): the pre-check raises a coded bad_request, and a refusal that
+    # cannot name the repository it refused is the null-blind envelope the
+    # ToolError slug/db_path convention exists to remove.
     slug, db_path = _resolve_target(arguments, ctx)
+    settle = arguments.get("settle_seconds")
+    if settle is not None:
+        # FB-001: the ONE shared validator (finite, non-negative, <=300) the
+        # config chain and the CLI flag apply. Its ConfigError becomes a
+        # coded bad_request that CARRIES the resolved identity.
+        from zaxbygraph import claims as _claims_mod
+
+        try:
+            _claims_mod._coerce_settle(settle, "the settle_seconds argument")
+        except _claims_mod.ConfigError as exc:
+            raise ToolError(
+                "bad_request",
+                str(exc),
+                hint="pass settle_seconds as seconds (default [claims] settle_seconds)",
+                slug=slug,
+                db_path=db_path,
+            ) from exc
+        except (OverflowError, ValueError) as exc:
+            # A guard, not a reachable path: _coerce_settle converts every
+            # range fault to ConfigError today. It stays so a future change
+            # inside that validator degrades to a coded refusal with identity
+            # rather than to the dispatcher's identity-less generic handler.
+            raise ToolError(
+                "bad_request",
+                f"settle_seconds is outside the representable range: {exc}",
+                hint="pass settle_seconds as seconds (default [claims] settle_seconds)",
+                slug=slug,
+                db_path=db_path,
+            ) from exc
 
     def _flow(repo: str, cfg: dict):
         from zaxbygraph import claims as claims_mod
@@ -1708,7 +1784,7 @@ def _tool_claim(arguments: dict, ctx) -> dict:
             repo, numbers, cfg, settle_seconds=float(settle) if settle is not None else None
         )
 
-    return _live_claims_envelope(slug, db_path, _flow)
+    return _live_claims_envelope(slug, db_path, _flow, tool="claim")
 
 
 def _tool_release(arguments: dict, ctx) -> dict:
@@ -1735,7 +1811,7 @@ def _tool_release(arguments: dict, ctx) -> dict:
             repo, numbers, cfg, None if tokenless else token
         )
 
-    return _live_claims_envelope(slug, db_path, _flow)
+    return _live_claims_envelope(slug, db_path, _flow, tool="release")
 
 
 def _tool_pr_guard(arguments: dict, ctx) -> dict:
@@ -1747,7 +1823,7 @@ def _tool_pr_guard(arguments: dict, ctx) -> dict:
 
         return claims_mod.pr_guard(repo, numbers, cfg)
 
-    return _live_claims_envelope(slug, db_path, _flow)
+    return _live_claims_envelope(slug, db_path, _flow, tool="pr_guard")
 
 
 def _tool_claims(arguments: dict, ctx) -> dict:
@@ -1771,7 +1847,7 @@ def _tool_claims(arguments: dict, ctx) -> dict:
                     f"GitHub could not be reached: {exc.message}",
                 )
 
-        return _live_claims_envelope(slug, db_path, _flow)
+        return _live_claims_envelope(slug, db_path, _flow, tool="claims")
     conn = _open_corpus(slug, db_path)
     try:
         data = _translated_derive(_claims_query, conn, slug, db_path, None)
@@ -2662,8 +2738,13 @@ _TOOL_SHAPES: dict[str, dict] = {
         " untrusted_text. Derived from stored comments by default (ages from"
         " the store's last sync time); live=true reads the repo-wide"
         " comments feed from GitHub with wall-clock ages.",
-        "data_keys": ("claims", "claims_config", "config_source", "derived",
-                      "live", "stale_claims"),
+        # FB-024: `claims`/`stale_claims` are CONDITIONAL, not
+        # always-present. A live read that FAILED must not fabricate an empty
+        # listing out of a read that never happened (the rule
+        # LiveListingFailClosedTests pins on the CLI), so the always-present
+        # set stops at the keys a failed live attempt still answers. The
+        # listings stay declared properties for the success payload.
+        "data_keys": ("claims_config", "config_source", "derived", "live"),
         "row_fields": {
             "claims": (
                 "active", "age_hours", "author", "author_association",
@@ -2696,8 +2777,7 @@ _TOOL_SHAPES: dict[str, dict] = {
                 ),
                 "config_source": _STR,
             },
-            ("claims", "claims_config", "config_source", "derived", "live",
-             "stale_claims"),
+            ("claims_config", "config_source", "derived", "live"),
         ),
     },
 }

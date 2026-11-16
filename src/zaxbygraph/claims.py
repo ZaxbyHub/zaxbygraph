@@ -22,6 +22,7 @@ still be listed and a safety read must be complete.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -64,7 +65,10 @@ _TOKEN_CHARSET = r"[A-Za-z0-9-]{16,64}"
 #: digits is not a reference, so an oversized token matches nothing instead
 #: of wedging ``int()``.
 _MAX_REF_DIGITS = 9
-_REF_RE = re.compile(r"#(\d{1,%d})(?!\w)" % _MAX_REF_DIGITS)
+#: ASCII-only digit classes (FB-005): Python's ``\d`` is Unicode-aware, so
+#: ``#٥`` (Arabic-Indic five) would otherwise localize to issue 5. GitHub
+#: issue references are ASCII digits.
+_REF_RE = re.compile(r"#([0-9]{1,%d})(?!\w)" % _MAX_REF_DIGITS)
 
 #: A cross-repo reference (``other/repo#5``): the ref is skipped, never
 #: localized to the same-numbered local item.
@@ -78,6 +82,9 @@ _GH_TIMEOUT_S_DEFAULT = 30.0
 #: of proceeding on partial evidence. Only the repo-wide presentation feed
 #: may cap, and only AFTER complete collection.
 _SAFETY_MAX_PAGES = 40
+#: The page size every paged gh read requests; the completeness check uses
+#: the RAW page length against it (FB-018).
+_PAGE_SIZE = 100
 _PRESENTATION_MAX_ENTRIES = 500
 
 #: The live view caps PR scanning the same way the CLI does.
@@ -140,14 +147,77 @@ def _validate_claims_value(key: str, value, path: str | None) -> Any:
             )
         return int(value)
     if key == "settle_seconds":
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or value < 0
+            or value > _MAX_SETTLE_SECONDS
+        ):
             raise ConfigError(
-                "[claims] settle_seconds must be a non-negative number", path=path
+                "[claims] settle_seconds must be a finite non-negative number"
+                f" at most {_MAX_SETTLE_SECONDS:g}",
+                path=path,
             )
+        try:
+            if not math.isfinite(value):
+                raise ConfigError(
+                    "[claims] settle_seconds must be finite", path=path
+                )
+        except OverflowError:
+            # A TOML integer past the float range: coded, never a traceback.
+            raise ConfigError(
+                "[claims] settle_seconds is outside the representable range",
+                path=path,
+            ) from None
         return float(value)
     raise ConfigError(
         f"unknown [claims] key {key!r} (allowed: {sorted(_CLAIMS_KEYS)})", path=path
     )
+
+
+#: The settle delay's upper bound (FB-001 closeout): a finite-but-absurd
+#: value still raises OverflowError inside ``time.sleep`` AFTER the claim
+#: wave is posted, which is the orphan path this validation exists to close.
+#: Five minutes is already far past any useful settle window.
+_MAX_SETTLE_SECONDS = 300.0
+
+
+def _coerce_settle(value, source: str) -> float:
+    """The ONE settle validation, applied BEFORE any post (FB-001): a settle
+    value must be a finite non-negative number at or below
+    ``_MAX_SETTLE_SECONDS``. ``time.sleep`` raises ValueError for
+    negative/NaN and OverflowError for infinity AND for finite values past
+    the platform range, and those exceptions are not ``_GhFailure`` -- without
+    this check a bad override kills the command after the claim wave is
+    already posted, orphaning it. Raises ``ConfigError`` (a coded envelope on
+    every surface)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(
+            f"[claims] settle_seconds must be a number (got {value!r} from {source})"
+        )
+    try:
+        finite = math.isfinite(value)
+    except (OverflowError, ValueError):
+        # A TOML integer past the float range: tomllib accepts it, math does
+        # not -- a coded config_error, never a traceback.
+        raise ConfigError(
+            f"[claims] settle_seconds is outside the representable range"
+            f" (got a value from {source})"
+        ) from None
+    if not finite:
+        raise ConfigError(
+            f"[claims] settle_seconds must be finite (got {value!r} from {source})"
+        )
+    if value < 0:
+        raise ConfigError(
+            f"[claims] settle_seconds must be non-negative (got {value!r} from {source})"
+        )
+    if value > _MAX_SETTLE_SECONDS:
+        raise ConfigError(
+            f"[claims] settle_seconds must be at most {_MAX_SETTLE_SECONDS:g}"
+            f" (got {value!r} from {source})"
+        )
+    return float(value)
 
 
 def load_claims_config(
@@ -191,7 +261,10 @@ def load_claims_config(
                 raise ConfigError(
                     f"malformed TOML in {label} claims config: {exc}", path=path
                 ) from exc
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
+                # UnicodeDecodeError is what tomllib raises for a non-UTF-8
+                # file (Windows PowerShell writes UTF-16LE by default) --
+                # FB-010: it must be a coded config_error, not a traceback.
                 raise ConfigError(
                     f"cannot read {label} claims config: {exc}", path=path
                 ) from exc
@@ -201,8 +274,28 @@ def load_claims_config(
         for key, value in table.items():
             cfg[key] = _validate_claims_value(key, value, path)
             supplied = label
+    _validate_claims_vocabulary(cfg, supplied)
     cfg["_config_source"] = supplied or "built-ins"
     return cfg
+
+
+def _validate_claims_vocabulary(cfg: dict, source: str | None) -> None:
+    """Reject a claim pattern that is contained in the release prefix
+    (FB-004): the release form is ANCHORED and the claim form is a
+    substring test, so such an overlap makes every release parse as a
+    fresh claim -- the release could never end the claim it targets."""
+    release = str(cfg.get("release_prefix") or "").lower()
+    if not release:
+        return
+    for pattern in cfg.get("patterns") or []:
+        if str(pattern).lower() in release:
+            raise ConfigError(
+                "[claims] patterns entry "
+                f"{pattern!r} is contained in release_prefix "
+                f"{cfg.get('release_prefix')!r}; a release body matching a claim"
+                " pattern could never end its claim",
+                path=None,
+            )
 
 
 def claims_config_echo(cfg: dict) -> dict:
@@ -296,7 +389,7 @@ def parse_claim(body: str | None, cfg: dict) -> dict | None:
                     continue  # cross-repo ref: dropped, never localized
                 if piece.startswith("#"):
                     piece = piece[1:]
-                if re.fullmatch(r"\d{1,%d}" % _MAX_REF_DIGITS, piece):
+                if re.fullmatch(r"[0-9]{1,%d}" % _MAX_REF_DIGITS, piece):
                     named.add(int(piece))
         named |= _ref_numbers(line)
         return {
@@ -455,6 +548,16 @@ def collect_claims(
         except (TypeError, ValueError):
             github_id = 0
         title = row[7] if len(row) > 7 else titles.get(number, "")
+        # Release-first (FB-004): the release form is ANCHORED (starts-with),
+        # the claim form is an unanchored substring test, so a configured
+        # claim pattern contained in the release prefix would otherwise
+        # consume the release before parse_release ever sees it.
+        parsed_release = parse_release(body, cfg)
+        if parsed_release is not None:
+            releases_by_issue.setdefault(number, []).append(
+                {**parsed_release, "_key": (str(created_at or ""), github_id)}
+            )
+            continue
         parsed = parse_claim(body, cfg)
         if parsed is not None:
             claims_by_issue.setdefault(number, []).append(
@@ -474,14 +577,6 @@ def collect_claims(
                 }
             )
             continue
-        parsed_release = parse_release(body, cfg)
-        if parsed_release is not None:
-            releases_by_issue.setdefault(number, []).append(
-                {
-                    "token": parsed_release["token"],
-                    "_key": (str(created_at or ""), github_id),
-                }
-            )
 
     out: list[dict] = []
     for number, claims in claims_by_issue.items():
@@ -521,15 +616,25 @@ def collect_claims(
 
 def _store_claim_rows(conn: sqlite3.Connection, repo: str) -> list[tuple]:
     """Comment rows of the repo's OPEN ISSUES (the derived tier's caller
-    selection): issue comments only -- review comments are not claims."""
-    return conn.execute(
-        "SELECT c.number, c.author, c.author_association, c.created_at,"
-        " c.body, c.html_url, c.github_id"
-        " FROM comments c JOIN items i ON i.repo = c.repo AND i.number = c.number"
-        " WHERE c.repo = ? AND c.kind = 'issue_comment'"
-        " AND i.kind = 'issue' AND i.state = 'open'",
-        (repo,),
-    ).fetchall()
+    selection): issue comments only -- review comments are not claims.
+
+    The full set is materialized once (FB-021, disclosed boundary): the gate
+    needs every candidate row before it can sort and classify, so incremental
+    consumption is not available at this layer. The AGENTS.md
+    "fetched incrementally" rule is stated for the ``sql`` escape hatch's
+    user-supplied queries, not for this internal fixed read; the critic rated
+    the materialization INFO (optional) and it is recorded as a boundary
+    rather than claimed as a fix."""
+    return list(
+        conn.execute(
+            "SELECT c.number, c.author, c.author_association, c.created_at,"
+            " c.body, c.html_url, c.github_id"
+            " FROM comments c JOIN items i ON i.repo = c.repo AND i.number = c.number"
+            " WHERE c.repo = ? AND c.kind = 'issue_comment'"
+            " AND i.kind = 'issue' AND i.state = 'open'",
+            (repo,),
+        )
+    )
 
 
 def claims_gate_by_number(
@@ -612,9 +717,12 @@ def claims_listing(
 
 def run_gh(argv: list[str]) -> tuple[int, str, str]:
     """One ``gh`` subprocess call: argv list, no shell. The subprocess
-    timeout rides ``ZAXBYGRAPH_CLAIM_GH_TIMEOUT_S`` (default 30 s). Tests
-    replace this module attribute to redirect the surface offline; the
-    command functions late-bind it at CALL time.
+    timeout rides ``ZAXBYGRAPH_CLAIM_GH_TIMEOUT_S`` (default 30 s; values
+    BELOW 30 are clamped up to 30 -- the floor keeps a misconfigured small
+    value from turning slow calls into false github_unreachable verdicts, so
+    the knob can lengthen a call, not shorten it). Tests replace this module
+    attribute to redirect the surface offline; the command functions
+    late-bind it at CALL time.
 
     Subprocess faults never escape as tracebacks: a missing/unrunnable gh
     binary (FileNotFoundError/OSError) and a timed-out call both translate
@@ -758,7 +866,8 @@ def _resolve_login_trust(
         return True, probes
 
     # Both membership probes missed conclusively: the corroborating
-    # viewerPermission fallback (never a mask -- failures raised above).
+    # viewerPermission fallback. A FAILED probe raises (never masked into a
+    # negative trust verdict -- FB-002); only a conclusive answer counts.
     try:
         payload = _json_call(
             runner,
@@ -768,9 +877,15 @@ def _resolve_login_trust(
             "graphql viewerPermission",
         )
     except _GhFailure:
-        payload = None
+        raise
     permission = ""
     if isinstance(payload, dict):
+        errors = payload.get("errors")
+        if errors:
+            raise _GhFailure(
+                "graphql viewerPermission returned errors: "
+                + str(errors)[:160]
+            )
         permission = str(
             ((payload.get("data") or {}).get("repository") or {}).get(
                 "viewerPermission"
@@ -809,14 +924,29 @@ def _read_page_stream(
             raise _GhFailure(f"gh {what} page {page_no} was unparseable: {exc}") from exc
         if not isinstance(payload, list):
             raise _GhFailure(f"gh {what} page {page_no} was not a list")
-        entries = [e for e in payload if isinstance(e, dict)]
+        malformed = [e for e in payload if not isinstance(e, dict)]
+        if malformed:
+            # A safety read is complete or it fails closed (FB-018): a
+            # malformed entry's content is unknown, and a claim-bearing
+            # comment hidden inside one must never be silently dropped from
+            # a decision that can put two sessions on one issue.
+            raise _GhFailure(
+                f"gh {what} page {page_no} carried {len(malformed)} malformed"
+                " entr" + ("y" if len(malformed) == 1 else "ies")
+                + "; the read fails closed rather than dropping unknown content"
+            )
+        entries = list(payload)
         page_ids = {
             e["id"] for e in entries if isinstance(e.get("id"), int)
         }
         fresh = bool(page_ids - seen_ids) if page_ids else None
         seen_ids |= page_ids
         out.extend(entries)
-        if len(entries) < 100:
+        # Completeness is judged on the RAW page length (FB-018): counting
+        # only well-formed entries would treat a full page carrying one
+        # malformed element as the final page and silently truncate the
+        # safety read.
+        if len(payload) < _PAGE_SIZE:
             return out
         if fresh is False:
             # A page of only-already-seen comment ids: the listing is
@@ -835,7 +965,7 @@ def _issue_comments(runner: Callable, repo: str, number: int) -> list[dict]:
     def _argv(page: int) -> list[str]:
         return [
             "gh", "api",
-            f"repos/{repo}/issues/{number}/comments?page={page}&per_page=100",
+            f"repos/{repo}/issues/{number}/comments?page={page}&per_page={_PAGE_SIZE}",
         ]
 
     return _read_page_stream(
@@ -1012,7 +1142,7 @@ def list_claims_live(repo: str, cfg: dict, run_gh: Callable | None = None) -> di
     def _argv(page: int) -> list[str]:
         return [
             "gh", "api",
-            f"repos/{repo}/issues/comments?page={page}&per_page=100",
+            f"repos/{repo}/issues/comments?page={page}&per_page={_PAGE_SIZE}",
         ]
 
     feed = _read_page_stream(
@@ -1232,6 +1362,17 @@ def _hold_snapshot(
             comments, number, cfg, issue_open=True, closing_prs=[]
         )
         active[number] = [e for e in entries if e.get("active")]
+    # DISCLOSED BOUNDARY (FB-006): the derived gate also holds every issue a
+    # claim NAMES, wherever that claim was posted; the live pre-read reads
+    # only the REQUESTED issues' own threads, so a claim posted solely on an
+    # issue outside the request set that names a requested one is invisible
+    # here (the derived gate still covers it once the store is synced). A
+    # cross-read among the requested threads was tried and removed: under the
+    # all-or-nothing refusal it is unobservable (the naming issue's own hold
+    # already refuses the command), so it was dead code. Closing the gap for
+    # real needs the repo-wide feed (which the 40x100 safety cap would make a
+    # hard refusal on large repositories) or a store read (which trades the
+    # live path's freshness guarantee) -- both recorded as boundaries.
     if not problems:
         prs = _open_closing_prs(runner, repo)
     return active, prs, problems
@@ -1256,9 +1397,9 @@ def take_claims(
     wave released atomically when it loses."""
     runner = _runner(run_gh)
     ordered = sorted({int(n) for n in numbers})
-    settle = float(cfg.get("settle_seconds", 2.0))
+    settle = _coerce_settle(cfg.get("settle_seconds", 2.0), "config")
     if settle_seconds is not None:
-        settle = float(settle_seconds)
+        settle = _coerce_settle(settle_seconds, "override")
     echo = claims_config_echo(cfg)
     base_data: dict = {"claims_config": echo, "config_source": echo["config_source"]}
 
