@@ -112,5 +112,9 @@ class BudgetCapPins(unittest.TestCase):
 
     def test_above_floor_bound_reachable(self) -> None:
         chars, data = self._run("100000")
-        self.assertNotIn("truncated", data)
+        # Amendment (issue #70 AC6): the one-call selection carries the
+        # budget flag whenever a budget is in effect, so a budget that
+        # binds nothing answers truncated=false (absent at base, when no
+        # budget flag existed at all).
+        self.assertIs(data.get("truncated", False), False)
         self.assertLessEqual(chars, 100000 * 4)

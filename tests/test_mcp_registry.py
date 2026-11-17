@@ -63,6 +63,12 @@ CLI_TO_SURFACE = {
     # Snapshot transport (issue #34): a human-workflow surface (moves a
     # store between machines), not an agent read - the MCP gap is recorded.
     "snapshot": "documented-gap: snapshot transport (issue #34); MCP surfacing is a future lane",
+    # First use and packaged-skill maintenance (issue #73): init drives gh
+    # and the first sync from a shell; skill prints/installs/checks the
+    # packaged skill file. Both are human-workflow surfaces - the MCP tool
+    # list is unchanged (C14's digest pins it).
+    "init": "documented-gap: first-use bootstrap (issue #73); gh preflight + first sync + MCP line from a shell",
+    "skill": "documented-gap: packaged-skill maintenance (issue #73); print/install/check from a shell",
 }
 
 #: {tool -> CLI command}. Every typed tool must stay reachable from the

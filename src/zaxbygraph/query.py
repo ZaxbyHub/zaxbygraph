@@ -8,6 +8,7 @@ import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 
+from zaxbygraph import __version__
 from zaxbygraph.db import CURRENT_USER_VERSION, _V7_USER_VERSION, _V8_USER_VERSION
 from zaxbygraph.repo import validate_slug
 
@@ -302,6 +303,13 @@ def status(conn: sqlite3.Connection, repo: str | None = None) -> dict:
         "counts": [dict(r) for r in items],
         "coverage": _coverage(conn, repo, user_version),
         "snapshot": snapshot,
+        # One version everywhere (issue #73): the TOOL version beside the
+        # OPENED store's schema version — PRAGMA user_version of the file the
+        # caller is actually reading, NOT CURRENT_USER_VERSION (a v11 store
+        # opened by a v12 build must report 11, so a stale store is visible
+        # beside the tool that would upgrade it on the next sync).
+        "tool_version": __version__,
+        "schema_version": user_version,
     }
 
 

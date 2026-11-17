@@ -1459,7 +1459,7 @@ class AsOfViewTests(_StoreTestCase):
             f" (hub share of src/feature.py = 1/3); got {merged_at_t1}",
         )
 
-        asof = derive.triage(self.conn, REPO, as_of=t1)
+        asof = derive.triage(self.conn, REPO, as_of=t1, explain=True)
         numbers = [r["number"] for r in asof["rows"]]
         self.assertIn(1001, numbers)
         self.assertIn(1002, numbers)
@@ -1550,7 +1550,7 @@ class AsOfViewTests(_StoreTestCase):
             " vocabulary (the post-T body shares no tokens)",
         )
 
-        full = derive.triage(self.conn, REPO, include_gated=True)
+        full = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         full_rows = {r["number"]: r for r in full["rows"]}
         self.assertIn(1004, full_rows)
         self.assertEqual(

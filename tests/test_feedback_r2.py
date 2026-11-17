@@ -449,7 +449,10 @@ class BotAuthorParticipantsTests(_StoreTestCase):
         _pin_synced_at(conn)
 
     def test_bot_author_not_counted(self) -> None:
-        out = derive.triage(self.conn, REPO, include_gated=True)
+        # explain=True: the per-feature dump the assertion reads rides
+        # the EXPLAIN payload (issue #70 AC8 slim default moves it off
+        # the default rows).
+        out = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(500, rows)
         participants = rows[500]["scores"]["features_raw"]["participants"]

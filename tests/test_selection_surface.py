@@ -279,11 +279,23 @@ class DerivedScaleTests(_StoreTestCase):
         # granularity: 6,000 fires ~= 6M VDBE instructions (base measured
         # 1,884-3,937 fires). Round-5 correction: the first draft compared
         # raw fires against a 6,000,000 budget - 1000x too loose.
+        #
+        # Python-call budgets (issue #70 AC1's operation-count contract):
+        # the base measured 40.5M (triage), 42.7M (bundle), 41.2M (brief),
+        # 1.29M (similar) - the dominant residual cost is the stage-2
+        # analog scan (pair_components over every candidate), which is the
+        # algorithm's design, not the O(refs x vocab) path-resolution
+        # defect this issue fixes. That defect is discriminated by leg 1's
+        # seam counter (<=64 vocabulary visits per resolution) and by the
+        # wall ceilings in leg 3b. These budgets therefore pin the
+        # algorithm's FIXED cost with headroom: 1.5x the measured base
+        # catches a regression (a re-introduced vocabulary scan multiplies
+        # the count) while tolerating machine-shape variance.
         budgets = {
-            "triage": (10_000_000, 6_000),
-            "bundle": (10_000_000, 6_000),
-            "similar": (300_000, 6_000),
-            "brief": (10_000_000, 6_000),
+            "triage": (60_000_000, 6_000),
+            "bundle": (64_000_000, 6_000),
+            "similar": (2_000_000, 6_000),
+            "brief": (62_000_000, 6_000),
         }
         vdbe = {"n": 0}
         py_calls = {"n": 0}
@@ -381,7 +393,13 @@ class DerivedScaleTests(_StoreTestCase):
             derive_calls = {"n": 0}
 
             def _counting_compute(*a, **k):
-                counting["n"] += 1
+                # Single-row mode (only=...) is the FIXED shape: brief
+                # scores one row through the shared compute. Only a FULL
+                # (no only=) recompute counts as the defect this leg
+                # pins (issue #70 AC1: brief must not recompute the whole
+                # triage for one row).
+                if not k.get("only"):
+                    counting["n"] += 1
                 return real_compute(*a, **k)
 
             def _profile(frame, event, arg):
@@ -846,7 +864,7 @@ class SlimRowsTests(_StoreTestCase):
         )
         self.assertTrue(env_x["ok"], env_x)
         rows_x = env_x["data"]["rows"]
-        self.assertEqual(len(rows_x), 3)
+        self.assertEqual(len(rows_x), 5)
         for row in rows_x:
             blob = json.dumps(row)
             self.assertIn(

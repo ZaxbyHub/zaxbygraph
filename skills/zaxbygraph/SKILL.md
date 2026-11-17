@@ -6,7 +6,7 @@ description: >
   history question, recurrence hunt, regression archaeology, or "what touched this file"
   task for a GitHub repo.
 ---
-<!-- zaxbygraph skill-version: 0.4.0 -->
+<!-- zaxbygraph skill-version: 0.5.0 hash=18b5de12b93651e9735921b8ccef18d22330e99d3b0e9f1e2f50b73e527f77f6 -->
 
 # ZaxbyGraph
 
@@ -37,6 +37,12 @@ the checkout itself so the origin host is captured; a bare
 `--repo OWNER/REPO` always keys the store under `github.com` - mixing the
 two forms splits one repo across two stores.)
 
+On a fresh machine, `zaxbygraph init --repo OWNER/REPO` is the one command:
+it checks gh is installed and authenticated (coded errors name the fix —
+install gh, or `gh auth login`), runs the first sync through the same
+locked path as `sync`, and prints the MCP registration line
+(`claude mcp add zaxbygraph -- zaxbygraph mcp`).
+
 If a corpus exists but `complete: false` or `last_error` is non-null, the
 last sync stopped early — re-run the same `sync` (it resumes from the
 watermark) and do not draw conclusions from the DB until it finishes clean.
@@ -56,6 +62,29 @@ Check the result before trusting the DB:
   nothing changed upstream, which is success, not failure.
 - `ok: false` → read `error`. Sync reports failure as a **result object on
   stdout**, not on stderr, so don't infer success from a silent stderr.
+
+## Workflow recipe: one call first
+
+For "what should we work on next" — the common case — one bounded call
+answers it. `bundle --with-briefs` returns the top work bundles with every
+member's decision fields (labels, dates, author, URL, a body excerpt,
+gates, and the named files split existing/not-yet-existing) inside a token
+budget:
+
+```bash
+zaxbygraph bundle --with-briefs --budget-tokens 4000 --repo OWNER/REPO
+```
+
+- The default budget is 4000 tokens; raise or lower it with
+  `--budget-tokens B`. `truncated: true` in the payload says the budget
+  cut the members list — widen the budget or page the pool if you need
+  everything.
+- Pick a bundle, `claim` its issues, then work it in the bundle's
+  `order`. The MCP `bundle` tool called with no arguments answers the
+  same one-call selection.
+- The per-command recipe below (triage → bundle → brief) is the fallback
+  when you need to steer the selection by hand: filter the pool, page
+  triage, or pull one item's full packet.
 
 ## MCP surface (prefer when configured)
 
@@ -321,7 +350,7 @@ bodies and marks them `truncated: true` (`0` is the explicit uncapped
 override — the default 20 KiB body bound does not apply; negatives are a
 usage error).
 
-**Payloads (`data`):** `status` → `{repos[], counts[]}` · `search` →
+**Payloads (`data`):** `status` → `{repos[], counts[], schema_version, tool_version}` · `search` →
 `{items[], matched_mode, total_matches, corpus_items, index_stale}`
 (comment hits merge into their item: `matching_comments` +
 `comment_snippet`; `index_stale` is true when the DB predates the schema —
@@ -380,7 +409,7 @@ always-present keys are.
 | search | broadened_matches, corpus_items, index_stale, items, matched_mode, offset, strict_matches, total_matches |
 | similar | candidates, capabilities, derived, ls_files_applied, ls_files_head, repo, resolved_path_count, target, weights |
 | sql | columns, rows |
-| status | counts, coverage, repos, snapshot |
+| status | counts, coverage, repos, schema_version, snapshot, tool_version |
 | triage | blocking_source, claims_config, closeable_trackers, config_source, cursor, derived, formula_version, gated, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
 | what-closed | commits, index_stale, keyword_closes, kind, number, prs |
 
@@ -503,6 +532,16 @@ corpus exists for the resolved repo.
 - `zaxbygraph doctor [--consolidate] [--scan DIR]` reports scattered legacy
   DBs (per-DB item and garbled-row counts); `--consolidate` copies the
   freshest complete corpus into the store — originals are never modified.
+  doctor also reports the `skill_copies` section: every installed copy of
+  this skill under the four default skill homes (`~/.claude/skills`,
+  `~/.agents/skills`, `~/.zcode/skills`, `~/.opencode/skills`) plus each
+  `--scan` dir, classified `stale`/`current` by content hash against the
+  packaged skill, with the one-line refresh command.
+- `zaxbygraph skill` prints the packaged copy of this skill;
+  `skill --install DIR` writes a stamped copy to `DIR/zaxbygraph/SKILL.md`
+  (the stamp carries the package version and the skill body's sha256);
+  `skill --check [--dir DIR]` is the read-only version of the same scan
+  doctor reports. `--install` is the only write path.
 - A second `sync` while one is running joins it: `{ok: true, ..., data: {joined: true}}`
   with zero GitHub calls; `--wait` blocks for the lock instead.
 

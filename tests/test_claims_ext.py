@@ -624,7 +624,8 @@ class BriefSuppressionTests(_StoreTest):
         # triage/bundle KEEP the additive fields the brief strips.
         out_t = io.StringIO()
         with redirect_stdout(out_t):
-            main(["triage", "--include-gated", "--limit", "50", "--repo", REPO, "--format", "json"])
+            main(["triage", "--include-gated", "--limit", "50", "--explain",
+                  "--repo", REPO, "--format", "json"])
         data_t = (_env_of(out_t.getvalue()).get("data") or {})
         row_t = next(r for r in data_t["rows"] if r.get("number") == 52)
         self.assertIn("claim_evidence", row_t, "the triage row carries claim evidence")

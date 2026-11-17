@@ -741,37 +741,63 @@ class FilteredCountSyncTests(TempDBTest):
         queries: list[str] = []
         failures = {"n": 0}
 
-        class _DegradingTransport(GraphQLSource):
-            """Answers with the PRODUCTION validation-failure shape
-            (GitHubError) while any rendered query still selects
-            filteredCount; serves the canned page once the query omits
-            it."""
-
-            def __init__(self) -> None:
-                super().__init__("probe", "clinic")
-                self.last_dropped_sections: dict[int, list] = {}
-
-            def _graphql(self, query: str, aliases: dict | None = None) -> dict:
-                queries.append(query)
-                if "filteredCount" in query:
-                    failures["n"] += 1
-                    raise GitHubError(
-                        "Field 'filteredCount' doesn't exist on type"
-                        " 'IssueTimelineItemsConnection'"
-                    )
-                self.last_dropped_sections = {}
-                return {"repository": {"p63": node}}
-
         class _SeamSource(FakeGitHubSource):
             def __init__(self) -> None:
                 super().__init__()
-                self._gql = _DegradingTransport()
+                self._gql = GraphQLSource(*SRC)
 
             def fetch_children(self, items) -> dict[int, dict]:
                 return self._gql.fetch_children(items)
 
+            def _timeline_page(self, number: int, kind: str, args: str):
+                return self._gql._timeline_page(number, kind, args)
+
         src = _SeamSource()
         src.add_pr(issue(63, title="degrading host", kind="pr"), pull(63))
+
+        # The degrading host answers at the TRANSPORT level, so the
+        # production _graphql — and therefore its shared retry seam — runs
+        # for real: while any rendered query selects filteredCount the host
+        # answers a payload-level validation error naming the field; once
+        # the query omits it, the canned page is served.
+        import subprocess as _sp
+
+        real_run = _sp.run
+
+        def _degrading_run(cmd, **kwargs):
+            # Only the GraphQL legs degrade; REST listing legs keep the
+            # fixture's canned answers (the fixture never shells out, so an
+            # empty JSON is the right shape for them).
+            is_graphql = "graphql" in cmd
+            body = kwargs.get("input") or ""
+            if is_graphql and isinstance(body, str) and body:
+                try:
+                    queries.append(json.loads(body)["query"])
+                except Exception:
+                    queries.append(body)
+            if is_graphql and "filteredCount" in body:
+                failures["n"] += 1
+                out = {
+                    "errors": [
+                        {
+                            "message": (
+                                "Field 'filteredCount' doesn't exist on type"
+                                " 'IssueTimelineItemsConnection'"
+                            ),
+                            "type": "VALIDATION_ERROR",
+                        }
+                    ],
+                    "data": None,
+                }
+            elif is_graphql:
+                out = {"data": {"repository": {"p63": node}}}
+            else:
+                out = {}
+            return _sp.CompletedProcess(cmd, 0, json.dumps(out), "")
+
+        patcher = patch("subprocess.run", _degrading_run)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         result = sync_repo(self.conn, src, REPO)
         self.assertIsNone(
             result["last_error"],

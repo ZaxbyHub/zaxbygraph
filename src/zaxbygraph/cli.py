@@ -1736,6 +1736,7 @@ def _triage_query(
     include_gated: bool,
     config: str | None,
     as_of: str | None = None,
+    explain: bool = False,
     repo: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
@@ -1756,6 +1757,7 @@ def _triage_query(
         config=config,
         weights=weights,
         as_of=as_of,
+        explain=explain,
     )
 
 
@@ -1770,6 +1772,7 @@ def _bundle_query(
     budget_tokens: int | None,
     config: str | None,
     as_of: str | None = None,
+    with_briefs: bool = False,
     repo: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
@@ -1795,6 +1798,7 @@ def _bundle_query(
         budget_tokens=budget_tokens,
         weights=weights,
         as_of=as_of,
+        with_briefs=with_briefs,
     )
 
 
@@ -1851,6 +1855,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
         bool(getattr(args, "include_gated", False)),
         args.config,
         getattr(args, "as_of", None),
+        bool(getattr(args, "explain", False)),
     )
 
 
@@ -1870,6 +1875,7 @@ def cmd_bundle(args: argparse.Namespace) -> int:
         args.budget_tokens,
         args.config,
         getattr(args, "as_of", None),
+        bool(getattr(args, "with_briefs", False)),
     )
 
 
@@ -2296,6 +2302,271 @@ def cmd_file_history(args: argparse.Namespace) -> int:
 
 def cmd_what_closed(args: argparse.Namespace) -> int:
     return _run_read_promote_truncated(args, what_closed, args.number)
+
+
+#: The MCP registration line init reports (issue #73 AC3): first use ends
+#: at a working agent surface, not just a populated store.
+MCP_REGISTRATION_LINE = "claude mcp add zaxbygraph -- zaxbygraph mcp"
+
+#: gh-presence markers: a failed ``gh --version`` whose combined output says
+#: the BINARY could not run (vs. any other nonzero exit — e.g. an
+#: unauthenticated host) classifies as gh-missing.
+_GH_MISSING_MARKERS = (
+    "could not run",
+    "cannot find",
+    "no such file",
+    "winerror",
+    "filenotfound",
+    "is not recognized",
+    "not installed",
+)
+
+
+def _preflight_gh() -> tuple[str, str | None]:
+    """issue #73 AC3: gh presence + authentication, through the SAME
+    ``zaxbygraph.claims.run_gh`` seam the claim commands use — late-bound
+    at CALL time via the module attribute, never a from-import alias, so a
+    patched seam stays in charge.
+
+    Returns ``("ok", None)`` or ``(code, detail)`` with DISTINCT coded
+    error keys: ``gh_missing`` (hint: install gh) and
+    ``gh_unauthenticated`` (hint: gh auth login)."""
+    runner = claims_mod.run_gh
+    rc, out, err = runner(["gh", "--version"])
+    if rc != 0 and any(m in f"{out} {err}".lower() for m in _GH_MISSING_MARKERS):
+        return "gh_missing", (err or out).strip()[:300] or "gh could not run"
+    rc, out, err = runner(["gh", "auth", "status"])
+    if rc != 0:
+        return "gh_unauthenticated", (err or out).strip()[:300] or "gh auth status failed"
+    return "ok", None
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    """``init --repo O/R`` (issue #73 AC3): preflight gh, then build the
+    store through the CLI's own sync path — the shared quiet ``_sync_core``
+    seam under the sync lock, with the store-profile inheritance and error
+    reporting cmd_sync applies — and report the MCP registration line in
+    the envelope payload."""
+    try:
+        if args.repo:
+            slug = validate_slug(args.repo)
+            host = DEFAULT_HOST
+        else:
+            host, slug = remote_info()
+    except RepoError as exc:
+        return emit_failure(args, 2, str(exc), slug=None)
+    db_path, _chain = resolve_db(slug, explicit=args.db, host=host)
+    # Preflight BEFORE any store work (AC3): a missing or unauthenticated
+    # gh fails fast with its coded error and never attempts the first sync.
+    verdict, detail = _preflight_gh()
+    if verdict == "gh_missing":
+        return emit_failure(
+            args,
+            1,
+            f"gh is not available: {detail}",
+            slug=slug,
+            db_path=db_path,
+            code_key="gh_missing",
+            hint="install the GitHub CLI (https://cli.github.com/), make sure"
+            " gh is on PATH, then re-run zaxbygraph init",
+        )
+    if verdict == "gh_unauthenticated":
+        return emit_failure(
+            args,
+            1,
+            f"gh is not authenticated with GitHub: {detail}",
+            slug=slug,
+            db_path=db_path,
+            code_key="gh_unauthenticated",
+            hint="run `gh auth login` to authenticate with GitHub, then"
+            " re-run zaxbygraph init",
+        )
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = connect(db_path)
+        init_schema(conn)
+    except RuntimeError as exc:
+        # Environment guards (SQLite floor, database newer than this build):
+        # never retryable — the same exit-2 contract as cmd_sync.
+        if conn is not None:
+            conn.close()
+        return emit_failure(args, 2, str(exc), slug=slug, db_path=db_path)
+    except Exception as exc:
+        # A storage fault before the sync starts is a result object, not a
+        # traceback (AGENTS.md: reported, not swallowed).
+        if conn is not None:
+            conn.close()
+        emit_result(
+            args,
+            None,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
+        return 1
+    lock: SyncLock | None = None
+    try:
+        lock = acquire_sync_lock(db_path, wait=False)
+    except OSError as exc:
+        conn.close()
+        emit_result(
+            args,
+            None,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
+        return 1
+    if lock is None:
+        # The cmd_sync contract: another process is already syncing this
+        # store — join it (zero GitHub calls) instead of double-syncing,
+        # and still report the registration line.
+        fresh = _freshness(conn, slug)
+        conn.close()
+        emit_result(
+            args,
+            {"repo": slug, "joined": True, "mcp": MCP_REGISTRATION_LINE},
+            slug=slug,
+            db_path=db_path,
+            freshness=fresh,
+            identity=False,
+        )
+        return 0
+    try:
+        # Profile inheritance, mirroring cmd_sync: a run without an explicit
+        # source uses the store's recorded profile read UNDER the sync lock
+        # (a fresh store has no row yet and takes the graphql default), and
+        # an unstated source never re-stamps the recorded profile (issue
+        # #48). The call goes through the shared quiet core (issue #31) —
+        # the same zaxbygraph.cli._sync_core seam cmd_sync uses.
+        stored = conn.execute(
+            "SELECT include_patches, fetch_source FROM sync_state WHERE repo = ?",
+            (slug,),
+        ).fetchone()
+        stored_patches = bool(stored["include_patches"]) if stored else False
+        stored_source = (
+            stored["fetch_source"] if stored and stored["fetch_source"] else None
+        ) or "graphql"
+        result = _sync_core(
+            conn,
+            slug,
+            force=False,
+            include_patches=stored_patches,
+            jsonl_path=None,
+            numbers=None,
+            source_name=stored_source,
+            stamp_source=None,
+        )
+    except SyncError as exc:
+        emit_result(
+            args,
+            None,
+            conn=conn,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
+        return 1
+    except Exception as exc:  # recorded by sync_repo; reported, not a traceback
+        emit_result(
+            args,
+            None,
+            conn=conn,
+            slug=slug,
+            db_path=db_path,
+            error=_error_for("runtime", str(exc)),
+            identity=False,
+        )
+        return 1
+    finally:
+        lock.release_owned()
+        fresh = _freshness(conn, slug)
+        conn.close()
+    sync_summary = {k: v for k, v in result.items() if k not in ("repo", "db")}
+    emit_result(
+        args,
+        {
+            "repo": slug,
+            "sync": sync_summary,
+            "mcp": MCP_REGISTRATION_LINE,
+            "skill_hint": "zaxbygraph skill --install DIR installs the"
+            " packaged agent skill",
+        },
+        slug=slug,
+        db_path=db_path,
+        freshness=fresh,
+        identity=False,
+    )
+    return 0
+
+
+def cmd_skill(args: argparse.Namespace) -> int:
+    """``skill`` (issue #73 AC6/AC7): print the packaged skill, ``--install
+    DIR`` write a stamped copy to DIR/zaxbygraph/SKILL.md, or ``--check``
+    classify installed copies by body hash through the ONE scanner doctor
+    shares. ``--check`` writes nothing — ``--install`` is the only writer."""
+    from zaxbygraph import skill as skill_mod
+
+    if args.check and args.install:
+        return emit_failure(
+            args, 2, "--check and --install are mutually exclusive"
+        )
+    if args.install:
+        try:
+            record = skill_mod.install_skill(Path(args.install))
+        except FileNotFoundError as exc:
+            return emit_failure(
+                args,
+                1,
+                str(exc),
+                code_key="skill_missing",
+                hint="re-install the zaxbygraph package; the skill ships as"
+                " package data",
+            )
+        except OSError as exc:
+            return emit_failure(
+                args,
+                1,
+                f"could not write the skill copy: {exc}",
+                code_key="runtime",
+            )
+        emit_result(args, record, identity=False)
+        return 0
+    if args.check:
+        dirs = [Path(d) for d in (args.dir or [])]
+        emit_result(
+            args,
+            skill_mod.scan_skill_copies(dirs, include_defaults=not dirs),
+            identity=False,
+        )
+        return 0
+    try:
+        text = skill_mod.packaged_skill_text()
+    except FileNotFoundError as exc:
+        return emit_failure(
+            args,
+            1,
+            str(exc),
+            code_key="skill_missing",
+            hint="re-install the zaxbygraph package; the skill ships as"
+            " package data",
+        )
+    except OSError as exc:
+        return emit_failure(args, 1, f"could not read the packaged skill: {exc}")
+    emit_result(
+        args,
+        {
+            "skill": "zaxbygraph",
+            "version": __version__,
+            "body_sha256": skill_mod.body_sha256(skill_mod.skill_body(text)),
+            "content": text,
+        },
+        identity=False,
+    )
+    return 0
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
@@ -3336,6 +3607,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--as-of", dest="as_of", default=None, metavar="T",
         help="Answer from the as-of snapshot view at instant T (ISO-8601 Z)",
     )
+    sp.add_argument(
+        "--explain", action="store_true",
+        help="Add the per-feature dumps to every row (the default rows are"
+        " slim; the requires-sentences ride the payload-level legend)",
+    )
     sp.add_argument("--config", help="Explicit [triage] TOML (highest precedence)")
     sp.set_defaults(func=cmd_triage)
 
@@ -3359,6 +3635,12 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Bundle file-set cap (default: [triage] max_files)")
     sp.add_argument("--budget-tokens", dest="budget_tokens", type=int, default=None,
                     help="Cap the serialized payload at N tokens (chars/4; positive integer)")
+    sp.add_argument(
+        "--with-briefs", dest="with_briefs", action="store_true",
+        help="Enrich every member with its decision fields (labels, dates,"
+        " author, URL, body excerpt, gates, files split"
+        " existing/not-yet-existing) within the payload budget",
+    )
     sp.add_argument(
         "--as-of", dest="as_of", default=None, metavar="T",
         help="Answer from the as-of snapshot view at instant T (ISO-8601 Z)",
@@ -3578,6 +3860,47 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sp, max_age=True)
     sp.add_argument("number", type=int)
     sp.set_defaults(func=cmd_what_closed)
+
+    sp = sub.add_parser(
+        "init",
+        help="First-use bootstrap: preflight gh (presence + auth), build the"
+        " store through the sync path, print the MCP registration line",
+    )
+    add_common(sp)
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser(
+        "skill",
+        help="The packaged agent skill: print it, --install a stamped copy,"
+        " or --check installed copies for staleness",
+    )
+    # --repo/--db ride the common surface for envelope-shape uniformity (the
+    # skill command reads package data, not a store, so the values are
+    # accepted and ignored).
+    add_common(sp)
+    sp.add_argument(
+        "--install",
+        default=None,
+        metavar="DIR",
+        help="Write the stamped skill to DIR/zaxbygraph/SKILL.md"
+        " (the only write path)",
+    )
+    sp.add_argument(
+        "--check",
+        action="store_true",
+        help="Classify installed copies by body hash against the packaged"
+        " skill; writes nothing (refresh with --install)",
+    )
+    sp.add_argument(
+        "--dir",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="Skill home to scan under --check (repeatable) instead of the"
+        " four documented default homes (~/.claude, ~/.agents, ~/.zcode,"
+        " ~/.opencode)",
+    )
+    sp.set_defaults(func=cmd_skill)
 
     sp = sub.add_parser(
         "mcp", help="Run the stdio MCP server (typed tools over JSON-RPC 2.0)"
