@@ -239,6 +239,170 @@ class NullSectionGuardTests(TempDBTest):
         )
 
 
+class NonzeroExitSyncTests(TempDBTest):
+    """Issue #82 sync-level integration: the fake gh serves every errored
+    GraphQL response the way the real binary does - body on stdout, a
+    `gh: <first error>` stderr line, exit 1 - so these tests exercise the
+    NON-ZERO classification, not the zero-exit one."""
+
+    def test_not_found_nonzero_exit_degrades_per_item(self) -> None:
+        """AC1 at the sync level: a NOT_FOUND nulled alias on a NON-ZERO exit
+        degrades that one item to the per-item REST path (its stored comments
+        match the REST fallback, not anything bulk) while the sibling stays
+        on bulk GraphQL (its comments match the bulk payload), and the run
+        finishes clean. Killed by: raising on the non-zero exit before the
+        errors body is classified."""
+        host = _FakeGhHost()
+        host.write_schema(_FULL_SCHEMA)
+        payload = _page_payload([1, 2])
+        payload["data"]["repository"]["i1"] = None  # requested alias nulled
+        payload["errors"] = [
+            {
+                "type": "NOT_FOUND",
+                "message": "Could not resolve to an issue with the number of 1.",
+            }
+        ]
+        host.write_graphql_responses([payload])
+        # listing page, the per-item REST fallback for item 1's comments (the
+        # bulk payload's i1 was null), the verification pass's listing page,
+        # then releases.
+        host.write_rest_responses(
+            [
+                [
+                    issue(1, title="one", comments=1, updated_at=ts(10)),
+                    issue(2, title="two", comments=1, updated_at=ts(20)),
+                ],
+                [comment(50_001, "rest fallback comment")],
+                [
+                    issue(1, title="one", comments=1, updated_at=ts(10)),
+                    issue(2, title="two", comments=1, updated_at=ts(20)),
+                ],
+                [],
+            ]
+        )
+        host.set_mode("nonzero_errors")
+        with host:
+            src = host.source()
+            result = sync_repo(self.conn, src, REPO)
+            rest_paths = host.rest_paths()
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM items WHERE number IN (1, 2)"),
+            2,
+            "both items must be ingested",
+        )
+        rows1 = self.conn.execute(
+            "SELECT body FROM comments WHERE number = 1"
+        ).fetchall()
+        self.assertEqual(
+            [r["body"] for r in rows1],
+            ["rest fallback comment"],
+            "the omitted item's comments must come from per-item REST",
+        )
+        rows2 = self.conn.execute(
+            "SELECT body FROM comments WHERE number = 2"
+        ).fetchall()
+        self.assertEqual(
+            [r["body"] for r in rows2],
+            ["comment 2"],
+            "the sibling's comments must come from the bulk payload",
+        )
+        self.assertEqual(
+            sum(
+                1
+                for p in rest_paths
+                if p.startswith("repos/acme/forgegate/issues/1/comments")
+            ),
+            1,
+            "exactly one per-item REST fetch for the omitted item",
+        )
+
+    def test_section_drop_nonzero_exit_no_whole_source_degradation(self) -> None:
+        """AC2 at the sync level: a FORBIDDEN scoped to item 1's comments on
+        a NON-ZERO exit drops only that section (REST answers it, the drop is
+        logged) - the sibling keeps its bulk GraphQL section and NO
+        whole-source 'graphql unavailable' degradation row appears, which is
+        what the same 403-shaped exit triggered before the fix. Killed by:
+        classifying the non-zero exit as a plain transport/permission
+        failure."""
+        host = _FakeGhHost()
+        host.write_schema(_FULL_SCHEMA)
+        payload = _page_payload([1, 2])
+        payload["data"]["repository"]["i1"] = {
+            "databaseId": 10_001,
+            "comments": None,
+        }
+        payload["errors"] = [
+            {
+                "type": "FORBIDDEN",
+                "message": "mocked per-field FORBIDDEN on i1 comments",
+                "path": ["repository", "i1", "comments"],
+            }
+        ]
+        host.write_graphql_responses([payload])
+        # listing page, the per-item REST fallback for item 1's dropped
+        # comments section, the verification pass's listing page, releases.
+        host.write_rest_responses(
+            [
+                [
+                    issue(1, title="one", comments=1, updated_at=ts(10)),
+                    issue(2, title="two", comments=1, updated_at=ts(20)),
+                ],
+                [comment(50_001, "fallback comment")],
+                [
+                    issue(1, title="one", comments=1, updated_at=ts(10)),
+                    issue(2, title="two", comments=1, updated_at=ts(20)),
+                ],
+                [],
+            ]
+        )
+        host.set_mode("nonzero_errors")
+        with host:
+            src = host.source()
+            result = sync_repo(self.conn, src, REPO)
+            rest_paths = host.rest_paths()
+        self.assertIsNone(result["last_error"])
+        self.assertEqual(
+            self.count("SELECT COUNT(*) FROM items WHERE number IN (1, 2)"),
+            2,
+            "both items must be ingested",
+        )
+        rows1 = self.conn.execute(
+            "SELECT body FROM comments WHERE number = 1"
+        ).fetchall()
+        self.assertEqual(
+            [r["body"] for r in rows1],
+            ["fallback comment"],
+            "the dropped section must be completed over per-item REST",
+        )
+        rows2 = self.conn.execute(
+            "SELECT body FROM comments WHERE number = 2"
+        ).fetchall()
+        self.assertEqual(
+            [r["body"] for r in rows2],
+            ["comment 2"],
+            "the sibling's comments must stay on bulk GraphQL",
+        )
+        notes = [
+            r["note"]
+            for r in self.conn.execute("SELECT note FROM fetch_log").fetchall()
+        ]
+        self.assertTrue(
+            any(
+                (n or "").startswith("dropped comments: FORBIDDEN") for n in notes
+            ),
+            "the dropped section must be named in fetch_log",
+        )
+        self.assertFalse(
+            any("graphql unavailable" in (n or "") for n in notes),
+            "the section drop must NOT degrade the whole GraphQL source",
+        )
+        self.assertFalse(
+            any(p.startswith("repos/acme/forgegate/issues/2/comments") for p in rest_paths),
+            "the unaffected item must keep its GraphQL-provided section",
+        )
+
+
 class CapabilityCacheTests(TempDBTest):
     """The persisted meta cache: reuse across sources, invalidation by
     host/gh-version, and no probe machinery for sources without the pair."""

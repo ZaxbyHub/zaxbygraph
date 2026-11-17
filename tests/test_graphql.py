@@ -12,9 +12,9 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from fixtures import REPO, BulkNestedSource, TempDBTest, add_bulk_prs, pr_file
-from zaxbygraph.github import GitHubError
+from zaxbygraph.github import GitHubError, GitHubTransportError
 from zaxbygraph.graphql import GRAPHQL_CHILDREN_PAGE, GraphQLSource
-from zaxbygraph.sync import sync_repo
+from zaxbygraph.sync import _degradable_error, sync_repo
 
 #: One GraphQL page response covering aliases i1..i25 / p26..p40 (chunk 1).
 _CHUNK1_ITEMS = 40
@@ -188,7 +188,26 @@ class _FakeGraphQLHost:
             "    n = int(counter.read_text()) if counter.exists() else 0",
             "    counter.write_text(str(n + 1))",
             "    response = d / f'graphql_response_{n + 1}.json'",
-            "    print(response.read_text(encoding='utf-8'))",
+            "    body = response.read_text(encoding='utf-8')",
+            "    print(body)",
+            # Issue #82: real gh exits 1 for ANY errored GraphQL response,
+            # writing the errors body to stdout and a one-line `gh: <first
+            # error message>` diagnostic to stderr ('boom' when the body has
+            # no parseable errors or the first carries no message).
+            "    if mode == 'nonzero_errors':",
+            "        msg = 'boom'",
+            "        try:",
+            "            parsed = json.loads(body)",
+            "        except ValueError:",
+            "            parsed = None",
+            "        if isinstance(parsed, dict):",
+            "            errors = parsed.get('errors')",
+            "            if isinstance(errors, list) and errors:",
+            "                first = errors[0]",
+            "                if isinstance(first, dict) and first.get('message'):",
+            "                    msg = str(first['message'])",
+            "        print('gh: ' + msg, file=sys.stderr)",
+            "        raise SystemExit(1)",
             "elif argv[0] == 'rate_limit':",
             "    print((d / 'rate_limit_response.json').read_text(encoding='utf-8'))",
             "else:",
@@ -519,6 +538,223 @@ class SentQueryAndEdgeCaseTests(unittest.TestCase):
             src = host.source()
             with self.assertRaises(GitHubError):
                 src.check_deleted([1])
+
+
+class NonzeroExitClassificationTests(unittest.TestCase):
+    """Issue #82: real `gh api graphql` exits NON-ZERO for every errored
+    response (errors body on stdout, a one-line `gh:` diagnostic on stderr),
+    so the classification the zero-exit path applies must also hold on the
+    non-zero path - same soft NOT_FOUND degrade, same path-scoped section
+    drop, same rate-limit surfacing, same fail-closed everything-else."""
+
+    def test_not_found_on_nonzero_exit(self) -> None:
+        """AC1: a NOT_FOUND on a requested alias served over a NON-ZERO exit
+        omits the nulled item (per-item REST fallback) while its sibling
+        survives, and records no section drop for it."""
+        host = _FakeGraphQLHost()
+        payloads = _graphql_payloads_for_listing(2)
+        payloads[0]["data"]["repository"]["i1"] = None  # requested alias nulled
+        payloads[0]["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 1."}
+        ]
+        host.write_graphql_responses(payloads)
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(2))
+        self.assertNotIn(1, children)
+        self.assertIn(2, children)
+        self.assertNotIn(
+            1, src.last_fetch_drops, "a NOT_FOUND is a soft omit, not a drop"
+        )
+
+    def test_section_error_on_nonzero_exit(self) -> None:
+        """AC2: a FORBIDDEN scoped to [repository, i1, comments] on a
+        NON-ZERO exit drops only that section - the item survives with no
+        comments-derived key and the drop lands in last_fetch_drops[1]."""
+        host = _FakeGraphQLHost()
+        payloads = _graphql_payloads_for_listing(2)
+        payloads[0]["data"]["repository"]["i1"] = {
+            "databaseId": 10_001, "comments": None
+        }
+        payloads[0]["errors"] = [
+            {"type": "FORBIDDEN",
+             "message": "mocked per-field FORBIDDEN on i1 comments",
+             "path": ["repository", "i1", "comments"]}
+        ]
+        host.write_graphql_responses(payloads)
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            children = src.fetch_children(_listing_items(2))
+        self.assertEqual(list(children), [1, 2])
+        self.assertFalse(
+            any(k.startswith("issue_comments") for k in children[1]),
+            "the errored section must stay absent so REST answers it",
+        )
+        self.assertEqual(children[2]["issue_comments"][0]["id"], 900_002)
+        drops = src.last_fetch_drops.get(1, [])
+        self.assertTrue(any(e[0] == "comments" for e in drops))
+
+    def test_plain_error_on_nonzero_exit_stays_fatal(self) -> None:
+        """AC3: an unscoped error on a NON-ZERO exit keeps the exact
+        GitHubError class (not the transport subclass), the stderr-derived
+        message, a None status, and is NOT a degradable (whole-source REST)
+        failure."""
+        host = _FakeGraphQLHost()
+        payload = _graphql_payloads_for_listing(1)[0]
+        payload["errors"] = [{"type": "SOME_OTHER", "message": "boom"}]
+        host.write_graphql_responses([payload])
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        exc = ctx.exception
+        self.assertNotIsInstance(exc, GitHubTransportError)
+        self.assertIsNone(exc.status)
+        self.assertFalse(_degradable_error(exc))
+        self.assertEqual(str(exc), "gh: boom")
+
+    def test_mixed_not_found_and_rate_limited_on_nonzero_exit(self) -> None:
+        """A mixed payload on a NON-ZERO exit whose stderr carries only the
+        NOT_FOUND first-error line must still surface status 429 (the
+        classification, not the stderr wording) and engage the rate-budget
+        enrichment: the fake's rate_limit endpoint reports remaining 0."""
+        host = _FakeGraphQLHost()
+        payload = _graphql_payloads_for_listing(1)[0]
+        payload["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 1."},
+            {"type": "RATE_LIMITED", "message": "API rate limit exceeded"},
+        ]
+        host.write_graphql_responses([payload])
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        exc = ctx.exception
+        self.assertEqual(exc.status, 429)
+        self.assertEqual(getattr(exc, "rate_limit_remaining", None), 0)
+        self.assertTrue(getattr(exc, "rate_limit_reset", None))
+
+    def test_null_data_rate_limited_on_nonzero_exit(self) -> None:
+        """A data:null body with a hard RATE_LIMITED error on a NON-ZERO exit
+        raises with status 429 and the budget enrichment - the stdout-derived
+        classification, not a stderr-only status."""
+        host = _FakeGraphQLHost()
+        host.write_graphql_responses(
+            [
+                {
+                    "data": None,
+                    "errors": [
+                        {"type": "RATE_LIMITED",
+                         "message": "API rate limit exceeded"}
+                    ],
+                }
+            ]
+        )
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        exc = ctx.exception
+        self.assertEqual(exc.status, 429)
+        self.assertEqual(getattr(exc, "rate_limit_remaining", None), 0)
+        self.assertTrue(getattr(exc, "rate_limit_reset", None))
+
+    def test_nonzero_fail_closed_matrix(self) -> None:
+        """The fail-closed matrix for the non-zero path: unparseable stdout,
+        non-dict JSON, a body with neither errors nor data, soft errors with
+        null data (NOT soft success), and a section error naming an UNKNOWN
+        alias are all fatal with the stderr-derived message and a None
+        status. (The empty-stderr stdout-fallback-message case cannot be
+        driven by this fake - its stderr line always carries the 'gh: '
+        prefix - so it is skipped rather than weakly approximated.)"""
+        soft_not_found = json.dumps(
+            {
+                "data": None,
+                "errors": [
+                    {"type": "NOT_FOUND",
+                     "message": "Could not resolve to an issue with the"
+                                " number of 1."}
+                ],
+            }
+        )
+        unknown_alias = _graphql_payloads_for_listing(1)[0]
+        unknown_alias["errors"] = [
+            {"type": "FORBIDDEN",
+             "message": "mocked per-field denial on iX comments",
+             "path": ["repository", "iX", "comments"]}
+        ]
+        cases = [
+            # (stdout body served by the fake, expected stderr-derived text)
+            ("not json at all", "gh: boom"),
+            ("42", "gh: boom"),
+            (json.dumps({"foo": "bar"}), "gh: boom"),
+            (soft_not_found,
+             "gh: Could not resolve to an issue with the number of 1."),
+            (json.dumps(unknown_alias),
+             "gh: mocked per-field denial on iX comments"),
+        ]
+        host = _FakeGraphQLHost()
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            for i, (body, expected_message) in enumerate(cases, start=1):
+                with self.subTest(case_index=i):
+                    (host.cwd / f"graphql_response_{i}.json").write_text(
+                        body, encoding="utf-8"
+                    )
+                    with self.assertRaises(GitHubError) as ctx:
+                        src.fetch_children(_listing_items(1))
+                    self.assertIsNone(ctx.exception.status)
+                    self.assertEqual(str(ctx.exception), expected_message)
+
+    def test_nonzero_exit_reuses_shared_classification(self) -> None:
+        """The shared-classification property: the SAME payload driven
+        through a zero exit (mode ok) and a non-zero exit (mode
+        nonzero_errors) yields IDENTICAL children maps and IDENTICAL
+        last_fetch_drops - one classifier, two transports."""
+        host = _FakeGraphQLHost()
+        payload = _graphql_payloads_for_listing(2)[0]
+        payload["data"]["repository"]["i1"] = None  # NOT_FOUND soft omit
+        payload["data"]["repository"]["i2"]["comments"] = None  # section drop
+        payload["errors"] = [
+            {"type": "NOT_FOUND",
+             "message": "Could not resolve to an issue with the number of 1."},
+            {"type": "FORBIDDEN",
+             "message": "mocked per-field FORBIDDEN on i2 comments",
+             "path": ["repository", "i2", "comments"]},
+        ]
+        # One response file per transport run; the counter advances per call.
+        (host.cwd / "graphql_response_1.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        (host.cwd / "graphql_response_2.json").write_text(
+            json.dumps(payload), encoding="utf-8"
+        )
+        (host.cwd / "mode.txt").write_text("ok", encoding="utf-8")
+        with host:
+            src = host.source()
+            children_zero = src.fetch_children(_listing_items(2))
+            drops_zero = {n: list(v) for n, v in src.last_fetch_drops.items()}
+            (host.cwd / "mode.txt").write_text(
+                "nonzero_errors", encoding="utf-8"
+            )
+            children_nonzero = src.fetch_children(_listing_items(2))
+            drops_nonzero = {
+                n: list(v) for n, v in src.last_fetch_drops.items()
+            }
+        # Both runs classified (not just both succeeded): the omit and the
+        # drop are visible, so the identity assertions below discriminate.
+        self.assertNotIn(1, children_zero)
+        self.assertIn(2, drops_zero)
+        self.assertEqual(children_zero, children_nonzero)
+        self.assertEqual(drops_zero, drops_nonzero)
 
 
 class IncludePatchesForcesRestTests(TempDBTest):
