@@ -2444,8 +2444,15 @@ def _triage_compute(
     the [claims] chain so the claimed gate honours the same file the
     [triage] table came from. ``only`` (issue #70 AC1) scores ONE
     issue instead of every open one - the brief path - while sharing
-    every line of the arithmetic (the hotspot population still runs
-    over every open issue so the max normalisation is identical)."""
+    every line of the arithmetic: stage 1 still runs over the whole
+    population (it is cheap, and the requested row's RANK among that
+    population decides its top-K eligibility exactly as the full
+    triage decides it), the hotspot normalisation still runs over the
+    whole ungated population so the max is identical, and only the
+    requested row's expensive stage 2 ever runs - and only when that
+    rank puts it inside top_k, so a brief for an outside-top-K issue
+    reports the same ``not_computed (outside top_k)`` row the full
+    ranking would. The returned ``rows`` carry just that row."""
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
     index, file_support, population = _coupling_index(conn, repo, caps)
@@ -2484,8 +2491,6 @@ def _triage_compute(
 
     rows: list[dict] = []
     for number, feat in features.items():
-        if only is not None and number != only:
-            continue
         item = items.get(number)
         labels = set(item.labels) if item is not None else set()
         # Priority features — the blessed missing-feature rule: source data
@@ -2574,31 +2579,22 @@ def _triage_compute(
         raw = _hotspot_raw(row["resolved_paths"])
         row["hotspot_raw"] = round(raw, 9)
     max_raw = max((r["hotspot_raw"] for r in ungated), default=0.0)
-    if only is not None:
-        # Single-row mode: the max normalisation still runs over the
-        # WHOLE ungated population (the raw sums are cheap - no
-        # analog scan), so the row's hotspot is identical to the full
-        # compute's.
-        for other in features.values():
-            if other["gates"] or other["number"] == only:
-                continue
-            other_item = items.get(other["number"])
-            if other_item is None:
-                continue
-            # The row loop rounds every raw sum to 9 places BEFORE the
-            # max is taken, so the population loop rounds identically -
-            # otherwise the single-row hotspot differs from the full
-            # compute's in the last digits (round-then-max, not
-            # max-then-round).
-            other_raw = round(_hotspot_raw(sorted(other_item.paths)), 9)
-            if other_raw > max_raw:
-                max_raw = other_raw
 
 
     # Stage 2 for the top-K UNGATED rows only (top-K contract preserved:
     # analog/regression work and the stage-2 bonus stay top-K-only; only
     # the cheap raw sums ran for everyone).
-    for row in ungated[: max(1, top_k)]:
+    stage2_rows = ungated[: max(1, top_k)]
+    if only is not None:
+        # Single-row mode (issue #70 AC1): the requested row keeps its
+        # full-population stage-1 rank, so its top-K ELIGIBILITY is the
+        # full triage's - an outside-top-K brief reports the same
+        # not_computed row the ranking would, never a stage-2 score the
+        # full compute would refuse it. Only that one row's expensive
+        # stage 2 runs; the other top-K rows are left uncomputed (and
+        # dropped from the payload below).
+        stage2_rows = [r for r in stage2_rows if r["number"] == only]
+    for row in stage2_rows:
         number = row["number"]
         hotspot = row["hotspot_raw"] / max_raw if max_raw > 0 else 0.0
         analog, regression = _analog_for(
@@ -2615,13 +2611,20 @@ def _triage_compute(
         row["analog"] = analog
         row["stage2"] = bonus
         row["total_score"] = row["stage1"] + bonus
-    for row in ungated[max(1, top_k):]:
+    computed = {r["number"] for r in stage2_rows}
+    for row in ungated:
+        if row["number"] in computed:
+            continue
         row["hotspot"] = None
         row["regression"] = None
         row["analog"] = None
         row["stage2"] = None
-        row["note"] = "not_computed (outside top_k)"
         row["total_score"] = row["stage1"]
+        if only is not None and row["number"] != only:
+            # Not the requested row: this payload never scores it.
+            row["note"] = "not_computed (single-row mode)"
+        else:
+            row["note"] = "not_computed (outside top_k)"
     for row in rows:
         if not row["ranked"]:
             row["hotspot_raw"] = None
@@ -2631,6 +2634,12 @@ def _triage_compute(
             row["stage2"] = None
             row["note"] = "not_computed (gated)"
             row["total_score"] = row["stage1"]
+
+    if only is not None:
+        # The population existed to rank THIS row and to normalise its
+        # hotspot; the payload carries the one row the caller asked for.
+        rows = [r for r in rows if r["number"] == only]
+        ungated = [r for r in ungated if r["number"] == only]
 
     return {
         "rows": rows,
@@ -3053,9 +3062,15 @@ def bundle(
     only; ``linked``/``analog`` evidence paths are reported but never
     constrain selection (unless
     ``allow_shared_files``). Read-only. ``budget_tokens`` (chars/4, a
-    positive integer) caps the WHOLE serialized payload: bundles are
-    dropped first, then the tails of ``merge_candidates``/
-    ``related_not_bundleable``, then the ``pool`` echo; ``truncated: true``
+    positive integer) caps the WHOLE serialized payload. The shedding
+    order is cheapest-evidence-loss first: under ``--with-briefs`` the
+    ENRICHED member fields (labels, author, dates, html_url, excerpt,
+    the file lists) go before any whole bundle — a member's number and
+    title are the evidence, its brief fields are the convenience layer;
+    then whole bundles, the tails of ``merge_candidates``/
+    ``related_not_bundleable``, the ``pool`` echo, the ``unbundled``/
+    ``gated`` audit tails, and last the reported ``weights``/
+    ``claims_config`` echoes. ``truncated: true``
     marks any payload that needed it, including one still over budget only
     because of its mandatory echoes. The payload's ``weights`` echo is the
     effective ``[triage]`` table PLUS the effective affinity weights under
@@ -3501,13 +3516,30 @@ def _bundle(
             )
 
         if _size() > budget:
-            # The cap binds the WHOLE payload, not just the bundles list:
-            # whole bundles drop first, then the tails of merge_candidates
-            # and related_not_bundleable, and only as the last resort the
+            # The cap binds the WHOLE payload, not just the bundles list.
+            # The shedding order is deliberate, cheapest-evidence-loss
+            # first (issue #70 AC6, implementation review): the ENRICHED
+            # --with-briefs member fields are the convenience layer, so
+            # they go before any whole bundle does — a member's number and
+            # title are the evidence, its labels/excerpt are not. Only
+            # then whole bundles, the merge_candidates and
+            # related_not_bundleable tails, and as the last resort the
             # pool echo (a convenience copy, not evidence). The flag is set
             # up front so a payload that stays over budget purely through
             # its mandatory echoes (weights, excluded) is still marked.
             payload["truncated"] = True
+            # --with-briefs member shedding FIRST, and the size is checked
+            # BEFORE each bundle's members are stripped (a step that
+            # cannot help is never taken).
+            for bundle in payload.get("bundles", []):
+                if _size() <= budget:
+                    break
+                for member in bundle.get("members", []):
+                    for key in ("labels", "author", "created_at",
+                                "updated_at", "html_url", "excerpt",
+                                "files_existing", "files_missing",
+                                "not_in_vocabulary"):
+                        member.pop(key, None)
             for section in ("bundles", "merge_candidates",
                             "related_not_bundleable"):
                 while payload[section] and _size() > budget:
@@ -3526,19 +3558,6 @@ def _bundle(
                     "by_gate": {},
                     "numbers": [],
                 }
-            # --with-briefs member shedding: before dropping whole
-            # bundles, drop the ENRICHED brief fields from the
-            # remaining members (the member numbers and titles are
-            # the evidence; the briefs are the convenience layer).
-            for bundle in payload.get("bundles", []):
-                for member in bundle.get("members", []):
-                    for key in ("labels", "author", "created_at",
-                                "updated_at", "html_url", "excerpt",
-                                "files_existing", "files_missing",
-                                "not_in_vocabulary"):
-                        member.pop(key, None)
-                if _size() <= budget:
-                    break
             # Last resort below the mandatory-echo floor: the
             # [triage]/[claims] config echoes are REPORTED values, not
             # evidence - a budget under their combined width sheds them

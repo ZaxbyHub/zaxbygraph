@@ -374,6 +374,142 @@ class ChildrenMappingTests(unittest.TestCase):
         )
 
 
+class MixedChunkKindTests(unittest.TestCase):
+    """Issue #75 (Phase 4.5 implementation review finding 1): the chunk
+    builder must carry EACH alias's own kind into its `_children_from_node`
+    call. The timeline count policy is kind-dependent — a PR's
+    ``timelineItems.totalCount`` is the COLLECTION's size (the itemTypes
+    filter does not apply to it), an issue's is the filtered page's size —
+    so one shared kind misjudges half of any mixed chunk."""
+
+    PR_NODE = {
+        "number": 63,
+        "id": "PR_63",
+        "baseRefName": "main",
+        "headRefName": "feat/63",
+        "timelineItems": {
+            # A host that does not answer filteredCount (issue #75/AC22):
+            # the COLLECTION's count (42) beside two rendered nodes. Only
+            # the node's own KIND decides this page — a PR's totalCount is
+            # the collection's size, so the page is complete; an issue's
+            # would be a truncation flag.
+            "totalCount": 42,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "__typename": "ClosedEvent",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "actor": {"login": "amy"},
+                    "closer": {"__typename": "PullRequest", "number": 7},
+                },
+                {
+                    "__typename": "CrossReferencedEvent",
+                    "createdAt": "2026-01-01T00:01:00Z",
+                    "actor": {"login": "bob"},
+                    "isCrossRepository": False,
+                    "willCloseTarget": False,
+                    "source": {
+                        "__typename": "PullRequest",
+                        "number": 9,
+                        "repository": {"nameWithOwner": REPO},
+                    },
+                },
+            ],
+        },
+    }
+    ISSUE_NODE = {
+        "number": 64,
+        "id": "I_64",
+        "timelineItems": {
+            # No filteredCount, totalCount 3 beside ONE rendered node: an
+            # issue-kind page the totalCount arm must flag (issue #53).
+            "totalCount": 3,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "__typename": "CrossReferencedEvent",
+                    "createdAt": "2026-01-01T00:01:00Z",
+                    "actor": {"login": "bob"},
+                    "isCrossRepository": False,
+                    "willCloseTarget": False,
+                    "source": {
+                        "__typename": "PullRequest",
+                        "number": 9,
+                        "repository": {"nameWithOwner": REPO},
+                    },
+                }
+            ],
+        },
+    }
+    PR_LISTING = {
+        "id": 63,
+        "number": 63,
+        "title": "pr sixty-three",
+        "pull_request": {"url": "x"},
+    }
+    ISSUE_LISTING = {"id": 64, "number": 64, "title": "issue sixty-four"}
+
+    class _ChunkSource(GraphQLSource):
+        """Answers the chunk query from the canned nodes, keyed by alias."""
+
+        def __init__(self, nodes: dict) -> None:
+            super().__init__("probe", "clinic")
+            self._nodes = nodes
+            # The real `_graphql` initializes these; the stub replaces it.
+            self.last_dropped_sections: dict[int, list] = {}
+
+        def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+            self.last_dropped_sections = {}
+            return {"repository": dict(self._nodes)}
+
+    def _children(self, order: list[dict]) -> dict:
+        src = self._ChunkSource({"p63": self.PR_NODE, "i64": self.ISSUE_NODE})
+        return src.fetch_children(order)
+
+    def test_pr_first_chunk_judges_each_kind(self) -> None:
+        """PR first: the PR's collection-sized totalCount must NOT flag its
+        complete filtered page, while the issue's short page still is
+        flagged. RED at the pre-fix head 5fc2404, where every node in the
+        chunk inherited the LAST listing row's kind (the issue's), so the
+        PR was falsely flagged truncated."""
+        children = self._children([self.PR_LISTING, self.ISSUE_LISTING])
+        self.assertIn(63, children, "the PR alias must be answered")
+        self.assertIn(64, children, "the issue alias must be answered")
+        self.assertNotIn(
+            "timeline_incomplete",
+            children[63],
+            "a complete filtered PR page must not be flagged truncated"
+            " (its totalCount is the collection's size)",
+        )
+        self.assertNotIn("timeline_cursor", children[63])
+        self.assertIn(
+            "timeline_incomplete",
+            children[64],
+            "an issue page whose totalCount exceeds its rendered nodes must"
+            " still be flagged (issue #53 protection)",
+        )
+
+    def test_issue_first_chunk_judges_each_kind(self) -> None:
+        """Issue first: the mirror leg. RED at the pre-fix head 5fc2404,
+        where every node inherited the LAST listing row's kind (the PR's),
+        so the issue's truncation flag was lost — the #53 protection
+        silently dropped for every issue sharing a chunk with a PR."""
+        children = self._children([self.ISSUE_LISTING, self.PR_LISTING])
+        self.assertIn(63, children, "the PR alias must be answered")
+        self.assertIn(64, children, "the issue alias must be answered")
+        self.assertNotIn(
+            "timeline_incomplete",
+            children[63],
+            "a complete filtered PR page must not be flagged truncated",
+        )
+        self.assertIn(
+            "timeline_incomplete",
+            children[64],
+            "an issue page whose totalCount exceeds its rendered nodes must"
+            " still be flagged when a PR precedes it in the chunk",
+        )
+
+
 class ItemEventGateTests(TempDBTest):
     def test_events_replace_only_when_complete(self) -> None:
         """A complete timeline replaces (a vanished event is retracted); an

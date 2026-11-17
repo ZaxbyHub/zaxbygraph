@@ -232,12 +232,20 @@ _REOPENED_FRAGMENT = """
 """
 
 
-def _timeline_nodes(types: str = _TIMELINE_TYPES_ALL) -> str:
+def _timeline_nodes(
+    types: str = _TIMELINE_TYPES_ALL, *, omit_filtered_count: bool = False
+) -> str:
     """The timelineItems selection at a given itemTypes list. Page queries
     AND continuation queries render through the same helper (the continuation
-    path calls GraphQLSource._timeline_selection, which shares this)."""
+    path calls GraphQLSource._timeline_selection, which shares this).
+    ``omit_filtered_count`` (issue #75/AC22) renders the selection WITHOUT the
+    connection's filteredCount for a host whose schema answered a validation
+    error naming it - the capability path still filters the rest."""
     reopened = _REOPENED_FRAGMENT if "REOPENED_EVENT" in types else ""
-    return _TIMELINE_NODES_TMPL % {"types": types, "reopened": reopened}
+    rendered = _TIMELINE_NODES_TMPL % {"types": types, "reopened": reopened}
+    if omit_filtered_count:
+        rendered = rendered.replace("\n  filteredCount", "", 1)
+    return rendered
 
 
 #: Timeline events ride every page query (issue #6): closed events carry the
@@ -289,19 +297,17 @@ _PULL_TYPE_BLOCKS = (
 _PULL_FIELDS = "\n".join(["databaseId", *(block for _, block in _PULL_TYPE_BLOCKS)])
 
 
-def _fields_blocks(blocks: tuple, *, omit_filtered_count: bool = False) -> str:
-    """The page-query field blocks, with the timeline block rendered WITHOUT
-    filteredCount when a host's schema answered a validation error naming it
-    (issue #75/AC22): the cached absence drives the RENDERING, so every later
-    query omits the field from the start instead of failing once per query."""
+def _fields_unfiltered(blocks: tuple, *, omit_filtered_count: bool = False) -> str:
+    """The FULL field selection for one type — used when no capability map
+    exists or the probe reported nothing for the type (issue #23's fail-open) —
+    with the timeline block rendered WITHOUT filteredCount when a host's schema
+    answered a validation error naming it (issue #75/AC22): the cached absence
+    drives the RENDERING, so every later query omits the field from the start
+    instead of failing once per query."""
     out = ["databaseId"]
     for name, block in blocks:
         if name == "timelineItems" and omit_filtered_count:
-            rendered = (
-                _TIMELINE_NODES_TMPL
-                % {"types": _TIMELINE_TYPES_ALL, "reopened": _REOPENED_FRAGMENT}
-            ).replace("\n  filteredCount", "")
-            out.append(rendered)
+            out.append(_timeline_nodes(omit_filtered_count=True))
         else:
             out.append(block)
     return "\n".join(out)
@@ -797,8 +803,10 @@ class GraphQLSource(GhApiSource):
             kept = ["CLOSED_EVENT", "CROSS_REFERENCED_EVENT"]
         return "[" + ", ".join(kept) + "]"
 
-    def _timeline_block(self) -> str:
-        return _timeline_nodes(self._timeline_item_types())
+    def _timeline_block(self, *, omit_filtered_count: bool = False) -> str:
+        return _timeline_nodes(
+            self._timeline_item_types(), omit_filtered_count=omit_filtered_count
+        )
 
     def _fields_for(self, kind: str) -> str:
         """Field selection for one alias, honoring the active capability map.
@@ -810,23 +818,23 @@ class GraphQLSource(GhApiSource):
         that knows the comment type and lacks the field strips the line from
         the comment blocks; an unknown comment type fails open."""
         if kind == "pr":
-            blocks, lead = _PULL_TYPE_BLOCKS, _PULL_FIELDS
+            blocks = _PULL_TYPE_BLOCKS
         else:
-            blocks, lead = _ISSUE_TYPE_BLOCKS, _ISSUE_FIELDS
-        if self._filtered_count_unsupported_cached:
-            # Issue #75/AC22: this host lacks the timeline connection's
-            # filteredCount, so the RENDERED selection omits it — the cache
-            # drives rendering, not just retry suppression, and every later
-            # query omits the field from the start.
-            return _fields_blocks(blocks, omit_filtered_count=True)
+            blocks = _ISSUE_TYPE_BLOCKS
+        # Issue #75/AC22: a host whose schema lacks the timeline connection's
+        # filteredCount (learned through the validation-error retry) has the
+        # field omitted from the RENDERED selection from the start — the cache
+        # drives rendering, not just retry suppression. It rides the existing
+        # capability-aware path: every other known omission still applies.
+        omit_fc = self._filtered_count_unsupported_cached
         caps = self._capabilities
         if caps is None:
-            return lead
+            return _fields_unfiltered(blocks, omit_filtered_count=omit_fc)
         present = caps.get("PullRequest" if kind == "pr" else "Issue")
         if present is None:
             # The probe reported nothing for this type: unknown, not absent —
             # fail open to the full selection (issue #23).
-            return lead
+            return _fields_unfiltered(blocks, omit_filtered_count=omit_fc)
         issue_comment_caps = caps.get("IssueComment")
         strip_issue = (
             issue_comment_caps is not None
@@ -838,7 +846,7 @@ class GraphQLSource(GhApiSource):
             and "authorAssociation" not in review_comment_caps
         )
         parts = ["databaseId"]
-        timeline_block = self._timeline_block()
+        timeline_block = self._timeline_block(omit_filtered_count=omit_fc)
         for field, block in blocks:
             if block is _TIMELINE_NODES:
                 block = timeline_block
@@ -1215,16 +1223,17 @@ class GraphQLSource(GhApiSource):
 
     def _fetch_children_chunk(self, chunk: list[dict]) -> dict[int, dict]:
         aliases: list[str] = []
-        wanted: list[tuple[int, str]] = []
+        wanted: list[tuple[int, str, str]] = []
         alias_numbers: dict[str, int] = {}
         for raw in chunk:
             if not isinstance(raw, dict) or "number" not in raw:
                 continue
             number = int(raw["number"])
-            alias = ("p" if "pull_request" in raw else "i") + str(number)
-            fields = self._fields_for("pr" if "pull_request" in raw else "issue")
-            aliases.append(f"{alias}: {'pullRequest' if 'pull_request' in raw else 'issue'}(number: {number}) {{{fields}}}")
-            wanted.append((number, alias))
+            kind = "pr" if "pull_request" in raw else "issue"
+            alias = ("p" if kind == "pr" else "i") + str(number)
+            fields = self._fields_for(kind)
+            aliases.append(f"{alias}: {'pullRequest' if kind == 'pr' else 'issue'}(number: {number}) {{{fields}}}")
+            wanted.append((number, alias, kind))
             alias_numbers[alias] = number
         if not aliases:
             return {}
@@ -1240,7 +1249,7 @@ class GraphQLSource(GhApiSource):
         for number, drops in self.last_dropped_sections.items():
             self.last_fetch_drops.setdefault(number, []).extend(drops)
         out: dict[int, dict] = {}
-        for number, alias in wanted:
+        for number, alias, kind in wanted:
             node = repo.get(alias)
             if not isinstance(node, dict):
                 continue
@@ -1248,9 +1257,7 @@ class GraphQLSource(GhApiSource):
                 # The errored section must read as ABSENT (not empty) so the
                 # sync's per-item REST fallback answers it (issue #23).
                 node.pop(section, None)
-            out[number] = self._children_from_node(
-                node, kind="pr" if "pull_request" in raw else "issue"
-            )
+            out[number] = self._children_from_node(node, kind=kind)
         return out
 
     def _children_from_node(self, node: dict, *, kind: str | None = None) -> dict:

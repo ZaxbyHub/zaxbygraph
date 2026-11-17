@@ -429,14 +429,21 @@ class DerivedScaleTests(_StoreTestCase):
             )
             # deterministic Python-call budget (fix: one row's scoring; base
             # calibration measured 112,956 derive-module calls for the
-            # whole-triage recompute, so the 50k budget sits 2.26x below the
-            # measured base and discriminates the single-row rewrite —
-            # measured, not 'orders of magnitude', per the round-4 critic)
+            # whole-triage recompute). Recalibrated at the Phase 4.5
+            # implementation review (finding 3): the corrected single-row
+            # mode must keep the requested row's FULL-population stage-1
+            # rank so its top-K eligibility matches the full triage, so the
+            # population stage-1 pass now runs (it is cheap arithmetic; the
+            # expensive stage-2 analog scans still run for the one row
+            # only). Measured head 53,863 (deterministic call count; the
+            # shared context + coupling-index build dominates it), so the
+            # 70k budget sits 1.61x below the measured base and still
+            # fails the whole-triage recompute it discriminates against.
             self.assertLess(
-                derive_calls["n"], 50_000,
+                derive_calls["n"], 70_000,
                 f"single-row brief made {derive_calls['n']} derive-module"
-                " calls (budget 50k; base whole-triage recompute measured"
-                " 112,956)",
+                " calls (budget 70k; base whole-triage recompute measured"
+                " 112,956, head measured 53,863)",
             )
             self.assertEqual(packet.get("number"), 1001)
             # row-equality half (plan-critic round 4): the packet's row and
@@ -571,6 +578,66 @@ class DerivedScaleTests(_StoreTestCase):
             )
         finally:
             conn.close()
+
+    def test_brief_outside_top_k_matches_full_triage(self) -> None:
+        """RED at the pre-fix implementation head 5fc2404, GREEN after the
+        fix (Phase 4.5 implementation review finding 3). The single-row
+        brief keeps the requested row's FULL-population stage-1 rank, so its
+        top-K eligibility is the full triage's: a brief for an issue that
+        ranks OUTSIDE top_k reports the SAME row the full ranking reports
+        for it - stage2/hotspot/regression/analog None, note
+        'not_computed (outside top_k)', and total_score == stage1 with no
+        stage-2 bonus. The pre-fix single-row mode made the requested row
+        the sole ungated member of its own population, so it always received
+        stage 2 and always a bonus: a total_score the full triage would
+        never give that row (the pin's failure there was
+        "AssertionError: 0.0 is not None : an outside-top_k brief must not
+        report stage2"). GREEN at the base too - the base brief picked its
+        row from the whole-triage recompute, so the row was always the full
+        ranking's; what the base got wrong was the cost, not this row."""
+        from zaxbygraph import derive as _d
+
+        conn = open_existing(self.db_path)
+        try:
+            cfg = _d.load_triage_config()
+            full = _d._triage_compute(conn, REPO, cfg, cfg["top_k"])
+            outside = full["ungated"][max(1, cfg["top_k"]):]
+            self.assertTrue(
+                outside,
+                "the 200-open-issue fixture must have rows outside top_k"
+                f" (top_k={cfg['top_k']}, ungated={len(full['ungated'])})",
+            )
+            target = outside[0]["number"]
+            expected = next(r for r in full["rows"] if r["number"] == target)
+            packet = _d.brief(conn, REPO, target, budget_tokens=4000)
+        finally:
+            conn.close()
+
+        row = dict(packet.get("features") or {})
+        self.assertEqual(row.get("number"), target)
+        for key in ("stage2", "hotspot", "regression", "analog"):
+            self.assertIsNone(
+                row.get(key),
+                f"an outside-top_k brief must not report {key} (the full"
+                " triage leaves it uncomputed for that row)",
+            )
+        self.assertEqual(
+            row.get("note"),
+            "not_computed (outside top_k)",
+            "an outside-top_k brief must carry the full triage's note",
+        )
+        self.assertEqual(
+            row.get("total_score"),
+            expected["total_score"],
+            "the outside-top_k brief's total_score must equal the full"
+            " triage row's (stage1, no stage-2 bonus)",
+        )
+        self.assertEqual(
+            row.get("total_score"),
+            expected["stage1"],
+            "an outside-top_k row's total_score IS its stage1",
+        )
+
 
 # ==== C7: one-call work selection (bundle --with-briefs) ====================
 
@@ -737,6 +804,91 @@ class OneCallBundleTests(_StoreTestCase):
             len(json.dumps(env).encode("utf-8")),
             "the 200-token payload must be strictly shorter than the"
             " 4000-token one (cutting must have occurred)",
+        )
+
+    def test_bundle_budget_sheds_brief_fields_before_bundles(self) -> None:
+        """RED at the pre-fix implementation head 5fc2404, GREEN after the
+        fix (Phase 4.5 implementation review finding 4). Under --with-briefs
+        a budget that binds sheds the ENRICHED member fields - the
+        convenience layer - BEFORE it drops a whole bundle: a member's
+        number, title and triage scores are the evidence, its
+        labels/author/dates/excerpt/file lists are not. The pre-fix order
+        dropped whole bundles first, so a tight budget answered an empty
+        bundles list while the cheap convenience fields were still intact on
+        the rows it threw away (the pin's failure there was
+        "AssertionError: [] is not true : the convenience brief fields must
+        be shed BEFORE any whole bundle is dropped"). The size is also
+        checked BEFORE each destructive step, so a payload already inside
+        budget is never stripped. ERROR at the base, where --with-briefs did
+        not exist yet (TypeError: unexpected keyword argument)."""
+        from zaxbygraph import derive as _d
+
+        conn = open_existing(self.db_path)
+        try:
+            roomy = _d.bundle(
+                conn, REPO, with_briefs=True, budget_tokens=100_000,
+            )
+            self.assertFalse(
+                roomy.get("truncated"),
+                "a 100k-token budget must not bind on this fixture"
+                f" (got truncated={roomy.get('truncated')!r})",
+            )
+            bundles = roomy.get("bundles") or []
+            self.assertTrue(
+                bundles, "the fixture must produce a bundle over {801, 802}"
+            )
+            members = bundles[0].get("members") or []
+            self.assertTrue(members, "the bundle must carry members")
+            self.assertIn(
+                "labels", members[0],
+                "the roomy payload's members must carry the brief fields",
+            )
+            roomy_chars = len(
+                json.dumps(roomy, sort_keys=True, ensure_ascii=True,
+                           separators=(",", ":")).encode("utf-8")
+            )
+            # A budget one token under the roomy payload's own width binds
+            # by a hair, so exactly the convenience layer has to go.
+            tight = max(1, roomy_chars // 4 - 1)
+            cut = _d.bundle(
+                conn, REPO, with_briefs=True, budget_tokens=tight,
+            )
+        finally:
+            conn.close()
+
+        self.assertIs(
+            cut.get("truncated"), True,
+            "a budget below the payload's width must be flagged truncated",
+        )
+        cut_bundles = cut.get("bundles") or []
+        self.assertTrue(
+            cut_bundles,
+            "the convenience brief fields must be shed BEFORE any whole"
+            f" bundle is dropped (bundles={cut_bundles!r})",
+        )
+        cut_members = cut_bundles[0].get("members") or []
+        self.assertTrue(cut_members, "the surviving bundle keeps its members")
+        for member in cut_members:
+            for key in ("labels", "author", "created_at", "updated_at",
+                        "html_url", "excerpt", "files_existing",
+                        "files_missing", "not_in_vocabulary"):
+                self.assertNotIn(
+                    key, member,
+                    f"the shed convenience field {key!r} must be gone from a"
+                    " budget-cut member",
+                )
+            for key in ("number", "title", "triage_total", "stage1"):
+                self.assertIn(
+                    key, member,
+                    f"the evidence field {key!r} must survive budget cutting",
+                )
+        cut_chars = len(
+            json.dumps(cut, sort_keys=True, ensure_ascii=True,
+                       separators=(",", ":")).encode("utf-8")
+        )
+        self.assertLessEqual(
+            cut_chars, tight * 4,
+            "the cut payload must respect its own budget (chars/4)",
         )
 
 
