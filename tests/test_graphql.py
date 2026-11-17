@@ -206,7 +206,13 @@ class _FakeGraphQLHost:
             "                first = errors[0]",
             "                if isinstance(first, dict) and first.get('message'):",
             "                    msg = str(first['message'])",
-            "        print('gh: ' + msg, file=sys.stderr)",
+            "        stderr_path = d / 'nonzero_stderr.txt'",
+            "        if stderr_path.exists():",
+            "            line = stderr_path.read_text(encoding='utf-8')",
+            "            if line:",
+            "                print(line, file=sys.stderr)",
+            "        else:",
+            "            print('gh: ' + msg, file=sys.stderr)",
             "        raise SystemExit(1)",
             "elif argv[0] == 'rate_limit':",
             "    print((d / 'rate_limit_response.json').read_text(encoding='utf-8'))",
@@ -643,15 +649,19 @@ class NonzeroExitClassificationTests(unittest.TestCase):
     def test_null_data_rate_limited_on_nonzero_exit(self) -> None:
         """A data:null body with a hard RATE_LIMITED error on a NON-ZERO exit
         raises with status 429 and the budget enrichment - the stdout-derived
-        classification, not a stderr-only status."""
+        classification, not a stderr-only status. The FIRST error (whose
+        message becomes the fake's stderr line) names NO rate limit, so a
+        mutant that gates before classification and derives status from
+        stderr alone answers None here and is killed (PR review r1)."""
         host = _FakeGraphQLHost()
         host.write_graphql_responses(
             [
                 {
                     "data": None,
                     "errors": [
+                        {"type": "SOME_OTHER", "message": "boom"},
                         {"type": "RATE_LIMITED",
-                         "message": "API rate limit exceeded"}
+                         "message": "API rate limit exceeded"},
                     ],
                 }
             ]
@@ -662,6 +672,7 @@ class NonzeroExitClassificationTests(unittest.TestCase):
             with self.assertRaises(GitHubError) as ctx:
                 src.fetch_children(_listing_items(1))
         exc = ctx.exception
+        self.assertEqual(str(exc), "gh: boom")
         self.assertEqual(exc.status, 429)
         self.assertEqual(getattr(exc, "rate_limit_remaining", None), 0)
         self.assertTrue(getattr(exc, "rate_limit_reset", None))
@@ -669,11 +680,13 @@ class NonzeroExitClassificationTests(unittest.TestCase):
     def test_nonzero_fail_closed_matrix(self) -> None:
         """The fail-closed matrix for the non-zero path: unparseable stdout,
         non-dict JSON, a body with neither errors nor data, soft errors with
-        null data (NOT soft success), and a section error naming an UNKNOWN
-        alias are all fatal with the stderr-derived message and a None
-        status. (The empty-stderr stdout-fallback-message case cannot be
-        driven by this fake - its stderr line always carries the 'gh: '
-        prefix - so it is skipped rather than weakly approximated.)"""
+        null data (NOT soft success), a section error naming an UNKNOWN
+        alias, a NON-LIST errors field, and an EMPTY errors list are all
+        fatal with the stderr-derived message and a None status - the
+        non-zero path never treats an unclassified body as success
+        (PR review r1). The EMPTY-STDERR stdout-fallback case is driven by
+        the fake's stderr override file (a data:dict body with a hard error
+        whose stderr is empty answers with the stdout-fallback message)."""
         soft_not_found = json.dumps(
             {
                 "data": None,
@@ -699,6 +712,12 @@ class NonzeroExitClassificationTests(unittest.TestCase):
              "gh: Could not resolve to an issue with the number of 1."),
             (json.dumps(unknown_alias),
              "gh: mocked per-field denial on iX comments"),
+            # A NON-LIST errors field next to dict data: no classifiable
+            # error -> unclassified non-zero failure -> fatal (PR review r1).
+            (json.dumps({"data": {}, "errors": "x"}), "gh: boom"),
+            # An EMPTY errors list next to dict data: same unclassified
+            # failure -> fatal (PR review r1).
+            (json.dumps({"data": {}, "errors": []}), "gh: boom"),
         ]
         host = _FakeGraphQLHost()
         (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
@@ -713,6 +732,26 @@ class NonzeroExitClassificationTests(unittest.TestCase):
                         src.fetch_children(_listing_items(1))
                     self.assertIsNone(ctx.exception.status)
                     self.assertEqual(str(ctx.exception), expected_message)
+            # Empty stderr (the fake's nonzero_stderr.txt override, empty
+            # file -> NO stderr line): err falls back to the stdout body, so
+            # the fatal GitHubError carries the stdout-fallback message
+            # (PR review r1). Same with-host block: the fake's temp dir is
+            # cleaned on context exit, so the host cannot be re-entered.
+            hard_body = json.dumps(
+                {
+                    "data": {"repository": {}},
+                    "errors": [{"type": "SOME_OTHER", "message": "boom"}],
+                }
+            )
+            src2 = host.source()
+            (host.cwd / "graphql_response_8.json").write_text(
+                hard_body, encoding="utf-8"
+            )
+            (host.cwd / "nonzero_stderr.txt").write_text("", encoding="utf-8")
+            with self.assertRaises(GitHubError) as ctx2:
+                src2.fetch_children(_listing_items(1))
+            self.assertIsNone(ctx2.exception.status)
+            self.assertEqual(str(ctx2.exception), hard_body)
 
     def test_nonzero_exit_reuses_shared_classification(self) -> None:
         """The shared-classification property: the SAME payload driven
