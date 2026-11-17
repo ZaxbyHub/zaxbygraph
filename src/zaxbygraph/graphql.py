@@ -890,6 +890,27 @@ class GraphQLSource(GhApiSource):
                 return True
         return False
 
+    @staticmethod
+    def _errors_body(stdout: str | None) -> list[dict]:
+        """The dict entries of a GraphQL ``errors`` body written to stdout,
+        or [] when stdout is not such a body. gh exits non-zero for ANY
+        errored response, so the zero-exit path's error handling never sees
+        these bodies; the AC22 seam (issue #75) parses one here so a host
+        whose schema lacks the timeline connection's filteredCount gets its
+        ONE stripped retry instead of a fatal error."""
+        if not stdout:
+            return []
+        try:
+            data = json.loads(stdout.strip() or "{}")
+        except ValueError:
+            return []
+        if not isinstance(data, dict):
+            return []
+        errors = data.get("errors")
+        if not isinstance(errors, list):
+            return []
+        return [e for e in errors if isinstance(e, dict)]
+
     def _graphql(
         self, query: str, aliases: dict[str, int] | None = None, *, stripped: bool = False
     ) -> dict:
@@ -940,6 +961,21 @@ class GraphQLSource(GhApiSource):
             ) from exc
         if proc.returncode != 0:
             err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
+            # gh exits NON-ZERO whenever the response carries errors, and the
+            # errors body rides stdout — so the validation error naming the
+            # timeline connection's filteredCount (issue #75/AC22) arrives
+            # HERE, never on the zero-exit path below. Parse the body before
+            # raising so the ONE shared retry seam can see it: without this a
+            # host whose schema lacks the field dies on EVERY sync (a fatal
+            # statusless validation error) instead of degrading once and
+            # caching the absence. Narrow by construction — every other error
+            # keeps its existing fatal path.
+            hard = self._errors_body(proc.stdout)
+            if hard and not stripped and self._filtered_count_unsupported(hard, query):
+                self._filtered_count_unsupported_cached = True
+                return self._graphql(
+                    _strip_filtered_count(query), aliases, stripped=True
+                )
             raise self._with_rate_budget(
                 GitHubError(err, status=_status_from_stderr(err))
             )

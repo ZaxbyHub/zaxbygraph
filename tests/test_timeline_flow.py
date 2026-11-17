@@ -789,6 +789,21 @@ class FilteredCountSyncTests(TempDBTest):
                     ],
                     "data": None,
                 }
+                # REAL gh SHAPE (final-critic finding, Phase 4.6): `gh api
+                # graphql` exits 1 whenever the response carries errors, and
+                # writes the errors body to stdout while the one-line `gh:`
+                # diagnostic goes to stderr. The earlier fake exited 0, which
+                # routed the validation error down the zero-exit path and
+                # certified a retry seam production could never reach — the
+                # source parses the body in the non-zero branch precisely
+                # because this is how gh answers.
+                return _sp.CompletedProcess(
+                    cmd,
+                    1,
+                    json.dumps(out),
+                    "gh: Field 'filteredCount' doesn't exist on type"
+                    " 'IssueTimelineItemsConnection'",
+                )
             elif is_graphql:
                 out = {"data": {"repository": {"p63": node}}}
             else:
