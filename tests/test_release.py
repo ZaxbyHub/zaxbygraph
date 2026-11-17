@@ -572,6 +572,21 @@ class PackagingMetadataTests(unittest.TestCase):
             f"classifiers must cover the supported range through 3.14:"
             f" {classifiers}",
         )
+        # PEP 639 (post-publication CI failure on this PR): setuptools >= 77
+        # REFUSES to build a project that carries BOTH an SPDX license
+        # expression and a `License ::` classifier ("License classifiers have
+        # been superseded by license expressions"). The SPDX expression IS the
+        # license, so no license classifier may ride beside it — without this
+        # pin the combination fails only inside `pip install -e .`, which the
+        # suite never runs.
+        license_classifiers = [c for c in classifiers if c.startswith("License ::")]
+        self.assertEqual(
+            license_classifiers,
+            [],
+            "a `License ::` classifier is superseded by the SPDX license"
+            f" expression (PEP 639) and makes the build fail:"
+            f" {license_classifiers}",
+        )
 
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         self.assertIn(
