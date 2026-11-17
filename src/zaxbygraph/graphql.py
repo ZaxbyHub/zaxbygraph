@@ -909,15 +909,19 @@ class GraphQLSource(GhApiSource):
             # scoped to a known alias fail closed.
             hard, dropped = self._classify_errors(error_list, aliases)
             self.last_dropped_sections = dropped
-            # Issue #82 (PR review r1): a NON-ZERO exit means gh judged the
-            # response errored, so soft success additionally requires the body
-            # to carry at least one classifiable error. A non-zero body with a
-            # data dict but NO errors (or a non-list/empty errors field) is an
-            # UNCLASSIFIED failure, never a success; the zero-exit path keeps
-            # its existing no-errors-means-clean behavior.
+            # Issue #82 (PR review r1/r2): a NON-ZERO exit means gh judged the
+            # response errored, so soft success additionally requires EVERY
+            # reported error to be classifiable and soft. A non-zero body with
+            # a data dict but NO errors (a non-list or empty errors field), or
+            # whose errors list carries entries the classifier must SKIP
+            # (non-dict elements), is an UNCLASSIFIED failure, never a
+            # success; the zero-exit path keeps its existing skip-and-continue
+            # behavior for malformed entries.
+            malformed = sum(1 for e in error_list if not isinstance(e, dict))
+            unclassified = not error_list or malformed
             if (
                 hard
-                or (nonzero_err is not None and not error_list)
+                or (nonzero_err is not None and unclassified)
                 or not isinstance(data.get("data"), dict)
             ):
                 if nonzero_err is not None:

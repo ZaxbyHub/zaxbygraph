@@ -718,6 +718,21 @@ class NonzeroExitClassificationTests(unittest.TestCase):
             # An EMPTY errors list next to dict data: same unclassified
             # failure -> fatal (PR review r1).
             (json.dumps({"data": {}, "errors": []}), "gh: boom"),
+            # A NONEMPTY list of MALFORMED entries next to dict data: the
+            # classifier skips every entry, so nothing is classifiable ->
+            # fatal (PR review r2).
+            (json.dumps({"data": {}, "errors": ["x"]}), "gh: boom"),
+            # A MIXED list (a classifiable soft error next to a malformed
+            # entry): the malformed entry must not turn a failed subprocess
+            # into success -> fatal (PR review r2). The stderr line carries
+            # the FIRST error's message.
+            (json.dumps({"data": {}, "errors": [
+                {"type": "NOT_FOUND",
+                 "message": "Could not resolve to an issue with the"
+                            " number of 1."},
+                "x",
+            ]}),
+             "gh: Could not resolve to an issue with the number of 1."),
         ]
         host = _FakeGraphQLHost()
         (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
@@ -744,7 +759,9 @@ class NonzeroExitClassificationTests(unittest.TestCase):
                 }
             )
             src2 = host.source()
-            (host.cwd / "graphql_response_8.json").write_text(
+            # Nine loop cases preceded this one, so the fake's call counter
+            # is at 9 and the next served response file is _10.
+            (host.cwd / "graphql_response_10.json").write_text(
                 hard_body, encoding="utf-8"
             )
             (host.cwd / "nonzero_stderr.txt").write_text("", encoding="utf-8")
