@@ -135,7 +135,30 @@ if sub == "graphql":
         counter = d / "graphql_calls.txt"
         n = int(counter.read_text()) if counter.exists() else 0
         counter.write_text(str(n + 1))
-        print((d / ("graphql_response_%d.json" % (n + 1))).read_text(encoding="utf-8"))
+        body = (d / ("graphql_response_%d.json" % (n + 1))).read_text(encoding="utf-8")
+        print(body)
+        # Issue #82: real gh exits 1 for ANY errored GraphQL response, with
+        # the errors body on stdout and a one-line `gh: <first error
+        # message>` diagnostic on stderr ('boom' when the body has no
+        # parseable errors or the first carries no message).
+        mode = "ok"
+        mode_file = d / "mode.txt"
+        if mode_file.exists():
+            mode = mode_file.read_text(encoding="utf-8").strip()
+        if mode == "nonzero_errors":
+            msg = "boom"
+            try:
+                parsed = json.loads(body)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                errors = parsed.get("errors")
+                if isinstance(errors, list) and errors:
+                    first = errors[0]
+                    if isinstance(first, dict) and first.get("message"):
+                        msg = str(first["message"])
+            print("gh: " + msg, file=sys.stderr)
+            raise SystemExit(1)
 elif sub == "rate_limit":
     print((d / "rate_limit_response.json").read_text(encoding="utf-8"))
 elif sub.startswith("repos/"):
@@ -177,6 +200,13 @@ class _FakeGhHost:
             (self.cwd / f"rest_response_{i}.json").write_text(
                 json.dumps(payload), encoding="utf-8"
             )
+
+    def set_mode(self, mode: str) -> None:
+        """Force the fake's transport mode (issue #82): 'ok' is the default
+        when no mode file exists; 'nonzero_errors' serves the GraphQL
+        response to stdout with a `gh: <first error>` stderr line and exit 1
+        (real-gh shape)."""
+        (self.cwd / "mode.txt").write_text(mode, encoding="utf-8")
 
     def calls(self) -> list[dict]:
         log = self.cwd / "calls.log"

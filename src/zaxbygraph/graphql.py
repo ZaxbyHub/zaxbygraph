@@ -902,7 +902,12 @@ class GraphQLSource(GhApiSource):
             return []
         try:
             data = json.loads(stdout.strip() or "{}")
-        except ValueError:
+        except (ValueError, RecursionError):
+            # PR #83 review (F-B1), composed (issue #82's 05-fix-plan.md): a
+            # pathologically nested untrusted body raises RecursionError, not
+            # a ValueError; EVERY stdout parse site on the combined tree
+            # catches the same tuple so both exit paths fail closed the SAME
+            # way (the seam is the third site the composition adds).
             return []
         if not isinstance(data, dict):
             return []
@@ -910,6 +915,79 @@ class GraphQLSource(GhApiSource):
         if not isinstance(errors, list):
             return []
         return [e for e in errors if isinstance(e, dict)]
+
+    @staticmethod
+    def _errors_payload(stdout: str | None) -> dict | None:
+        """The full GraphQL response dict of a non-zero exit's stdout, or None
+        when stdout is not such a body (issue #82): gh exits non-zero for ANY
+        errored response, writing the errors body to stdout with a one-line
+        gh: diagnostic on stderr, so this ONE parse feeds the classification,
+        the data-dict soft-success gate, and the shared return tail. On the
+        combined PR #81 tree its seam's list-returning _errors_body slots in
+        before classification per the approved composition rule (issue #82's
+        05-fix-plan.md)."""
+        if not stdout:
+            return None
+        try:
+            parsed = json.loads(stdout.strip() or "{}")
+        except (ValueError, RecursionError):
+            # PR #83 review (F-B1): a pathologically nested untrusted body
+            # raises RecursionError, which is not a ValueError; both parse
+            # sites catch it together so the two exit paths fail closed the
+            # SAME way (the critic's probe verified the escape at both).
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return parsed
+
+    def _classify_errors(
+        self, errors: list, aliases: dict[str, int] | None
+    ) -> tuple[list[dict], dict[int, list[tuple[str, str, str]]]]:
+        """The ONE GraphQL errors-body classification (issue #82): shared by
+        the zero-exit path (which parses its body first) and the non-zero path
+        (which parses stdout before reaching it). NOT_FOUND on an issue/pull
+        reference -> soft (per-item REST fallback); RATE_LIMIT -> hard (the
+        sleep/retry ladder must see it, PR #37 review); an error scoped by
+        path to a known alias's section -> dropped (the absent-section REST
+        fallback answers it); everything else -> hard. Returns
+        (hard, dropped)."""
+        hard: list[dict] = []
+        dropped: dict[int, list[tuple[str, str, str]]] = {}
+        for e in errors:
+            if not isinstance(e, dict):
+                continue
+            etype = str(e.get("type", "")).upper()
+            emsg = str(e.get("message", ""))
+            if (
+                etype == "NOT_FOUND"
+                or "Could not resolve to an issue" in emsg
+                or "Could not resolve to a pullRequest" in emsg
+            ):
+                continue
+            if "RATE_LIMIT" in etype or "rate limit" in emsg.lower():
+                # A rate-limit error must always surface to the sleep/retry
+                # ladder, even when GitHub scopes it to one section with a
+                # path - dropping it would store partial data as a clean
+                # run and keep hammering a throttled API (PR #37 review).
+                hard.append(e)
+                continue
+            path = e.get("path")
+            if (
+                aliases is not None
+                and isinstance(path, list)
+                and len(path) >= 3
+                and path[0] == "repository"
+                and isinstance(path[1], str)
+                and path[1] in aliases
+                and isinstance(path[2], str)
+            ):
+                number = aliases[path[1]]
+                dropped.setdefault(number, []).append(
+                    (path[2], etype or "GRAPHQL_ERROR", emsg[:120])
+                )
+                continue
+            hard.append(e)
+        return hard, dropped
 
     def _graphql(
         self, query: str, aliases: dict[str, int] | None = None, *, stripped: bool = False
@@ -959,52 +1037,67 @@ class GraphQLSource(GhApiSource):
             raise GitHubTransportError(
                 f"gh CLI could not be launched: {exc}"
             ) from exc
+        nonzero_err: str | None = None
         if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
-            # gh exits NON-ZERO whenever the response carries errors, and the
-            # errors body rides stdout — so the validation error naming the
-            # timeline connection's filteredCount (issue #75/AC22) arrives
-            # HERE, never on the zero-exit path below. Parse the body before
-            # raising so the ONE shared retry seam can see it: without this a
-            # host whose schema lacks the field dies on EVERY sync (a fatal
-            # statusless validation error) instead of degrading once and
-            # caching the absence. Narrow by construction — every other error
-            # keeps its existing fatal path.
-            hard = self._errors_body(proc.stdout)
-            if hard and not stripped and self._filtered_count_unsupported(hard, query):
-                self._filtered_count_unsupported_cached = True
-                return self._graphql(
-                    _strip_filtered_count(query), aliases, stripped=True
-                )
-            raise self._with_rate_budget(
-                GitHubError(err, status=_status_from_stderr(err))
+            nonzero_err = (proc.stderr or proc.stdout or "gh api graphql failed").strip()
+            # Issue #82: gh exits NON-ZERO for ANY errored response (errors
+            # body on stdout, a one-line gh: diagnostic on stderr), so the
+            # classification below is what every errored response hits in
+            # production. Unified ordering (plan-critic-approved): parse the
+            # body, CLASSIFY the errors regardless of `data`, raise with the
+            # stderr-derived message and stdout-derived 429 priority, and let
+            # the data-dict gate decide SOFT success only.
+            data = self._errors_payload(proc.stdout) or {}
+        else:
+            try:
+                data = json.loads(proc.stdout.strip() or "{}")
+            except (ValueError, RecursionError) as exc:
+                # PR #83 review (F-B1): a pathologically nested untrusted body
+                # raises RecursionError, which is not a ValueError; both parse
+                # sites catch it together so the two exit paths fail closed
+                # the SAME way (critic-probe verified at head and base).
+                raise GitHubError(f"unexpected graphql payload: {exc}") from exc
+            if not isinstance(data, dict):
+                raise GitHubError("unexpected graphql payload")
+        # Issue #75/AC22 seam, slotted before classification per the approved
+        # composition rule (issue #82's 05-fix-plan.md): gh exits NON-ZERO for
+        # ANY errored response, so a host whose schema lacks the timeline
+        # connection's filteredCount surfaces its data:null validation error
+        # HERE, never through the zero-exit path in production. Parse the body
+        # as the flat errors list and retry this query ONCE with only
+        # filteredCount stripped, caching the absence so every later query
+        # (bulk and continuation) omits it from the start. Narrow by
+        # construction — every other error keeps its classification below.
+        seam_hard = self._errors_body(proc.stdout)
+        if seam_hard and not stripped and self._filtered_count_unsupported(seam_hard, query):
+            self._filtered_count_unsupported_cached = True
+            return self._graphql(
+                _strip_filtered_count(query), aliases, stripped=True
             )
-        try:
-            data = json.loads(proc.stdout.strip() or "{}")
-        except ValueError as exc:
-            raise GitHubError(f"unexpected graphql payload: {exc}") from exc
-        if not isinstance(data, dict):
-            raise GitHubError("unexpected graphql payload")
         errors = data.get("errors")
-        if errors:
+        if errors or nonzero_err is not None:
             error_list = errors if isinstance(errors, list) else []
             # A mixed payload (one alias NOT_FOUND next to a RATE_LIMITED)
             # must surface the rate-limit error so sync's sleep-retry sees it.
-            first = next(
-                (
-                    e
-                    for e in error_list
-                    if isinstance(e, dict)
-                    and (
-                        "RATE_LIMIT" in str(e.get("type", "")).upper()
-                        or "rate limit" in str(e.get("message", "")).lower()
-                    )
-                ),
-                errors[0] if error_list else {},
-            )
-            message = str(first.get("message") or "graphql error") if isinstance(first, dict) else "graphql error"
-            type_name = str(first.get("type", "")).upper() if isinstance(first, dict) else ""
-            status = 429 if ("RATE_LIMIT" in type_name or "rate limit" in message.lower()) else None
+            # The selection feeds only the ZERO-exit fatal raise (the non-zero
+            # path raises with the stderr-derived message below), so it is
+            # computed only there (PR review r3 nit).
+            if nonzero_err is None:
+                first = next(
+                    (
+                        e
+                        for e in error_list
+                        if isinstance(e, dict)
+                        and (
+                            "RATE_LIMIT" in str(e.get("type", "")).upper()
+                            or "rate limit" in str(e.get("message", "")).lower()
+                        )
+                    ),
+                    error_list[0] if error_list else {},
+                )
+                message = str(first.get("message") or "graphql error") if isinstance(first, dict) else "graphql error"
+                type_name = str(first.get("type", "")).upper() if isinstance(first, dict) else ""
+                status = 429 if ("RATE_LIMIT" in type_name or "rate limit" in message.lower()) else None
             # Per-alias NOT_FOUND errors ride alongside partial data when an
             # item was deleted between the listing and this query; the nulled
             # aliases then degrade to the per-item REST path below instead of
@@ -1014,57 +1107,38 @@ class GraphQLSource(GhApiSource):
             # item's node so the established absent-section REST fallback
             # answers it. Validation errors (data null) and anything not
             # scoped to a known alias fail closed.
-            hard = []
-            dropped: dict[int, list[tuple[str, str, str]]] = {}
-            for e in errors if isinstance(errors, list) else []:
-                if not isinstance(e, dict):
-                    continue
-                etype = str(e.get("type", "")).upper()
-                emsg = str(e.get("message", ""))
-                if (
-                    etype == "NOT_FOUND"
-                    or "Could not resolve to an issue" in emsg
-                    or "Could not resolve to a pullRequest" in emsg
-                ):
-                    continue
-                if "RATE_LIMIT" in etype or "rate limit" in emsg.lower():
-                    # A rate-limit error must always surface to the sleep/retry
-                    # ladder, even when GitHub scopes it to one section with a
-                    # path — dropping it would store partial data as a clean
-                    # run and keep hammering a throttled API (PR #37 review).
-                    hard.append(e)
-                    continue
-                path = e.get("path")
-                if (
-                    aliases is not None
-                    and isinstance(path, list)
-                    and len(path) >= 3
-                    and path[0] == "repository"
-                    and isinstance(path[1], str)
-                    and path[1] in aliases
-                    and isinstance(path[2], str)
-                ):
-                    number = aliases[path[1]]
-                    dropped.setdefault(number, []).append(
-                        (path[2], etype or "GRAPHQL_ERROR", emsg[:120])
-                    )
-                    continue
-                hard.append(e)
+            hard, dropped = self._classify_errors(error_list, aliases)
             self.last_dropped_sections = dropped
-            if hard or not isinstance(data.get("data"), dict):
-                if self._filtered_count_unsupported(hard, query) and not stripped:
-                    # Issue #75/AC22: a host whose schema lacks the timeline
-                    # connection's filteredCount answers a validation error
-                    # naming the field. The capability probe introspects
-                    # top-level fields only and continuation queries bypass
-                    # _fields_for, so the field cannot be stripped by the
-                    # capability layer — ONE shared retry seam lives here:
-                    # strip ONLY filteredCount, retry this query once, cache
-                    # the absence so every later query (bulk and
-                    # continuation) omits it from the start.
-                    self._filtered_count_unsupported_cached = True
-                    return self._graphql(
-                        _strip_filtered_count(query), aliases, stripped=True
+            # Issue #82 (PR review r1/r2): a NON-ZERO exit means gh judged the
+            # response errored, so soft success additionally requires EVERY
+            # reported error to be classifiable and soft. A non-zero body with
+            # a data dict but NO errors (a non-list or empty errors field), or
+            # whose errors list carries entries the classifier must SKIP
+            # (non-dict elements), is an UNCLASSIFIED failure, never a
+            # success; the zero-exit path keeps its existing skip-and-continue
+            # behavior for malformed entries.
+            malformed = sum(1 for e in error_list if not isinstance(e, dict))
+            unclassified = not error_list or malformed
+            if (
+                hard
+                or (nonzero_err is not None and unclassified)
+                or not isinstance(data.get("data"), dict)
+            ):
+                if nonzero_err is not None:
+                    # Issue #82: the non-zero path keeps the stderr-derived
+                    # message text, and derives the STATUS from the classified
+                    # errors: a rate-limit-shaped hard error surfaces as 429 so
+                    # sync's sleep/retry ladder sees it regardless of stderr
+                    # wording (plan-critic r1); everything else keeps
+                    # _status_from_stderr's stderr-derived class.
+                    rate_limited = any(
+                        "RATE_LIMIT" in str(e.get("type", "")).upper()
+                        or "rate limit" in str(e.get("message", "")).lower()
+                        for e in hard
+                    )
+                    status = 429 if rate_limited else _status_from_stderr(nonzero_err)
+                    raise self._with_rate_budget(
+                        GitHubError(nonzero_err, status=status)
                     )
                 raise self._with_rate_budget(GitHubError(message, status=status))
         payload = data.get("data")
