@@ -745,7 +745,11 @@ class GraphQLSource(GhApiSource):
             return None
         try:
             parsed = json.loads(stdout.strip() or "{}")
-        except ValueError:
+        except (ValueError, RecursionError):
+            # PR #83 review (F-B1): a pathologically nested untrusted body
+            # raises RecursionError, which is not a ValueError; both parse
+            # sites catch it together so the two exit paths fail closed the
+            # SAME way (the critic's probe verified the escape at both).
             return None
         if not isinstance(parsed, dict):
             return None
@@ -860,7 +864,11 @@ class GraphQLSource(GhApiSource):
         else:
             try:
                 data = json.loads(proc.stdout.strip() or "{}")
-            except ValueError as exc:
+            except (ValueError, RecursionError) as exc:
+                # PR #83 review (F-B1): a pathologically nested untrusted body
+                # raises RecursionError, which is not a ValueError; both parse
+                # sites catch it together so the two exit paths fail closed
+                # the SAME way (critic-probe verified at head and base).
                 raise GitHubError(f"unexpected graphql payload: {exc}") from exc
             if not isinstance(data, dict):
                 raise GitHubError("unexpected graphql payload")

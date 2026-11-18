@@ -198,7 +198,7 @@ class _FakeGraphQLHost:
             "        msg = 'boom'",
             "        try:",
             "            parsed = json.loads(body)",
-            "        except ValueError:",
+            "        except (ValueError, RecursionError):",
             "            parsed = None",
             "        if isinstance(parsed, dict):",
             "            errors = parsed.get('errors')",
@@ -769,6 +769,47 @@ class NonzeroExitClassificationTests(unittest.TestCase):
                 src2.fetch_children(_listing_items(1))
             self.assertIsNone(ctx2.exception.status)
             self.assertEqual(str(ctx2.exception), hard_body)
+
+    def test_deeply_nested_body_nonzero_exit_fails_closed(self) -> None:
+        """A pathologically nested stdout body raises RecursionError in
+        json.loads, which is NOT a ValueError; _errors_payload must catch it
+        so the non-zero exit fails closed through the classification
+        (GitHubError with the stderr-derived message), not as an escaping
+        RecursionError (PR #83 review F-B1)."""
+        host = _FakeGraphQLHost()
+        nested = "[" * 1_000_000 + "]" * 1_000_000
+        # Precondition: the input must actually trigger the decoder's
+        # RecursionError on THIS interpreter (3.14's reworked C-stack
+        # recursion needs ~20000+ nesting; 1e6 covers every supported
+        # version), or the assertions below pass vacuously (PR #83 critic).
+        with self.assertRaises(RecursionError):
+            json.loads(nested)
+        (host.cwd / "graphql_response_1.json").write_text(nested, encoding="utf-8")
+        (host.cwd / "nonzero_stderr.txt").write_text(
+            "gh: deep nesting", encoding="utf-8"
+        )
+        (host.cwd / "mode.txt").write_text("nonzero_errors", encoding="utf-8")
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        self.assertIsNone(ctx.exception.status)
+        self.assertEqual(str(ctx.exception), "gh: deep nesting")
+
+    def test_deeply_nested_body_zero_exit_fails_closed(self) -> None:
+        """The zero-exit parse site catches RecursionError the same way
+        (PR #83 review F-B1: both sites together, or the paths diverge)."""
+        host = _FakeGraphQLHost()
+        nested = "[" * 1_000_000 + "]" * 1_000_000
+        with self.assertRaises(RecursionError):
+            json.loads(nested)  # interpreter precondition, see the sibling test
+        (host.cwd / "graphql_response_1.json").write_text(nested, encoding="utf-8")
+        with host:
+            src = host.source()
+            with self.assertRaises(GitHubError) as ctx:
+                src.fetch_children(_listing_items(1))
+        self.assertIsNone(ctx.exception.status)
+        self.assertTrue(str(ctx.exception).startswith("unexpected graphql payload"))
 
     def test_nonzero_exit_reuses_shared_classification(self) -> None:
         """The shared-classification property: the SAME payload driven
