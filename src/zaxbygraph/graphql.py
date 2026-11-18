@@ -869,35 +869,25 @@ class GraphQLSource(GhApiSource):
             error_list = errors if isinstance(errors, list) else []
             # A mixed payload (one alias NOT_FOUND next to a RATE_LIMITED)
             # must surface the rate-limit error so sync's sleep-retry sees it.
-            first = next(
-                (
-                    e
-                    for e in error_list
-                    if isinstance(e, dict)
-                    and (
-                        "RATE_LIMIT" in str(e.get("type", "")).upper()
-                        or "rate limit" in str(e.get("message", "")).lower()
-                    )
-                ),
-                error_list[0] if error_list else {},
-            )
-            # A mixed payload (one alias NOT_FOUND next to a RATE_LIMITED)
-            # must surface the rate-limit error so sync's sleep-retry sees it.
-            first = next(
-                (
-                    e
-                    for e in error_list
-                    if isinstance(e, dict)
-                    and (
-                        "RATE_LIMIT" in str(e.get("type", "")).upper()
-                        or "rate limit" in str(e.get("message", "")).lower()
-                    )
-                ),
-                errors[0] if error_list else {},
-            )
-            message = str(first.get("message") or "graphql error") if isinstance(first, dict) else "graphql error"
-            type_name = str(first.get("type", "")).upper() if isinstance(first, dict) else ""
-            status = 429 if ("RATE_LIMIT" in type_name or "rate limit" in message.lower()) else None
+            # The selection feeds only the ZERO-exit fatal raise (the non-zero
+            # path raises with the stderr-derived message below), so it is
+            # computed only there (PR review r3 nit).
+            if nonzero_err is None:
+                first = next(
+                    (
+                        e
+                        for e in error_list
+                        if isinstance(e, dict)
+                        and (
+                            "RATE_LIMIT" in str(e.get("type", "")).upper()
+                            or "rate limit" in str(e.get("message", "")).lower()
+                        )
+                    ),
+                    error_list[0] if error_list else {},
+                )
+                message = str(first.get("message") or "graphql error") if isinstance(first, dict) else "graphql error"
+                type_name = str(first.get("type", "")).upper() if isinstance(first, dict) else ""
+                status = 429 if ("RATE_LIMIT" in type_name or "rate limit" in message.lower()) else None
             # Per-alias NOT_FOUND errors ride alongside partial data when an
             # item was deleted between the listing and this query; the nulled
             # aliases then degrade to the per-item REST path below instead of
