@@ -27,6 +27,20 @@ evidence — if a row is here, GitHub said it. Interpretation is the caller's jo
 
 ## Install
 
+One line from the repository (pipx keeps the CLI in its own environment):
+
+```bash
+pipx install git+https://github.com/ZaxbyHub/zaxbygraph
+```
+
+or with uv:
+
+```bash
+uvx --from git+https://github.com/ZaxbyHub/zaxbygraph zaxbygraph --help
+```
+
+From a checkout (development):
+
 ```bash
 pip install -e .
 zaxbygraph --help
@@ -37,6 +51,19 @@ Requires the [GitHub CLI](https://cli.github.com/), authenticated:
 ```bash
 gh auth login
 ```
+
+First use on a fresh machine is one command — it preflights gh (presence
+and authentication), builds the store, and prints the MCP registration
+line:
+
+```bash
+zaxbygraph init --repo OWNER/REPO
+```
+
+The agent skill ships inside the package: `zaxbygraph skill` prints it,
+`zaxbygraph skill --install DIR` writes a stamped copy under `DIR`, and
+`zaxbygraph skill --check` (also reported by `zaxbygraph doctor`) names any
+installed copy whose content drifted from the packaged one.
 
 Tested on Windows and Linux; CI runs both on Python 3.11 through 3.14.
 

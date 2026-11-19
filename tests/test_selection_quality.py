@@ -410,7 +410,7 @@ class DemandExclusionTests(_StoreTestCase):
     def test_demand_excludes_bots_and_children(self) -> None:
         """RED at base, GREEN after the fix. (a) participants excludes bot
         actors; (b) inbound_mentions counts only open non-child sources."""
-        out = derive.triage(self.conn, REPO, include_gated=True)
+        out = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(500, rows)
         self.assertIn(510, rows)
@@ -1427,7 +1427,7 @@ class BuiltinLabelHotspotTests(_StoreTestCase):
         oracle, and the additive hotspot_raw diagnostic - unlike the
         normalized value, which is uniform-offset invariant BY DESIGN -
         differs between the T-anchored and stored-stamp runs)."""
-        out = derive.triage(self.conn, REPO, include_gated=True)
+        out = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         rows = {r["number"]: r for r in out["rows"]}
         for n in (801, 802, 811, 812, 813):
             self.assertIn(n, rows)
@@ -1478,7 +1478,7 @@ class BuiltinLabelHotspotTests(_StoreTestCase):
         # removed that inequality: it could only ever pass by float
         # noise). Three legs instead:
         t = "2027-07-11T00:00:00Z"
-        asof = derive.triage(self.conn, REPO, as_of=t)
+        asof = derive.triage(self.conn, REPO, as_of=t, explain=True)
         asof_rows = {r["number"]: r for r in asof["rows"]}
         for n in (811, 812, 813):
             self.assertIn(

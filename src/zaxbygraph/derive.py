@@ -268,6 +268,8 @@ class _ItemData:
         "author",
         "milestone",
         "created_at",
+        "updated_at",
+        "html_url",
         "merged_at",
         "tokens",
         "title_tokens",
@@ -287,6 +289,8 @@ class _ItemData:
         self.author = row["author"]
         self.milestone = row["milestone"] if "milestone" in row.keys() else None
         self.created_at = row["created_at"]
+        self.updated_at = row["updated_at"] if "updated_at" in row.keys() else None
+        self.html_url = row["html_url"] if "html_url" in row.keys() else None
         self.merged_at = row["merged_at"] if "merged_at" in row.keys() else None
         self.tokens = tokenize(f"{self.title}\n{self.body or ''}")
         self.title_tokens = tokenize(self.title)
@@ -298,7 +302,7 @@ class _ItemData:
 
 
 def _load_items(conn: sqlite3.Connection, repo: str, caps: _Capabilities) -> dict[int, _ItemData]:
-    cols = "repo, number, kind, state, title, body, author, created_at, merged_at"
+    cols = "repo, number, kind, state, title, body, author, created_at, updated_at, html_url, merged_at"
     if caps.has_milestone:
         cols += ", milestone"
     items: dict[int, _ItemData] = {}
@@ -339,10 +343,33 @@ def _resolve_ref(ref: str, vocab: set[str], by_suffix: dict[str, list[str]]) -> 
     matches = by_suffix.get(ref)
     if matches and len(matches) == 1:
         return matches[0]
-    # Reverse direction: a vocab path that is a tail of the longer ref.
-    heads = [p for p in vocab if p != ref and ref.endswith("/" + p)]
+    # Reverse direction: a vocab path that is a tail of the longer ref
+    # (absolute or checkout-prefixed mentions, /repo/src/a.py -> src/a.py).
+    # Enumerate the REF's own component-boundary suffixes and look each up
+    # in the forward suffix index: O(depth) lookups instead of an O(vocab)
+    # scan per reference (issue #70 AC1). Collect ALL matches before
+    # deciding, so the ambiguity semantics are identical (exactly one
+    # match resolves; zero or many resolve to None). When the caller
+    # passes no (or an incomplete) index, the index is derived from the
+    # vocab itself so a direct caller keeps the documented behavior.
+    parts = PurePosixPath(ref).parts
+    heads: set[str] = set()
+    index = by_suffix
+    if not index:
+        index = {}
+        for path in vocab:
+            pp = PurePosixPath(path).parts
+            for i in range(len(pp)):
+                index.setdefault("/".join(pp[i:]), []).append(path)
+    for i in range(len(parts)):
+        tail = "/".join(parts[i:])
+        if not tail or tail == ref:
+            continue
+        for cand in index.get(tail, ()):
+            if cand != ref and ref.endswith("/" + cand):
+                heads.add(cand)
     if len(heads) == 1:
-        return heads[0]
+        return next(iter(heads))
     return None
 
 
@@ -593,10 +620,21 @@ def _term_idf(term: str, ctx: dict) -> float:
     """IDF for one lexical term: ``log(1 + N/df)`` with N = items in the
     store and df = items whose title+body contain the term (issue #69 AC7).
     A term no stored item carries (df 0) scores the maximal weight — it can
-    only appear through a stale context, never from these items."""
+    only appear through a stale context, never from these items.
+
+    The value is a pure function of (term, ctx), so it is memoized on the
+    context (issue #70 AC1): the candidate ranking asks for the same term
+    millions of times on a large store, and the per-call log()/dict lookups
+    dominated the profile."""
+    cache = ctx.setdefault("_term_idf_cache", {})
+    hit = cache.get(term)
+    if hit is not None:
+        return hit
     n_items = max(1, ctx.get("item_count", 1))
     df = ctx.get("term_df", {}).get(term, 0)
-    return math.log(1.0 + n_items / max(1, df))
+    value = math.log(1.0 + n_items / max(1, df))
+    cache[term] = value
+    return value
 
 
 def _overlap_score(a: set, b: set) -> float:
@@ -735,6 +773,7 @@ def _cochange_between(
     file_support = ctx.get("coupling_filesupport") or {}
     best = 0.0
     pairs = []
+    seen: set[frozenset[str]] = set()
     for fa in sorted(a_paths):
         row = support.get(fa)
         if not row:
@@ -744,6 +783,13 @@ def _cochange_between(
                 sym_conf = sup / max(
                     file_support.get(fa, sup), file_support.get(fb, sup)
                 )
+                # ONE row per unordered pair (issue #70 AC5): the
+                # coupling support is symmetric, so the (a,b) and
+                # (b,a) rows are the SAME fact listed twice.
+                key = frozenset((fa, fb))
+                if key in seen:
+                    continue
+                seen.add(key)
                 pairs.append(
                     {"a": fa, "b": fb, "support": sup, "confidence": sym_conf}
                 )
@@ -2384,6 +2430,7 @@ def _triage_compute(
     top_k: int,
     weights: dict | None = None,
     claims_explicit: str | None = None,
+    only: int | None = None,
 ) -> dict:
     """The full two-stage triage computation shared by triage/bundle/brief:
     stage-1 features + gates for every open issue, stage-2 (hotspot,
@@ -2395,7 +2442,17 @@ def _triage_compute(
     defaults, preserving bare library-call behavior).
     ``claims_explicit`` is the caller's explicit --config path, threaded to
     the [claims] chain so the claimed gate honours the same file the
-    [triage] table came from."""
+    [triage] table came from. ``only`` (issue #70 AC1) scores ONE
+    issue instead of every open one - the brief path - while sharing
+    every line of the arithmetic: stage 1 still runs over the whole
+    population (it is cheap, and the requested row's RANK among that
+    population decides its top-K eligibility exactly as the full
+    triage decides it), the hotspot normalisation still runs over the
+    whole ungated population so the max is identical, and only the
+    requested row's expensive stage 2 ever runs - and only when that
+    rank puts it inside top_k, so a brief for an outside-top-K issue
+    reports the same ``not_computed (outside top_k)`` row the full
+    ranking would. The returned ``rows`` carry just that row."""
     caps = _Capabilities(conn)
     ctx = build_context(conn, repo, caps)
     index, file_support, population = _coupling_index(conn, repo, caps)
@@ -2523,10 +2580,21 @@ def _triage_compute(
         row["hotspot_raw"] = round(raw, 9)
     max_raw = max((r["hotspot_raw"] for r in ungated), default=0.0)
 
+
     # Stage 2 for the top-K UNGATED rows only (top-K contract preserved:
     # analog/regression work and the stage-2 bonus stay top-K-only; only
     # the cheap raw sums ran for everyone).
-    for row in ungated[: max(1, top_k)]:
+    stage2_rows = ungated[: max(1, top_k)]
+    if only is not None:
+        # Single-row mode (issue #70 AC1): the requested row keeps its
+        # full-population stage-1 rank, so its top-K ELIGIBILITY is the
+        # full triage's - an outside-top-K brief reports the same
+        # not_computed row the ranking would, never a stage-2 score the
+        # full compute would refuse it. Only that one row's expensive
+        # stage 2 runs; the other top-K rows are left uncomputed (and
+        # dropped from the payload below).
+        stage2_rows = [r for r in stage2_rows if r["number"] == only]
+    for row in stage2_rows:
         number = row["number"]
         hotspot = row["hotspot_raw"] / max_raw if max_raw > 0 else 0.0
         analog, regression = _analog_for(
@@ -2543,13 +2611,20 @@ def _triage_compute(
         row["analog"] = analog
         row["stage2"] = bonus
         row["total_score"] = row["stage1"] + bonus
-    for row in ungated[max(1, top_k):]:
+    computed = {r["number"] for r in stage2_rows}
+    for row in ungated:
+        if row["number"] in computed:
+            continue
         row["hotspot"] = None
         row["regression"] = None
         row["analog"] = None
         row["stage2"] = None
-        row["note"] = "not_computed (outside top_k)"
         row["total_score"] = row["stage1"]
+        if only is not None and row["number"] != only:
+            # Not the requested row: this payload never scores it.
+            row["note"] = "not_computed (single-row mode)"
+        else:
+            row["note"] = "not_computed (outside top_k)"
     for row in rows:
         if not row["ranked"]:
             row["hotspot_raw"] = None
@@ -2559,6 +2634,12 @@ def _triage_compute(
             row["stage2"] = None
             row["note"] = "not_computed (gated)"
             row["total_score"] = row["stage1"]
+
+    if only is not None:
+        # The population existed to rank THIS row and to normalise its
+        # hotspot; the payload carries the one row the caller asked for.
+        rows = [r for r in rows if r["number"] == only]
+        ungated = [r for r in ungated if r["number"] == only]
 
     return {
         "rows": rows,
@@ -2640,6 +2721,8 @@ def _asof_meta_echo(conn: sqlite3.Connection, repo: str) -> dict:
 
 
 def _triage_row_payload(row: dict) -> dict:
+    """The EXPLAIN row: the full per-feature dump (issue #70 AC8: the slim
+    default drops these; --explain restores them verbatim)."""
     return {
         "number": row["number"],
         "title": row["title"],
@@ -2666,6 +2749,45 @@ def _triage_row_payload(row: dict) -> dict:
     }
 
 
+def _triage_slim_row(row: dict, item: _ItemData | None) -> dict:
+    """The slim default row (issue #70 AC3): the decision fields an agent
+    acts on; the per-feature dumps and the requires-sentences move to the
+    payload-level legend (``features_missing`` appears at most once per
+    payload). ``--explain`` restores the full dump per row."""
+    out: dict = {
+        "number": row["number"],
+        "title": row["title"],
+        "gates": list(row["gates"]),
+        "ranked": row["ranked"],
+        "scores": {
+            "stage1": row["scores"]["stage1"],
+            "groups": row["scores"]["groups"],
+        },
+        "total_score": row["total_score"],
+        "stage2": row["stage2"],
+        "hotspot": row["hotspot"],
+        "regression": row["regression"],
+        "top_files": row["resolved_paths"][:5],
+    }
+    if item is not None:
+        out["labels"] = sorted(item.labels)
+        out["author"] = item.author
+        out["created_at"] = item.created_at
+        out["updated_at"] = item.updated_at
+        out["html_url"] = item.html_url
+    return out
+
+
+def _triage_features_legend(rows: list[dict]) -> dict:
+    """The payload-level legend: the union of every row's
+    features_missing sentences, carried ONCE per payload (issue #70 AC3)."""
+    missing: dict = {}
+    for row in rows:
+        for key, sentence in (row["scores"].get("features_missing") or {}).items():
+            missing.setdefault(key, sentence)
+    return missing
+
+
 def _cursor_key(total: float, number: int) -> str:
     return f"{round(total, 9):.9f}:{number}"
 
@@ -2680,6 +2802,7 @@ def triage(
     config: str | None = None,
     weights: dict | None = None,
     as_of: str | None = None,
+    explain: bool = False,
 ) -> dict:
     """Two-stage triage of every open issue (issue #30, 04-root-cause.md
     section 2). Read-only; ``config`` is an explicit ``[triage]`` TOML path
@@ -2719,11 +2842,13 @@ def triage(
         conn = prepare_snapshot(conn, repo, as_of=as_of, exclude_pr=None, reopen=True)
         try:
             return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                           include_gated, weights, claims_explicit=config)
+                           include_gated, weights, claims_explicit=config,
+                           explain=explain)
         finally:
             drop_snapshot(conn)
     return _triage(conn, repo, cfg, effective_top_k, limit, cursor,
-                   include_gated, weights, claims_explicit=config)
+                   include_gated, weights, claims_explicit=config,
+                   explain=explain)
 
 
 def _triage(
@@ -2736,6 +2861,7 @@ def _triage(
     include_gated: bool,
     weights: dict | None,
     claims_explicit: str | None = None,
+    explain: bool = False,
 ) -> dict:
     compute = _triage_compute(
         conn, repo, cfg, effective_top_k, weights=weights,
@@ -2780,9 +2906,17 @@ def _triage(
         if truncated and page
         else None
     )
+    if explain:
+        rows_payload = [_triage_row_payload(row) for row in page]
+    else:
+        items = compute["ctx"]["items"]
+        rows_payload = [
+            _triage_slim_row(row, items.get(row["number"]))
+            for row in page
+        ]
     result = {
         "repo": repo,
-        "rows": [_triage_row_payload(row) for row in page],
+        "rows": rows_payload,
         "weights": {
             **{k: v for k, v in cfg.items() if k != "_config_source"},
             "affinity": dict(compute["analog_weights"]),
@@ -2799,6 +2933,9 @@ def _triage(
         "triage_asof": compute["asof"],
         "hotspot_asof": compute["asof"],
         "blocking_source": compute["blocking_source"],
+        # The payload-level legend: the union of the rows' requires
+        # sentences, carried ONCE per payload (issue #70 AC3).
+        "features_missing": _triage_features_legend(page),
         "gated": _gated_block(compute["rows"]),
         "closeable_trackers": list(compute["closeable_trackers"]),
         "cursor": next_cursor,
@@ -2896,6 +3033,7 @@ def bundle(
     budget_tokens: int | None = None,
     weights: dict | None = None,
     as_of: str | None = None,
+    with_briefs: bool = False,
 ) -> dict:
     """Greedy work bundles over the triage pool (issue #30, 04-root-cause.md
     section 3). Pool = the top-K UNGATED triage rows (or the named
@@ -2924,9 +3062,15 @@ def bundle(
     only; ``linked``/``analog`` evidence paths are reported but never
     constrain selection (unless
     ``allow_shared_files``). Read-only. ``budget_tokens`` (chars/4, a
-    positive integer) caps the WHOLE serialized payload: bundles are
-    dropped first, then the tails of ``merge_candidates``/
-    ``related_not_bundleable``, then the ``pool`` echo; ``truncated: true``
+    positive integer) caps the WHOLE serialized payload. The shedding
+    order is cheapest-evidence-loss first: under ``--with-briefs`` the
+    ENRICHED member fields (labels, author, dates, html_url, excerpt,
+    the file lists) go before any whole bundle — a member's number and
+    title are the evidence, its brief fields are the convenience layer;
+    then whole bundles, the tails of ``merge_candidates``/
+    ``related_not_bundleable``, the ``pool`` echo, the ``unbundled``/
+    ``gated`` audit tails, and last the reported ``weights``/
+    ``claims_config`` echoes. ``truncated: true``
     marks any payload that needed it, including one still over budget only
     because of its mandatory echoes. The payload's ``weights`` echo is the
     effective ``[triage]`` table PLUS the effective affinity weights under
@@ -2947,12 +3091,14 @@ def bundle(
         try:
             return _bundle(conn, repo, size, count, pool, exclude,
                            allow_shared_files, max_files, config,
-                           budget_tokens, weights, cfg=cfg)
+                           budget_tokens, weights, cfg=cfg,
+                           with_briefs=with_briefs)
         finally:
             drop_snapshot(conn)
     return _bundle(conn, repo, size, count, pool, exclude,
                    allow_shared_files, max_files, config,
-                   budget_tokens, weights, cfg=cfg)
+                   budget_tokens, weights, cfg=cfg,
+                   with_briefs=with_briefs)
 
 
 def _bundle(
@@ -2968,6 +3114,7 @@ def _bundle(
     budget_tokens: int | None,
     weights: dict | None,
     cfg: dict,
+    with_briefs: bool = False,
 ) -> dict:
     compute = _triage_compute(
         conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
@@ -3291,6 +3438,7 @@ def _bundle(
                 _bundle_payload(
                     conn, repo, group, compute, pair_cache, edge_weight, cfg,
                     weights_echo, open_prs, relaxed, why, ctx,
+                    with_briefs=with_briefs,
                 )
             )
             used |= set(group)
@@ -3337,6 +3485,14 @@ def _bundle(
         "formula_version": cfg["formula_version"],
         "derived": True,
     }
+    if budget_tokens is not None:
+        # The budget flag rides the payload whenever a budget is in
+        # effect (issue #70 AC6): false when the payload fit inside
+        # it, true when any shedding fired. The pre-existing
+        # above-floor pin was amended for this flag's presence
+        # (truncated=false on a non-binding budget).
+        payload["truncated"] = bool(payload.get("_shed"))
+        payload["budget_tokens"] = budget_tokens
     # As-of echo (final-critic F2): a payload answered from a prepared
     # snapshot view names the instant and carries the snapshot's disclosure
     # keys (undated tables suppressed, evidence suppressed by source, text
@@ -3360,13 +3516,30 @@ def _bundle(
             )
 
         if _size() > budget:
-            # The cap binds the WHOLE payload, not just the bundles list:
-            # whole bundles drop first, then the tails of merge_candidates
-            # and related_not_bundleable, and only as the last resort the
+            # The cap binds the WHOLE payload, not just the bundles list.
+            # The shedding order is deliberate, cheapest-evidence-loss
+            # first (issue #70 AC6, implementation review): the ENRICHED
+            # --with-briefs member fields are the convenience layer, so
+            # they go before any whole bundle does — a member's number and
+            # title are the evidence, its labels/excerpt are not. Only
+            # then whole bundles, the merge_candidates and
+            # related_not_bundleable tails, and as the last resort the
             # pool echo (a convenience copy, not evidence). The flag is set
             # up front so a payload that stays over budget purely through
             # its mandatory echoes (weights, excluded) is still marked.
             payload["truncated"] = True
+            # --with-briefs member shedding FIRST, and the size is checked
+            # BEFORE each bundle's members are stripped (a step that
+            # cannot help is never taken).
+            for bundle in payload.get("bundles", []):
+                if _size() <= budget:
+                    break
+                for member in bundle.get("members", []):
+                    for key in ("labels", "author", "created_at",
+                                "updated_at", "html_url", "excerpt",
+                                "files_existing", "files_missing",
+                                "not_in_vocabulary"):
+                        member.pop(key, None)
             for section in ("bundles", "merge_candidates",
                             "related_not_bundleable"):
                 while payload[section] and _size() > budget:
@@ -3385,6 +3558,14 @@ def _bundle(
                     "by_gate": {},
                     "numbers": [],
                 }
+            # Last resort below the mandatory-echo floor: the
+            # [triage]/[claims] config echoes are REPORTED values, not
+            # evidence - a budget under their combined width sheds them
+            # (the payload still names the budget it could not meet
+            # through ``truncated``).
+            if _size() > budget:
+                payload["weights"] = {}
+                payload["claims_config"] = {}
     return payload
 
 
@@ -3401,6 +3582,7 @@ def _bundle_payload(
     relaxed: set[int],
     why: str,
     ctx: dict,
+    with_briefs: bool = False,
 ) -> dict:
     all_rows = {r["number"]: r for r in compute["rows"]}
     items = ctx["items"]
@@ -3414,9 +3596,29 @@ def _bundle_payload(
             "triage_total": row["total_score"],
             "stage1": row["stage1"],
             "gates": list(row["gates"]),
+            "labels": sorted(items[number].labels) if number in items else [],
         }
         if number in relaxed:
             member["gate_relaxed"] = True
+        if with_briefs and number in items:
+            item = items[number]
+            vocab = ctx["vocab"]
+            member.update({
+                "labels": sorted(item.labels),
+                "author": item.author,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+                "html_url": item.html_url,
+                "excerpt": _untrusted((item.body or "")[:400]),
+                "files_existing": sorted(
+                    p for p in item.paths if p in vocab
+                ),
+                "files_missing": sorted(item.unresolved_refs),
+                "not_in_vocabulary": [
+                    {"path": p, "not_in_vocabulary": True}
+                    for p in sorted(item.unresolved_refs)
+                ],
+            })
         members.append(member)
 
     direct = sorted(
@@ -3829,8 +4031,12 @@ def brief(
         # silently-disabled cap (pr45 review K09).
         raise ValueError("budget-tokens must be a positive integer")
     cfg = load_triage_config(*_triage_config_chain(conn, config))
+    # Single-row compute (issue #70 AC1): the packet needs THIS
+    # issue's row, not the whole ranking - the hotspot normalisation
+    # still runs over the population inside _triage_compute.
     compute = _triage_compute(
-        conn, repo, cfg, cfg["top_k"], weights=weights, claims_explicit=config
+        conn, repo, cfg, cfg["top_k"], weights=weights,
+        claims_explicit=config, only=number,
     )
     all_rows = {r["number"]: r for r in compute["rows"]}
     row = all_rows.get(number)
@@ -3847,7 +4053,7 @@ def brief(
         raise LookupError(f"item not found: #{number}")
 
     item_row = conn.execute(
-        "SELECT title, body, author, created_at FROM items"
+        "SELECT title, body, author, created_at, updated_at, html_url FROM items"
         " WHERE repo = ? AND kind = 'issue' AND number = ?",
         (repo, number),
     ).fetchone()
@@ -3921,14 +4127,21 @@ def brief(
     if item_data is not None:
         unresolved_count = len(item_data.unresolved_refs)
 
-    analog, _regression = _analog_for(
-        conn,
-        repo,
-        number,
-        compute["features"][number]["reverted_prs"],
-        ctx=compute["ctx"],
-        weights=compute["analog_weights"],
-    )
+    # The single-row compute already derived this row's analog in its
+    # stage-2 pass; reuse it and only fall back to a direct derivation when
+    # the requested row sat outside the stage-2 population (its analog is
+    # None there) — the bounded path scanned analog candidates twice
+    # (PR #81 review F-08's sibling, cubic's derive.py finding).
+    analog = row.get("analog")
+    if analog is None:
+        analog, _regression = _analog_for(
+            conn,
+            repo,
+            number,
+            compute["features"][number]["reverted_prs"],
+            ctx=compute["ctx"],
+            weights=compute["analog_weights"],
+        )
     analog_block = None
     if analog:
         arow = conn.execute(
@@ -4036,6 +4249,13 @@ def brief(
         "repo": repo,
         "number": number,
         "features": features,
+        # The decision fields the packet always carried in the row
+        # but never emitted (issue #70 AC4): labels, author, dates.
+        "labels": sorted(item_data.labels) if item_data is not None else [],
+        "author": item_row["author"],
+        "created_at": item_row["created_at"],
+        "updated_at": item_row["updated_at"] if "updated_at" in item_row.keys() else None,
+        "html_url": item_row["html_url"] if "html_url" in item_row.keys() else None,
         "content_trust": _UNTRUSTED_NOTE,
         "comments": [
             {
@@ -4049,6 +4269,10 @@ def brief(
         "body": _untrusted(item_row["body"] or ""),
         "files": {
             "resolved": list(resolved),
+            "unresolved": [
+                {"path": p, "not_in_vocabulary": True}
+                for p in sorted(item_data.unresolved_refs)
+            ] if item_data is not None else [],
             "unresolved_count": unresolved_count,
         },
         "analog": analog_block,

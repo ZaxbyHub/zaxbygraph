@@ -153,7 +153,7 @@ class PreV12BotColumnTests(unittest.TestCase):
             try:
                 rows = {
                     r["number"]: r
-                    for r in derive.triage(ro, REPO, include_gated=True)["rows"]
+                    for r in derive.triage(ro, REPO, include_gated=True, explain=True)["rows"]
                 }
                 v12_participants = rows[500]["scores"]["features_raw"][
                     "participants"
@@ -181,7 +181,7 @@ class PreV12BotColumnTests(unittest.TestCase):
         ro = open_existing(db_path)
         try:
             # RED pre-fix: both reads died on 'no such column: is_bot'.
-            out = derive.triage(ro, REPO, include_gated=True)
+            out = derive.triage(ro, REPO, include_gated=True, explain=True)
             rows = {r["number"]: r for r in out["rows"]}
             self.assertIn(500, rows)
             self.assertEqual(
@@ -268,7 +268,7 @@ class AsOfExtractedColumnsTests(_StoreTestCase):
         """Control leg: at head (no as_of) the same store DOES gate the
         epic — the fix nulls only the as-of copy, never the live
         columns."""
-        out = derive.triage(self.conn, REPO, include_gated=True)
+        out = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(
             "tracking", rows[900]["gates"],
@@ -304,7 +304,7 @@ class TrackingCiteNegativeTests(_StoreTestCase):
         _pin_synced_at(conn)
 
     def test_citing_issue_stays_rankable(self) -> None:
-        out = derive.triage(self.conn, REPO, include_gated=True)
+        out = derive.triage(self.conn, REPO, include_gated=True, explain=True)
         rows = {r["number"]: r for r in out["rows"]}
         self.assertIn(610, rows)
         self.assertNotIn(

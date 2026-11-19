@@ -1,12 +1,25 @@
 [project]
 name = "zaxbygraph"
-version = "0.4.0"
+version = "0.5.0"
 description = "Incremental SQLite knowledge graph of a repository's GitHub issues and pull requests."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 authors = [{ name = "ZaxbyHub" }]
 keywords = ["github", "sqlite", "knowledge-graph", "issues", "pull-requests"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Version Control :: Git",
+]
 
 [project.urls]
 Homepage = "https://github.com/ZaxbyHub/zaxbygraph"
@@ -15,12 +28,14 @@ Repository = "https://github.com/ZaxbyHub/zaxbygraph"
 [project.scripts]
 zaxbygraph = "zaxbygraph.cli:main"
 
+# setuptools >= 77 is what understands the PEP 639 SPDX license expression
+# above (build-time only; the runtime package stays stdlib-only).
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-zaxbygraph = ["schema.sql"]
+zaxbygraph = ["schema.sql", "skills/zaxbygraph/SKILL.md"]

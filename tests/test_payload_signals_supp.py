@@ -378,6 +378,78 @@ class MapperAbsenceTests(unittest.TestCase):
                 "supp-v7: unknown comment type must fail open",
             )
 
+    def test_filtered_count_cache_still_honours_capability_map(self) -> None:
+        """Phase 4.5 implementation review finding 2: the
+        filteredCount-unsupported cache (issue #75/AC22) drives the RENDERED
+        selection, but it must ride the SAME capability-aware path — a host
+        that lacks the timeline connection's filteredCount AND whose schema
+        lacks another field still gets that field stripped and recorded,
+        while every rendered selection omits filteredCount. The pre-fix
+        early return bypassed the capability map entirely, so a masked
+        field stayed in the query for exactly the hosts that had already
+        answered a validation error once."""
+        caps = {
+            "Issue": {"databaseId", "comments", "timelineItems"},
+            # `changedFiles` is DELIBERATELY absent: this host's schema
+            # lacks it, so the capability path must strip and record it.
+            # (The word `additions` cannot be the probe: it also rides the
+            # files block's node selection.)
+            "PullRequest": {
+                "databaseId",
+                "comments",
+                "reviews",
+                "files",
+                "timelineItems",
+            },
+        }
+        # Baseline, no cache: the capability path strips changedFiles
+        # and records the drop; filteredCount still rides the timeline.
+        src = self._source()
+        src.attach_capabilities(caps)
+        plain = src._fields_for("pr")
+        self.assertNotIn(
+            "changedFiles", plain,
+            "supp-v7: the capability map must strip a field the host lacks",
+        )
+        self.assertIn(
+            "changedFiles", src.omitted_fields,
+            "supp-v7: the capability strip must be recorded for fetch_log",
+        )
+        self.assertIn("filteredCount", plain)
+
+        # The cache active: filteredCount is gone from the RENDERED
+        # selection, and the capability strip still applies on top of it.
+        src2 = self._source()
+        src2.attach_capabilities(caps)
+        src2._filtered_count_unsupported_cached = True
+        degraded = src2._fields_for("pr")
+        self.assertNotIn(
+            "filteredCount", degraded,
+            "supp-v7: the cached absence must omit the field from the"
+            " rendered selection",
+        )
+        self.assertNotIn(
+            "changedFiles", degraded,
+            "supp-v7: the filteredCount cache must not bypass the"
+            " capability map (implementation review finding 2)",
+        )
+        self.assertIn(
+            "changedFiles", src2.omitted_fields,
+            "supp-v7: the capability strip must still be recorded when the"
+            " filteredCount cache is active",
+        )
+        self.assertIn(
+            "timelineItems", degraded,
+            "supp-v7: the timeline block itself must survive",
+        )
+        # No capability map at all (unknown schema): the cache still
+        # omits the field, and the rest of the selection fails open.
+        src3 = self._source()
+        src3._filtered_count_unsupported_cached = True
+        open_selection = src3._fields_for("pr")
+        self.assertNotIn("filteredCount", open_selection)
+        self.assertIn("changedFiles", open_selection)
+
     def test_comment_association_absent_when_not_selected(self) -> None:
         """A node whose comment dict lacks authorAssociation maps to a
         payload WITHOUT the author_association key (mutant: .get() default

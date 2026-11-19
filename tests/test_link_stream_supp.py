@@ -21,7 +21,7 @@ from zaxbygraph.extract import (
     edges_from_item,
     edges_from_pr_state,
 )
-from zaxbygraph.graphql import GraphQLSource, _timeline_event
+from zaxbygraph.graphql import GraphQLSource, _connection, _timeline_event
 from zaxbygraph.store import delete_owned_edges, ingest_item
 from zaxbygraph.sync import _resolve_children
 
@@ -253,6 +253,132 @@ class CompletenessBoundaryTests(unittest.TestCase):
         self.assertEqual(links_incomplete, ["blocked_by"])
 
 
+class MalformedCountTests(unittest.TestCase):
+    """PR #81 review F-01: a PRESENT, non-null ``totalCount`` that is not a
+    comparable integer (bool/str/float) is malformed — the connection reads
+    INCOMPLETE (union-only), never complete-empty, so a malformed payload can
+    never authorize a destructive replacement of stored link facts (issue
+    #53's no-retraction rule; `_page_rendered_faithfully` already applies
+    this to timelines)."""
+
+    def test_bool_count_reads_union_only(self) -> None:
+        children = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": True,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        self.assertEqual(children["links"]["blocked_by"], [])
+        self.assertIn(
+            "blocked_by",
+            children["links_incomplete"],
+            "a malformed bool totalCount must read union-only, never"
+            " complete-empty — a falsely complete connection can retract"
+            " stored blocked_by facts (PR #81 review F-01)",
+        )
+
+    def test_non_integer_counts_read_union_only_at_the_truth_table(self) -> None:
+        for bad in ("3", 3.0):
+            out, incomplete = _connection(
+                {"totalCount": bad, "pageInfo": {"hasNextPage": False}, "nodes": []}
+            )
+            self.assertEqual(out, [])
+            self.assertTrue(
+                incomplete,
+                f"totalCount={bad!r} must read incomplete (union-only)",
+            )
+
+    def test_real_zero_stays_complete_empty(self) -> None:
+        out, incomplete = _connection(
+            {"totalCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}
+        )
+        self.assertEqual(out, [])
+        self.assertFalse(
+            incomplete,
+            "a genuine integer 0 on an empty page stays complete-empty —"
+            " the malformed-count guard must not widen past malformed"
+            " values",
+        )
+
+
+class MalformedCountRetractionTests(TempDBTest):
+    """PR #81 review F-01 end-to-end (Stage-B review): a stored blocked_by
+    edge survives a re-ingest whose blockedBy connection carries a malformed
+    bool totalCount with empty nodes — the malformed count reads incomplete,
+    so the connection is union-only and never authorizes replacement. The
+    complete-empty CONTROL leg proves discrimination: a genuine
+    totalCount:0/empty connection DOES replace (retract), so the malformed
+    arm's survival is the union-only behavior, not an absent replacement
+    path."""
+
+    def test_bool_count_blockedBy_cannot_retract_stored_edge(self) -> None:
+        from zaxbygraph.sync import sync_repo
+
+        def sync_full(src: "_BulkSource") -> None:
+            sync_repo(self.conn, src, REPO)
+
+        def blocked_by_count() -> int:
+            return self.count(
+                "SELECT COUNT(*) FROM edges WHERE rel = 'blocked_by'"
+            )
+
+        # ---- healthy sync stores the edge --------------------------------
+        src = _BulkSource()
+        src.add_issue(issue(3, title="one", updated_at=ts(10)))
+        src.children[3] = {
+            "links": {"blocked_by": [{"number": 1, "repo": None}]},
+        }
+        sync_full(src)
+        self.assertEqual(blocked_by_count(), 1, "fixture sanity: the edge stored")
+
+        # ---- malformed re-ingest: the edge SURVIVES ----------------------
+        malformed = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": True,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        src2 = _BulkSource()
+        src2.add_issue(issue(3, title="one", updated_at=ts(20)))
+        src2.children[3] = malformed
+        sync_full(src2)
+        self.assertEqual(
+            blocked_by_count(), 1,
+            "RETraction-BY-MALFORMED-COUNT: a blockedBy connection with"
+            " totalCount:true and empty nodes reads incomplete (union-only)"
+            " and must NOT retract the stored blocked_by edge (PR #81"
+            " review F-01)",
+        )
+
+        # ---- control: a genuine complete-empty connection replaces -------
+        control = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": 0,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        src3 = _BulkSource()
+        src3.add_issue(issue(3, title="one", updated_at=ts(30)))
+        src3.children[3] = control
+        sync_full(src3)
+        self.assertEqual(
+            blocked_by_count(), 0,
+            "CONTROL-LEG: a genuine totalCount:0/empty blockedBy connection"
+            " is COMPLETE, so its replacement retracts the edge — proving"
+            " the malformed arm above survived via the union-only behavior,"
+            " not because the replacement path is dead",
+        )
+
+
 class EnumCapabilityTests(unittest.TestCase):
     def test_populated_enum_round_trip(self) -> None:
         source = GraphQLSource("o", "r")
@@ -371,6 +497,142 @@ class ChildrenMappingTests(unittest.TestCase):
         self.assertEqual(
             _timeline_event({"__typename": "ReopenedEvent", "createdAt": ts(1)}),
             {"type": "reopened", "created_at": ts(1)},
+        )
+
+
+class MixedChunkKindTests(unittest.TestCase):
+    """Issue #75 (Phase 4.5 implementation review finding 1): the chunk
+    builder must carry EACH alias's own kind into its `_children_from_node`
+    call. The timeline count policy is kind-dependent — a PR's
+    ``timelineItems.totalCount`` is the COLLECTION's size (the itemTypes
+    filter does not apply to it), an issue's is the filtered page's size —
+    so one shared kind misjudges half of any mixed chunk."""
+
+    PR_NODE = {
+        "number": 63,
+        "id": "PR_63",
+        "baseRefName": "main",
+        "headRefName": "feat/63",
+        "timelineItems": {
+            # A host that does not answer filteredCount (issue #75/AC22):
+            # the COLLECTION's count (42) beside two rendered nodes. Only
+            # the node's own KIND decides this page — a PR's totalCount is
+            # the collection's size, so the page is complete; an issue's
+            # would be a truncation flag.
+            "totalCount": 42,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "__typename": "ClosedEvent",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "actor": {"login": "amy"},
+                    "closer": {"__typename": "PullRequest", "number": 7},
+                },
+                {
+                    "__typename": "CrossReferencedEvent",
+                    "createdAt": "2026-01-01T00:01:00Z",
+                    "actor": {"login": "bob"},
+                    "isCrossRepository": False,
+                    "willCloseTarget": False,
+                    "source": {
+                        "__typename": "PullRequest",
+                        "number": 9,
+                        "repository": {"nameWithOwner": REPO},
+                    },
+                },
+            ],
+        },
+    }
+    ISSUE_NODE = {
+        "number": 64,
+        "id": "I_64",
+        "timelineItems": {
+            # No filteredCount, totalCount 3 beside ONE rendered node: an
+            # issue-kind page the totalCount arm must flag (issue #53).
+            "totalCount": 3,
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "__typename": "CrossReferencedEvent",
+                    "createdAt": "2026-01-01T00:01:00Z",
+                    "actor": {"login": "bob"},
+                    "isCrossRepository": False,
+                    "willCloseTarget": False,
+                    "source": {
+                        "__typename": "PullRequest",
+                        "number": 9,
+                        "repository": {"nameWithOwner": REPO},
+                    },
+                }
+            ],
+        },
+    }
+    PR_LISTING = {
+        "id": 63,
+        "number": 63,
+        "title": "pr sixty-three",
+        "pull_request": {"url": "x"},
+    }
+    ISSUE_LISTING = {"id": 64, "number": 64, "title": "issue sixty-four"}
+
+    class _ChunkSource(GraphQLSource):
+        """Answers the chunk query from the canned nodes, keyed by alias."""
+
+        def __init__(self, nodes: dict) -> None:
+            super().__init__("probe", "clinic")
+            self._nodes = nodes
+            # The real `_graphql` initializes these; the stub replaces it.
+            self.last_dropped_sections: dict[int, list] = {}
+
+        def _graphql(self, query: str, aliases: dict | None = None) -> dict:
+            self.last_dropped_sections = {}
+            return {"repository": dict(self._nodes)}
+
+    def _children(self, order: list[dict]) -> dict:
+        src = self._ChunkSource({"p63": self.PR_NODE, "i64": self.ISSUE_NODE})
+        return src.fetch_children(order)
+
+    def test_pr_first_chunk_judges_each_kind(self) -> None:
+        """PR first: the PR's collection-sized totalCount must NOT flag its
+        complete filtered page, while the issue's short page still is
+        flagged. RED at the pre-fix head 5fc2404, where every node in the
+        chunk inherited the LAST listing row's kind (the issue's), so the
+        PR was falsely flagged truncated."""
+        children = self._children([self.PR_LISTING, self.ISSUE_LISTING])
+        self.assertIn(63, children, "the PR alias must be answered")
+        self.assertIn(64, children, "the issue alias must be answered")
+        self.assertNotIn(
+            "timeline_incomplete",
+            children[63],
+            "a complete filtered PR page must not be flagged truncated"
+            " (its totalCount is the collection's size)",
+        )
+        self.assertNotIn("timeline_cursor", children[63])
+        self.assertIn(
+            "timeline_incomplete",
+            children[64],
+            "an issue page whose totalCount exceeds its rendered nodes must"
+            " still be flagged (issue #53 protection)",
+        )
+
+    def test_issue_first_chunk_judges_each_kind(self) -> None:
+        """Issue first: the mirror leg. RED at the pre-fix head 5fc2404,
+        where every node inherited the LAST listing row's kind (the PR's),
+        so the issue's truncation flag was lost — the #53 protection
+        silently dropped for every issue sharing a chunk with a PR."""
+        children = self._children([self.ISSUE_LISTING, self.PR_LISTING])
+        self.assertIn(63, children, "the PR alias must be answered")
+        self.assertIn(64, children, "the issue alias must be answered")
+        self.assertNotIn(
+            "timeline_incomplete",
+            children[63],
+            "a complete filtered PR page must not be flagged truncated",
+        )
+        self.assertIn(
+            "timeline_incomplete",
+            children[64],
+            "an issue page whose totalCount exceeds its rendered nodes must"
+            " still be flagged when a PR precedes it in the chunk",
         )
 
 

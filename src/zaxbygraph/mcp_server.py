@@ -1533,9 +1533,10 @@ def _tool_triage(arguments: dict, ctx) -> dict:
     slug, db_path = _resolve_target(arguments, ctx)
     conn = _open_corpus(slug, db_path)
     try:
+        explain = _bool_arg(arguments, "explain")
         data = _translated_derive(
             _triage_query, conn, slug, db_path, limit, cursor, top_k, include_gated,
-            None, as_of,
+            None, as_of, explain,
         )
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
@@ -1556,7 +1557,10 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
     max_files = arguments.get("max_files")
     if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
         raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
-    budget_tokens = arguments.get("budget_tokens")
+    # The no-args one-call selection (issue #70 AC6): the DEFAULT budget
+    # is the documented 4000 tokens, so a no-argument bundle call returns
+    # the enriched selection inside a real budget.
+    budget_tokens = _int_arg(arguments, "budget_tokens", 4000)
     if budget_tokens is not None and (isinstance(budget_tokens, bool) or not isinstance(budget_tokens, int)):
         raise ToolError("bad_request", "budget_tokens must be an integer", hint="pass budget_tokens as an integer")
     as_of = arguments.get("as_of")
@@ -1569,6 +1573,7 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
             _bundle_query, conn, slug, db_path,
             size if size is not None else "2-3", count, pool, exclude,
             allow_shared_files, max_files, budget_tokens, None, as_of,
+            True,
         )
         return _read_envelope(conn, slug, db_path, data, False, ctx)
     finally:
@@ -1930,8 +1935,14 @@ _TOOL_SHAPES: dict[str, dict] = {
         "description": "Sync state and corpus coverage for the resolved"
         " repo: one sync_state row per held repo, grouped item counts,"
         " coverage, and snapshot provenance when the store was installed"
-        " by snapshot pull.",
-        "data_keys": ("counts", "coverage", "repos", "snapshot"),
+        " by snapshot pull. The payload also names the tool version and"
+        " the opened store's schema version (issue #73: one version on"
+        " every read surface, so a stale store is visible beside the"
+        " build that would upgrade it).",
+        "data_keys": (
+            "counts", "coverage", "repos", "schema_version", "snapshot",
+            "tool_version",
+        ),
         "data": _props(
             {
                 "repos": _open_objects(
@@ -1951,6 +1962,17 @@ _TOOL_SHAPES: dict[str, dict] = {
                     "description": "{publisher, manifest_sha256, pulled_at}"
                     " when the store came from snapshot pull; null otherwise",
                 },
+                "tool_version": {
+                    "type": "string",
+                    "description": "the zaxbygraph package version serving"
+                    " this answer",
+                },
+                "schema_version": {
+                    "type": "integer",
+                    "description": "the opened store's PRAGMA user_version"
+                    " (the schema the file actually carries, not the build's"
+                    " current schema)",
+                },
                 "sync_lock": {
                     "type": ["object", "null"],
                     "additionalProperties": True,
@@ -1959,7 +1981,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                 },
                 "jobs": _open_objects("live sync jobs (present while one runs)"),
             },
-            ("counts", "coverage", "repos", "snapshot"),
+            (
+                "counts", "coverage", "repos", "schema_version", "snapshot",
+                "tool_version",
+            ),
         ),
     },
     "search": {
@@ -2349,9 +2374,10 @@ _TOOL_SHAPES: dict[str, dict] = {
         " (derived, read-only).",
         "data_keys": ("blocking_source", "claims_config",
                       "closeable_trackers", "config_source", "cursor",
-                      "derived", "formula_version", "gated", "hotspot_asof",
-                      "repo", "rows", "stage2_weight", "top_k",
-                      "triage_asof", "truncated", "weights"),
+                      "derived", "features_missing", "formula_version",
+                      "gated", "hotspot_asof", "repo", "rows",
+                      "stage2_weight", "top_k", "triage_asof", "truncated",
+                      "weights"),
         "row_fields": {
             "rows": ("analog", "claim_evidence", "gates", "hotspot",
                      "hotspot_raw", "note", "number", "ranked", "regression",
@@ -3009,6 +3035,7 @@ _TOOLS: list[dict] = [
                 "top_k": {"type": "integer", "minimum": 1, "maximum": _MAX_TOP_K, "description": f"Keep only the top K ranked rows (at most {_MAX_TOP_K})"},
                 "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
                 "as_of": {"type": "string", "description": "Answer from the as-of snapshot view at instant T (ISO-8601 Z)"},
+                "explain": {"type": "boolean", "description": "Include per-feature score dumps and missing-feature legends on every row (verbose)"},
                 **_REPO_DB,
             }
         ),
@@ -3347,9 +3374,13 @@ def _discover_result(modern: bool) -> dict:
     """server/discover: the versions this server speaks (the modern revision
     plus every served legacy revision, derived from the one constants seam),
     capabilities, and the tool registry — the issue-mandated `tools` field is
-    an additive DiscoverResult extension (#33 AC9)."""
+    an additive DiscoverResult extension (#33 AC9). serverInfo carries the
+    package version (issue #73: one version on every read surface; the same
+    value `initialize` answers, repeated here because stateless 2026-07-28
+    clients never see the handshake)."""
     result = {
         "supportedVersions": [_MODERN_PROTOCOL_VERSION, *_PROTOCOL_VERSIONS],
+        "serverInfo": {"name": "zaxbygraph", "version": __version__},
         "capabilities": {
             "tools": {"listChanged": False},
             "resources": {"subscribe": False, "listChanged": False},

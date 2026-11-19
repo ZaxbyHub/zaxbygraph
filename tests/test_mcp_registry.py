@@ -63,6 +63,12 @@ CLI_TO_SURFACE = {
     # Snapshot transport (issue #34): a human-workflow surface (moves a
     # store between machines), not an agent read - the MCP gap is recorded.
     "snapshot": "documented-gap: snapshot transport (issue #34); MCP surfacing is a future lane",
+    # First use and packaged-skill maintenance (issue #73): init drives gh
+    # and the first sync from a shell; skill prints/installs/checks the
+    # packaged skill file. Both are human-workflow surfaces - the MCP tool
+    # list is unchanged (C14's digest pins it).
+    "init": "documented-gap: first-use bootstrap (issue #73); gh preflight + first sync + MCP line from a shell",
+    "skill": "documented-gap: packaged-skill maintenance (issue #73); print/install/check from a shell",
 }
 
 #: {tool -> CLI command}. Every typed tool must stay reachable from the
@@ -154,6 +160,35 @@ class SurfaceMappingTests(unittest.TestCase):
             tools,
             handlers,
             "tools/list and the dispatch table disagree; one of them is a lie",
+        )
+
+    def test_triage_input_schema_declares_explain(self) -> None:
+        """PR #81 review F-06: the triage handler reads an ``explain`` flag
+        the CLI exposes as --explain; MCP discovery must advertise it too —
+        ``additionalProperties: true`` keeps an informed caller working but
+        schema-driven agents can only find fields through tools/list."""
+        triage = next(t for t in mcp_server._TOOLS if t["name"] == "triage")
+        props = triage.get("inputSchema", {}).get("properties", {})
+        self.assertIn(
+            "explain", props,
+            "the triage inputSchema must declare the explain flag the"
+            " handler reads (PR #81 review F-06)",
+        )
+        self.assertEqual(
+            props["explain"].get("type"), "boolean",
+            f"explain is a boolean argument (got {props['explain']!r})",
+        )
+
+    def test_triage_output_shape_declares_features_missing(self) -> None:
+        """PR #81 review F-07 (as-002): the triage payload always carries
+        ``features_missing`` (the slim-row requires legend); the declared
+        output shape must name it — the shape registry's honesty rule says
+        data_keys names the ALWAYS-present top-level keys."""
+        shape = mcp_server._TOOL_SHAPES["triage"]
+        self.assertIn(
+            "features_missing", shape["data_keys"],
+            "triage data_keys must name the always-present"
+            " features_missing legend (PR #81 review F-07)",
         )
 
     def test_mapped_tools_really_exist_in_the_registry(self) -> None:

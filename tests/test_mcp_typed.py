@@ -480,7 +480,11 @@ class TestMcpTypedToolSurface(unittest.TestCase):
             ("churn", {"merged_only": True}, ["churn", "--merged-only"]),
             ("similar_items", {"number": 1}, ["similar", "1"]),
             ("triage", {}, ["triage"]),
-            ("bundle", {}, ["bundle"]),
+            # AC6 (issue #70): the no-args MCP bundle is the one-call
+            # selection under the documented 4000-token default budget, so
+            # parity binds to the CLI invocation that produces the same
+            # payload (bare bundle answers without budget keys at base).
+            ("bundle", {}, ["bundle", "--budget-tokens", "4000"]),
             ("brief", {"number": 1}, ["brief", "1"]),
         )
         for tool_name, tool_args, cli_argv in parity:
@@ -603,7 +607,7 @@ class TestMcpTypedToolSurface(unittest.TestCase):
             structured = (result or {}).get("structuredContent")
             self.assertIsInstance(structured, dict, "AC4 cli envelope mismatch: the arrays leg must carry structuredContent")
             code, out, err = run_cli(
-                ["bundle", "--pool", "1,2", "--exclude", "4", "--repo", REPO, "--db", str(self.db_path), "--format", "json"]
+                ["bundle", "--pool", "1,2", "--exclude", "4", "--budget-tokens", "4000", "--repo", REPO, "--db", str(self.db_path), "--format", "json"]
             )
             if code == 0:
                 cli_data = json.loads(out).get("data")

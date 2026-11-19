@@ -117,6 +117,13 @@ def _guardrail_commands() -> list[list[str]]:
         ["brief", "1"],
         # issue #74 derived claims listing over the same seed corpus.
         ["claims"],
+        # issue #73 first use and packaged-skill maintenance: `init`
+        # drives gh (a network write path whose outcome envelopes --
+        # gh_missing/gh_unauthenticated plus the first-sync result --
+        # are pinned by tests/test_release.py C16), and `skill`
+        # prints/installs/checks the packaged skill file (its envelope
+        # rides here because it is a pure read of package data).
+        ["skill"],
     ]
 
 
@@ -426,6 +433,11 @@ class EnvelopeContractTests(unittest.TestCase):
             # Live gh-writing claim commands (issues #77/#74): outcome
             # envelopes pinned by test_claim_cmd.py / test_claims_ext.py.
             "claim", "release", "pr-guard",
+            # First use (issue #73): init drives gh and the first sync,
+            # a network write path whose outcome envelopes (gh_missing /
+            # gh_unauthenticated / the first-sync result) are pinned by
+            # tests/test_release.py C16.
+            "init",
         }
         self.assertFalse(
             uncovered, f"guardrail gap: subcommands with no envelope check: {sorted(uncovered)}"

@@ -223,6 +223,42 @@ def _cli_json(*argv: str, path_override: str | None = None) -> dict:
     return json.loads(out.decode("utf-8"))
 
 
+def _explain_supported(parser) -> bool:
+    """Whether one argparse parser's triage subcommand advertises --explain."""
+    for action in parser._subparsers._group_actions:  # noqa: SLF001 - test seam
+        if "triage" in (getattr(action, "choices", None) or {}):
+            triage_parser = action.choices["triage"]
+            return any(
+                # argparse stores the DASHED form ("--explain") in
+                # option_strings; compare bare names on both sides
+                # (plan-critic round 2: exact 'explain' membership never
+                # matched and would have left the amended test on the
+                # legacy path post-fix).
+                getattr(opt, "option_strings", ()) and
+                any(o.lstrip("-") == "explain"
+                    for o in opt.option_strings)
+                for opt in triage_parser._actions  # noqa: SLF001 - test seam
+            )
+    return False
+
+
+def _triage_explain_supported() -> bool:
+    """Capability detection for the slim-rows amendment (issue-tracer
+    checkpoint AMEND, plan-critic round 1; round 2 fixed the dashed-form
+    comparison and added the synthetic-parser probe). When the CLI
+    advertises ``triage --explain`` (the slim-rows surface), the formula
+    test requests the full dump explicitly; on a tree without the flag
+    (base), the default rows already carry it. Same assertions on both
+    shapes - green at base and green at the fix."""
+    try:
+        import zaxbygraph.cli as cli_mod
+
+        return _explain_supported(cli_mod.build_parser())
+    except Exception:
+        return False
+    return False
+
+
 def _bundle_member_numbers(bundle: dict) -> list[int]:
     """Members may be dicts ({number, title, ...}) or bare numbers."""
     out = []
@@ -433,6 +469,25 @@ class TriageFormulaTests(_StoreTestCase):
         total DESC number ASC) and the payload echoes weights +
         config_source + top_k/stage2_weight + triage_asof +
         formula_version."""
+        # capability-detection regression probe (plan-critic round 2): a
+        # parser advertising --explain must be detected True and one
+        # without it False, BEFORE the invocation choice below is trusted.
+        import argparse as _ap
+
+        def _synthetic(with_explain: bool):
+            p = _ap.ArgumentParser()
+            p.add_argument("cmd")
+            sub = p.add_subparsers()
+            t = sub.add_parser("triage")
+            if with_explain:
+                t.add_argument("--explain", action="store_true")
+            return p
+
+        self.assertTrue(_explain_supported(_synthetic(True)),
+                        "a parser advertising --explain must be detected")
+        self.assertFalse(_explain_supported(_synthetic(False)),
+                         "a parser without --explain must not be detected")
+
         with tempfile.TemporaryDirectory() as td:
             cfg = Path(td) / "triage.toml"
             cfg.write_text(
@@ -443,10 +498,15 @@ class TriageFormulaTests(_StoreTestCase):
                 "[triage.types]\nBug = 3.0\n",
                 encoding="utf-8",
             )
-            env = _cli_json(
+            argv = [
                 "triage", "--db", str(self.db_path), "--repo", REPO,
                 "--config", str(cfg), "--format", "json",
-            )
+            ]
+            if _triage_explain_supported():
+                # Slim-default trees: ask for the full per-feature dump the
+                # hand-computation reads (checkpoint AMEND, plan-critic R1).
+                argv.append("--explain")
+            env = _cli_json(*argv)
         self.assertTrue(env["ok"], env)
         data = env["data"]
         for key in ("rows", "weights", "config_source", "top_k", "stage2_weight"):

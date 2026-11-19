@@ -197,6 +197,7 @@ _TIMELINE_TYPES_ALL = "[" + ", ".join(_TIMELINE_EVENT_TYPES) + "]"
 _TIMELINE_NODES_TMPL = """
 timelineItems(first: 50, itemTypes: %(types)s) {
   totalCount
+  filteredCount
   pageInfo { hasNextPage endCursor }
   nodes {
     __typename
@@ -231,12 +232,20 @@ _REOPENED_FRAGMENT = """
 """
 
 
-def _timeline_nodes(types: str = _TIMELINE_TYPES_ALL) -> str:
+def _timeline_nodes(
+    types: str = _TIMELINE_TYPES_ALL, *, omit_filtered_count: bool = False
+) -> str:
     """The timelineItems selection at a given itemTypes list. Page queries
     AND continuation queries render through the same helper (the continuation
-    path calls GraphQLSource._timeline_selection, which shares this)."""
+    path calls GraphQLSource._timeline_selection, which shares this).
+    ``omit_filtered_count`` (issue #75/AC22) renders the selection WITHOUT the
+    connection's filteredCount for a host whose schema answered a validation
+    error naming it - the capability path still filters the rest."""
     reopened = _REOPENED_FRAGMENT if "REOPENED_EVENT" in types else ""
-    return _TIMELINE_NODES_TMPL % {"types": types, "reopened": reopened}
+    rendered = _TIMELINE_NODES_TMPL % {"types": types, "reopened": reopened}
+    if omit_filtered_count:
+        rendered = rendered.replace("\n  filteredCount", "", 1)
+    return rendered
 
 
 #: Timeline events ride every page query (issue #6): closed events carry the
@@ -287,6 +296,22 @@ _PULL_TYPE_BLOCKS = (
 
 _PULL_FIELDS = "\n".join(["databaseId", *(block for _, block in _PULL_TYPE_BLOCKS)])
 
+
+def _fields_unfiltered(blocks: tuple, *, omit_filtered_count: bool = False) -> str:
+    """The FULL field selection for one type — used when no capability map
+    exists or the probe reported nothing for the type (issue #23's fail-open) —
+    with the timeline block rendered WITHOUT filteredCount when a host's schema
+    answered a validation error naming it (issue #75/AC22): the cached absence
+    drives the RENDERING, so every later query omits the field from the start
+    instead of failing once per query."""
+    out = ["databaseId"]
+    for name, block in blocks:
+        if name == "timelineItems" and omit_filtered_count:
+            out.append(_timeline_nodes(omit_filtered_count=True))
+        else:
+            out.append(block)
+    return "\n".join(out)
+
 #: Field-selection fragments for the page query, each tagged with the exact
 #: schema field it renders. A capability probe drops every fragment whose
 #: field the host's schema no longer carries — PER FIELD, not per block, so
@@ -336,14 +361,61 @@ def _int_or_none(value) -> int | None:
 _MALFORMED_LINK_NODE = {"__malformed__": True}
 
 
-def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
+#: Timeline count policy (issue #75): how a carried timeline page's count
+#: fields are compared with its rendered node count. On a PULL REQUEST the
+#: connection's totalCount IGNORES the itemTypes filter, so it is the
+#: COLLECTION's size, not the page's filtered size — comparing it with the
+#: node count called every complete PR page unfaithful (the #75 false flag).
+#: The FILTERED count is the honest comparator on every kind; totalCount
+#: stays the comparator only where it IS the filtered count (issues, and
+#: unknown kinds that keep the legacy #53 protection).
+def _timeline_count_incomplete(payload: dict) -> bool:
+    """True when the count comparison says the page dropped nodes, under
+    the ONE timeline count policy shared by `_connection` and
+    `_page_rendered_faithfully` (issue #75, plan-critic rounds 1-3):
+    filteredCount first (the honest comparator on every kind), the
+    totalCount fallback on issue-kind/unknown-kind pages only. The payload
+    carries `_rendered` (the rendered node list) and `_kind`."""
+    filtered = payload.get("filteredCount")
+    rendered = payload.get("_rendered", [])
+    kind = payload.get("_kind")
+    if isinstance(filtered, int) and not isinstance(filtered, bool):
+        return filtered > len(rendered)
+    # A host that does not answer filteredCount (or a kind-less caller)
+    # keeps the legacy totalCount comparison — never weaken #53 for them.
+    if kind != "pr" and isinstance(payload.get("totalCount"), int):
+        return bool(payload.get("totalCount")) and payload["totalCount"] > len(rendered)
+    return False
+
+
+def _connection(
+    nodes: object, count_policy: object | None = None
+) -> tuple[list[dict], bool]:
     """(nodes, incomplete) for one GraphQL connection payload. A null or
     malformed connection value returns ([], False) — callers distinguish a
     genuinely empty page from a section the node did not carry by checking
     key presence before calling this. A malformed CONTAINER inside a carried
     connection (a non-list `nodes`, a non-dict `pageInfo`) or dropped
     non-dict nodes returns ([], True): the section degrades to union-only
-    rather than presenting a silently empty page as complete (issue #53)."""
+    rather than presenting a silently empty page as complete (issue #53).
+
+    A PRESENT, non-null ``totalCount`` that is not a comparable integer
+    (bool/str/float) is malformed: the page reads INCOMPLETE (union-only),
+    never complete-empty. Base `_connection` excluded bools from the
+    comparison entirely (reading a bool or str count as complete — no
+    overflow flag), while the timeline count policy flagged ``True > 0``
+    through its int comparison; neither path failed closed on a malformed
+    value, and any falsely complete carried connection can authorize a
+    destructive replacement of stored facts, so every non-comparable count
+    now fails closed the way `_page_rendered_faithfully` already does for
+    the timeline (issue #53's no-retraction-on-malformed rule; PR #81
+    review F-01).
+
+    ``count_policy`` (issue #75) is the ONE count comparison, threaded only
+    by the timeline call path; the default keeps the legacy unfiltered
+    totalCount behavior for every non-timeline connection (those carry no
+    itemTypes filter, so totalCount == the page's own count when fully
+    returned)."""
     if not isinstance(nodes, dict):
         return [], False
     raw_nodes = nodes.get("nodes")
@@ -357,24 +429,37 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
         return [], True
     incomplete = bool(page_info.get("hasNextPage")) or len(out) != len(raw_nodes)
     total = nodes.get("totalCount")
-    if isinstance(total, int) and total > len(out):
+    if count_policy is not None:
+        payload = dict(nodes)
+        payload["_rendered"] = out
+        if count_policy(payload):
+            incomplete = True
+    elif total is not None and not (
+        isinstance(total, int) and not isinstance(total, bool)
+    ):
+        # Malformed count (bool/str/float): fail closed, union-only.
+        incomplete = True
+    elif isinstance(total, int) and total > len(out):
         incomplete = True
     return out, incomplete
 
 
-def _carried_connection(raw: object) -> tuple[list[dict], bool]:
+def _carried_connection(
+    raw: object, count_policy: object | None = None
+) -> tuple[list[dict], bool]:
     """A CARRIED connection (the caller checked key presence): a non-dict
     value (null, a scalar) is malformed — union-only, never complete-empty
     (issue #53). A dict value goes through `_connection`'s container
     validation. This is the one truth-table entry shared by the link
     connections and the timeline container, so a malformed carried section
-    can never present a silently empty page as complete at either site."""
+    can never present a silently empty page as complete at either site.
+    ``count_policy`` (issue #75) is threaded only by the timeline call path."""
     if not isinstance(raw, dict):
         return [], True
-    return _connection(raw)
+    return _connection(raw, count_policy)
 
 
-def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
+def _page_rendered_faithfully(raw: object, *, initial: bool, kind: str | None = None) -> bool:
     """True when a carried timeline page rendered EVERY node it reported.
 
     A non-dict container, a non-list `nodes`, a non-dict `pageInfo`, or a
@@ -398,6 +483,15 @@ def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
     regression the re-gate caught). While `hasNextPage` is true the count is
     likewise the collection's, so exceeding the node count is ordinary
     pagination (issue #53, review PRR-004).
+
+    Issue #75 (the unfiltered-count fix): the count comparison now runs
+    through the ONE timeline count policy (`_timeline_count_incomplete`),
+    threaded by `_children_from_node`'s ``kind`` — on a pull request the
+    collection-wide ``totalCount`` no longer flags a complete filtered page
+    (``filteredCount`` is the honest comparator), while issue-kind and
+    kind-less callers keep the legacy totalCount protection. The malformed
+    count arm below (a non-int totalCount on a claimed-last page) is
+    unchanged.
     """
     if not isinstance(raw, dict):
         return False
@@ -424,13 +518,12 @@ def _page_rendered_faithfully(raw: object, *, initial: bool) -> bool:
         # this arm is the malformed-payload contract, not an observed shape.
         # A bool is not an int here, matching `_int_or_none` (PRR-003).
         return False
-    if (
-        initial
-        and not page_info.get("hasNextPage")
-        and comparable
-        and total > len(raw_nodes)
-    ):
-        return False
+    if initial and not page_info.get("hasNextPage"):
+        payload = dict(raw)
+        payload["_rendered"] = raw_nodes
+        payload["_kind"] = kind
+        if _timeline_count_incomplete(payload):
+            return False
     return True
 
 
@@ -523,17 +616,29 @@ def _timeline_event(node: dict) -> dict:
     return {"type": str(typename or "unknown").lower()}
 
 
-def _timeline_selection(args: str, types: str = _TIMELINE_TYPES_ALL) -> str:
+def _timeline_selection(
+    args: str,
+    types: str = _TIMELINE_TYPES_ALL,
+    *,
+    omit_filtered_count: bool = False,
+) -> str:
     """The timelineItems selection shared by the page query and the
     continuation/replacement queries (always inside the 250-per-request
     GitHub cap). `types` is the capability-degraded itemTypes list the source
-    computes (issue #27) — page and continuation cannot drift."""
+    computes (issue #27) — page and continuation cannot drift. filteredCount
+    rides every rendered timeline selection (issue #75): on a PR the
+    connection's totalCount IGNORES itemTypes, so the faithful-page decision
+    compares the rendered node count with the FILTERED count. A host whose
+    schema lacks the field answers a validation error; the shared retry seam
+    (GraphQLSource._graphql) strips it and caches the absence for the run."""
     reopened = (
         " ... on ReopenedEvent { createdAt }" if "REOPENED_EVENT" in types else ""
     )
     return (
         "timelineItems(%s itemTypes: %s) {"
-        " totalCount pageInfo { hasNextPage hasPreviousPage startCursor endCursor }"
+        + (" totalCount" if omit_filtered_count
+           else " totalCount filteredCount")
+        + " pageInfo { hasNextPage hasPreviousPage startCursor endCursor }"
         " nodes { __typename"
         " ... on ClosedEvent { createdAt actor { login } closer { __typename"
         " ... on Commit { oid } ... on PullRequest { number } } }"
@@ -542,6 +647,21 @@ def _timeline_selection(args: str, types: str = _TIMELINE_TYPES_ALL) -> str:
         " ... on Issue { number repository { nameWithOwner } }"
         " ... on PullRequest { number repository { nameWithOwner } } } }%s } }"
     ) % (args, types, reopened)
+
+
+def _strip_filtered_count(query: str) -> str:
+    """Remove ONLY the timeline connection's ``filteredCount`` selection
+    from a rendered query (issue #75/AC22), in BOTH rendered forms: the
+    standalone line the bulk page template emits
+    (``\\n  filteredCount\\n``) and the space-separated token the
+    continuation/`_timeline_selection` template emits
+    (`` totalCount filteredCount pageInfo``). The retry seam is
+    deliberately narrow — every other selected field stays, so a host
+    lacking only this field keeps answering everything else."""
+    query = query.replace(" totalCount filteredCount", " totalCount", 1)
+    lines = query.split("\n")
+    lines = [ln for ln in lines if ln.strip() != "filteredCount"]
+    return "\n".join(lines)
 
 
 class GraphQLSource(GhApiSource):
@@ -556,6 +676,10 @@ class GraphQLSource(GhApiSource):
         #: once a probe ran or a persisted cache was attached (issue #23).
         #: None means "no capability knowledge" - the full field set is sent.
         self._capabilities: dict[str, set[str]] | None = None
+        #: Issue #75/AC22: this host's schema answered a validation error
+        #: for the timeline connection's filteredCount, so every later
+        #: query omits it from the start (the one retry already happened).
+        self._filtered_count_unsupported_cached = False
         #: Field names omitted from page queries by the active capabilities,
         #: for sync to record in fetch_log.
         self.omitted_fields: list[str] = []
@@ -672,8 +796,10 @@ class GraphQLSource(GhApiSource):
             kept = ["CLOSED_EVENT", "CROSS_REFERENCED_EVENT"]
         return "[" + ", ".join(kept) + "]"
 
-    def _timeline_block(self) -> str:
-        return _timeline_nodes(self._timeline_item_types())
+    def _timeline_block(self, *, omit_filtered_count: bool = False) -> str:
+        return _timeline_nodes(
+            self._timeline_item_types(), omit_filtered_count=omit_filtered_count
+        )
 
     def _fields_for(self, kind: str) -> str:
         """Field selection for one alias, honoring the active capability map.
@@ -685,17 +811,23 @@ class GraphQLSource(GhApiSource):
         that knows the comment type and lacks the field strips the line from
         the comment blocks; an unknown comment type fails open."""
         if kind == "pr":
-            blocks, lead = _PULL_TYPE_BLOCKS, _PULL_FIELDS
+            blocks = _PULL_TYPE_BLOCKS
         else:
-            blocks, lead = _ISSUE_TYPE_BLOCKS, _ISSUE_FIELDS
+            blocks = _ISSUE_TYPE_BLOCKS
+        # Issue #75/AC22: a host whose schema lacks the timeline connection's
+        # filteredCount (learned through the validation-error retry) has the
+        # field omitted from the RENDERED selection from the start — the cache
+        # drives rendering, not just retry suppression. It rides the existing
+        # capability-aware path: every other known omission still applies.
+        omit_fc = self._filtered_count_unsupported_cached
         caps = self._capabilities
         if caps is None:
-            return lead
+            return _fields_unfiltered(blocks, omit_filtered_count=omit_fc)
         present = caps.get("PullRequest" if kind == "pr" else "Issue")
         if present is None:
             # The probe reported nothing for this type: unknown, not absent —
             # fail open to the full selection (issue #23).
-            return lead
+            return _fields_unfiltered(blocks, omit_filtered_count=omit_fc)
         issue_comment_caps = caps.get("IssueComment")
         strip_issue = (
             issue_comment_caps is not None
@@ -707,7 +839,7 @@ class GraphQLSource(GhApiSource):
             and "authorAssociation" not in review_comment_caps
         )
         parts = ["databaseId"]
-        timeline_block = self._timeline_block()
+        timeline_block = self._timeline_block(omit_filtered_count=omit_fc)
         for field, block in blocks:
             if block is _TIMELINE_NODES:
                 block = timeline_block
@@ -730,6 +862,55 @@ class GraphQLSource(GhApiSource):
         return "\n".join(parts)
 
     # -- transport ----------------------------------------------------------
+
+    def _filtered_count_unsupported(
+        self, hard: list[dict], query: str
+    ) -> bool:
+        """True when a GraphQL validation failure names the timeline
+        connection's filteredCount (issue #75/AC22) AND this query still
+        selects it AND the absence is not already cached."""
+        if self._filtered_count_unsupported_cached:
+            return False
+        if "filteredCount" not in query:
+            return False
+        for e in hard:
+            if not isinstance(e, dict):
+                continue
+            message = str(e.get("message", ""))
+            if "filteredCount" in message and (
+                "doesn't exist" in message or "Cannot query field" in message
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _errors_body(stdout: str | None) -> list[dict]:
+        """The dict entries of a GraphQL ``errors`` body written to stdout,
+        or [] when stdout is not such a body. gh exits non-zero for ANY
+        errored response, so the zero-exit path's error handling never sees
+        these bodies; the AC22 seam (issue #75) parses one here so a host
+        whose schema lacks the timeline connection's filteredCount gets its
+        ONE stripped retry instead of a fatal error."""
+        if not stdout:
+            return []
+        try:
+            data = json.loads(stdout.strip() or "{}")
+        except (ValueError, RecursionError):
+            # PR #83 review (F-B1), composed (issue #82's 05-fix-plan.md): a
+            # pathologically nested untrusted body raises RecursionError, not
+            # a ValueError; EVERY stdout parse site of THIS GRAPHQL TRANSPORT
+            # (the seam's _errors_body, _errors_payload, and the zero-exit
+            # json.loads) catches the same tuple so both exit paths fail
+            # closed the SAME way. The REST transport's parse sites live in
+            # github.py and are tracked separately (PR #81 review F-04
+            # follow-up question).
+            return []
+        if not isinstance(data, dict):
+            return []
+        errors = data.get("errors")
+        if not isinstance(errors, list):
+            return []
+        return [e for e in errors if isinstance(e, dict)]
 
     @staticmethod
     def _errors_payload(stdout: str | None) -> dict | None:
@@ -804,7 +985,9 @@ class GraphQLSource(GhApiSource):
             hard.append(e)
         return hard, dropped
 
-    def _graphql(self, query: str, aliases: dict[str, int] | None = None) -> dict:
+    def _graphql(
+        self, query: str, aliases: dict[str, int] | None = None, *, stripped: bool = False
+    ) -> dict:
         """One GraphQL request. The query travels on stdin as the JSON
         request body (`gh api graphql --input -`, issue #23): no argv element
         carries query text, so Windows' CreateProcessW command-line limit can
@@ -872,6 +1055,21 @@ class GraphQLSource(GhApiSource):
                 raise GitHubError(f"unexpected graphql payload: {exc}") from exc
             if not isinstance(data, dict):
                 raise GitHubError("unexpected graphql payload")
+        # Issue #75/AC22 seam, slotted before classification per the approved
+        # composition rule (issue #82's 05-fix-plan.md): gh exits NON-ZERO for
+        # ANY errored response, so a host whose schema lacks the timeline
+        # connection's filteredCount surfaces its data:null validation error
+        # HERE, never through the zero-exit path in production. Parse the body
+        # as the flat errors list and retry this query ONCE with only
+        # filteredCount stripped, caching the absence so every later query
+        # (bulk and continuation) omits it from the start. Narrow by
+        # construction — every other error keeps its classification below.
+        seam_hard = self._errors_body(proc.stdout)
+        if seam_hard and not stripped and self._filtered_count_unsupported(seam_hard, query):
+            self._filtered_count_unsupported_cached = True
+            return self._graphql(
+                _strip_filtered_count(query), aliases, stripped=True
+            )
         errors = data.get("errors")
         if errors or nonzero_err is not None:
             error_list = errors if isinstance(errors, list) else []
@@ -1001,7 +1199,8 @@ class GraphQLSource(GhApiSource):
         query = (
             "query { rateLimit { remaining resetAt } "
             f"repository(owner: {_q(self.owner)}, name: {_q(self.repo)}) {{ "
-            f"{alias}: {node_name}(number: {number}) {{ {_timeline_selection(args, self._timeline_item_types())} }} }} }}"
+            f"{alias}: {node_name}(number: {number}) {{ "
+            f"{_timeline_selection(args, self._timeline_item_types(), omit_filtered_count=self._filtered_count_unsupported_cached)} }} }} }}"
         )
         # The alias map lets a section-scoped runtime error degrade the same
         # way the page query degrades: the timeline section drops and the
@@ -1130,16 +1329,17 @@ class GraphQLSource(GhApiSource):
 
     def _fetch_children_chunk(self, chunk: list[dict]) -> dict[int, dict]:
         aliases: list[str] = []
-        wanted: list[tuple[int, str]] = []
+        wanted: list[tuple[int, str, str]] = []
         alias_numbers: dict[str, int] = {}
         for raw in chunk:
             if not isinstance(raw, dict) or "number" not in raw:
                 continue
             number = int(raw["number"])
-            alias = ("p" if "pull_request" in raw else "i") + str(number)
-            fields = self._fields_for("pr" if "pull_request" in raw else "issue")
-            aliases.append(f"{alias}: {'pullRequest' if 'pull_request' in raw else 'issue'}(number: {number}) {{{fields}}}")
-            wanted.append((number, alias))
+            kind = "pr" if "pull_request" in raw else "issue"
+            alias = ("p" if kind == "pr" else "i") + str(number)
+            fields = self._fields_for(kind)
+            aliases.append(f"{alias}: {'pullRequest' if kind == 'pr' else 'issue'}(number: {number}) {{{fields}}}")
+            wanted.append((number, alias, kind))
             alias_numbers[alias] = number
         if not aliases:
             return {}
@@ -1155,7 +1355,7 @@ class GraphQLSource(GhApiSource):
         for number, drops in self.last_dropped_sections.items():
             self.last_fetch_drops.setdefault(number, []).extend(drops)
         out: dict[int, dict] = {}
-        for number, alias in wanted:
+        for number, alias, kind in wanted:
             node = repo.get(alias)
             if not isinstance(node, dict):
                 continue
@@ -1163,10 +1363,16 @@ class GraphQLSource(GhApiSource):
                 # The errored section must read as ABSENT (not empty) so the
                 # sync's per-item REST fallback answers it (issue #23).
                 node.pop(section, None)
-            out[number] = self._children_from_node(node)
+            out[number] = self._children_from_node(node, kind=kind)
         return out
 
-    def _children_from_node(self, node: dict) -> dict:
+    def _children_from_node(self, node: dict, *, kind: str | None = None) -> dict:
+        """Nested children for one node. ``kind`` is the item kind
+        ("pr"/"issue") when the caller knows it (issue #75): the timeline
+        count policy needs it because a PR's timelineItems.totalCount is
+        the COLLECTION's size. Production threads it from the chunk
+        builder's per-kind fields choice; a kind-less direct caller keeps
+        the legacy totalCount protection (the #53 rule)."""
         children: dict = {}
         # A section the node does not carry (permission mask, partial error)
         # must stay ABSENT so the sync's per-item REST fallback runs for it;
@@ -1376,7 +1582,12 @@ class GraphQLSource(GhApiSource):
 
         if node.get("timelineItems") is not None:
             timeline_conn = node.get("timelineItems")
-            events, timeline_more = _carried_connection(timeline_conn)
+            events, timeline_more = _carried_connection(
+                timeline_conn,
+                lambda payload: _timeline_count_incomplete(
+                    {**payload, "_kind": kind}
+                ),
+            )
             children["timeline"] = [_timeline_event(e) for e in events]
             # The completeness decision and the cursor decision use the SAME
             # predicate: a page that did not render faithfully (a non-dict
@@ -1390,7 +1601,9 @@ class GraphQLSource(GhApiSource):
             # subset (issue #53, review PRR-004). No cursor is emitted for an
             # unfaithful page, so `_complete_timeline` cannot drain past a
             # prefix it only partly saw.
-            faithful = _page_rendered_faithfully(timeline_conn, initial=True)
+            faithful = _page_rendered_faithfully(
+                timeline_conn, initial=True, kind=kind
+            )
             if timeline_more or not faithful:
                 children["timeline_incomplete"] = True
                 if faithful:

@@ -13,7 +13,10 @@ under `data`, with `ok`/`db`/`repo`/`freshness` on the envelope root):
      "revisions_adopted": <int>, "revisions_preserved": <int>,
      "tables_preserved": [<table>, ...],
      "scanned": [{"path", "items", "garbled", "complete", "issues_since",
-                  "adopted", "unreadable", "unreadable_reason"}, ...]}
+                  "adopted", "unreadable", "unreadable_reason"}, ...],
+     "skill_copies": {"skill", "packaged_version", "packaged_present",
+                      "packaged_body_sha256", "scanned_dirs",
+                      "stale_copies", "copies", ["error" on scan failure]}}
 
 `tables_preserved` names the repo-keyed tables the adopted candidate's
 VERSION never had (issue #56): the migration recreates them empty, so the
@@ -49,6 +52,7 @@ from zaxbygraph.db import (
     open_existing,
 )
 from zaxbygraph.paths import legacy_db_paths
+from zaxbygraph.skill import scan_skill_copies
 from zaxbygraph.store import recount
 
 _MOJIBAKE_LIKE = (
@@ -1293,6 +1297,26 @@ def doctor(
         rev_adopted = 0
         rev_preserved = 0
         tables_preserved = []
+    # The skill-copies staleness section (issue #73 AC7): the SAME scanner
+    # `skill --check` uses, over the four documented default skill homes
+    # plus every --scan dir. Read-only like the rest of the report, and a
+    # scanner fault must never abort the legacy-DB report above it.
+    try:
+        skill_copies = scan_skill_copies(extra_scans or [])
+    except Exception as exc:  # reported, not fatal (AGENTS.md contract)
+        # Same keys as the success payload (PR #81 review F-13) with the
+        # scan-dependent ones null/empty and the error recorded, so a
+        # consumer can never misread a failed scan as an empty success.
+        skill_copies = {
+            "skill": "zaxbygraph",
+            "packaged_version": None,
+            "packaged_present": None,
+            "packaged_body_sha256": None,
+            "scanned_dirs": [],
+            "stale_copies": None,
+            "copies": [],
+            "error": str(exc),
+        }
     return {
         "ok": True,
         "adopted": adopted,
@@ -1300,4 +1324,5 @@ def doctor(
         "revisions_preserved": rev_preserved,
         "tables_preserved": sorted(tables_preserved),
         "scanned": scanned,
+        "skill_copies": skill_copies,
     }
