@@ -75,10 +75,11 @@ budget:
 zaxbygraph bundle --with-briefs --budget-tokens 4000 --repo OWNER/REPO
 ```
 
-- The default budget is 4000 tokens; raise or lower it with
-  `--budget-tokens B`. `truncated: true` in the payload says the budget
-  cut the members list — widen the budget or page the pool if you need
-  everything.
+- The MCP bundle tool defaults to a 4000-token budget; the CLI applies a
+  budget only when you pass `--budget-tokens B` (without it,
+  `bundle --with-briefs` returns the full payload). `truncated: true` in
+  the payload says the budget cut the members list — widen the budget or
+  page the pool if you need everything.
 - Pick a bundle, `claim` its issues, then work it in the bundle's
   `order`. The MCP `bundle` tool called with no arguments answers the
   same one-call selection.
@@ -410,7 +411,7 @@ always-present keys are.
 | similar | candidates, capabilities, derived, ls_files_applied, ls_files_head, repo, resolved_path_count, target, weights |
 | sql | columns, rows |
 | status | counts, coverage, repos, schema_version, snapshot, tool_version |
-| triage | blocking_source, claims_config, closeable_trackers, config_source, cursor, derived, formula_version, gated, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
+| triage | blocking_source, claims_config, closeable_trackers, config_source, cursor, derived, features_missing, formula_version, gated, hotspot_asof, repo, rows, stage2_weight, top_k, triage_asof, truncated, weights |
 | what-closed | commits, index_stale, keyword_closes, kind, number, prs |
 
 **Schema discovery:** run `zaxbygraph schema [TABLE]` for live DDL plus
@@ -551,6 +552,7 @@ Never commit `history.db` — it is a rebuildable cache.
 
 Replace "page every issue into context" with: `zaxbygraph sync`, then collectors
 run `search` / `sql` / `related` and return truncated rows. The lead model alone
-generates candidates. Full program:
-[`../frontier-audit-enhance/SKILL.md`](../frontier-audit-enhance/SKILL.md).
-Contract: [`../../docs/frontier-audit-hook.md`](../../docs/frontier-audit-hook.md).
+generates candidates. The full program and its executable contract live in the
+repository, not inside this installed copy: `skills/frontier-audit-enhance/SKILL.md`
+and `docs/frontier-audit-hook.md` (repo-root paths, relative to the zaxbygraph
+checkout).

@@ -245,6 +245,14 @@ class DerivedScaleTests(_StoreTestCase):
         finally:
             conn.close()
 
+    @classmethod
+    def tearDownClass(cls) -> None:
+        # PR #81 review F-23: clean the 20k scale store too — the inherited
+        # teardown only cleans _td, leaving the scale database on disk for
+        # the rest of the suite run.
+        cls._td_scale.cleanup()
+        super().tearDownClass()
+
     def test_derived_commands_scale(self) -> None:
         """RED at base, GREEN after the fix. The AC's operation-count budget
         ("within a fixed budget corresponding to under 10s on CI") as a
@@ -356,7 +364,17 @@ class DerivedScaleTests(_StoreTestCase):
                 " fires at 1000-instruction granularity)",
             )
 
-        # ---- leg 3b: wall ceilings as SECONDARY guards --------------------
+        # ---- leg 3b: wall ceilings as INFORMATIONAL (PR #81 review F-24) --
+        # The 30s wall ceilings were false-red on the primary development
+        # platform (measured 31.1s/31.6s on the maintainer's Windows box at
+        # this same head while CI runs the same legs under 10s), so an
+        # unconditional ceiling masked machine variance while allowing a 3x
+        # regression through. The HARD guards for this contract are leg 3's
+        # deterministic Python-call and VDBE-instruction budgets above; the
+        # wall numbers are recorded, and asserted only when
+        # ZAXBYGRAPH_SCALE_WALL_GUARD=1 opts into the machine-sensitive
+        # check (the skip reason is stated here).
+        wall_guard = os.environ.get("ZAXBYGRAPH_SCALE_WALL_GUARD") == "1"
         scale_t0 = time.perf_counter()
         for argv in (
             ["triage", "--db", str(self.scale_db_path), "--repo", REPO, "--format", "json"],
@@ -369,12 +387,19 @@ class DerivedScaleTests(_StoreTestCase):
             env = _cli_json(*argv)
             elapsed = time.perf_counter() - t0
             self.assertTrue(env.get("ok"), f"{name} leg must answer ok")
-            self.assertLess(
-                elapsed, 30.0,
-                f"{name} over the 20k scale store took {elapsed:.1f}s"
-                " (budget 30s; the AC budget corresponds to under 10s on"
-                " CI)",
-            )
+            if wall_guard:
+                self.assertLess(
+                    elapsed, 30.0,
+                    f"{name} over the 20k scale store took {elapsed:.1f}s"
+                    " (opted-in wall guard, budget 30s; the AC budget"
+                    " corresponds to under 10s on CI)",
+                )
+            else:
+                print(
+                    f"CHECK_RESULT wall-info {name}={elapsed:.1f}s"
+                    " (informational; set ZAXBYGRAPH_SCALE_WALL_GUARD=1 to"
+                    " enforce the 30s ceiling)"
+                )
         print(
             f"CHECK_RESULT scale-legs total={time.perf_counter() - scale_t0:.1f}s"
         )
@@ -828,8 +853,15 @@ class OneCallBundleTests(_StoreTestCase):
             roomy = _d.bundle(
                 conn, REPO, with_briefs=True, budget_tokens=100_000,
             )
-            self.assertFalse(
-                roomy.get("truncated"),
+            # PR #81 review F-18: the flag must be PRESENT-and-False when
+            # the budget does not bind, not merely falsy-by-default.
+            self.assertIn(
+                "truncated", roomy,
+                "an above-floor budget payload must carry the truncated"
+                " flag (PR #81 review F-18)",
+            )
+            self.assertIs(
+                roomy["truncated"], False,
                 "a 100k-token budget must not bind on this fixture"
                 f" (got truncated={roomy.get('truncated')!r})",
             )
@@ -1123,6 +1155,22 @@ class BriefDecisionFieldsTests(_StoreTestCase):
                          "brief must carry the item's author")
         self.assertEqual(data.get("created_at"), "2027-06-15T00:00:00Z",
                          "brief must carry the item's created_at")
+
+        # PR #81 review F-08: the packet carries the STORED values of
+        # updated_at and html_url — never constant nulls (the row query
+        # selects both columns; the keys can no longer be silently absent).
+        self.assertIn("updated_at", data, "brief always emits updated_at")
+        self.assertIn("html_url", data, "brief always emits html_url")
+        self.assertTrue(
+            data.get("updated_at"),
+            f"brief's updated_at must carry the STORED value, not null"
+            f" (got {data.get('updated_at')!r}; PR #81 review F-08)",
+        )
+        self.assertTrue(
+            data.get("html_url"),
+            f"brief's html_url must carry the STORED value, not null"
+            f" (got {data.get('html_url')!r}; PR #81 review F-08)",
+        )
 
         files = data.get("files")
         self.assertIsInstance(files, dict, "brief.files must be an object")

@@ -2322,22 +2322,75 @@ _GH_MISSING_MARKERS = (
 )
 
 
-def _preflight_gh() -> tuple[str, str | None]:
-    """issue #73 AC3: gh presence + authentication, through the SAME
-    ``zaxbygraph.claims.run_gh`` seam the claim commands use — late-bound
-    at CALL time via the module attribute, never a from-import alias, so a
-    patched seam stays in charge.
+#: gh-auth markers: the subset of a failed ``gh auth status`` output that
+#: UNAMBIGUOUSLY evidences a credential verdict. Only the no-account state
+#: qualifies: gh 2.92's failed-login block (``X Failed to log in to <host>
+#: account <login> (<source>)`` + ``- The token in <source> is invalid.``
+#: — the phrase "invalid token" never appears) is rendered by gh's
+#: authEntryStateError for BOTH a rejected token AND non-timeout network
+#: failures, and gh's human formatter suppresses the underlying error, so
+#: the block is byte-ambiguous and MUST NOT claim a credential verdict
+#: (closeout-critic r1 + re-gate r1/r2 against gh's status.go). That block
+#: codes gh_unavailable with an honest both-remedies message; only
+#: ``gh_unauthenticated``'s no-account state names the fix outright.
+_GH_NO_ACCOUNT_MARKERS = (
+    "not logged in",
+    "no account",
+)
+#: The ambiguous failed-login block (any error-state rendering that is not
+#: the no-account state and not the verbatim timeout).
+_GH_FAILED_LOGIN_MARKERS = ("failed to log in",)
+_GH_TIMEOUT_MARKERS = ("timeout trying to log in",)
+
+
+def _preflight_gh(host: str) -> tuple[str, str | None]:
+    """issue #73 AC3: gh presence + authentication for the TARGET host,
+    through the SAME ``zaxbygraph.claims.run_gh`` seam the claim commands
+    use — late-bound at CALL time via the module attribute, never a
+    from-import alias, so a patched seam stays in charge.
 
     Returns ``("ok", None)`` or ``(code, detail)`` with DISTINCT coded
-    error keys: ``gh_missing`` (hint: install gh) and
-    ``gh_unauthenticated`` (hint: gh auth login)."""
+    error keys: ``gh_missing`` (hint: install gh), ``gh_unauthenticated``
+    (hint: gh auth login — claimed only when the output EVIDENCES a
+    credential verdict), and ``gh_unavailable`` (hint: connectivity; never
+    a credential diagnosis on a failure the output does not evidence —
+    PR #81 review F-10)."""
     runner = claims_mod.run_gh
     rc, out, err = runner(["gh", "--version"])
-    if rc != 0 and any(m in f"{out} {err}".lower() for m in _GH_MISSING_MARKERS):
-        return "gh_missing", (err or out).strip()[:300] or "gh could not run"
-    rc, out, err = runner(["gh", "auth", "status"])
     if rc != 0:
-        return "gh_unauthenticated", (err or out).strip()[:300] or "gh auth status failed"
+        if any(m in f"{out} {err}".lower() for m in _GH_MISSING_MARKERS):
+            return "gh_missing", (err or out).strip()[:300] or "gh could not run"
+        # gh is present but --version itself failed for an unmatched
+        # reason: an unavailability verdict, never an auth diagnosis.
+        return "gh_unavailable", (err or out).strip()[:300] or "gh --version failed"
+    rc, out, err = runner(["gh", "auth", "status", "--hostname", host])
+    if rc != 0:
+        combined = f"{out} {err}".lower()
+        # gh distinguishes a timeout verbatim — the one network case with
+        # its own text; it codes gh_unavailable (closeout-critic round 1).
+        if any(m in combined for m in _GH_TIMEOUT_MARKERS):
+            return (
+                "gh_unavailable",
+                (err or out).strip()[:300] or "gh auth status failed",
+            )
+        if any(m in combined for m in _GH_NO_ACCOUNT_MARKERS):
+            # UNAMBIGUOUS: gh says no credential exists for this host.
+            return (
+                "gh_unauthenticated",
+                (err or out).strip()[:300] or "gh auth status failed",
+            )
+        # Everything else — gh's failed-login block included — is
+        # byte-ambiguous between a rejected token and a non-timeout network
+        # failure (gh suppresses the underlying error in its human output;
+        # closeout re-gate rounds 1-3), so NO credential verdict is claimed:
+        # the message says so, the echoed detail is attributed to gh ("gh
+        # reported:" — its invalid-token assertion is the ambiguous part),
+        # and cmd_init's hint carries both remedies.
+        return "gh_unavailable", (
+            "its status output cannot distinguish an invalid token from a"
+            " network problem. gh reported: "
+            + ((err or out).strip()[:170] or "gh auth status failed")
+        )
     return "ok", None
 
 
@@ -2356,9 +2409,10 @@ def cmd_init(args: argparse.Namespace) -> int:
     except RepoError as exc:
         return emit_failure(args, 2, str(exc), slug=None)
     db_path, _chain = resolve_db(slug, explicit=args.db, host=host)
-    # Preflight BEFORE any store work (AC3): a missing or unauthenticated
-    # gh fails fast with its coded error and never attempts the first sync.
-    verdict, detail = _preflight_gh()
+    # Preflight BEFORE any store work (AC3): a missing, unauthenticated, or
+    # unreachable gh fails fast with its coded error and never attempts the
+    # first sync.
+    verdict, detail = _preflight_gh(host)
     if verdict == "gh_missing":
         return emit_failure(
             args,
@@ -2380,6 +2434,19 @@ def cmd_init(args: argparse.Namespace) -> int:
             code_key="gh_unauthenticated",
             hint="run `gh auth login` to authenticate with GitHub, then"
             " re-run zaxbygraph init",
+        )
+    if verdict == "gh_unavailable":
+        return emit_failure(
+            args,
+            1,
+            f"gh could not confirm authentication for {host}: {detail}",
+            slug=slug,
+            db_path=db_path,
+            code_key="gh_unavailable",
+            hint="gh's status output cannot distinguish an invalid token"
+            " from a network problem. Run `gh auth status --hostname"
+            f" {host}` to see the state yourself; if the token is stale,"
+            f" run `gh auth login -h {host}`, then re-run zaxbygraph init",
         )
     conn: sqlite3.Connection | None = None
     try:

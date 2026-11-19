@@ -21,7 +21,7 @@ from zaxbygraph.extract import (
     edges_from_item,
     edges_from_pr_state,
 )
-from zaxbygraph.graphql import GraphQLSource, _timeline_event
+from zaxbygraph.graphql import GraphQLSource, _connection, _timeline_event
 from zaxbygraph.store import delete_owned_edges, ingest_item
 from zaxbygraph.sync import _resolve_children
 
@@ -251,6 +251,132 @@ class CompletenessBoundaryTests(unittest.TestCase):
         self.assertFalse(complete["links_blocked_by"])
         self.assertTrue(complete["links_open_prs"])
         self.assertEqual(links_incomplete, ["blocked_by"])
+
+
+class MalformedCountTests(unittest.TestCase):
+    """PR #81 review F-01: a PRESENT, non-null ``totalCount`` that is not a
+    comparable integer (bool/str/float) is malformed — the connection reads
+    INCOMPLETE (union-only), never complete-empty, so a malformed payload can
+    never authorize a destructive replacement of stored link facts (issue
+    #53's no-retraction rule; `_page_rendered_faithfully` already applies
+    this to timelines)."""
+
+    def test_bool_count_reads_union_only(self) -> None:
+        children = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": True,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        self.assertEqual(children["links"]["blocked_by"], [])
+        self.assertIn(
+            "blocked_by",
+            children["links_incomplete"],
+            "a malformed bool totalCount must read union-only, never"
+            " complete-empty — a falsely complete connection can retract"
+            " stored blocked_by facts (PR #81 review F-01)",
+        )
+
+    def test_non_integer_counts_read_union_only_at_the_truth_table(self) -> None:
+        for bad in ("3", 3.0):
+            out, incomplete = _connection(
+                {"totalCount": bad, "pageInfo": {"hasNextPage": False}, "nodes": []}
+            )
+            self.assertEqual(out, [])
+            self.assertTrue(
+                incomplete,
+                f"totalCount={bad!r} must read incomplete (union-only)",
+            )
+
+    def test_real_zero_stays_complete_empty(self) -> None:
+        out, incomplete = _connection(
+            {"totalCount": 0, "pageInfo": {"hasNextPage": False}, "nodes": []}
+        )
+        self.assertEqual(out, [])
+        self.assertFalse(
+            incomplete,
+            "a genuine integer 0 on an empty page stays complete-empty —"
+            " the malformed-count guard must not widen past malformed"
+            " values",
+        )
+
+
+class MalformedCountRetractionTests(TempDBTest):
+    """PR #81 review F-01 end-to-end (Stage-B review): a stored blocked_by
+    edge survives a re-ingest whose blockedBy connection carries a malformed
+    bool totalCount with empty nodes — the malformed count reads incomplete,
+    so the connection is union-only and never authorizes replacement. The
+    complete-empty CONTROL leg proves discrimination: a genuine
+    totalCount:0/empty connection DOES replace (retract), so the malformed
+    arm's survival is the union-only behavior, not an absent replacement
+    path."""
+
+    def test_bool_count_blockedBy_cannot_retract_stored_edge(self) -> None:
+        from zaxbygraph.sync import sync_repo
+
+        def sync_full(src: "_BulkSource") -> None:
+            sync_repo(self.conn, src, REPO)
+
+        def blocked_by_count() -> int:
+            return self.count(
+                "SELECT COUNT(*) FROM edges WHERE rel = 'blocked_by'"
+            )
+
+        # ---- healthy sync stores the edge --------------------------------
+        src = _BulkSource()
+        src.add_issue(issue(3, title="one", updated_at=ts(10)))
+        src.children[3] = {
+            "links": {"blocked_by": [{"number": 1, "repo": None}]},
+        }
+        sync_full(src)
+        self.assertEqual(blocked_by_count(), 1, "fixture sanity: the edge stored")
+
+        # ---- malformed re-ingest: the edge SURVIVES ----------------------
+        malformed = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": True,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        src2 = _BulkSource()
+        src2.add_issue(issue(3, title="one", updated_at=ts(20)))
+        src2.children[3] = malformed
+        sync_full(src2)
+        self.assertEqual(
+            blocked_by_count(), 1,
+            "RETraction-BY-MALFORMED-COUNT: a blockedBy connection with"
+            " totalCount:true and empty nodes reads incomplete (union-only)"
+            " and must NOT retract the stored blocked_by edge (PR #81"
+            " review F-01)",
+        )
+
+        # ---- control: a genuine complete-empty connection replaces -------
+        control = GraphQLSource("o", "r")._children_from_node(
+            {
+                "blockedBy": {
+                    "totalCount": 0,
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [],
+                },
+            }
+        )
+        src3 = _BulkSource()
+        src3.add_issue(issue(3, title="one", updated_at=ts(30)))
+        src3.children[3] = control
+        sync_full(src3)
+        self.assertEqual(
+            blocked_by_count(), 0,
+            "CONTROL-LEG: a genuine totalCount:0/empty blockedBy connection"
+            " is COMPLETE, so its replacement retracts the edge — proving"
+            " the malformed arm above survived via the union-only behavior,"
+            " not because the replacement path is dead",
+        )
 
 
 class EnumCapabilityTests(unittest.TestCase):

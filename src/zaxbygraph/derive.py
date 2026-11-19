@@ -4053,7 +4053,7 @@ def brief(
         raise LookupError(f"item not found: #{number}")
 
     item_row = conn.execute(
-        "SELECT title, body, author, created_at FROM items"
+        "SELECT title, body, author, created_at, updated_at, html_url FROM items"
         " WHERE repo = ? AND kind = 'issue' AND number = ?",
         (repo, number),
     ).fetchone()
@@ -4127,14 +4127,21 @@ def brief(
     if item_data is not None:
         unresolved_count = len(item_data.unresolved_refs)
 
-    analog, _regression = _analog_for(
-        conn,
-        repo,
-        number,
-        compute["features"][number]["reverted_prs"],
-        ctx=compute["ctx"],
-        weights=compute["analog_weights"],
-    )
+    # The single-row compute already derived this row's analog in its
+    # stage-2 pass; reuse it and only fall back to a direct derivation when
+    # the requested row sat outside the stage-2 population (its analog is
+    # None there) — the bounded path scanned analog candidates twice
+    # (PR #81 review F-08's sibling, cubic's derive.py finding).
+    analog = row.get("analog")
+    if analog is None:
+        analog, _regression = _analog_for(
+            conn,
+            repo,
+            number,
+            compute["features"][number]["reverted_prs"],
+            ctx=compute["ctx"],
+            weights=compute["analog_weights"],
+        )
     analog_block = None
     if analog:
         arow = conn.execute(

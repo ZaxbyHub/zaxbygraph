@@ -2374,9 +2374,10 @@ _TOOL_SHAPES: dict[str, dict] = {
         " (derived, read-only).",
         "data_keys": ("blocking_source", "claims_config",
                       "closeable_trackers", "config_source", "cursor",
-                      "derived", "formula_version", "gated", "hotspot_asof",
-                      "repo", "rows", "stage2_weight", "top_k",
-                      "triage_asof", "truncated", "weights"),
+                      "derived", "features_missing", "formula_version",
+                      "gated", "hotspot_asof", "repo", "rows",
+                      "stage2_weight", "top_k", "triage_asof", "truncated",
+                      "weights"),
         "row_fields": {
             "rows": ("analog", "claim_evidence", "gates", "hotspot",
                      "hotspot_raw", "note", "number", "ranked", "regression",
@@ -3034,6 +3035,7 @@ _TOOLS: list[dict] = [
                 "top_k": {"type": "integer", "minimum": 1, "maximum": _MAX_TOP_K, "description": f"Keep only the top K ranked rows (at most {_MAX_TOP_K})"},
                 "include_gated": {"type": "boolean", "description": "Include blocked/assigned/locked rows (ranked: false)"},
                 "as_of": {"type": "string", "description": "Answer from the as-of snapshot view at instant T (ISO-8601 Z)"},
+                "explain": {"type": "boolean", "description": "Include per-feature score dumps and missing-feature legends on every row (verbose)"},
                 **_REPO_DB,
             }
         ),

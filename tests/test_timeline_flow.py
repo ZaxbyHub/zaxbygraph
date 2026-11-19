@@ -486,7 +486,11 @@ class FilteredCountTests(unittest.TestCase):
             "baseRefName": "main",
             "headRefName": "feat/63",
             "timelineItems": {
-                "totalCount": 5,
+                # PR #81 review F-19: totalCount stays BELOW the rendered
+                # count so this arm discriminates on filteredCount alone —
+                # a totalCount-keyed implementation would see 2 >= 2 and
+                # pass instead of flagging the filtered overflow.
+                "totalCount": 2,
                 "filteredCount": 5,
                 "pageInfo": {"hasNextPage": False, "endCursor": None},
                 "nodes": events,

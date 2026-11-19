@@ -322,10 +322,13 @@ class OneVersionEverywhereTests(_HermeticCliTest):
         from zaxbygraph import mcp_server
 
         discover = mcp_server._discover_result(False)
-        self.assertIn(
+        # PR #81 review F-22: the version must sit in the STRUCTURED field,
+        # not merely somewhere in the payload dump.
+        self.assertEqual(
+            discover.get("serverInfo", {}).get("version"),
             version,
-            json.dumps(discover),
-            "the server/discover payload must name the tool version",
+            f"server/discover names the package version in serverInfo"
+            f" (found {discover.get('serverInfo')!r})",
         )
 
         # status reports the schema version BESIDE the tool version
@@ -393,6 +396,12 @@ class _FakeGh:
         if not self.installed:
             return (1, "", "gh could not run: [WinError 2] gh: The system"
                            " cannot find the file specified")
+        # Stage-B review fix: the arms model the PROBE the preflight makes —
+        # a healthy --version (presence) and an authed-arm-dependent auth
+        # status — so the unauthenticated arm exercises the auth-status
+        # verdict, not an unmatched version failure.
+        if argv[:2] == ["gh", "--version"]:
+            return (0, "gh version 2.92.0\n", "")
         if not self.authed:
             return (1, "", "You are not logged into any GitHub hosts."
                            " Run gh auth login to authenticate.")
@@ -484,6 +493,16 @@ class InitPreflightTests(_HermeticCliTest):
             "auth login", blob,
             f"the auth-failure hint names 'gh auth login' verbatim: {error!r}",
         )
+        # Stage-B review fix + re-gate r2: ONLY the no-account state is
+        # unambiguous — gh's failed-login block is byte-identical for a
+        # rejected token and a non-timeout network failure, so those code
+        # gh_unavailable (arms e/e2/f); the no-account state here must
+        # carry the gh_unauthenticated verdict itself.
+        self.assertEqual(
+            error.get("code"), "gh_unauthenticated",
+            f"the no-account failure codes gh_unauthenticated"
+            f" (got {error!r})",
+        )
         self.assertEqual(synced, [], "auth failure must not attempt the sync")
 
         # distinct coded errors (plan-critic R1): the two preflight arms
@@ -505,7 +524,8 @@ class InitPreflightTests(_HermeticCliTest):
 
         # ---- (c) healthy: preflight + sync + MCP line ----------------------
         db_c = self.root / "init-c.db"
-        code, env = self._run_init(db_c, _FakeGh(), fake_sync_core)
+        gh_ok = _FakeGh()
+        code, env = self._run_init(db_c, gh_ok, fake_sync_core)
         self.assertEqual(code, 0, f"healthy init exits 0: {env}")
         self.assertTrue(env.get("ok"), env)
         self.assertEqual(
@@ -522,6 +542,193 @@ class InitPreflightTests(_HermeticCliTest):
         self.assertTrue(
             db_c.is_file(),
             "init builds the store at the resolved database path",
+        )
+
+        # ---- preflight CONTRACT pinned by argv (PR #81 review F-10/cubic):
+        # gh --version probes presence FIRST, and authentication is checked
+        # for the TARGET host only (`gh auth status --hostname <host>`), so
+        # an expired token on some OTHER host can never fail the preflight.
+        self.assertEqual(
+            gh_ok.calls[0], ["gh", "--version"],
+            f"the preflight probes gh presence first (got {gh_ok.calls!r})",
+        )
+        self.assertEqual(
+            gh_ok.calls[1],
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            f"authentication is checked for the target host only"
+            f" (got {gh_ok.calls!r})",
+        )
+        # A healthy preflight makes exactly these two probe calls — nothing
+        # more (the failing arms were already asserted not to sync).
+        self.assertEqual(
+            len(gh_ok.calls), 2,
+            f"the healthy preflight makes exactly two gh probes"
+            f" (got {gh_ok.calls!r})",
+        )
+
+        # ---- (d) unmatched non-auth failure (PR #81 review F-10): output
+        # that evidences NO credential verdict (and is not gh's verbatim
+        # timeout text) codes gh_unavailable with a connectivity hint,
+        # never the `gh auth login` remedy, and never attempts the sync.
+        class _NetworkDownGh:
+            def __call__(self, argv: list[str]):
+                if argv[:2] == ["gh", "--version"]:
+                    return (0, "gh version 2.92.0\n", "")
+                return (
+                    1,
+                    "",
+                    'error: Get "https://api.github.com/": dial tcp:'
+                    " lookup api.github.com: no such host",
+                )
+
+        db_d = self.root / "init-d.db"
+        code_d, env_d = self._run_init(db_d, _NetworkDownGh(), fake_sync_core)
+        self.assertFalse(env_d.get("ok", False), "an unreachable gh fails preflight")
+        error_d = env_d.get("error")
+        self.assertIsInstance(error_d, dict)
+        self.assertEqual(
+            error_d.get("code"), "gh_unavailable",
+            f"a non-auth failure carries the gh_unavailable code, not"
+            f" gh_unauthenticated (got {error_d!r})",
+        )
+        blob_d = (
+            str(error_d.get("message", "")) + str(error_d.get("hint", ""))
+        ).lower()
+        # The unified gh_unavailable hint is conditional ("if the token is
+        # stale..."), so `auth login` may appear without a diagnosis being
+        # claimed — the honest verdict is the CODE plus the cannot-
+        # distinguish/no-diagnosis message (re-gate r2 contract).
+        self.assertIn(
+            "auth status", blob_d,
+            f"the hint names the check command (got {error_d!r})",
+        )
+        self.assertEqual(
+            synced, [REPO], "the network-down arm made no NEW sync attempt"
+            " (the healthy arm's sync is the only one)"
+        )
+
+        # ---- (e) gh's VERBATIM failed-login block (closeout-critic r1 +
+        # re-gate r1/r2): gh 2.92 prints `X Failed to log in to <host>
+        # account <login> (<source>)` + `- The token in <source> is
+        # invalid.` — and the SAME byte-identical block renders for
+        # non-timeout network failures (gh suppresses the underlying
+        # error in its human output). NO credential verdict may be claimed:
+        # the code is gh_unavailable, the message says it cannot
+        # distinguish, and the hint carries BOTH remedies.
+        class _InvalidTokenGh:
+            def __call__(self, argv: list[str]):
+                if argv[:2] == ["gh", "--version"]:
+                    return (0, "gh version 2.92.0\n", "")
+                return (
+                    1,
+                    "",
+                    "X Failed to log in to github.com account zaxbysauce"
+                    " (keyring)\n- The token in keyring is invalid.\n"
+                    "  - To re-authenticate, run: gh auth login -h"
+                    " github.com",
+                )
+
+        db_e = self.root / "init-e.db"
+        code_e, env_e = self._run_init(db_e, _InvalidTokenGh(), fake_sync_core)
+        self.assertFalse(
+            env_e.get("ok", False), "an inconclusive auth status fails preflight"
+        )
+        error_e = env_e.get("error")
+        self.assertEqual(
+            error_e.get("code"), "gh_unavailable",
+            f"gh's ambiguous failed-login block codes gh_unavailable —"
+            f" no credential verdict from a byte-ambiguous shape"
+            f" (got {error_e!r}; re-gate r2: gh suppresses the underlying"
+            f" error, so the block is identical for invalid tokens and"
+            f" network failures)",
+        )
+        blob_e = (
+            str(error_e.get("message", "")) + str(error_e.get("hint", ""))
+        ).lower()
+        self.assertIn(
+            "cannot distinguish", blob_e,
+            f"the message must say the output cannot distinguish the"
+            f" causes (got {error_e!r})",
+        )
+        # Re-gate r3: gh's unqualified invalid-token assertion is echoed
+        # ATTRIBUTED ("gh reported: ..."), never as this tool's own claim.
+        self.assertIn(
+            "gh reported:", blob_e,
+            f"the echoed gh detail must be attributed to gh (got"
+            f" {error_e!r})",
+        )
+        self.assertIn(
+            "auth status", blob_e,
+            f"the hint names the check command (got {error_e!r})",
+        )
+        self.assertIn(
+            "auth login", blob_e,
+            f"the hint carries the conditional re-auth remedy (got"
+            f" {error_e!r})",
+        )
+
+        # ---- (e2) the SAME block WITH network detail appended: identical
+        # classification (gh's normal output suppresses the detail — the
+        # network-evidence discriminator was withdrawn in re-gate r2; this
+        # arm pins that even detail-bearing variants do not claim a
+        # credential verdict).
+        class _InvalidTokenWithNetworkGh:
+            def __call__(self, argv: list[str]):
+                if argv[:2] == ["gh", "--version"]:
+                    return (0, "gh version 2.92.0\n", "")
+                return (
+                    1,
+                    "",
+                    "X Failed to log in to github.com account zaxbysauce"
+                    " (keyring)\n- The token in keyring is invalid.\n"
+                    "  - dial tcp: lookup api.github.com: no such host",
+                )
+
+        db_e2 = self.root / "init-e2.db"
+        code_e2, env_e2 = self._run_init(
+            db_e2, _InvalidTokenWithNetworkGh(), fake_sync_core
+        )
+        error_e2 = env_e2.get("error")
+        self.assertEqual(
+            error_e2.get("code"), "gh_unavailable",
+            f"the detail-bearing variant codes gh_unavailable too"
+            f" (got {error_e2!r})",
+        )
+
+        # ---- (f) gh's VERBATIM timeout block codes gh_unavailable: the
+        # timeout is the one network case gh distinguishes verbatim, and it
+        # must win over the failed-login header wording.
+        class _AuthTimeoutGh:
+            def __call__(self, argv: list[str]):
+                if argv[:2] == ["gh", "--version"]:
+                    return (0, "gh version 2.92.0\n", "")
+                return (
+                    1,
+                    "",
+                    "X Failed to log in to github.com account zaxbysauce"
+                    " (keyring): Timeout trying to log in to github.com"
+                    " account zaxbysauce",
+                )
+
+        db_f = self.root / "init-f.db"
+        code_f, env_f = self._run_init(db_f, _AuthTimeoutGh(), fake_sync_core)
+        error_f = env_f.get("error")
+        self.assertEqual(
+            error_f.get("code"), "gh_unavailable",
+            f"gh's verbatim timeout output codes gh_unavailable even"
+            f" inside the failed-login block — the timeout marker wins"
+            f" over the header wording (got {error_f!r})",
+        )
+        # The unified gh_unavailable hint is CONDITIONAL ("if the token is
+        # stale..."), so it may name `gh auth login` for every
+        # gh_unavailable shape without claiming a diagnosis; the CODE is
+        # the honest verdict (re-gate r2 contract).
+        blob_f = (
+            str(error_f.get("message", "")) + str(error_f.get("hint", ""))
+        ).lower()
+        self.assertIn(
+            "auth status", blob_f,
+            f"the hint names the check command (got {error_f!r})",
         )
 
 
@@ -564,14 +771,15 @@ class PackagingMetadataTests(unittest.TestCase):
             classifiers,
             "the supported-Python floor (3.11) must be classified",
         )
-        self.assertTrue(
-            any(
-                re.fullmatch(r"Programming Language :: Python :: 3\.1[2-4]", c)
-                for c in classifiers
-            ),
-            f"classifiers must cover the supported range through 3.14:"
-            f" {classifiers}",
-        )
+        # PR #81 review F-22: every supported interpreter is classified
+        # INDIVIDUALLY — an `any` match could hide a missing middle version.
+        for minor in ("3.12", "3.13", "3.14"):
+            self.assertIn(
+                f"Programming Language :: Python :: {minor}",
+                classifiers,
+                f"the supported range must classify {minor} individually:"
+                f" {classifiers}",
+            )
         # PEP 639 (post-publication CI failure on this PR): setuptools >= 77
         # REFUSES to build a project that carries BOTH an SPDX license
         # expression and a `License ::` classifier ("License classifiers have
@@ -588,17 +796,44 @@ class PackagingMetadataTests(unittest.TestCase):
             f" {license_classifiers}",
         )
 
+        # PR #81 review F-22: the install claims must live in the Install
+        # SECTION, not anywhere in the README — search the section body so
+        # a stray URL elsewhere cannot satisfy the contract.
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        install_match = re.search(
+            r"(?ms)^##\s+Install\s*$\n(.*?)(?=^##\s+|\Z)", readme
+        )
+        self.assertIsNotNone(
+            install_match, "README must carry an '## Install' section"
+        )
+        install_section = install_match.group(1)
         self.assertIn(
             "git+https://github.com/ZaxbyHub/zaxbygraph",
-            readme,
+            install_section,
             "README's Install section must offer the one-line install from"
             " the repository URL",
         )
         self.assertTrue(
-            "pipx" in readme or "uvx" in readme,
+            "pipx" in install_section or "uvx" in install_section,
             "the one-line install must be a pipx/uvx command (no editable"
             " pip install as the only path)",
+        )
+        # Stage-B review fix: the tool and the repository URL must sit on
+        # the SAME command line — separate lines could pass independently.
+        install_line = next(
+            (
+                ln
+                for ln in install_section.splitlines()
+                if ("pipx" in ln or "uvx" in ln)
+                and "git+https://github.com/ZaxbyHub/zaxbygraph" in ln
+            ),
+            None,
+        )
+        self.assertIsNotNone(
+            install_line,
+            "the Install section must carry ONE command line containing"
+            " both the installer (pipx/uvx) and the repository URL"
+            f" (section: {install_section[:300]!r})",
         )
 
 
@@ -660,37 +895,35 @@ class PackagedSkillTests(_HermeticCliTest):
 
         # (d) `zaxbygraph skill` prints it. Under piped stdio the CLI's
         # default is the JSON envelope, so accept either design: the raw
-        # text on stdout, or the skill content riding inside an envelope
-        # (probed via distinctive safe lines that survive JSON escaping).
+        # text on stdout, or the skill content riding inside an envelope.
+        # PR #81 review F-22: the envelope branch must carry the COMPLETE
+        # packaged text in its structured content field — one prose line is
+        # not the contract.
         code, out, err = _run_cli_inproc(["skill"])
         self.assertEqual(
             code, 0, f"`zaxbygraph skill` must succeed (exit {code};"
                      f" stderr {err.strip()[:160]!r})"
         )
-        probe_lines = [
-            ln
-            for ln in packaged_text.splitlines()
-            if len(ln.strip()) > 40
-            and not any(ch in ln for ch in "\"'\\")
-        ]
-        self.assertTrue(
-            probe_lines, "fixture sanity: the packaged skill carries"
-                         " distinctive prose lines"
-        )
-        printed_raw = packaged_text.strip() in out or probe_lines[0] in out
-        printed_envelope = False
+        env_print = None
         try:
             env_print = json.loads(out)
-            printed_envelope = isinstance(env_print, dict) and (
-                probe_lines[0] in json.dumps(env_print)
-            )
         except ValueError:
-            printed_envelope = False
-        self.assertTrue(
-            printed_raw or printed_envelope,
-            "`zaxbygraph skill` prints the packaged skill content (raw or"
-            " inside its envelope)",
-        )
+            env_print = None
+        if isinstance(env_print, dict) and isinstance(
+            env_print.get("data"), dict
+        ):
+            self.assertEqual(
+                env_print["data"].get("content"),
+                packaged_text,
+                "the skill envelope's data.content must be the COMPLETE"
+                " packaged text (PR #81 review F-22)",
+            )
+        else:
+            self.assertIn(
+                packaged_text.strip(), out,
+                "`zaxbygraph skill` prints the packaged skill content"
+                " verbatim (raw-text design)",
+            )
 
         # (e) `skill --install DIR` writes the stamped copy
         target_dir = self.root / "claude-skills"
@@ -783,6 +1016,55 @@ class StaleSkillReportTests(_HermeticCliTest):
         )
         return stamp + "\n" + body
 
+    def test_doctor_skill_scan_failure_keeps_payload_shape(self) -> None:
+        """PR #81 review F-13: a scanner fault must not collapse doctor's
+        skill_copies section to {skill, error} — the failure payload keeps
+        the SUCCESS keys (scan-dependent ones null/empty) alongside error,
+        so a consumer can never misread a failed scan as an empty success."""
+        import zaxbygraph.doctor as doctor_mod
+
+        db = self.root / "doctor-fallback.db"
+        conn = connect(db)
+        try:
+            init_schema(conn)
+            src = FakeGitHubSource()
+            src.add_issue(issue(1, title="probe", body="b"))
+            sync_repo(conn, src, REPO)
+        finally:
+            conn.close()
+        os.environ["ZAXBYGRAPH_DB"] = str(db)
+        with mock.patch.object(
+            doctor_mod, "scan_skill_copies",
+            side_effect=RuntimeError("scanner boom"),
+        ):
+            code, out, err = _run_cli_inproc(
+                ["doctor", "--repo", REPO, "--db", str(db), "--format", "json"]
+            )
+        self.assertEqual(
+            code, 0,
+            f"doctor still answers ok when the skill scanner faults"
+            f" (exit {code}; stderr {err.strip()[:120]!r})",
+        )
+        env = json.loads(out)
+        self.assertTrue(env.get("ok"), env)
+        payload = env.get("data", {}).get("skill_copies")
+        self.assertIsInstance(
+            payload, dict,
+            f"the skill_copies section survives the fault: {env.get('data')!r}",
+        )
+        for key in ("skill", "packaged_version", "packaged_present",
+                    "packaged_body_sha256", "scanned_dirs", "stale_copies",
+                    "copies", "error"):
+            self.assertIn(
+                key, payload,
+                f"the failure payload keeps the success key {key!r}"
+                f" (PR #81 review F-13): {payload!r}",
+            )
+        self.assertEqual(payload["error"], "scanner boom")
+        self.assertEqual(payload["copies"], [])
+        self.assertIsNone(payload["packaged_present"])
+        self.assertEqual(payload["scanned_dirs"], [])
+
     def test_stale_skill_copies_are_reported(self) -> None:
         """RED at base (no skill subcommand), GREEN after the fix.
         ``zaxbygraph skill --check --dir DIR`` reports each found copy's
@@ -836,89 +1118,53 @@ class StaleSkillReportTests(_HermeticCliTest):
             self.assertTrue(env.get("ok"), env)
             return env.get("data") if isinstance(env.get("data"), dict) else env
 
-        def _records(payload: object, root: Path) -> list[list[str]]:
-            """Every per-copy RECORD naming a skill copy under `root`: each
-            dict (or bare string) in the payload whose flattened string
-            values contain the scanned root path contributes its full
-            flattened string set (parsed strings — Windows path
-            backslashes never match a raw JSON dump; and the record's
-            sibling fields — status, refresh command — travel with it)."""
-            needle = str(root)
-            needle_alt = str(root).replace("\\", "/")
-            records: list[list[str]] = []
-
-            def _flat_strings(node) -> list[str]:
-                if isinstance(node, str):
-                    return [node]
-                if isinstance(node, dict):
-                    out: list[str] = []
-                    for v in node.values():
-                        out.extend(_flat_strings(v))
-                    return out
-                if isinstance(node, list):
-                    out = []
-                    for v in node:
-                        out.extend(_flat_strings(v))
-                    return out
-                return []
+        def _copy_record(payload: object, copy_path: Path) -> dict:
+            """The per-copy RECORD whose OWN ``path`` equals copy_path
+            (PR #81 review F-22/cubic: the status must be asserted on the
+            record describing THAT copy — a substring walk over aggregated
+            strings could not associate a status with its path)."""
+            found: list[dict] = []
 
             def _walk(node) -> None:
                 if isinstance(node, dict):
-                    strings = _flat_strings(node)
-                    if any(needle in s or needle_alt in s for s in strings):
-                        records.append(strings)
-                    else:
-                        for v in node.values():
-                            _walk(v)
+                    if node.get("path") == str(copy_path):
+                        found.append(node)
+                        return
+                    for v in node.values():
+                        _walk(v)
                 elif isinstance(node, list):
                     for v in node:
                         _walk(v)
-                elif isinstance(node, str) and (needle in node or needle_alt in node):
-                    records.append([node])
 
             _walk(payload)
-            return records
+            self.assertTrue(
+                found,
+                f"the check payload must carry the per-copy record with"
+                f" path {copy_path}: {json.dumps(payload)[:400]}",
+            )
+            return found[0]
 
         # ---- the stale copy ------------------------------------------------
         payload = _check(stale_root)
-        records = _records(payload, stale_root)
-        self.assertTrue(
-            records,
-            f"the --dir copy must be reported in the check payload:"
-            f" {json.dumps(payload)[:400]}",
+        stale_record = _copy_record(payload, stale_copy)
+        self.assertEqual(
+            stale_record.get("status"), "stale",
+            f"the body-hash-differing copy's OWN record is classified"
+            f" stale: {stale_record!r}",
         )
-        self.assertTrue(
-            any("stale" in " ".join(r).lower() for r in records),
-            f"the body-hash-differing copy must be classified stale:"
-            f" {records[:3]}",
-        )
-        self.assertTrue(
-            any("--install" in " ".join(r) for r in records),
-            f"the stale report carries the refresh command naming"
-            f" --install: {records[:3]}",
+        self.assertIn(
+            "--install", stale_record.get("refresh", ""),
+            f"the stale record carries the refresh command naming"
+            f" --install: {stale_record!r}",
         )
 
         # ---- the current copy ----------------------------------------------
         payload2 = _check(current_root)
-        records2 = _records(payload2, current_root)
-        self.assertTrue(
-            records2,
-            f"the current --dir copy must be reported: "
-            f"{json.dumps(payload2)[:400]}",
-        )
-        self.assertTrue(
-            any("current" in " ".join(r).lower() for r in records2),
-            f"a copy whose body hash equals the packaged body must be"
-            f" classified current: {records2[:3]}",
-        )
-        self.assertFalse(
-            any(
-                "stale" in " ".join(r).lower() and "current" not in
-                " ".join(r).lower()
-                for r in records2
-            ),
-            f"the current copy's record must not be reported stale:"
-            f" {records2[:3]}",
+        current_record = _copy_record(payload2, current_copy)
+        self.assertEqual(
+            current_record.get("status"), "current",
+            f"a copy whose body hash equals the packaged body is"
+            f" classified current in its OWN record: {current_record!r}",
         )
 
         # ---- --check writes NOTHING ----------------------------------------
@@ -975,38 +1221,18 @@ class StaleSkillReportTests(_HermeticCliTest):
                 else env_nd
             )
             for tool in stale_tools:
-                records_nd = _records(payload_nd, default_copies[tool].parent)
-                self.assertTrue(
-                    records_nd,
-                    f"the default {tool} copy must be reported by the"
-                    f" default-dirs check: {json.dumps(payload_nd)[:400]}",
-                )
-                self.assertTrue(
-                    any("stale" in " ".join(r).lower() for r in records_nd),
-                    f"the stale default {tool} copy must be classified"
-                    f" stale: {records_nd[:3]}",
+                record_nd = _copy_record(payload_nd, default_copies[tool])
+                self.assertEqual(
+                    record_nd.get("status"), "stale",
+                    f"the stale default {tool} copy's OWN record is"
+                    f" classified stale: {record_nd!r}",
                 )
             for tool in current_tools:
-                records_nd = _records(payload_nd, default_copies[tool].parent)
-                self.assertTrue(
-                    records_nd,
-                    f"the current default {tool} copy must be reported by"
-                    f" the default-dirs check:"
-                    f" {json.dumps(payload_nd)[:400]}",
-                )
-                self.assertTrue(
-                    any("current" in " ".join(r).lower() for r in records_nd),
-                    f"the current default {tool} copy must be classified"
-                    f" current: {records_nd[:3]}",
-                )
-                self.assertFalse(
-                    any(
-                        "stale" in " ".join(r).lower()
-                        and "current" not in " ".join(r).lower()
-                        for r in records_nd
-                    ),
-                    f"the current default {tool} copy must not be reported"
-                    f" stale: {records_nd[:3]}",
+                record_nd = _copy_record(payload_nd, default_copies[tool])
+                self.assertEqual(
+                    record_nd.get("status"), "current",
+                    f"the current default {tool} copy's OWN record is"
+                    f" classified current: {record_nd!r}",
                 )
 
             # doctor reports the SAME skill-copies staleness section: the
@@ -1033,29 +1259,18 @@ class StaleSkillReportTests(_HermeticCliTest):
                 else env_d
             )
             for tool in stale_tools:
-                records_d = _records(payload_d, default_copies[tool].parent)
-                self.assertTrue(
-                    records_d,
-                    f"doctor's payload must report the default {tool} skill"
-                    " copy (the skill-copies staleness section):"
-                    f" {json.dumps(payload_d)[:400]}",
-                )
-                self.assertTrue(
-                    any("stale" in " ".join(r).lower() for r in records_d),
+                record_d = _copy_record(payload_d, default_copies[tool])
+                self.assertEqual(
+                    record_d.get("status"), "stale",
                     f"doctor must classify the stale default {tool} copy"
-                    f" stale: {records_d[:3]}",
+                    f" stale in its OWN record: {record_d!r}",
                 )
             for tool in current_tools:
-                records_d = _records(payload_d, default_copies[tool].parent)
-                self.assertTrue(
-                    records_d,
-                    f"doctor's payload must report the current default"
-                    f" {tool} skill copy: {json.dumps(payload_d)[:400]}",
-                )
-                self.assertTrue(
-                    any("current" in " ".join(r).lower() for r in records_d),
+                record_d = _copy_record(payload_d, default_copies[tool])
+                self.assertEqual(
+                    record_d.get("status"), "current",
                     f"doctor must classify the current default {tool} copy"
-                    f" current: {records_d[:3]}",
+                    f" current in its OWN record: {record_d!r}",
                 )
 
         # neither the default-dirs check nor doctor wrote anything: the

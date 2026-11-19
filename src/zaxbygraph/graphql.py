@@ -371,7 +371,7 @@ _MALFORMED_LINK_NODE = {"__malformed__": True}
 #: unknown kinds that keep the legacy #53 protection).
 def _timeline_count_incomplete(payload: dict) -> bool:
     """True when the count comparison says the page dropped nodes, under
-    the ONE timeline count policy shared by `_connection_counted` and
+    the ONE timeline count policy shared by `_connection` and
     `_page_rendered_faithfully` (issue #75, plan-critic rounds 1-3):
     filteredCount first (the honest comparator on every kind), the
     totalCount fallback on issue-kind/unknown-kind pages only. The payload
@@ -388,7 +388,9 @@ def _timeline_count_incomplete(payload: dict) -> bool:
     return False
 
 
-def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
+def _connection(
+    nodes: object, count_policy: object | None = None
+) -> tuple[list[dict], bool]:
     """(nodes, incomplete) for one GraphQL connection payload. A null or
     malformed connection value returns ([], False) — callers distinguish a
     genuinely empty page from a section the node did not carry by checking
@@ -396,10 +398,24 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
     connection (a non-list `nodes`, a non-dict `pageInfo`) or dropped
     non-dict nodes returns ([], True): the section degrades to union-only
     rather than presenting a silently empty page as complete (issue #53).
-    ``count_policy`` is the ONE count comparison (issue #75); the default
-    keeps the legacy unfiltered-totalCount behavior every non-timeline
-    connection has always had (those connections carry no itemTypes filter,
-    so totalCount == the page's own count when fully returned)."""
+
+    A PRESENT, non-null ``totalCount`` that is not a comparable integer
+    (bool/str/float) is malformed: the page reads INCOMPLETE (union-only),
+    never complete-empty. Base `_connection` excluded bools from the
+    comparison entirely (reading a bool or str count as complete — no
+    overflow flag), while the timeline count policy flagged ``True > 0``
+    through its int comparison; neither path failed closed on a malformed
+    value, and any falsely complete carried connection can authorize a
+    destructive replacement of stored facts, so every non-comparable count
+    now fails closed the way `_page_rendered_faithfully` already does for
+    the timeline (issue #53's no-retraction-on-malformed rule; PR #81
+    review F-01).
+
+    ``count_policy`` (issue #75) is the ONE count comparison, threaded only
+    by the timeline call path; the default keeps the legacy unfiltered
+    totalCount behavior for every non-timeline connection (those carry no
+    itemTypes filter, so totalCount == the page's own count when fully
+    returned)."""
     if not isinstance(nodes, dict):
         return [], False
     raw_nodes = nodes.get("nodes")
@@ -413,41 +429,18 @@ def _connection(nodes: dict | None) -> tuple[list[dict], bool]:
         return [], True
     incomplete = bool(page_info.get("hasNextPage")) or len(out) != len(raw_nodes)
     total = nodes.get("totalCount")
-    if isinstance(total, int) and not isinstance(total, bool):
-        if total > len(out):
-            incomplete = True
-    return out, incomplete
-
-
-def _connection_counted(
-    nodes: dict | None, count_policy: object | None = None
-) -> tuple[list[dict], bool]:
-    """`_connection` under an EXPLICIT count policy (issue #75): the timeline
-    call path passes the kind-aware comparator so both flag sites derive from
-    ONE policy. The payload is normalized once (pageInfo null -> {}) and the
-    rendered node count is threaded into the policy, never re-read per call."""
-    if not isinstance(nodes, dict):
-        return [], False
-    raw_nodes = nodes.get("nodes")
-    if not isinstance(raw_nodes, list):
-        return [], True
-    out = [n for n in raw_nodes if isinstance(n, dict)]
-    page_info = nodes.get("pageInfo")
-    if page_info is None:
-        page_info = {}
-    elif not isinstance(page_info, dict):
-        return [], True
-    incomplete = bool(page_info.get("hasNextPage")) or len(out) != len(raw_nodes)
     if count_policy is not None:
         payload = dict(nodes)
         payload["_rendered"] = out
         if count_policy(payload):
             incomplete = True
-        return out, incomplete
-    total = nodes.get("totalCount")
-    if isinstance(total, int) and not isinstance(total, bool):
-        if total > len(out):
-            incomplete = True
+    elif total is not None and not (
+        isinstance(total, int) and not isinstance(total, bool)
+    ):
+        # Malformed count (bool/str/float): fail closed, union-only.
+        incomplete = True
+    elif isinstance(total, int) and total > len(out):
+        incomplete = True
     return out, incomplete
 
 
@@ -463,7 +456,7 @@ def _carried_connection(
     ``count_policy`` (issue #75) is threaded only by the timeline call path."""
     if not isinstance(raw, dict):
         return [], True
-    return _connection_counted(raw, count_policy)
+    return _connection(raw, count_policy)
 
 
 def _page_rendered_faithfully(raw: object, *, initial: bool, kind: str | None = None) -> bool:
@@ -905,9 +898,12 @@ class GraphQLSource(GhApiSource):
         except (ValueError, RecursionError):
             # PR #83 review (F-B1), composed (issue #82's 05-fix-plan.md): a
             # pathologically nested untrusted body raises RecursionError, not
-            # a ValueError; EVERY stdout parse site on the combined tree
-            # catches the same tuple so both exit paths fail closed the SAME
-            # way (the seam is the third site the composition adds).
+            # a ValueError; EVERY stdout parse site of THIS GRAPHQL TRANSPORT
+            # (the seam's _errors_body, _errors_payload, and the zero-exit
+            # json.loads) catches the same tuple so both exit paths fail
+            # closed the SAME way. The REST transport's parse sites live in
+            # github.py and are tracked separately (PR #81 review F-04
+            # follow-up question).
             return []
         if not isinstance(data, dict):
             return []
