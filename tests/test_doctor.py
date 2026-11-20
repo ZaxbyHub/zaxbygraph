@@ -507,16 +507,35 @@ class GarbledQuotedPatternTests(unittest.TestCase):
     def test_null_fields_in_candidate_row_no_traceback(self) -> None:
         # A row can become a candidate via one field while another is NULL
         # (body is nullable; labels_text is nullable). The strip path must
-        # treat NULL as empty, never raise.
+        # treat NULL as empty, never raise. The NULL fields are examined
+        # BEFORE the matching field: body/labels come first in the census's
+        # (title, body, labels_text) probe order? No — the SELECT orders
+        # title, body, labels_text, so a NULL CANNOT precede the matching
+        # title. Instead this test pins the NULL conversion directly: the
+        # row is a candidate via labels_text (the LAST field), so the
+        # census examines NULL title and NULL body through _field_text
+        # before reaching the matching labels.
         report = self._inspect_raw_store(
-            [(1, MOJIBAKE_TITLE, None, None)]
+            [(1, None, None, MOJIBAKE_TITLE)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_null_title_candidate_counts_via_body(self) -> None:
+        # NULL title examined first (field order title, body, labels_text):
+        # the candidate matches via body, and the NULL title conversion
+        # must not raise or mis-count.
+        report = self._inspect_raw_store(
+            [(1, None, MOJIBAKE_TITLE, None)]
         )
         self.assertEqual(report["garbled"], 1)
 
     def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
         # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
         # prefilter (executed probe at plan time) and must keep counting
-        # after the strip pass (decode errors="replace").
+        # after the strip pass (decode errors="replace"). The clean TEXT
+        # title pins that the count comes from the BLOB: the row is a
+        # candidate ONLY via the BLOB body, and the count is 1 exactly
+        # when the BLOB's decoded text still carries the signature.
         blob = "rÃ©sumÃ© damaged".encode("utf-8")
         report = self._inspect_raw_store(
             [(1, "clean title", blob, None)]
@@ -525,16 +544,45 @@ class GarbledQuotedPatternTests(unittest.TestCase):
 
     def test_blob_quoted_pattern_is_not_counted(self) -> None:
         # Same storage class, quoted shape: a BLOB whose bytes quote the
-        # pattern inside backticks is detector vocabulary, not damage.
+        # pattern inside backticks is detector vocabulary, not damage. The
+        # DISCRIMINATING half: the same row with the BLOB bytes OUTSIDE
+        # backticks counts 1 (the next test), so a 0 here proves the BLOB
+        # was selected, decoded, and stripped — never skipped.
         blob = "rows matching `Ã` in a blob".encode("utf-8")
         report = self._inspect_raw_store(
             [(1, "clean title", blob, None)]
         )
         self.assertEqual(report["garbled"], 0)
 
+    def test_blob_pattern_outside_backticks_counts_one(self) -> None:
+        # The discriminating companion to the quoted-BLOB test: identical
+        # seeding except the signature sits OUTSIDE the backticks. If the
+        # BLOB were never selected or decoded, BOTH tests would answer 0;
+        # this one answering 1 (with the quoted twin answering 0) proves
+        # the BLOB reaches _field_text and the strip pass.
+        blob = "rows matching Ã outside a blob".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
 
 class StripInlineCodeUnitTests(unittest.TestCase):
     """Unit pins for _strip_inline_code's GFM code-span semantics."""
+
+    def test_field_text_storage_classes(self) -> None:
+        # The production end-to-end tests cannot discriminate a benign
+        # str(None) mutant (the rendered 'None' carries no signature), so
+        # the conversion contract is pinned at the unit level: every
+        # storage class maps to the text the census should see.
+        from zaxbygraph.doctor import _field_text
+
+        self.assertEqual(_field_text(None), "")
+        self.assertEqual(_field_text("rÃ©sumÃ©"), "rÃ©sumÃ©")
+        self.assertEqual(
+            _field_text("rÃ©sumÃ©".encode("utf-8")), "rÃ©sumÃ©"
+        )
+        self.assertEqual(_field_text(5), "5")
 
     def test_matched_single_span(self) -> None:
         self.assertEqual(_strip_inline_code("a `Ã` b"), "a  b")
@@ -571,6 +619,22 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         # The escape is literal; the later single-run pair still forms a
         # span and is dropped.
         self.assertEqual(_strip_inline_code("\\`a`b`"), "`a")
+
+    def test_backslash_inside_span_is_literal_so_span_closes(self) -> None:
+        # GFM example 310 class: escapes do not operate inside a code
+        # span, so the first equal-length run closes it (review round 2):
+        # the span `a\` drops entirely and the trailing b + unmatched
+        # backtick stay literal.
+        self.assertEqual(_strip_inline_code("`a\\`b`"), "b`")
+
+    def test_backslash_parity_before_delimiter(self) -> None:
+        # Two backslashes render as ONE literal slash (they escape each
+        # other), so the following backtick IS a real delimiter.
+        self.assertEqual(_strip_inline_code("\\\\`x"), "\\`x")
+        # One backslash escapes the backtick: no delimiter, bare backtick.
+        self.assertEqual(_strip_inline_code("\\`x"), "`x")
+        # Two slashes render as one, then a matched span is dropped.
+        self.assertEqual(_strip_inline_code("\\\\`Ã`"), "\\")
 
     def test_trailing_backslash_is_literal(self) -> None:
         self.assertEqual(_strip_inline_code("end\\"), "end\\")

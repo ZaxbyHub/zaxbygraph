@@ -82,85 +82,91 @@ def _strip_inline_code(text: str) -> str:
     quoted example is detector vocabulary, not mojibake content — so the
     garbled census must not count it (epic #8 gate).
 
-    Semantics (GFM §code-spans):
-    - a span opens at a backtick RUN of length N and closes at the next
+    Semantics (GFM §code-spans and §backslash-escapes), single pass:
+    - OUTSIDE a code span, a backslash escapes exactly one following
+      punctuation character. An escaped backtick (`` \\` ``) is a literal
+      backtick — it can neither open nor close a span, and the rendered
+      form keeps the backtick without the backslash (example 361); a
+      backslash before anything else is literal. A run of 2k backslashes
+      followed by a backtick escapes k of them and leaves k literal
+      backslashes before a DELIMITER backtick (parity); a backslash run
+      not followed by a backtick is literal.
+    - A span opens at a backtick RUN of length N and closes at the next
       run of the same length N; the delimiters and the contents between
-      them (including line endings) are removed;
-    - an unmatched run emits ONLY that run as literal text and scanning
+      them (including line endings) are removed.
+    - INSIDE a code span, backslash escapes DO NOT operate (example 310:
+      contents are literal, including backslashes), so every backtick run
+      inside closes the span when its length matches the opener.
+    - An unmatched run emits ONLY that run as literal text and scanning
       continues after it — later runs remain eligible to form spans
-      (GFM example 359: `` `foo``bar`` `` keeps the first backtick + foo
-      and strips the ``bar`` span);
-    - runs of unequal length never pair with each other;
-    - a backslash-escaped backtick (`` \` ``) is a LITERAL backtick, not a
-      delimiter: the escape is dropped and the backtick stays in the
-      output as ordinary text (GFM example 361), so real mojibake between
-      escaped backticks keeps counting.
+      (example 359: `` `foo``bar`` `` keeps the first backtick + foo and
+      strips the ``bar`` span); runs of unequal length never pair with
+      each other.
 
-    Construction (linear in field size plus run count): one scan
-    tokenizes literal segments, escaped backticks, and backtick runs (a
-    backslash that escapes a backtick is consumed with it; a trailing
-    backslash outside an escape stays literal), a reverse pass
-    precomputes each run's next equal-length run index, one forward pass
-    emits output. O(n + runs) time, O(n) output + O(runs) auxiliary
-    memory.
+    Construction: one linear pass with an explicit state (outside /
+    inside-span-with-delimiter-length). Outside, backslash runs are
+    resolved by parity before a backtick run is read as a delimiter;
+    inside, the next equal-length run closes. O(n) time, O(n) output;
+    no auxiliary structure beyond the output buffer.
     """
-    if "`" not in text:
-        return text
-    runs: list[tuple[int, int, int]] = []
-    # Pre-pass: find backtick runs, skipping backslash-escaped backticks. A
-    # backslash escapes exactly the backtick that follows it (GFM example
-    # 361: the escape is dropped, the backtick is literal); any other
-    # backslash is ordinary text.
+    out: list[str] = []
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
-        if ch == "\\" and i + 1 < n and text[i + 1] == "`":
-            i += 2
+        if ch != "`":
+            if ch == "\\":
+                # Resolve the backslash run by parity (outside a span).
+                j = i
+                while j < n and text[j] == "\\":
+                    j += 1
+                slashes = j - i
+                if j < n and text[j] == "`":
+                    # pairs of backslashes are literal; an odd one escapes
+                    # the following backtick (which then can't delimit).
+                    pairs = slashes // 2
+                    out.append("\\" * pairs)
+                    if slashes % 2 == 1:
+                        out.append("`")
+                        j += 1
+                    # fall through: the backtick run starting at j (if any)
+                    # is a real delimiter.
+                else:
+                    out.append("\\" * slashes)
+                i = j
+                continue
+            out.append(ch)
+            i += 1
             continue
-        if ch == "`":
-            j = i
-            while j < n and text[j] == "`":
-                j += 1
-            runs.append((i, j, j - i))
+        # A backtick run: candidate opener.
+        j = i
+        while j < n and text[j] == "`":
+            j += 1
+        length = j - i
+        # Find the closing run of the same length scanning from j (inside
+        # the span, escapes do not operate; a shorter/longer run is content
+        # and keeps scanning).
+        k = j
+        close = -1
+        while k < n:
+            if text[k] == "`":
+                m = k
+                while m < n and text[m] == "`":
+                    m += 1
+                if m - k == length:
+                    close = k
+                    break
+                k = m
+                continue
+            k += 1
+        if close == -1:
+            # Unmatched opener: literal, keep scanning after it.
+            out.append(text[i:j])
             i = j
             continue
-        i += 1
-    if not runs:
-        # Only literal text and escaped backticks: the census sees the
-        # rendered text, so the escape backslashes are dropped.
-        return text.replace("\\`", "`")
-    count = len(runs)
-    # next_equal[i]: index of the first run after i with the same length,
-    # or -1. One reverse pass.
-    next_equal = [-1] * count
-    nearest: dict[int, int] = {}
-    for i in range(count - 1, -1, -1):
-        next_equal[i] = nearest.get(runs[i][2], -1)
-        nearest[runs[i][2]] = i
-    out: list[str] = []
-    pos = 0
-    i = 0
-    while i < count:
-        start, end, _ = runs[i]
-        if start > pos:
-            out.append(text[pos:start])
-        j = next_equal[i]
-        if j == -1:
-            # Unmatched run: literal, then keep scanning the tail.
-            out.append(text[start:end])
-            pos = end
-            i += 1
-        else:
-            # Matched span: drop delimiters and contents.
-            pos = runs[j][1]
-            i = j + 1
-    if pos < len(text):
-        out.append(text[pos:])
-    # Un-escape: escaped backticks were skipped by the run matcher and kept
-    # as literal text in the emitted segments; drop the escape backslashes
-    # so the census sees the rendered text.
-    return "".join(out).replace("\\`", "`")
+        # Matched span: drop delimiters and contents entirely.
+        i = close + length
+    return "".join(out)
 
 
 def _field_text(value: object) -> str:
