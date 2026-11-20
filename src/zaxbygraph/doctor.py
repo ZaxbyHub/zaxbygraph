@@ -163,10 +163,20 @@ def _strip_inline_code(text: str) -> str:
     out: list[str] = []
     pos = 0
     idx = 0
+    dropped = False  # a span (or span-equivalent) was removed since pos
     while idx < count:
         start, end, length = runs[idx]
         if start > pos:
+            if dropped:
+                # Region boundary: the removed span must not let the text
+                # before it and after it become adjacent, or the census
+                # could synthesize a signature that never existed outside
+                # the span (review round 5: "â" + removed span + "€"
+                # would join into "â€"). NUL cannot appear in a UTF-8
+                # signature and cannot bridge a Python `in` match.
+                out.append("\x00")
             out.append(text[pos:start])
+        dropped = False
         odd = slashes_before.get(start, 0) % 2 == 1
         # Candidate length after possibly escaping the first backtick.
         eff_start = start + 1 if odd else start
@@ -192,13 +202,18 @@ def _strip_inline_code(text: str) -> str:
             idx += 1
         else:
             # Paired: drop effective opener..closer inclusive. The
-            # escaped first backtick renders as a bare backtick.
+            # escaped first backtick renders as a bare backtick before
+            # the removed region (it is real output on the left side).
             if odd:
                 out.append("`")
+            dropped = True
             pos = runs[j][1]
             idx = j + 1
     if pos < n:
+        if dropped:
+            out.append("\x00")
         out.append(text[pos:])
+        dropped = False
     return _render_escapes("".join(out))
 
 

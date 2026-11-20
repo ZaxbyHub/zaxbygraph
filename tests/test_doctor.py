@@ -572,6 +572,57 @@ class GarbledQuotedPatternTests(unittest.TestCase):
             self.assertEqual(report["items"], 1)
             self.assertEqual(report["garbled"], 1)
 
+    def test_signature_cannot_synthesize_across_removed_span(self) -> None:
+        # Review round 5: removing a span must never let the text BEFORE
+        # it and AFTER it become adjacent, or the census could synthesize
+        # a signature that never existed outside the span. Here "â" sits
+        # DIRECTLY before a matched span and "€" DIRECTLY after it (the
+        # mojibake half of the â€ signature), while the quoted `Ã` made
+        # the row a prefilter candidate; with the pieces joined WITHOUT a
+        # boundary the span removal would manufacture "â€" out of
+        # never-adjacent characters, so this test discriminates exactly
+        # that implementation: the NUL boundary keeps "â€" out of every
+        # contiguous region and the row counts 0.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "â`quoted Ã example`€ tail", None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_signature_outside_removed_span_still_counts(self) -> None:
+        # The discriminating companion: the same shape with a REAL â€
+        # outside the span counts 1 — proving the NUL boundary does not
+        # over-suppress and that the quoted-Ã row in the twin test is 0
+        # because of the boundary, not because BLOB/quoted inputs are
+        # skipped.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "â€ `quoted Ã example` tail", None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_escaped_first_backtick_then_delimiter_run(self) -> None:
+        # Review round 4's exact counterexample through the production
+        # census: backslash + TWO backticks + Ã + one backtick. The
+        # backslash escapes only the FIRST backtick (a bare literal); the
+        # remainder opens a one-backtick span that the final backtick
+        # closes, so the Ã is INSIDE a matched span and must NOT count.
+        # The prior whole-run-escape implementation left the Ã outside
+        # and counted the row — this regression discriminates it.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "\\``Ã` tail", None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_escaped_first_backtick_then_unmatched_run_counts(self) -> None:
+        # The discriminating companion: the same escaped-first-backtick
+        # shape with NO closer — the remainder opens nothing, the Ã is
+        # outside any span, and the row MUST count (a whole-run-escape
+        # implementation also answers 0 here, so the twin pair pins the
+        # split behavior both ways).
+        report = self._inspect_raw_store(
+            [(1, "clean title", "\\``Ã tail", None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
     def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
         # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
         # prefilter (executed probe at plan time) and must keep counting
@@ -628,7 +679,7 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         self.assertEqual(_field_text(5), "5")
 
     def test_matched_single_span(self) -> None:
-        self.assertEqual(_strip_inline_code("a `Ã` b"), "a  b")
+        self.assertEqual(_strip_inline_code("a `Ã` b"), "a \x00 b")
 
     def test_unmatched_run_and_tail_kept(self) -> None:
         self.assertEqual(_strip_inline_code("a ` bÃc"), "a ` bÃc")
@@ -640,10 +691,10 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         self.assertEqual(_strip_inline_code("`Ã``tail"), "`Ã``tail")
 
     def test_span_crossing_newline(self) -> None:
-        self.assertEqual(_strip_inline_code("`a\nÃ`tail"), "tail")
+        self.assertEqual(_strip_inline_code("`a\nÃ`tail"), "\x00tail")
 
     def test_unmatched_then_later_match(self) -> None:
-        self.assertEqual(_strip_inline_code("`x ``yÃ``z"), "`x z")
+        self.assertEqual(_strip_inline_code("`x ``yÃ``z"), "`x \x00z")
 
     def test_no_backticks_passthrough(self) -> None:
         self.assertEqual(_strip_inline_code("rÃ©sumÃ©"), "rÃ©sumÃ©")
@@ -666,9 +717,9 @@ class StripInlineCodeUnitTests(unittest.TestCase):
     def test_backslash_inside_span_is_literal_so_span_closes(self) -> None:
         # GFM example 310 class: escapes do not operate inside a code
         # span, so the first equal-length run closes it (review round 2):
-        # the span `a\` drops entirely and the trailing b + unmatched
-        # backtick stay literal.
-        self.assertEqual(_strip_inline_code("`a\\`b`"), "b`")
+        # the span `a\` drops entirely (leaving a NUL region boundary,
+        # round 5) and the trailing b + unmatched backtick stay literal.
+        self.assertEqual(_strip_inline_code("`a\\`b`"), "\x00b`")
 
     def test_backslash_parity_before_delimiter(self) -> None:
         # Two backslashes render as ONE literal slash (they escape each
