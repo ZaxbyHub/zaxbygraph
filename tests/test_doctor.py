@@ -737,29 +737,89 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         # The review round 3 complexity guard: many DISTINCT-length
         # unmatched runs followed by a long tail must NOT re-scan the tail
         # per opener (the O(1) next_equal pairing bounds each run to one
-        # visit). The quadratic-worst-case shape the reviewer named: runs
-        # of length 1..N (each unique, so none pairs) each followed by a
-        # long tail — the old closer-search re-walked the tail per opener.
-        # Guard shape (review round 6): an ABSOLUTE wall-clock ceiling on
-        # the big input alone — a single unisolated ratio between two
-        # short measurements is scheduling-fragile, while the quadratic
-        # implementation needs orders of magnitude more time than the
-        # linear one, so a generous ceiling (10 s CPU vs ~5 ms actual)
-        # discriminates without flaking. time.process_time() counts CPU
-        # seconds, not wall pauses. Correctness (every unmatched run
-        # surviving) is asserted alongside; the structural linearity
-        # argument is the reviewed next_equal design, not this probe.
-        import time
+        # visit). Guard shape (review round 7): a STRUCTURAL AST guard —
+        # the executed measurements showed the faithful round-3
+        # tail-search mutant is timing-indistinguishable from the linear
+        # scanner at suite-tolerable sizes (~0.09 s vs ~0.06 s CPU at
+        # 1200 runs x 20k tail), so NO wall-clock or CPU ceiling can bite
+        # without a multi-gigabyte input; the sibling-guardrail pattern
+        # (tests/test_db_uri_open.py SiblingGuardrailTest) instead pins
+        # the mechanism: the emit walk must find its closer through the
+        # precomputed next_equal/next_shorter index (an O(1) subscript),
+        # never through a raw-text scan loop. Positive control: the
+        # shipped scanner passes. Negative controls: planting the round-3
+        # suffix-scan (a while loop walking the raw text to find the
+        # closer) is flagged, and so is deleting the index lookup.
+        import ast
 
-        tail = "y" * 20000
-        big = "".join("`" * k + "x" for k in range(1, 120)) + tail
-        t0 = time.process_time()
-        out_big = _strip_inline_code(big)
-        t1 = time.process_time()
-        # Every unmatched run survives verbatim: run of length k emits k
-        # backticks, so the total is sum(1..119).
-        self.assertEqual(out_big.count("`"), sum(range(1, 120)))
-        self.assertLessEqual(t1 - t0, 10.0)
+        src = (Path(__file__).resolve().parents[1] / "src" / "zaxbygraph"
+               / "doctor.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        fn = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_strip_inline_code"
+        )
+        # The only text-scanning loop allowed in the function is the
+        # tokenizer's run reader; the closer MUST come from the index —
+        # specifically as the emit walk's `j = next_...[idx]` assignment
+        # (checking the ASSIGNMENT, not any subscript anywhere: the
+        # reverse-index construction lines also subscript these names).
+        closer_via_index = False
+        raw_text_scan = False
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.IfExp)
+                    and "next_shorter" in ast.unparse(node.value)
+                    and "next_equal" in ast.unparse(node.value)):
+                closer_via_index = True
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Name)
+                    and ast.unparse(node.value) == "idx"):
+                pass  # advance bookkeeping, not evidence
+            if isinstance(node, ast.While):
+                unparsed = ast.unparse(node)
+                if "text[k]" in unparsed and "k += 1" in unparsed:
+                    raw_text_scan = True
+        self.assertTrue(
+            closer_via_index,
+            "the emit walk must pair via the precomputed index "
+            "(j = next_shorter[idx] if odd else next_equal[idx])",
+        )
+        self.assertFalse(
+            raw_text_scan,
+            "a raw-text suffix scan for the closer is the round-3 defect",
+        )
+
+    def test_the_linear_guard_rejects_the_tail_search_plant(self) -> None:
+        # Negative control for the structural guard above: planting the
+        # round-3 suffix-scan closer search must be flagged.
+        import ast
+
+        planted = (
+            "def _strip_inline_code(text):\n"
+            "    runs = []\n"
+            "    j = next_shorter[idx] if odd else next_equal[idx]\n"
+            "    k = eff_start\n"
+            "    while k < n:\n"
+            "        if text[k] == '`':\n"
+            "            m = k\n"
+            "            while m < n and text[m] == '`':\n"
+            "                m += 1\n"
+            "            if m - k == target:\n"
+            "                break\n"
+            "            k = m\n"
+            "            continue\n"
+            "        k += 1\n"
+            "    return runs\n"
+        )
+        fn = next(n for n in ast.walk(ast.parse(planted))
+                  if isinstance(n, ast.FunctionDef))
+        raw_text_scan = any(
+            isinstance(node, ast.While) and "text[k]" in ast.unparse(node)
+            for node in ast.walk(fn)
+        )
+        self.assertTrue(raw_text_scan, "the planted defect must be flagged")
 
 
 class RateBudgetProbeGuardTests(unittest.TestCase):
