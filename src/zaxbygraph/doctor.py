@@ -90,16 +90,46 @@ def _strip_inline_code(text: str) -> str:
       continues after it — later runs remain eligible to form spans
       (GFM example 359: `` `foo``bar`` `` keeps the first backtick + foo
       and strips the ``bar`` span);
-    - runs of unequal length never pair with each other.
+    - runs of unequal length never pair with each other;
+    - a backslash-escaped backtick (`` \` ``) is a LITERAL backtick, not a
+      delimiter: the escape is dropped and the backtick stays in the
+      output as ordinary text (GFM example 361), so real mojibake between
+      escaped backticks keeps counting.
 
-    Construction (linear in field size plus run count): one
-    ``re.finditer(r"`+")`` pass tokenizes, a reverse pass precomputes each
-    run's next equal-length run index, one forward pass emits output.
-    O(n + runs) time, O(n) output + O(runs) auxiliary memory.
+    Construction (linear in field size plus run count): one scan
+    tokenizes literal segments, escaped backticks, and backtick runs (a
+    backslash that escapes a backtick is consumed with it; a trailing
+    backslash outside an escape stays literal), a reverse pass
+    precomputes each run's next equal-length run index, one forward pass
+    emits output. O(n + runs) time, O(n) output + O(runs) auxiliary
+    memory.
     """
     if "`" not in text:
         return text
-    runs = [(m.start(), m.end(), m.end() - m.start()) for m in re.finditer(r"`+", text)]
+    runs: list[tuple[int, int, int]] = []
+    # Pre-pass: find backtick runs, skipping backslash-escaped backticks. A
+    # backslash escapes exactly the backtick that follows it (GFM example
+    # 361: the escape is dropped, the backtick is literal); any other
+    # backslash is ordinary text.
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n and text[i + 1] == "`":
+            i += 2
+            continue
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            runs.append((i, j, j - i))
+            i = j
+            continue
+        i += 1
+    if not runs:
+        # Only literal text and escaped backticks: the census sees the
+        # rendered text, so the escape backslashes are dropped.
+        return text.replace("\\`", "`")
     count = len(runs)
     # next_equal[i]: index of the first run after i with the same length,
     # or -1. One reverse pass.
@@ -127,7 +157,10 @@ def _strip_inline_code(text: str) -> str:
             i = j + 1
     if pos < len(text):
         out.append(text[pos:])
-    return "".join(out)
+    # Un-escape: escaped backticks were skipped by the run matcher and kept
+    # as literal text in the emitted segments; drop the escape backslashes
+    # so the census sees the rendered text.
+    return "".join(out).replace("\\`", "`")
 
 
 def _field_text(value: object) -> str:

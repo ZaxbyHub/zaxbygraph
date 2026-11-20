@@ -481,6 +481,57 @@ class GarbledQuotedPatternTests(unittest.TestCase):
         )
         self.assertEqual(report["garbled"], 1)
 
+    def _inspect_raw_store(self, rows: list[tuple[int, str, object, object]]) -> dict:
+        """Seed a store with (number, title, body, labels_text) values written
+        RAW (any SQLite storage class) and run the real doctor.inspect."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = connect(db)
+            init_schema(conn)
+            src = FakeGitHubSource()
+            for number, title, body, _labels in rows:
+                src.add_issue(issue(number, title=title, body="seed"))
+            sync_repo(conn, src, SLUG)
+            for number, _title, body, labels in rows:
+                conn.execute(
+                    "UPDATE items SET body = ?, labels_text = ? WHERE number = ?"
+                    " AND repo = ?",
+                    (body, labels, number, SLUG),
+                )
+            conn.commit()
+            conn.close()
+            report = inspect(db, SLUG)
+            self.assertIsNotNone(report)
+            return report
+
+    def test_null_fields_in_candidate_row_no_traceback(self) -> None:
+        # A row can become a candidate via one field while another is NULL
+        # (body is nullable; labels_text is nullable). The strip path must
+        # treat NULL as empty, never raise.
+        report = self._inspect_raw_store(
+            [(1, MOJIBAKE_TITLE, None, None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
+        # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
+        # prefilter (executed probe at plan time) and must keep counting
+        # after the strip pass (decode errors="replace").
+        blob = "rÃ©sumÃ© damaged".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_blob_quoted_pattern_is_not_counted(self) -> None:
+        # Same storage class, quoted shape: a BLOB whose bytes quote the
+        # pattern inside backticks is detector vocabulary, not damage.
+        blob = "rows matching `Ã` in a blob".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
 
 class StripInlineCodeUnitTests(unittest.TestCase):
     """Unit pins for _strip_inline_code's GFM code-span semantics."""
@@ -505,6 +556,24 @@ class StripInlineCodeUnitTests(unittest.TestCase):
 
     def test_no_backticks_passthrough(self) -> None:
         self.assertEqual(_strip_inline_code("rÃ©sumÃ©"), "rÃ©sumÃ©")
+
+    def test_escaped_backticks_are_literal_not_delimiters(self) -> None:
+        # GFM example 361: a backslash-escaped backtick is ordinary text.
+        # The mojibake between escaped backticks must keep counting (the
+        # round-1 reviewer finding; a delimiter-pairing scanner would
+        # suppress it as a fake span). Both escapes render as literal
+        # backticks.
+        self.assertEqual(
+            _strip_inline_code("\\`rÃ©sumÃ©\\`"), "`rÃ©sumÃ©`"
+        )
+
+    def test_escaped_backtick_then_matched_span(self) -> None:
+        # The escape is literal; the later single-run pair still forms a
+        # span and is dropped.
+        self.assertEqual(_strip_inline_code("\\`a`b`"), "`a")
+
+    def test_trailing_backslash_is_literal(self) -> None:
+        self.assertEqual(_strip_inline_code("end\\"), "end\\")
 
 
 class RateBudgetProbeGuardTests(unittest.TestCase):
