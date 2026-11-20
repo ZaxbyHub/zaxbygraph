@@ -31,6 +31,7 @@ Hermetic: temp dirs only, env restored, cwd restored, no network.
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -733,67 +734,67 @@ class StripInlineCodeUnitTests(unittest.TestCase):
     def test_trailing_backslash_is_literal(self) -> None:
         self.assertEqual(_strip_inline_code("end\\"), "end\\")
 
-    def test_many_unmatched_runs_stay_linear(self) -> None:
-        # The review round 3 complexity guard: many DISTINCT-length
-        # unmatched runs followed by a long tail must NOT re-scan the tail
-        # per opener (the O(1) next_equal pairing bounds each run to one
-        # visit). Guard shape (review round 7): a STRUCTURAL AST guard —
-        # the executed measurements showed the faithful round-3
-        # tail-search mutant is timing-indistinguishable from the linear
-        # scanner at suite-tolerable sizes (~0.09 s vs ~0.06 s CPU at
-        # 1200 runs x 20k tail), so NO wall-clock or CPU ceiling can bite
-        # without a multi-gigabyte input; the sibling-guardrail pattern
-        # (tests/test_db_uri_open.py SiblingGuardrailTest) instead pins
-        # the mechanism: the emit walk must find its closer through the
-        # precomputed next_equal/next_shorter index (an O(1) subscript),
-        # never through a raw-text scan loop. Positive control: the
-        # shipped scanner passes. Negative controls: planting the round-3
-        # suffix-scan (a while loop walking the raw text to find the
-        # closer) is flagged, and so is deleting the index lookup.
-        import ast
-
-        src = (Path(__file__).resolve().parents[1] / "src" / "zaxbygraph"
-               / "doctor.py").read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        fn = next(
-            node for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "_strip_inline_code"
-        )
-        # The only text-scanning loop allowed in the function is the
-        # tokenizer's run reader; the closer MUST come from the index —
-        # specifically as the emit walk's `j = next_...[idx]` assignment
-        # (checking the ASSIGNMENT, not any subscript anywhere: the
-        # reverse-index construction lines also subscript these names).
+    def _linear_guard_findings(self, fn: ast.FunctionDef) -> list[str]:
+        """The SHARED structural guard predicate (review round 8: the
+        negative control must call the same code as the production check,
+        or it cannot prove the guard rejects anything). Returns the list
+        of violations — empty means the function pairs via the
+        precomputed index and never raw-text-scans for a closer."""
+        findings: list[str] = []
         closer_via_index = False
-        raw_text_scan = False
         for node in ast.walk(fn):
             if (isinstance(node, ast.Assign)
                     and isinstance(node.value, ast.IfExp)
                     and "next_shorter" in ast.unparse(node.value)
                     and "next_equal" in ast.unparse(node.value)):
                 closer_via_index = True
-            if (isinstance(node, ast.Assign)
-                    and isinstance(node.value, ast.Name)
-                    and ast.unparse(node.value) == "idx"):
-                pass  # advance bookkeeping, not evidence
             if isinstance(node, ast.While):
                 unparsed = ast.unparse(node)
                 if "text[k]" in unparsed and "k += 1" in unparsed:
-                    raw_text_scan = True
-        self.assertTrue(
-            closer_via_index,
-            "the emit walk must pair via the precomputed index "
-            "(j = next_shorter[idx] if odd else next_equal[idx])",
+                    findings.append(
+                        "a raw-text suffix scan for the closer "
+                        "(the round-3 defect)"
+                    )
+        if not closer_via_index:
+            findings.append(
+                "the emit walk must pair via the precomputed index "
+                "(j = next_shorter[idx] if odd else next_equal[idx])"
+            )
+        return findings
+
+    def test_many_unmatched_runs_stay_linear(self) -> None:
+        # The review round 3 complexity guard: many DISTINCT-length
+        # unmatched runs followed by a long tail must NOT re-scan the tail
+        # per opener (the O(1) next_equal pairing bounds each run to one
+        # visit). Guard shape (review rounds 7-8): a STRUCTURAL AST guard
+        # with a SHARED predicate — the executed measurements showed the
+        # faithful round-3 tail-search mutant is timing-indistinguishable
+        # from the linear scanner at suite-tolerable sizes (~0.09 s vs
+        # ~0.06 s CPU at 1200 runs x 20k tail), so NO wall-clock or CPU
+        # ceiling can bite without a multi-gigabyte input; the
+        # sibling-guardrail pattern (tests/test_db_uri_open.py
+        # SiblingGuardrailTest) instead pins the mechanism: the emit walk
+        # must find its closer through the precomputed
+        # next_equal/next_shorter index (an O(1) subscript), never through
+        # a raw-text scan loop. Positive control: the shipped scanner
+        # passes. Negative control: the planted round-3 suffix scan is
+        # flagged BY THE SAME PREDICATE (shared _linear_guard_findings).
+        import ast
+
+        src = (Path(__file__).resolve().parents[1] / "src" / "zaxbygraph"
+               / "doctor.py").read_text(encoding="utf-8")
+        fn = next(
+            node for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_strip_inline_code"
         )
-        self.assertFalse(
-            raw_text_scan,
-            "a raw-text suffix scan for the closer is the round-3 defect",
-        )
+        self.assertEqual(self._linear_guard_findings(fn), [])
 
     def test_the_linear_guard_rejects_the_tail_search_plant(self) -> None:
         # Negative control for the structural guard above: planting the
-        # round-3 suffix-scan closer search must be flagged.
+        # round-3 suffix-scan closer search must be flagged BY THE SAME
+        # SHARED PREDICATE the production check runs — if the detector
+        # were removed or broken, this test fails too.
         import ast
 
         planted = (
@@ -815,11 +816,11 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         )
         fn = next(n for n in ast.walk(ast.parse(planted))
                   if isinstance(n, ast.FunctionDef))
-        raw_text_scan = any(
-            isinstance(node, ast.While) and "text[k]" in ast.unparse(node)
-            for node in ast.walk(fn)
+        findings = self._linear_guard_findings(fn)
+        self.assertTrue(
+            any("suffix scan" in f for f in findings),
+            f"the planted defect must be flagged: {findings}",
         )
-        self.assertTrue(raw_text_scan, "the planted defect must be flagged")
 
 
 class RateBudgetProbeGuardTests(unittest.TestCase):
