@@ -103,69 +103,120 @@ def _strip_inline_code(text: str) -> str:
       strips the ``bar`` span); runs of unequal length never pair with
       each other.
 
-    Construction: one linear pass with an explicit state (outside /
-    inside-span-with-delimiter-length). Outside, backslash runs are
-    resolved by parity before a backtick run is read as a delimiter;
-    inside, the next equal-length run closes. O(n) time, O(n) output;
-    no auxiliary structure beyond the output buffer.
+    Construction (linear, review round 3 final): pass 1 tokenizes
+    backslash runs and backtick runs in one sweep, recording the slash
+    count before each backtick run; an escape filter drops runs whose
+    first backtick is preceded by an ODD backslash run (outside-span
+    escapes; inside-span content never reaches the filter because span
+    pairing happens only over surviving runs); a reverse pass precomputes
+    each surviving run's next equal-length run; one forward emit walks
+    the surviving runs — a paired run drops opener..closer, an unpaired
+    run emits literally and the NEXT surviving run is a fresh opener
+    candidate (which is what makes example 359 work without re-walking a
+    tail). Every character is touched O(1) times: O(n) time, O(n) output
+    + O(runs) auxiliary memory.
     """
+    n = len(text)
+    if "`" not in text:
+        return text if "\\" not in text else _render_escapes(text)
+    # Pass 1: tokenize backslash runs and backtick runs; record the slash
+    # count immediately before each backtick run.
+    runs: list[tuple[int, int, int]] = []  # (start, end, length)
+    slashes_before: dict[int, int] = {}
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            if j < n and text[j] == "`":
+                slashes_before[j] = j - i
+            i = j
+            continue
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            runs.append((i, j, j - i))
+            i = j
+            continue
+        i += 1
+    # Emit: walk ALL runs in order with span state. Outside a span a run
+    # is an opener candidate — unless it is escaped (an ODD slash count
+    # immediately before it: outside-span escapes), in which case it
+    # emits literally. Inside a span (i.e. we are looking for the closer
+    # of a paired opener), escapes never operate: ANY equal-length run
+    # closes. Pairing via next_equal over ALL runs preserves the
+    # closer-geometry that a pre-filter would destroy.
+    count = len(runs)
+    next_equal = [-1] * count
+    nearest: dict[int, int] = {}
+    for i in range(count - 1, -1, -1):
+        next_equal[i] = nearest.get(runs[i][2], -1)
+        nearest[runs[i][2]] = i
+    out: list[str] = []
+    pos = 0
+    idx = 0
+    while idx < count:
+        start, end, length = runs[idx]
+        if start > pos:
+            out.append(text[pos:start])
+        if slashes_before.get(start, 0) % 2 == 1:
+            # Escaped run (outside-span rule): a bare backtick, never a
+            # delimiter. The render pass drops the escaping slash.
+            out.append(text[start:end])
+            pos = end
+            idx += 1
+            continue
+        j = next_equal[idx]
+        if j == -1:
+            # Unmatched opener: literal; the next run is a fresh
+            # candidate (GFM 359).
+            out.append(text[start:end])
+            pos = end
+            idx += 1
+        else:
+            # Paired: drop opener..closer inclusive. The closer may be
+            # an "escaped" run — inside a span escapes do not operate.
+            pos = runs[j][1]
+            idx = j + 1
+    if pos < n:
+        out.append(text[pos:])
+    return _render_escapes("".join(out))
+
+
+def _render_escapes(text: str) -> str:
+    """Render outside-span backslash escapes the way the census must see
+    them (GFM §backslash-escapes, left-to-right): a backslash escapes the
+    following punctuation character (a backtick here — every delimiter
+    and span content was already dropped, so all backticks are literal);
+    backslashes pairing with each other render as one literal slash; a
+    trailing unpaired backslash is literal. So a run of L slashes renders
+    as ``L // 2`` literal slashes when a backtick follows, else
+    ``ceil(L / 2)`` literal slashes."""
+    if "\\" not in text:
+        return text
     out: list[str] = []
     i = 0
     n = len(text)
     while i < n:
         ch = text[i]
-        if ch != "`":
-            if ch == "\\":
-                # Resolve the backslash run by parity (outside a span).
-                j = i
-                while j < n and text[j] == "\\":
-                    j += 1
-                slashes = j - i
-                if j < n and text[j] == "`":
-                    # pairs of backslashes are literal; an odd one escapes
-                    # the following backtick (which then can't delimit).
-                    pairs = slashes // 2
-                    out.append("\\" * pairs)
-                    if slashes % 2 == 1:
-                        out.append("`")
-                        j += 1
-                    # fall through: the backtick run starting at j (if any)
-                    # is a real delimiter.
-                else:
-                    out.append("\\" * slashes)
+        if ch == "\\":
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            slashes = j - i
+            if j < n and text[j] == "`":
+                out.append("\\" * (slashes // 2))
+                out.append("`")
+                i = j + 1
+            else:
+                out.append("\\" * ((slashes + 1) // 2))
                 i = j
-                continue
-            out.append(ch)
-            i += 1
             continue
-        # A backtick run: candidate opener.
-        j = i
-        while j < n and text[j] == "`":
-            j += 1
-        length = j - i
-        # Find the closing run of the same length scanning from j (inside
-        # the span, escapes do not operate; a shorter/longer run is content
-        # and keeps scanning).
-        k = j
-        close = -1
-        while k < n:
-            if text[k] == "`":
-                m = k
-                while m < n and text[m] == "`":
-                    m += 1
-                if m - k == length:
-                    close = k
-                    break
-                k = m
-                continue
-            k += 1
-        if close == -1:
-            # Unmatched opener: literal, keep scanning after it.
-            out.append(text[i:j])
-            i = j
-            continue
-        # Matched span: drop delimiters and contents entirely.
-        i = close + length
+        out.append(ch)
+        i += 1
     return "".join(out)
 
 

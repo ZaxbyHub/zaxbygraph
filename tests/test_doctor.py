@@ -504,28 +504,19 @@ class GarbledQuotedPatternTests(unittest.TestCase):
             self.assertIsNotNone(report)
             return report
 
-    def test_null_fields_in_candidate_row_no_traceback(self) -> None:
+    def test_null_body_and_labels_in_candidate_row_no_traceback(self) -> None:
         # A row can become a candidate via one field while another is NULL
-        # (body is nullable; labels_text is nullable). The strip path must
-        # treat NULL as empty, never raise. The NULL fields are examined
-        # BEFORE the matching field: body/labels come first in the census's
-        # (title, body, labels_text) probe order? No — the SELECT orders
-        # title, body, labels_text, so a NULL CANNOT precede the matching
-        # title. Instead this test pins the NULL conversion directly: the
-        # row is a candidate via labels_text (the LAST field), so the
-        # census examines NULL title and NULL body through _field_text
-        # before reaching the matching labels.
+        # (body and labels_text are nullable; the strip path must treat
+        # NULL as empty, never raise). title is NOT NULL and ingest
+        # coerces a falsey title to "" (store.py), so a NULL title cannot
+        # exist in any store this census reads — the conversion contract
+        # for None is pinned at the unit level
+        # (StripInlineCodeUnitTests.test_field_text_storage_classes).
+        # The NULL body is examined BEFORE the matching labels_text (field
+        # order title, body, labels_text), so this row exercises the NULL
+        # conversion in the production count path.
         report = self._inspect_raw_store(
-            [(1, None, None, MOJIBAKE_TITLE)]
-        )
-        self.assertEqual(report["garbled"], 1)
-
-    def test_null_title_candidate_counts_via_body(self) -> None:
-        # NULL title examined first (field order title, body, labels_text):
-        # the candidate matches via body, and the NULL title conversion
-        # must not raise or mis-count.
-        report = self._inspect_raw_store(
-            [(1, None, MOJIBAKE_TITLE, None)]
+            [(1, "clean title", None, MOJIBAKE_TITLE)]
         )
         self.assertEqual(report["garbled"], 1)
 
@@ -638,6 +629,33 @@ class StripInlineCodeUnitTests(unittest.TestCase):
 
     def test_trailing_backslash_is_literal(self) -> None:
         self.assertEqual(_strip_inline_code("end\\"), "end\\")
+
+    def test_many_unmatched_runs_stay_linear(self) -> None:
+        # The review round 3 complexity guard: many DISTINCT-length
+        # unmatched runs followed by a long tail must NOT re-scan the tail
+        # per opener (the O(1) next_equal pairing bounds each run to one
+        # visit). The quadratic-worst-case shape the reviewer named: runs
+        # of length 1..N (each unique, so none pairs) each followed by a
+        # long tail — the old closer-search re-walked the tail per opener.
+        # Structural probe: time the doubled shape; the ratio must stay
+        # ~linear (<= 3x), and every unmatched run must survive verbatim.
+        import time
+
+        tail = "y" * 20000
+        small = "".join("`" * k + "x" for k in range(1, 60)) + tail
+        big = "".join("`" * k + "x" for k in range(1, 120)) + tail
+        t0 = time.perf_counter()
+        out_small = _strip_inline_code(small)
+        t1 = time.perf_counter()
+        out_big = _strip_inline_code(big)
+        t2 = time.perf_counter()
+        small_t = max(t1 - t0, 1e-6)
+        big_t = max(t2 - t1, 1e-6)
+        # Every unmatched run survives verbatim: run of length k emits k
+        # backticks, so the totals are sum(1..59) and sum(1..119).
+        self.assertEqual(out_small.count("`"), sum(range(1, 60)))
+        self.assertEqual(out_big.count("`"), sum(range(1, 120)))
+        self.assertLessEqual(big_t / small_t, 3.0)
 
 
 class RateBudgetProbeGuardTests(unittest.TestCase):
