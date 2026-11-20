@@ -103,18 +103,18 @@ def _strip_inline_code(text: str) -> str:
       strips the ``bar`` span); runs of unequal length never pair with
       each other.
 
-    Construction (linear, review round 3 final): pass 1 tokenizes
+    Construction (linear, review round 4 final): pass 1 tokenizes
     backslash runs and backtick runs in one sweep, recording the slash
-    count before each backtick run; an escape filter drops runs whose
-    first backtick is preceded by an ODD backslash run (outside-span
-    escapes; inside-span content never reaches the filter because span
-    pairing happens only over surviving runs); a reverse pass precomputes
-    each surviving run's next equal-length run; one forward emit walks
-    the surviving runs — a paired run drops opener..closer, an unpaired
-    run emits literally and the NEXT surviving run is a fresh opener
-    candidate (which is what makes example 359 work without re-walking a
-    tail). Every character is touched O(1) times: O(n) time, O(n) output
-    + O(runs) auxiliary memory.
+    count before each backtick run; a reverse pass precomputes every
+    run's next equal-length run; one forward emit walks ALL runs with
+    span state. An ODD slash count immediately before a run escapes only
+    that run's FIRST backtick (review round 4: a backslash escapes one
+    character, never a run) — the escaped backtick renders as a bare
+    backtick, and the run's REMAINDER (length - 1) is still a real
+    delimiter candidate; an even slash count leaves the whole run
+    eligible. Inside a pairing, escapes never operate: any equal-length
+    run closes. Every character is touched O(1) times: O(n) time, O(n)
+    output + O(runs) auxiliary memory.
     """
     n = len(text)
     if "`" not in text:
@@ -142,19 +142,24 @@ def _strip_inline_code(text: str) -> str:
             i = j
             continue
         i += 1
-    # Emit: walk ALL runs in order with span state. Outside a span a run
-    # is an opener candidate — unless it is escaped (an ODD slash count
-    # immediately before it: outside-span escapes), in which case it
-    # emits literally. Inside a span (i.e. we are looking for the closer
-    # of a paired opener), escapes never operate: ANY equal-length run
-    # closes. Pairing via next_equal over ALL runs preserves the
-    # closer-geometry that a pre-filter would destroy.
+    # next_equal[i]: index of the first later run of the same RAW length,
+    # -1 (one reverse pass, over ALL runs). For an odd-escaped opener the
+    # span's length is length-1, so a second reverse index maps each run
+    # to the first later run of one-fewer backticks.
     count = len(runs)
     next_equal = [-1] * count
+    next_shorter = [-1] * count
     nearest: dict[int, int] = {}
     for i in range(count - 1, -1, -1):
-        next_equal[i] = nearest.get(runs[i][2], -1)
-        nearest[runs[i][2]] = i
+        length = runs[i][2]
+        next_equal[i] = nearest.get(length, -1)
+        next_shorter[i] = nearest.get(length - 1, -1)
+        nearest[length] = i
+    # Emit: walk ALL runs in order. An odd slash count before a run
+    # escapes its FIRST backtick only: the run emits one bare backtick
+    # and its remainder (length - 1) stays a delimiter candidate. An
+    # even slash count leaves the whole run eligible. Inside a pairing,
+    # escapes never operate (any equal-length run closes).
     out: list[str] = []
     pos = 0
     idx = 0
@@ -162,23 +167,34 @@ def _strip_inline_code(text: str) -> str:
         start, end, length = runs[idx]
         if start > pos:
             out.append(text[pos:start])
-        if slashes_before.get(start, 0) % 2 == 1:
-            # Escaped run (outside-span rule): a bare backtick, never a
-            # delimiter. The render pass drops the escaping slash.
-            out.append(text[start:end])
+        odd = slashes_before.get(start, 0) % 2 == 1
+        # Candidate length after possibly escaping the first backtick.
+        eff_start = start + 1 if odd else start
+        eff_length = length - 1 if odd else length
+        if eff_length <= 0:
+            # The whole run was one escaped backtick: a bare backtick.
+            out.append("`")
             pos = end
             idx += 1
             continue
-        j = next_equal[idx]
+        # The remainder is a run of eff_length backticks starting at
+        # eff_start. Its closer is the next run of RAW length eff_length
+        # (inside a pairing escapes never operate, so the closer's raw
+        # length is what matters).
+        j = next_shorter[idx] if odd else next_equal[idx]
         if j == -1:
-            # Unmatched opener: literal; the next run is a fresh
-            # candidate (GFM 359).
-            out.append(text[start:end])
+            # Unmatched opener: emit the escaped backtick (if any) and
+            # the remainder literally; the next run is a fresh candidate.
+            if odd:
+                out.append("`")
+            out.append(text[eff_start:end])
             pos = end
             idx += 1
         else:
-            # Paired: drop opener..closer inclusive. The closer may be
-            # an "escaped" run — inside a span escapes do not operate.
+            # Paired: drop effective opener..closer inclusive. The
+            # escaped first backtick renders as a bare backtick.
+            if odd:
+                out.append("`")
             pos = runs[j][1]
             idx = j + 1
     if pos < n:

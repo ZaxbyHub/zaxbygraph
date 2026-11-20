@@ -520,6 +520,58 @@ class GarbledQuotedPatternTests(unittest.TestCase):
         )
         self.assertEqual(report["garbled"], 1)
 
+    def test_null_title_in_divergent_candidate_counts_via_body(self) -> None:
+        # doctor.inspect reads PARTIAL/FOREIGN candidates too — a store
+        # whose items.title is nullable can hold a genuine NULL title
+        # (the current schema's NOT NULL and ingest's "" coercion do not
+        # reach it). Hand-build such a candidate: only the columns the
+        # census and inspect need, title NULL, the signature carried by
+        # body (a LATER field in the census probe order), sync_state.repo
+        # present so inspect reads it. Assert the storage class before
+        # inspection and the count after.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE items (
+                    pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    github_id INTEGER NOT NULL,
+                    repo TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    title TEXT,
+                    body TEXT,
+                    labels_text TEXT
+                );
+                CREATE TABLE sync_state (
+                    repo TEXT PRIMARY KEY,
+                    issues_since TEXT,
+                    last_full_sync_at TEXT,
+                    last_error TEXT
+                );
+                INSERT INTO items (github_id, repo, number, kind, state,
+                                   title, body, labels_text)
+                VALUES (1, 'acme/widget', 7, 'issue', 'open',
+                        NULL, 'real rÃ©sumÃ© damage', NULL);
+                INSERT INTO sync_state (repo, issues_since,
+                                        last_full_sync_at, last_error)
+                VALUES ('acme/widget', '2026-11-20T00:00:00Z',
+                        '2026-11-20T00:00:00Z', NULL);
+                """
+            )
+            conn.commit()
+            storage = conn.execute(
+                "SELECT typeof(title) FROM items WHERE number = 7"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(storage, "null")
+            report = inspect(db, "acme/widget")
+            self.assertIsNotNone(report)
+            self.assertEqual(report["items"], 1)
+            self.assertEqual(report["garbled"], 1)
+
     def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
         # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
         # prefilter (executed probe at plan time) and must keep counting
