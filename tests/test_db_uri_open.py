@@ -758,6 +758,20 @@ class SiblingGuardrailTest(unittest.TestCase):
         # instead of _clamp_fetch_limit re-opens AC3/AC4.
         import ast
 
+        # The doctor garbled census streams candidates in fixed batches; its
+        # single literal-arg fetchmany is bounded by construction, so the
+        # positive control pins its line by scanning the source for the call.
+        doctor_src = (ROOT / "src" / "zaxbygraph" / "doctor.py").read_text(
+            encoding="utf-8"
+        )
+        match = None
+        for i, line in enumerate(doctor_src.splitlines(), 1):
+            if ".fetchmany(" in line:
+                match = i
+                break
+        self.assertIsNotNone(match, "doctor census fetchmany site missing")
+        _DOCTOR_FETCHMANY_LINE = match
+
         offenders = []
         scanned = []
         for path in self._sources():
@@ -790,9 +804,13 @@ class SiblingGuardrailTest(unittest.TestCase):
                                 clamped = True
                 if not clamped:
                     offenders.append("%s:%d" % (path.name, node.lineno))
-        # Positive control: the scan must actually have found both shipped
-        # over-fetch sites, or an empty offenders list proves nothing.
-        self.assertEqual(len(scanned), 2)
+        # Positive control: the scan must actually have found the shipped
+        # fetchmany sites, or an empty offenders list proves nothing. Three
+        # shipped sites: the two `fetchmany(limit + 1)` over-fetch sites
+        # (clamped) plus doctor's fixed-batch `fetchmany(200)` census stream
+        # (bounded by construction — a constant, not a caller limit).
+        self.assertEqual(len(scanned), 3)
+        self.assertIn("doctor.py:%d" % _DOCTOR_FETCHMANY_LINE, scanned)
         self.assertEqual(offenders, [])
 
     def test_the_fetch_guard_rejects_a_docstring_mention(self) -> None:

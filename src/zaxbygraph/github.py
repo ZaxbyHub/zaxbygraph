@@ -163,7 +163,12 @@ class GhApiSource:
             data = self._api("rate_limit", _enrich_rate=False)
         except GitHubError:
             return exc
-        core = data.get("resources", {}).get("core") if isinstance(data, dict) else None
+        resources = data.get("resources") if isinstance(data, dict) else None
+        # The probe answer must be trusted only shape by shape: `resources`
+        # itself is guarded like every other hop (a wrong-typed value used
+        # to escape the chained .get as AttributeError, replacing the
+        # original 429 with a traceback — PR #83 review F-M2a/FB-004).
+        core = resources.get("core") if isinstance(resources, dict) else None
         if not isinstance(core, dict):
             return exc
         remaining = core.get("remaining")

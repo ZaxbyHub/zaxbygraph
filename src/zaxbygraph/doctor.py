@@ -28,10 +28,15 @@ Pinned semantics:
              (v2 schema), full_sync_pending = 0.
   freshest = greatest sync_state.issues_since among complete candidates.
   garbled  = slug rows whose title/body/labels_text contain mojibake
+             OUTSIDE matched inline-code spans (GFM code spans are quoted
+             examples — detector vocabulary, not damage; unmatched
+             backtick runs are literal content and their text still
+             counts)
              signatures (e.g. "Ã" or "â€").
 """
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import stat
@@ -63,6 +68,107 @@ _MOJIBAKE_LIKE = (
     "IFNULL(labels_text, '') LIKE '%Ã%'",
     "IFNULL(labels_text, '') LIKE '%â€%'",
 )
+
+#: The byte sequences the garbled census looks for, as Python strings.
+#: Kept in lockstep with _MOJIBAKE_LIKE (same two signatures).
+_MOJIBAKE_BYTES = ("Ã", "â€")
+
+
+def _strip_inline_code(text: str) -> str:
+    """Remove GFM code spans (matched backtick runs) from ``text``.
+
+    GitHub-authored issues quote the garbled detector's own byte patterns
+    inside inline code (issues #1/#2 quote ``Ã`` / ``â€`` verbatim), and a
+    quoted example is detector vocabulary, not mojibake content — so the
+    garbled census must not count it (epic #8 gate).
+
+    Semantics (GFM §code-spans):
+    - a span opens at a backtick RUN of length N and closes at the next
+      run of the same length N; the delimiters and the contents between
+      them (including line endings) are removed;
+    - an unmatched run emits ONLY that run as literal text and scanning
+      continues after it — later runs remain eligible to form spans
+      (GFM example 359: `` `foo``bar`` `` keeps the first backtick + foo
+      and strips the ``bar`` span);
+    - runs of unequal length never pair with each other.
+
+    Construction (linear in field size plus run count): one
+    ``re.finditer(r"`+")`` pass tokenizes, a reverse pass precomputes each
+    run's next equal-length run index, one forward pass emits output.
+    O(n + runs) time, O(n) output + O(runs) auxiliary memory.
+    """
+    if "`" not in text:
+        return text
+    runs = [(m.start(), m.end(), m.end() - m.start()) for m in re.finditer(r"`+", text)]
+    count = len(runs)
+    # next_equal[i]: index of the first run after i with the same length,
+    # or -1. One reverse pass.
+    next_equal = [-1] * count
+    nearest: dict[int, int] = {}
+    for i in range(count - 1, -1, -1):
+        next_equal[i] = nearest.get(runs[i][2], -1)
+        nearest[runs[i][2]] = i
+    out: list[str] = []
+    pos = 0
+    i = 0
+    while i < count:
+        start, end, _ = runs[i]
+        if start > pos:
+            out.append(text[pos:start])
+        j = next_equal[i]
+        if j == -1:
+            # Unmatched run: literal, then keep scanning the tail.
+            out.append(text[start:end])
+            pos = end
+            i += 1
+        else:
+            # Matched span: drop delimiters and contents.
+            pos = runs[j][1]
+            i = j + 1
+    if pos < len(text):
+        out.append(text[pos:])
+    return "".join(out)
+
+
+def _field_text(value: object) -> str:
+    """Normalize one stored field for the garbled census (every SQLite
+    storage class deliberate; never raises)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _count_garbled(conn: sqlite3.Connection, repo_l: str) -> int:
+    """Count this repo's rows that are STILL garbled after removing
+    inline-code spans (quoted detector examples stop counting; real
+    mojibake keeps counting).
+
+    The LIKE prefilter selects candidate rows exactly as the raw census
+    did; the strip pass runs only on candidates. Rows stream in fixed
+    fetchmany batches — an exact count with constant memory, no cap (a
+    cap would silently undercount the report) and no fetchall().
+    """
+    total = 0
+    cur = conn.execute(
+        "SELECT title, body, labels_text FROM items WHERE lower(repo) = ? "
+        "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
+        (repo_l,),
+    )
+    while True:
+        batch = cur.fetchmany(200)
+        if not batch:
+            break
+        for title, body, labels in batch:
+            for value in (title, body, labels):
+                stripped = _strip_inline_code(_field_text(value))
+                if any(sig in stripped for sig in _MOJIBAKE_BYTES):
+                    total += 1
+                    break
+    return total
 
 
 class _UnreadableCandidate(Exception):
@@ -346,11 +452,7 @@ def inspect(path: Path, repo: str) -> dict | None:
                 items = conn.execute(
                     "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
                 ).fetchone()["c"]
-                garbled = conn.execute(
-                    "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ? "
-                    "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
-                    (repo_l,),
-                ).fetchone()["c"]
+                garbled = _count_garbled(conn, repo_l)
                 complete = False
                 if state is not None:
                     row = conn.execute(

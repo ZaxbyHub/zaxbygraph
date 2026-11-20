@@ -17,7 +17,9 @@ Pinned semantics:
     found under DIR (recursively), in addition to the repo-local candidates
     <repo-root>/.zaxbygraph/history.db and <repo-root>/.swarm/zaxbygraph/history.db.
   * garbled rows = rows whose text columns contain mojibake signatures
-    (e.g. 'Ã' or 'â€').
+    (e.g. 'Ã' or 'â€') outside matched inline-code spans (quoted detector
+    examples are not damage; unmatched backtick runs stay literal and
+    their text still counts).
   * v1 candidates (no full_sync_pending column, user_version 0, pre-PR-1
     mixed-case repos) are adopted under the case-folded slug: the candidate
     file is copied and migrated on the copy; the original is never modified
@@ -43,6 +45,8 @@ from fixtures import FakeGitHubSource, issue
 from test_migrations import V1_SCHEMA_SQL
 from zaxbygraph.cli import main
 from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
+from zaxbygraph.doctor import _strip_inline_code, inspect
+from zaxbygraph.github import GhApiSource, GitHubError
 from zaxbygraph.sync import sync_repo
 
 SLUG = "acme/widget"
@@ -414,6 +418,132 @@ class DoctorTests(unittest.TestCase):
             2,
             "original candidate must still hold both duplicate rows",
         )
+
+
+class GarbledQuotedPatternTests(unittest.TestCase):
+    """Epic #8 gate: quoted detector byte patterns stop counting as garbled;
+    real mojibake keeps counting. Drives the PRODUCTION scan leg
+    (doctor.inspect) so the count under test is the number the doctor
+    report publishes."""
+
+    def _inspect_store(self, rows: list[tuple[int, str, str]]) -> dict:
+        """Seed a complete store with (number, title, body) rows and run the
+        real doctor.inspect on it."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = connect(db)
+            init_schema(conn)
+            src = FakeGitHubSource()
+            for number, title, body in rows:
+                src.add_issue(issue(number, title=title, body=body))
+            sync_repo(conn, src, SLUG)
+            conn.close()
+            report = inspect(db, SLUG)
+            self.assertIsNotNone(report)
+            return report
+
+    def test_quoted_patterns_only_are_not_garbled(self) -> None:
+        # The #1/#2 shape: the only pattern hits are inside inline code.
+        report = self._inspect_store(
+            [
+                (1, "detector notes", "an em dash stored as `â€”` (quoted)"),
+                (2, "ac rows", "garbled-row counts (rows matching `Ã` / `â€`)"),
+            ]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_real_mojibake_without_backticks_still_counted(self) -> None:
+        report = self._inspect_store([(1, MOJIBAKE_TITLE, "corpus")])
+        self.assertEqual(report["garbled"], 1)
+
+    def test_real_mojibake_after_unmatched_backtick_still_counted(self) -> None:
+        # GFM example 358: an unmatched backtick string is literal content.
+        report = self._inspect_store(
+            [(1, "title", "unmatched ` then rÃ©sumÃ© garbled")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_mojibake_inside_matched_span_is_excluded(self) -> None:
+        # The deliberate trade-off: a MATCHED span's contents are detector
+        # vocabulary, not damage.
+        report = self._inspect_store([(1, "title", "see `rÃ©sumÃ©` here")])
+        self.assertEqual(report["garbled"], 0)
+
+    def test_gfm_359_unmatched_then_matched_double_span(self) -> None:
+        # GFM example 359: the leading single backtick is literal; the
+        # double-backtick run pair still forms a span and is suppressed.
+        report = self._inspect_store([(1, "title", "lead ` here ``Ã`` tail")])
+        self.assertEqual(report["garbled"], 0)
+
+    def test_mixed_quoted_and_real_mojibake_counts_once(self) -> None:
+        report = self._inspect_store(
+            [(1, MOJIBAKE_TITLE, "quoted `Ã` plus real rÃ©sumÃ© outside")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+
+class StripInlineCodeUnitTests(unittest.TestCase):
+    """Unit pins for _strip_inline_code's GFM code-span semantics."""
+
+    def test_matched_single_span(self) -> None:
+        self.assertEqual(_strip_inline_code("a `Ã` b"), "a  b")
+
+    def test_unmatched_run_and_tail_kept(self) -> None:
+        self.assertEqual(_strip_inline_code("a ` bÃc"), "a ` bÃc")
+
+    def test_gfm_359(self) -> None:
+        self.assertEqual(_strip_inline_code("`foo``bar``"), "`foo")
+
+    def test_unequal_runs_never_pair(self) -> None:
+        self.assertEqual(_strip_inline_code("`Ã``tail"), "`Ã``tail")
+
+    def test_span_crossing_newline(self) -> None:
+        self.assertEqual(_strip_inline_code("`a\nÃ`tail"), "tail")
+
+    def test_unmatched_then_later_match(self) -> None:
+        self.assertEqual(_strip_inline_code("`x ``yÃ``z"), "`x z")
+
+    def test_no_backticks_passthrough(self) -> None:
+        self.assertEqual(_strip_inline_code("rÃ©sumÃ©"), "rÃ©sumÃ©")
+
+
+class RateBudgetProbeGuardTests(unittest.TestCase):
+    """FB-004 (PR #83 review F-M2a): the rate-budget probe parse must be
+    guarded shape-by-shape; a wrong-typed `resources` value keeps the
+    original 429 instead of escaping as AttributeError."""
+
+    def _source_with_probe(self, probe_body: object) -> GhApiSource:
+        src = GhApiSource.__new__(GhApiSource)
+        src._api = lambda path, paginate=False, _enrich_rate=True: probe_body  # noqa: E731
+        return src
+
+    def _original(self) -> GitHubError:
+        return GitHubError("gh: API rate limit exceeded", status=429)
+
+    def test_string_resources_keeps_original_429(self) -> None:
+        src = self._source_with_probe({"resources": "not-a-map"})
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
+
+    def test_wellformed_probe_still_enriches(self) -> None:
+        src = self._source_with_probe(
+            {"resources": {"core": {"remaining": 0, "reset": 1700000000}}}
+        )
+        original = self._original()
+        enriched = src._with_rate_budget(original)
+        self.assertIs(enriched, original)
+        self.assertEqual(original.rate_limit_remaining, 0)
+        self.assertTrue(original.rate_limit_reset.endswith("Z"))
+
+    def test_missing_resources_unchanged(self) -> None:
+        src = self._source_with_probe({"unexpected": True})
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
+
+    def test_non_dict_data_unchanged(self) -> None:
+        src = self._source_with_probe(["list", "shape"])
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
 
 
 if __name__ == "__main__":
