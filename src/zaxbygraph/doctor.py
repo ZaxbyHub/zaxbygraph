@@ -28,10 +28,15 @@ Pinned semantics:
              (v2 schema), full_sync_pending = 0.
   freshest = greatest sync_state.issues_since among complete candidates.
   garbled  = slug rows whose title/body/labels_text contain mojibake
+             OUTSIDE matched inline-code spans (GFM code spans are quoted
+             examples — detector vocabulary, not damage; unmatched
+             backtick runs are literal content and their text still
+             counts)
              signatures (e.g. "Ã" or "â€").
 """
 from __future__ import annotations
 
+import re
 import shutil
 import sqlite3
 import stat
@@ -63,6 +68,312 @@ _MOJIBAKE_LIKE = (
     "IFNULL(labels_text, '') LIKE '%Ã%'",
     "IFNULL(labels_text, '') LIKE '%â€%'",
 )
+
+#: The byte sequences the garbled census looks for, as Python strings.
+#: Kept in lockstep with _MOJIBAKE_LIKE (same two signatures).
+_MOJIBAKE_BYTES = ("Ã", "â€")
+
+
+def _at_fence_position(text: str, i: int) -> bool:
+    """True when the backtick run starting at ``i`` sits at a GFM
+    fenced-code delimiter position: at most 3 leading spaces on its line
+    (fences may be indented up to 3 spaces) and preceded on that line
+    only by whitespace."""
+    line_start = text.rfind("\n", 0, i) + 1
+    return text[line_start:i].strip() == ""
+
+
+def _strip_inline_code(text: str) -> str:
+    """Split out GFM fenced-code blocks and strip inline code spans
+    from the unfenced remainder.
+
+    GitHub-authored issues quote the garbled detector's own byte patterns
+    inside inline code (issues #1/#2 quote ``\u00c3`` / ``\u00e2\u20ac`` verbatim), and a
+    quoted example is detector vocabulary, not mojibake content \u2014 so the
+    garbled census must not count it (epic #8 gate). Fenced-code blocks
+    are BLOCK-level constructs, NOT inline spans: their contents stay in
+    the census (the base raw-LIKE census counted fenced text, and the
+    pinned semantics strip only matched inline-code spans). Unfenced
+    segments are stripped by _strip_spans; segments are rejoined with the
+    NUL region boundary so a removed span can never synthesize a
+    signature across a segment edge."""
+    n = len(text)
+    if "`" not in text:
+        return text if "\\" not in text else _render_escapes(text)
+    # GFM fenced-code blocks (a run of 3+ backticks starting a line,
+    # indented at most 3 spaces) are BLOCK-level constructs, not inline
+    # spans: their contents stay in the census (the pinned semantics strip
+    # only matched inline-code spans, and the base raw-LIKE census counted
+    # fenced text). Pre-split the field into fenced and unfenced segments;
+    # strip inline spans only from unfenced segments; rejoin with the NUL
+    # region boundary so a removed inline span can never synthesize a
+    # signature across a segment edge.
+    segments: list[tuple[str, bool]] = []  # (segment, is_fenced)
+    seg_start = 0
+    i = 0
+    in_fence = False
+    while i < n:
+        ch = text[i]
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            length = j - i
+            if length >= 3 and _at_fence_position(text, i):
+                if not in_fence:
+                    if i > seg_start:
+                        segments.append((text[seg_start:i], False))
+                    segments.append((text[i:j], True))
+                    seg_start = j
+                    in_fence = True
+                else:
+                    # A run of 3+ backticks inside a fence is content
+                    # unless it closes the fence (a fence is closed by a
+                    # run at least as long as the opener at line start).
+                    if _at_fence_position(text, i):
+                        segments.append((text[seg_start:i], True))
+                        segments.append((text[i:j], True))
+                        seg_start = j
+                        in_fence = False
+                i = j
+                continue
+            i = j
+            continue
+        i += 1
+    if seg_start < n:
+        segments.append((text[seg_start:], in_fence))
+    out_parts: list[str] = []
+    for segment, fenced in segments:
+        if fenced:
+            out_parts.append(segment)
+        else:
+            out_parts.append(_strip_spans(segment))
+    # Rejoin with NUL region boundaries: distinct segments (fenced vs
+    # stripped) must never become adjacent, or the census could synthesize
+    # a signature across the edge.
+    return "\x00".join(out_parts)
+
+def _strip_spans(text: str) -> str:
+    """Strip GFM inline code spans (matched backtick runs) from
+    ``text`` \u2014 the caller has already split out fenced-code blocks.
+
+    Semantics (GFM \u00a7code-spans and \u00a7backslash-escapes):
+    - OUTSIDE a code span, a backslash escapes exactly one following
+      punctuation character. An escaped backtick (`` \\` ``) is a literal
+      backtick \u2014 it can neither open nor close a span, and the rendered
+      form keeps the backtick without the backslash (example 361); a
+      backslash before anything else is literal. A run of 2k backslashes
+      followed by a backtick escapes k of them and leaves k literal
+      backslashes before a DELIMITER backtick (parity); a backslash run
+      not followed by a backtick is literal.
+    - A span opens at a backtick RUN of length N and closes at the next
+      run of the same length N; the delimiters and the contents between
+      them (including line endings) are removed.
+    - INSIDE a code span, backslash escapes DO NOT operate (example 310:
+      contents are literal, including backslashes), so every backtick run
+      inside closes the span when its length matches the opener.
+    - An unmatched run emits ONLY that run as literal text and scanning
+      continues after it \u2014 later runs remain eligible to form spans
+      (example 359); runs of unequal length never pair with each other.
+
+    Construction (linear): pass 1 tokenizes backslash runs and backtick
+    runs in one sweep, recording the slash count before each backtick
+    run; a reverse pass precomputes every run's next equal-length run
+    (and next one-shorter run, for escaped openers); one forward emit
+    walks ALL runs with span state. An ODD slash count immediately before
+    a run escapes only that run's FIRST backtick \u2014 the escaped backtick
+    renders as a bare backtick, and the run's REMAINDER (length - 1) is
+    still a real delimiter candidate; an even slash count leaves the
+    whole run eligible. Inside a pairing, escapes never operate: any
+    equal-length run closes. Every character is touched O(1) times: O(n)
+    time, O(n) output + O(runs) auxiliary memory."""
+    n = len(text)
+    if "`" not in text:
+        return text if "\\" not in text else _render_escapes(text)
+    # Pass 1: tokenize backslash runs and backtick runs; record the slash
+    # count immediately before each backtick run.
+    runs: list[tuple[int, int, int]] = []  # (start, end, length)
+    slashes_before: dict[int, int] = {}
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            if j < n and text[j] == "`":
+                slashes_before[j] = j - i
+            i = j
+            continue
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            runs.append((i, j, j - i))
+            i = j
+            continue
+        i += 1
+    # next_equal[i]: index of the first later run of the same RAW length,
+    # -1 (one reverse pass, over ALL runs). For an odd-escaped opener the
+    # span's length is length-1, so a second reverse index maps each run
+    # to the first later run of one-fewer backticks.
+    count = len(runs)
+    next_equal = [-1] * count
+    next_shorter = [-1] * count
+    nearest: dict[int, int] = {}
+    for i in range(count - 1, -1, -1):
+        length = runs[i][2]
+        next_equal[i] = nearest.get(length, -1)
+        next_shorter[i] = nearest.get(length - 1, -1)
+        nearest[length] = i
+    # Emit: walk ALL runs in order. An odd slash count before a run
+    # escapes its FIRST backtick only: the run emits one bare backtick
+    # and its remainder (length - 1) stays a delimiter candidate. An
+    # even slash count leaves the whole run eligible. Inside a pairing,
+    # escapes never operate (any equal-length run closes).
+    out: list[str] = []
+    pos = 0
+    idx = 0
+    dropped = False  # a span (or span-equivalent) was removed since pos
+    while idx < count:
+        start, end, length = runs[idx]
+        if start > pos:
+            if dropped:
+                # Region boundary: the removed span must not let the text
+                # before it and after it become adjacent, or the census
+                # could synthesize a signature that never existed outside
+                # the span (review round 5: "â" + removed span + "€"
+                # would join into "â€"). NUL cannot appear in a UTF-8
+                # signature and cannot bridge a Python `in` match.
+                out.append("\x00")
+            out.append(text[pos:start])
+        dropped = False
+        odd = slashes_before.get(start, 0) % 2 == 1
+        # Candidate length after possibly escaping the first backtick.
+        eff_start = start + 1 if odd else start
+        eff_length = length - 1 if odd else length
+        if eff_length <= 0:
+            # The whole run was one escaped backtick: a bare backtick.
+            out.append("`")
+            pos = end
+            idx += 1
+            continue
+        # The remainder is a run of eff_length backticks starting at
+        # eff_start. Its closer is the next run of RAW length eff_length
+        # (inside a pairing escapes never operate, so the closer's raw
+        # length is what matters).
+        j = next_shorter[idx] if odd else next_equal[idx]
+        if j == -1:
+            # Unmatched opener: emit the escaped backtick (if any) and
+            # the remainder literally; the next run is a fresh candidate.
+            if odd:
+                out.append("`")
+            out.append(text[eff_start:end])
+            pos = end
+            idx += 1
+        else:
+            # Paired: drop effective opener..closer inclusive. The
+            # escaped first backtick renders as a bare backtick before
+            # the removed region (it is real output on the left side).
+            if odd:
+                out.append("`")
+            dropped = True
+            pos = runs[j][1]
+            idx = j + 1
+    if pos < n:
+        if dropped:
+            out.append("\x00")
+        out.append(text[pos:])
+        dropped = False
+    return _render_escapes("".join(out))
+
+def _render_escapes(text: str) -> str:
+    """Render outside-span backslash escapes the way the census must see
+    them (GFM §backslash-escapes, left-to-right): a backslash escapes the
+    following punctuation character (a backtick here — every delimiter
+    and span content was already dropped, so all backticks are literal);
+    backslashes pairing with each other render as one literal slash; a
+    trailing unpaired backslash is literal. So a run of L slashes renders
+    as ``L // 2`` literal slashes when a backtick follows, else
+    ``ceil(L / 2)`` literal slashes."""
+    if "\\" not in text:
+        return text
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            j = i
+            while j < n and text[j] == "\\":
+                j += 1
+            slashes = j - i
+            if j < n and text[j] == "`":
+                out.append("\\" * (slashes // 2))
+                out.append("`")
+                i = j + 1
+            else:
+                out.append("\\" * ((slashes + 1) // 2))
+                i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _field_text(value: object) -> str:
+    """Normalize one stored field for the garbled census (every SQLite
+    storage class deliberate; never raises)."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _count_garbled(conn: sqlite3.Connection, repo_l: str) -> int:
+    """Count this repo's rows that are STILL garbled after removing
+    inline-code spans (quoted detector examples stop counting; real
+    mojibake keeps counting).
+
+    The LIKE prefilter selects candidate rows exactly as the raw census
+    did, with one deliberate widening: each column is CAST to TEXT before
+    the LIKE so a BLOB-stored body is selected on every SQLite build
+    (raw `text LIKE` on a BLOB operand is build-dependent — e.g. the
+    SQLITE_LIKE_DOESNT_MATCH_BLOBS compile option — and the mismatch
+    surfaced only as a CI failure on ubuntu after passing the Windows-only
+    plan-time probe; CAST(BLOB AS TEXT) decodes the UTF-8 bytes
+    deterministically everywhere, and TEXT/NULL values pass through CAST
+    unchanged). The strip pass runs only on candidates. Rows stream in
+    fixed fetchmany batches — an exact count with constant memory, no cap
+    (a cap would silently undercount the report) and no fetchall().
+    """
+    total = 0
+    cast_patterns = [
+        pattern.replace("title", "CAST(title AS TEXT)", 1)
+        .replace("IFNULL(body, '')", "CAST(IFNULL(body, '') AS TEXT)", 1)
+        .replace("IFNULL(labels_text, '')",
+                 "CAST(IFNULL(labels_text, '') AS TEXT)", 1)
+        for pattern in _MOJIBAKE_LIKE
+    ]
+    cur = conn.execute(
+        "SELECT title, body, labels_text FROM items WHERE lower(repo) = ? "
+        "AND (" + " OR ".join(cast_patterns) + ")",
+        (repo_l,),
+    )
+    while True:
+        batch = cur.fetchmany(200)
+        if not batch:
+            break
+        for title, body, labels in batch:
+            for value in (title, body, labels):
+                stripped = _strip_inline_code(_field_text(value))
+                if any(sig in stripped for sig in _MOJIBAKE_BYTES):
+                    total += 1
+                    break
+    return total
 
 
 class _UnreadableCandidate(Exception):
@@ -346,11 +657,7 @@ def inspect(path: Path, repo: str) -> dict | None:
                 items = conn.execute(
                     "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ?", (repo_l,)
                 ).fetchone()["c"]
-                garbled = conn.execute(
-                    "SELECT COUNT(*) AS c FROM items WHERE lower(repo) = ? "
-                    "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
-                    (repo_l,),
-                ).fetchone()["c"]
+                garbled = _count_garbled(conn, repo_l)
                 complete = False
                 if state is not None:
                     row = conn.execute(

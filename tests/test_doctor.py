@@ -17,7 +17,9 @@ Pinned semantics:
     found under DIR (recursively), in addition to the repo-local candidates
     <repo-root>/.zaxbygraph/history.db and <repo-root>/.swarm/zaxbygraph/history.db.
   * garbled rows = rows whose text columns contain mojibake signatures
-    (e.g. 'Ã' or 'â€').
+    (e.g. 'Ã' or 'â€') outside matched inline-code spans (quoted detector
+    examples are not damage; unmatched backtick runs stay literal and
+    their text still counts).
   * v1 candidates (no full_sync_pending column, user_version 0, pre-PR-1
     mixed-case repos) are adopted under the case-folded slug: the candidate
     file is copied and migrated on the copy; the original is never modified
@@ -29,6 +31,7 @@ Hermetic: temp dirs only, env restored, cwd restored, no network.
 """
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
@@ -43,6 +46,8 @@ from fixtures import FakeGitHubSource, issue
 from test_migrations import V1_SCHEMA_SQL
 from zaxbygraph.cli import main
 from zaxbygraph.db import CURRENT_USER_VERSION, connect, init_schema
+from zaxbygraph.doctor import _strip_inline_code, inspect
+from zaxbygraph.github import GhApiSource, GitHubError
 from zaxbygraph.sync import sync_repo
 
 SLUG = "acme/widget"
@@ -414,6 +419,489 @@ class DoctorTests(unittest.TestCase):
             2,
             "original candidate must still hold both duplicate rows",
         )
+
+
+class GarbledQuotedPatternTests(unittest.TestCase):
+    """Epic #8 gate: quoted detector byte patterns stop counting as garbled;
+    real mojibake keeps counting. Drives the PRODUCTION scan leg
+    (doctor.inspect) so the count under test is the number the doctor
+    report publishes."""
+
+    def _inspect_store(self, rows: list[tuple[int, str, str]]) -> dict:
+        """Seed a complete store with (number, title, body) rows and run the
+        real doctor.inspect on it."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = connect(db)
+            init_schema(conn)
+            src = FakeGitHubSource()
+            for number, title, body in rows:
+                src.add_issue(issue(number, title=title, body=body))
+            sync_repo(conn, src, SLUG)
+            conn.close()
+            report = inspect(db, SLUG)
+            self.assertIsNotNone(report)
+            return report
+
+    def test_quoted_patterns_only_are_not_garbled(self) -> None:
+        # The #1/#2 shape: the only pattern hits are inside inline code.
+        report = self._inspect_store(
+            [
+                (1, "detector notes", "an em dash stored as `â€”` (quoted)"),
+                (2, "ac rows", "garbled-row counts (rows matching `Ã` / `â€`)"),
+            ]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_real_mojibake_without_backticks_still_counted(self) -> None:
+        report = self._inspect_store([(1, MOJIBAKE_TITLE, "corpus")])
+        self.assertEqual(report["garbled"], 1)
+
+    def test_real_mojibake_after_unmatched_backtick_still_counted(self) -> None:
+        # GFM example 358: an unmatched backtick string is literal content.
+        report = self._inspect_store(
+            [(1, "title", "unmatched ` then rÃ©sumÃ© garbled")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_mojibake_inside_matched_span_is_excluded(self) -> None:
+        # The deliberate trade-off: a MATCHED span's contents are detector
+        # vocabulary, not damage.
+        report = self._inspect_store([(1, "title", "see `rÃ©sumÃ©` here")])
+        self.assertEqual(report["garbled"], 0)
+
+    def test_gfm_359_unmatched_then_matched_double_span(self) -> None:
+        # GFM example 359: the leading single backtick is literal; the
+        # double-backtick run pair still forms a span and is suppressed.
+        report = self._inspect_store([(1, "title", "lead ` here ``Ã`` tail")])
+        self.assertEqual(report["garbled"], 0)
+
+    def test_mixed_quoted_and_real_mojibake_counts_once(self) -> None:
+        report = self._inspect_store(
+            [(1, MOJIBAKE_TITLE, "quoted `Ã` plus real rÃ©sumÃ© outside")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def _inspect_raw_store(self, rows: list[tuple[int, str, object, object]]) -> dict:
+        """Seed a store with (number, title, body, labels_text) values written
+        RAW (any SQLite storage class) and run the real doctor.inspect."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = connect(db)
+            init_schema(conn)
+            src = FakeGitHubSource()
+            for number, title, body, _labels in rows:
+                src.add_issue(issue(number, title=title, body="seed"))
+            sync_repo(conn, src, SLUG)
+            for number, _title, body, labels in rows:
+                conn.execute(
+                    "UPDATE items SET body = ?, labels_text = ? WHERE number = ?"
+                    " AND repo = ?",
+                    (body, labels, number, SLUG),
+                )
+            conn.commit()
+            conn.close()
+            report = inspect(db, SLUG)
+            self.assertIsNotNone(report)
+            return report
+
+    def test_null_body_and_labels_in_candidate_row_no_traceback(self) -> None:
+        # A row can become a candidate via one field while another is NULL
+        # (body and labels_text are nullable; the strip path must treat
+        # NULL as empty, never raise). title is NOT NULL and ingest
+        # coerces a falsey title to "" (store.py), so a NULL title cannot
+        # exist in any store this census reads — the conversion contract
+        # for None is pinned at the unit level
+        # (StripInlineCodeUnitTests.test_field_text_storage_classes).
+        # The NULL body is examined BEFORE the matching labels_text (field
+        # order title, body, labels_text), so this row exercises the NULL
+        # conversion in the production count path.
+        report = self._inspect_raw_store(
+            [(1, "clean title", None, MOJIBAKE_TITLE)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_null_title_in_divergent_candidate_counts_via_body(self) -> None:
+        # doctor.inspect reads PARTIAL/FOREIGN candidates too — a store
+        # whose items.title is nullable can hold a genuine NULL title
+        # (the current schema's NOT NULL and ingest's "" coercion do not
+        # reach it). Hand-build such a candidate: only the columns the
+        # census and inspect need, title NULL, the signature carried by
+        # body (a LATER field in the census probe order), sync_state.repo
+        # present so inspect reads it. Assert the storage class before
+        # inspection and the count after.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            db = Path(td) / "history.db"
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE items (
+                    pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                    github_id INTEGER NOT NULL,
+                    repo TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    title TEXT,
+                    body TEXT,
+                    labels_text TEXT
+                );
+                CREATE TABLE sync_state (
+                    repo TEXT PRIMARY KEY,
+                    issues_since TEXT,
+                    last_full_sync_at TEXT,
+                    last_error TEXT
+                );
+                INSERT INTO items (github_id, repo, number, kind, state,
+                                   title, body, labels_text)
+                VALUES (1, 'acme/widget', 7, 'issue', 'open',
+                        NULL, 'real rÃ©sumÃ© damage', NULL);
+                INSERT INTO sync_state (repo, issues_since,
+                                        last_full_sync_at, last_error)
+                VALUES ('acme/widget', '2026-11-20T00:00:00Z',
+                        '2026-11-20T00:00:00Z', NULL);
+                """
+            )
+            conn.commit()
+            storage = conn.execute(
+                "SELECT typeof(title) FROM items WHERE number = 7"
+            ).fetchone()[0]
+            conn.close()
+            self.assertEqual(storage, "null")
+            report = inspect(db, "acme/widget")
+            self.assertIsNotNone(report)
+            self.assertEqual(report["items"], 1)
+            self.assertEqual(report["garbled"], 1)
+
+    def test_signature_cannot_synthesize_across_removed_span(self) -> None:
+        # Review round 5: removing a span must never let the text BEFORE
+        # it and AFTER it become adjacent, or the census could synthesize
+        # a signature that never existed outside the span. Here "â" sits
+        # DIRECTLY before a matched span and "€" DIRECTLY after it (the
+        # mojibake half of the â€ signature), while the quoted `Ã` made
+        # the row a prefilter candidate; with the pieces joined WITHOUT a
+        # boundary the span removal would manufacture "â€" out of
+        # never-adjacent characters, so this test discriminates exactly
+        # that implementation: the NUL boundary keeps "â€" out of every
+        # contiguous region and the row counts 0.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "â`quoted Ã example`€ tail", None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_signature_outside_removed_span_still_counts(self) -> None:
+        # The discriminating companion: the same shape with a REAL â€
+        # outside the span counts 1 — proving the NUL boundary does not
+        # over-suppress and that the quoted-Ã row in the twin test is 0
+        # because of the boundary, not because BLOB/quoted inputs are
+        # skipped.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "â€ `quoted Ã example` tail", None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_escaped_first_backtick_then_delimiter_run(self) -> None:
+        # Review round 4's exact counterexample through the production
+        # census: backslash + TWO backticks + Ã + one backtick. The
+        # backslash escapes only the FIRST backtick (a bare literal); the
+        # remainder opens a one-backtick span that the final backtick
+        # closes, so the Ã is INSIDE a matched span and must NOT count.
+        # The prior whole-run-escape implementation left the Ã outside
+        # and counted the row — this regression discriminates it.
+        report = self._inspect_raw_store(
+            [(1, "clean title", "\\``Ã` tail", None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_escaped_first_backtick_then_unmatched_run_counts(self) -> None:
+        # The discriminating companion: the same escaped-first-backtick
+        # shape with NO closer — the remainder opens nothing, the Ã is
+        # outside any span, and the row MUST count (a whole-run-escape
+        # implementation also answers 0 here, so the twin pair pins the
+        # split behavior both ways).
+        report = self._inspect_raw_store(
+            [(1, "clean title", "\\``Ã tail", None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_fenced_block_mojibake_still_counted(self) -> None:
+        # Cubic thread 4649312969 / review F-001: fenced-code blocks are
+        # BLOCK-level constructs, not inline spans — their contents keep
+        # counting (the base raw-LIKE census counted fenced text, and the
+        # pinned semantics strip only matched inline-code spans). RED
+        # first under the fence-unaware scanner (the fence pair stripped
+        # to a NUL boundary and the census missed the row).
+        report = self._inspect_store(
+            [(1, "clean title", "prose\n```\nreal rÃ©sumÃ© damage\n```\ntail")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_inline_span_after_fenced_block_still_excluded(self) -> None:
+        # The discriminating companion: a quoted example AFTER a fenced
+        # block is still an inline span and must not count — the fence
+        # handling must not over-widen the exclusion.
+        report = self._inspect_store(
+            [(1, "clean title", "```\ncode\n```\nsee `Ã` here")]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_unclosed_fence_keeps_counting(self) -> None:
+        # An unclosed fence is literal content (the unmatched-run rule):
+        # its text keeps counting.
+        report = self._inspect_store(
+            [(1, "clean title", "prose ```\nreal rÃ©sumÃ© damage")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
+        # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
+        # prefilter (executed probe at plan time) and must keep counting
+        # after the strip pass (decode errors="replace"). The clean TEXT
+        # title pins that the count comes from the BLOB: the row is a
+        # candidate ONLY via the BLOB body, and the count is 1 exactly
+        # when the BLOB's decoded text still carries the signature.
+        blob = "rÃ©sumÃ© damaged".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_blob_quoted_pattern_is_not_counted(self) -> None:
+        # Same storage class, quoted shape: a BLOB whose bytes quote the
+        # pattern inside backticks is detector vocabulary, not damage. The
+        # DISCRIMINATING half: the same row with the BLOB bytes OUTSIDE
+        # backticks counts 1 (the next test), so a 0 here proves the BLOB
+        # was selected, decoded, and stripped — never skipped.
+        blob = "rows matching `Ã` in a blob".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_blob_pattern_outside_backticks_counts_one(self) -> None:
+        # The discriminating companion to the quoted-BLOB test: identical
+        # seeding except the signature sits OUTSIDE the backticks. If the
+        # BLOB were never selected or decoded, BOTH tests would answer 0;
+        # this one answering 1 (with the quoted twin answering 0) proves
+        # the BLOB reaches _field_text and the strip pass.
+        blob = "rows matching Ã outside a blob".encode("utf-8")
+        report = self._inspect_raw_store(
+            [(1, "clean title", blob, None)]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+
+class StripInlineCodeUnitTests(unittest.TestCase):
+    """Unit pins for _strip_inline_code's GFM code-span semantics."""
+
+    def test_field_text_storage_classes(self) -> None:
+        # The production end-to-end tests cannot discriminate a benign
+        # str(None) mutant (the rendered 'None' carries no signature), so
+        # the conversion contract is pinned at the unit level: every
+        # storage class maps to the text the census should see.
+        from zaxbygraph.doctor import _field_text
+
+        self.assertEqual(_field_text(None), "")
+        self.assertEqual(_field_text("rÃ©sumÃ©"), "rÃ©sumÃ©")
+        self.assertEqual(
+            _field_text("rÃ©sumÃ©".encode("utf-8")), "rÃ©sumÃ©"
+        )
+        self.assertEqual(_field_text(5), "5")
+
+    def test_matched_single_span(self) -> None:
+        self.assertEqual(_strip_inline_code("a `Ã` b"), "a \x00 b")
+
+    def test_unmatched_run_and_tail_kept(self) -> None:
+        self.assertEqual(_strip_inline_code("a ` bÃc"), "a ` bÃc")
+
+    def test_gfm_359(self) -> None:
+        self.assertEqual(_strip_inline_code("`foo``bar``"), "`foo")
+
+    def test_unequal_runs_never_pair(self) -> None:
+        self.assertEqual(_strip_inline_code("`Ã``tail"), "`Ã``tail")
+
+    def test_span_crossing_newline(self) -> None:
+        self.assertEqual(_strip_inline_code("`a\nÃ`tail"), "\x00tail")
+
+    def test_unmatched_then_later_match(self) -> None:
+        self.assertEqual(_strip_inline_code("`x ``yÃ``z"), "`x \x00z")
+
+    def test_no_backticks_passthrough(self) -> None:
+        self.assertEqual(_strip_inline_code("rÃ©sumÃ©"), "rÃ©sumÃ©")
+
+    def test_escaped_backticks_are_literal_not_delimiters(self) -> None:
+        # GFM example 361: a backslash-escaped backtick is ordinary text.
+        # The mojibake between escaped backticks must keep counting (the
+        # round-1 reviewer finding; a delimiter-pairing scanner would
+        # suppress it as a fake span). Both escapes render as literal
+        # backticks.
+        self.assertEqual(
+            _strip_inline_code("\\`rÃ©sumÃ©\\`"), "`rÃ©sumÃ©`"
+        )
+
+    def test_escaped_backtick_then_matched_span(self) -> None:
+        # The escape is literal; the later single-run pair still forms a
+        # span and is dropped.
+        self.assertEqual(_strip_inline_code("\\`a`b`"), "`a")
+
+    def test_backslash_inside_span_is_literal_so_span_closes(self) -> None:
+        # GFM example 310 class: escapes do not operate inside a code
+        # span, so the first equal-length run closes it (review round 2):
+        # the span `a\` drops entirely (leaving a NUL region boundary,
+        # round 5) and the trailing b + unmatched backtick stay literal.
+        self.assertEqual(_strip_inline_code("`a\\`b`"), "\x00b`")
+
+    def test_backslash_parity_before_delimiter(self) -> None:
+        # Two backslashes render as ONE literal slash (they escape each
+        # other), so the following backtick IS a real delimiter.
+        self.assertEqual(_strip_inline_code("\\\\`x"), "\\`x")
+        # One backslash escapes the backtick: no delimiter, bare backtick.
+        self.assertEqual(_strip_inline_code("\\`x"), "`x")
+        # Two slashes render as one, then a matched span is dropped.
+        self.assertEqual(_strip_inline_code("\\\\`Ã`"), "\\")
+
+    def test_trailing_backslash_is_literal(self) -> None:
+        self.assertEqual(_strip_inline_code("end\\"), "end\\")
+
+    def _linear_guard_findings(self, fn: ast.FunctionDef) -> list[str]:
+        """The SHARED structural guard predicate (review round 8: the
+        negative control must call the same code as the production check,
+        or it cannot prove the guard rejects anything). Returns the list
+        of violations for ONE function: a raw-text suffix scan for a
+        closer. The caller aggregates across the scanner's functions and
+        additionally requires the precomputed-index closer assignment to
+        exist somewhere in the pair (the emit walk may live in either
+        after a refactor)."""
+        findings: list[str] = []
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.IfExp)
+                    and "next_shorter" in ast.unparse(node.value)
+                    and "next_equal" in ast.unparse(node.value)):
+                closer_via_index = True
+            if isinstance(node, ast.While):
+                unparsed = ast.unparse(node)
+                if "text[k]" in unparsed and "k += 1" in unparsed:
+                    findings.append(
+                        "a raw-text suffix scan for the closer "
+                        "(the round-3 defect)"
+                    )
+        return findings
+
+    def test_many_unmatched_runs_stay_linear(self) -> None:
+        # The review round 3 complexity guard: many DISTINCT-length
+        # unmatched runs followed by a long tail must NOT re-scan the tail
+        # per opener (the O(1) next_equal pairing bounds each run to one
+        # visit). Guard shape (review rounds 7-8): a STRUCTURAL AST guard
+        # with a SHARED predicate — the executed measurements showed the
+        # faithful round-3 tail-search mutant is timing-indistinguishable
+        # from the linear scanner at suite-tolerable sizes (~0.09 s vs
+        # ~0.06 s CPU at 1200 runs x 20k tail), so NO wall-clock or CPU
+        # ceiling can bite without a multi-gigabyte input; the
+        # sibling-guardrail pattern (tests/test_db_uri_open.py
+        # SiblingGuardrailTest) instead pins the mechanism: the emit walk
+        # must find its closer through the precomputed
+        # next_equal/next_shorter index (an O(1) subscript), never through
+        # a raw-text scan loop. Positive control: the shipped scanner
+        # passes. Negative control: the planted round-3 suffix scan is
+        # flagged BY THE SAME PREDICATE (shared _linear_guard_findings).
+        import ast
+
+        src = (Path(__file__).resolve().parents[1] / "src" / "zaxbygraph"
+               / "doctor.py").read_text(encoding="utf-8")
+        fns = [
+            node for node in ast.walk(ast.parse(src))
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("_strip_inline_code", "_strip_spans")
+        ]
+        self.assertEqual(len(fns), 2, "scanner functions must both exist")
+        findings: list[str] = []
+        closer_via_index = False
+        for fn in fns:
+            findings.extend(self._linear_guard_findings(fn))
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Assign)
+                        and isinstance(node.value, ast.IfExp)
+                        and "next_shorter" in ast.unparse(node.value)
+                        and "next_equal" in ast.unparse(node.value)):
+                    closer_via_index = True
+        if not closer_via_index:
+            findings.append(
+                "the emit walk must pair via the precomputed index "
+                "(j = next_shorter[idx] if odd else next_equal[idx])"
+            )
+        self.assertEqual(findings, [])
+
+    def test_the_linear_guard_rejects_the_tail_search_plant(self) -> None:
+        # Negative control for the structural guard above: planting the
+        # round-3 suffix-scan closer search must be flagged BY THE SAME
+        # SHARED PREDICATE the production check runs — if the detector
+        # were removed or broken, this test fails too.
+        import ast
+
+        planted = (
+            "def _strip_inline_code(text):\n"
+            "    runs = []\n"
+            "    j = next_shorter[idx] if odd else next_equal[idx]\n"
+            "    k = eff_start\n"
+            "    while k < n:\n"
+            "        if text[k] == '`':\n"
+            "            m = k\n"
+            "            while m < n and text[m] == '`':\n"
+            "                m += 1\n"
+            "            if m - k == target:\n"
+            "                break\n"
+            "            k = m\n"
+            "            continue\n"
+            "        k += 1\n"
+            "    return runs\n"
+        )
+        fn = next(n for n in ast.walk(ast.parse(planted))
+                  if isinstance(n, ast.FunctionDef))
+        findings = self._linear_guard_findings(fn)
+        self.assertTrue(
+            any("suffix scan" in f for f in findings),
+            f"the planted defect must be flagged: {findings}",
+        )
+
+
+class RateBudgetProbeGuardTests(unittest.TestCase):
+    """FB-004 (PR #83 review F-M2a): the rate-budget probe parse must be
+    guarded shape-by-shape; a wrong-typed `resources` value keeps the
+    original 429 instead of escaping as AttributeError."""
+
+    def _source_with_probe(self, probe_body: object) -> GhApiSource:
+        src = GhApiSource.__new__(GhApiSource)
+        src._api = lambda path, paginate=False, _enrich_rate=True: probe_body  # noqa: E731
+        return src
+
+    def _original(self) -> GitHubError:
+        return GitHubError("gh: API rate limit exceeded", status=429)
+
+    def test_string_resources_keeps_original_429(self) -> None:
+        src = self._source_with_probe({"resources": "not-a-map"})
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
+
+    def test_wellformed_probe_still_enriches(self) -> None:
+        src = self._source_with_probe(
+            {"resources": {"core": {"remaining": 0, "reset": 1700000000}}}
+        )
+        original = self._original()
+        enriched = src._with_rate_budget(original)
+        self.assertIs(enriched, original)
+        self.assertEqual(original.rate_limit_remaining, 0)
+        self.assertTrue(original.rate_limit_reset.endswith("Z"))
+
+    def test_missing_resources_unchanged(self) -> None:
+        src = self._source_with_probe({"unexpected": True})
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
+
+    def test_non_dict_data_unchanged(self) -> None:
+        src = self._source_with_probe(["list", "shape"])
+        original = self._original()
+        self.assertIs(src._with_rate_budget(original), original)
 
 
 if __name__ == "__main__":
