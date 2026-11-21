@@ -271,14 +271,14 @@ def _count_garbled(conn: sqlite3.Connection, repo_l: str) -> int:
     The LIKE prefilter selects candidate rows exactly as the raw census
     did, with one deliberate widening: each column is CAST to TEXT before
     the LIKE so a BLOB-stored body is selected on every SQLite build
-    (raw `text LIKE` on a BLOB operand is build-dependent — it matched on
-    the Windows CI of the plan-time probe but not on ubuntu's newer
-    SQLite, which surfaced only as a CI failure; CAST(BLOB AS TEXT)
-    decodes the UTF-8 bytes deterministically everywhere, and TEXT/NULL
-    values pass through CAST unchanged). The strip pass runs only on
-    candidates. Rows stream in fixed fetchmany batches — an exact count
-    with constant memory, no cap (a cap would silently undercount the
-    report) and no fetchall().
+    (raw `text LIKE` on a BLOB operand is build-dependent — e.g. the
+    SQLITE_LIKE_DOESNT_MATCH_BLOBS compile option — and the mismatch
+    surfaced only as a CI failure on ubuntu after passing the Windows-only
+    plan-time probe; CAST(BLOB AS TEXT) decodes the UTF-8 bytes
+    deterministically everywhere, and TEXT/NULL values pass through CAST
+    unchanged). The strip pass runs only on candidates. Rows stream in
+    fixed fetchmany batches — an exact count with constant memory, no cap
+    (a cap would silently undercount the report) and no fetchall().
     """
     total = 0
     cast_patterns = [
