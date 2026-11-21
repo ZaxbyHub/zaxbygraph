@@ -20,6 +20,15 @@ GH_TIMEOUT_S = 300
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def _reject_nonstandard_constant(name: str) -> float:
+    """json.loads parse_constant hook (issue #86): NaN/Infinity are not
+    JSON (RFC 8259 section 6), so a probe answer carrying one must fail
+    the decode — raising ValueError keeps it inside the probe's
+    fail-closed boundary instead of smuggling a hostile shape past the
+    field guards. The name argument is one of NaN/Infinity/-Infinity."""
+    raise ValueError(f"non-standard JSON constant in probe answer: {name}")
+
+
 class GitHubError(RuntimeError):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -128,6 +137,17 @@ class GhApiSource:
         text = proc.stdout.strip()
         if not text:
             return []
+        # The rate-budget probe's answer is guarded shape by shape
+        # downstream, so its PARSE must be strict too (issue #86): the
+        # probe path decodes the unstripped, transport-decoded stdout and
+        # rejects the non-standard JSON constants (NaN/Infinity — RFC 8259
+        # §6), so a malformed or hostile probe answer fails the decode
+        # instead of slipping a hostile shape past the field guards. Every
+        # other path keeps the lenient decode unchanged.
+        if path == "rate_limit":
+            return json.loads(
+                proc.stdout, parse_constant=_reject_nonstandard_constant
+            )
         if paginate and text.startswith("["):
             chunks: list[object] = []
             decoder = json.JSONDecoder()
@@ -156,12 +176,18 @@ class GhApiSource:
         non-zero budget means the failure is not the core limit and stays
         unenriched, and plain 403s (permissions, SSO) never get here. The
         `rate_limit` endpoint is exempt from the REST budget; a probe failure
-        keeps the original error (fail-fast as before)."""
+        keeps the original error (fail-fast as before). The probe answer is
+        untrusted beyond that single purpose (issue #86): a malformed or
+        hostile response — a parse failure (JSONDecodeError, over-limit
+        integers, deep nesting), a non-standard constant, a bool/fractional
+        `remaining`, an unrepresentable `reset` — leaves the original error
+        untouched, and nothing is assigned to it until every conversion of
+        the enrichment has succeeded."""
         if exc.status != 429:
             return exc
         try:
             data = self._api("rate_limit", _enrich_rate=False)
-        except GitHubError:
+        except (GitHubError, ValueError, RecursionError):
             return exc
         resources = data.get("resources") if isinstance(data, dict) else None
         # The probe answer must be trusted only shape by shape: `resources`
@@ -176,21 +202,30 @@ class GhApiSource:
         # bool is an int subclass and NaN compares unequal to itself; a
         # hostile/buggy value must never crash the enrichment path (that
         # would replace the original 429), so anything unrepresentable keeps
-        # the original error.
+        # the original error. `remaining` is type-tested like `reset`
+        # (issue #86): a value-only check read False as exhausted because
+        # bool is an int subclass, and a fractional remaining is not a
+        # well-formed exhausted budget (GitHub reports integers).
         if (
-            remaining != 0
+            not isinstance(remaining, int)
+            or isinstance(remaining, bool)
+            or remaining != 0
             or isinstance(reset, bool)
             or not isinstance(reset, (int, float))
             or reset != reset
         ):
             return exc
         try:
-            exc.rate_limit_remaining = 0
-            exc.rate_limit_reset = datetime.fromtimestamp(
+            # Compute BEFORE assigning (issue #86): assigning `remaining`
+            # first left a partially enriched exception behind when the
+            # reset conversion raised.
+            reset_iso = datetime.fromtimestamp(
                 float(reset), tz=timezone.utc
             ).strftime(_ISO_Z)
         except (OverflowError, OSError, ValueError):
             return exc
+        exc.rate_limit_remaining = 0
+        exc.rate_limit_reset = reset_iso
         return exc
 
     def list_issues(self, since: str | None) -> Iterator[list[dict]]:
