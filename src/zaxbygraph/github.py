@@ -94,13 +94,18 @@ class GhApiSource:
         cmd = [self.gh_bin, "api", path]
         if paginate:
             cmd.append("--paginate")
+        # The rate-budget probe's answer must be RFC-valid before enrichment
+        # (issue #86): read its raw BYTES and decode strictly, so an invalid
+        # UTF-8 sequence cannot be repaired into parseable text by the
+        # transport's errors="replace" before the JSON decoder sees it.
+        # Every other path keeps the lenient text decode unchanged.
+        strict_bytes = path == "rate_limit"
         try:
             proc = subprocess.run(
                 cmd,
                 check=False,
                 capture_output=True,
-                encoding="utf-8",
-                errors="replace",
+                **({} if strict_bytes else {"encoding": "utf-8", "errors": "replace"}),
                 timeout=GH_TIMEOUT_S,
             )
         except FileNotFoundError as exc:
@@ -129,25 +134,36 @@ class GhApiSource:
                 f"gh CLI could not be launched: {exc}"
             ) from exc
         if proc.returncode != 0:
-            err = (proc.stderr or proc.stdout or "gh api failed").strip()
+            err = (proc.stderr or proc.stdout or "gh api failed")
+            if isinstance(err, bytes):
+                err = err.decode("utf-8", errors="replace")
+            err = err.strip()
             exc = GitHubError(err, status=_status_from_stderr(err))
             if _enrich_rate:
                 exc = self._with_rate_budget(exc)
             raise exc
+        if strict_bytes:
+            # The rate-budget probe's answer must be RFC-valid before
+            # enrichment (issue #86): strict UTF-8 decode of the RAW bytes
+            # (no errors="replace" repair, no strip() normalization) plus
+            # rejection of the non-standard JSON constants (NaN/Infinity —
+            # RFC 8259 §6), so a malformed or hostile probe answer fails
+            # the decode instead of slipping past the field guards. Every
+            # other path keeps the lenient text decode unchanged.
+            raw = proc.stdout
+            if isinstance(raw, str):  # test doubles hand str; real bytes path decodes
+                raw_text = raw
+            else:
+                try:
+                    raw_text = raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ValueError(
+                        f"rate_limit probe answer is not valid UTF-8: {exc}"
+                    ) from exc
+            return json.loads(raw_text, parse_constant=_reject_nonstandard_constant)
         text = proc.stdout.strip()
         if not text:
             return []
-        # The rate-budget probe's answer is guarded shape by shape
-        # downstream, so its PARSE must be strict too (issue #86): the
-        # probe path decodes the unstripped, transport-decoded stdout and
-        # rejects the non-standard JSON constants (NaN/Infinity — RFC 8259
-        # §6), so a malformed or hostile probe answer fails the decode
-        # instead of slipping a hostile shape past the field guards. Every
-        # other path keeps the lenient decode unchanged.
-        if path == "rate_limit":
-            return json.loads(
-                proc.stdout, parse_constant=_reject_nonstandard_constant
-            )
         if paginate and text.startswith("["):
             chunks: list[object] = []
             decoder = json.JSONDecoder()

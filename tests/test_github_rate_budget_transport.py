@@ -72,6 +72,27 @@ class ProbeTransportDecodeTests(_EnrichmentAssertions, unittest.TestCase):
         self.assertEqual(exc.status, 429)
         self.assert_unenriched(exc)
 
+    def test_invalid_utf8_bytes_keep_original(self) -> None:
+        # The probe transport reads RAW BYTES and decodes strict UTF-8
+        # (issue #86): an invalid sequence inside a quoted value must not
+        # be repaired into parseable text by errors="replace".
+        src = GhApiSource("acme", "forgegate", gh_bin="gh")
+        proc = mock.Mock()
+        proc.returncode = 0
+        proc.stdout = (
+            b'{"resources": {"core": {"remaining": 0, "reset": 1700000000},'
+            b' "search": {"name": "caf\xe9"}}}'
+        )
+        proc.stderr = b""
+        with mock.patch("zaxbygraph.github.subprocess.run") as run:
+            run.return_value = proc
+            original = GitHubError("gh: API rate limit exceeded", status=429)
+            result = src._with_rate_budget(original)
+        self.assertIs(result, original)
+        self.assertEqual(result.status, 429)
+        self.assertFalse(hasattr(result, "rate_limit_remaining"))
+        self.assertFalse(hasattr(result, "rate_limit_reset"))
+
     def test_wellformed_trailing_newline_still_enriches(self) -> None:
         # The production shape: gh's stdout ends with a newline, which is
         # legal JSON whitespace — the strict decode must accept it.
