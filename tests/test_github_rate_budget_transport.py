@@ -1,14 +1,18 @@
 """Transport-level regression tests for the rate-budget probe decode
-(issue #86, plan change 0): the probe path of GhApiSource._api decodes the
-UNSTRIPPED, transport-decoded stdout with the non-standard JSON constants
-(NaN/Infinity, RFC 8259 section 6) rejected, while every other path keeps
-the lenient strip-then-parse decode.
+(issue #86, plan change 0): the probe path of GhApiSource._api captures the
+RAW BYTES of gh's stdout (subprocess.run without encoding=), strict-decodes
+them as UTF-8, and parses with the non-standard JSON constants
+(NaN/Infinity, RFC 8259 section 6) rejected — while every other path keeps
+the lenient text decode unchanged. Six cases: malformed JSON, sibling NaN,
+non-JSON whitespace wrapper, invalid UTF-8 bytes, pathologically nested
+body (RecursionError arm), and the well-formed trailing-newline control.
 
-These tests exercise the REAL `_api` through a mocked subprocess.run — no
-network, no gh binary. They are the change-0 guardrail the frozen seam-level
-checks (tests/test_github_rate_budget_probe.py) cannot provide: their stubs
-replace `_api` wholesale, so a regression that reverts `_api` to permissive
-decoding stays invisible to them, while these tests go red.
+These tests exercise the REAL `_api` through a mocked subprocess.run that
+honours the encoding kwargs like the real transport — no network, no gh
+binary. They are the change-0 guardrail the frozen seam-level checks
+(tests/test_github_rate_budget_probe.py) cannot provide: their stubs replace
+`_api` wholesale, so a regression that reverts `_api` to permissive decoding
+stays invisible to them, while these tests go red.
 """
 from __future__ import annotations
 
