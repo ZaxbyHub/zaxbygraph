@@ -269,14 +269,28 @@ def _count_garbled(conn: sqlite3.Connection, repo_l: str) -> int:
     mojibake keeps counting).
 
     The LIKE prefilter selects candidate rows exactly as the raw census
-    did; the strip pass runs only on candidates. Rows stream in fixed
-    fetchmany batches — an exact count with constant memory, no cap (a
-    cap would silently undercount the report) and no fetchall().
+    did, with one deliberate widening: each column is CAST to TEXT before
+    the LIKE so a BLOB-stored body is selected on every SQLite build
+    (raw `text LIKE` on a BLOB operand is build-dependent — it matched on
+    the Windows CI of the plan-time probe but not on ubuntu's newer
+    SQLite, which surfaced only as a CI failure; CAST(BLOB AS TEXT)
+    decodes the UTF-8 bytes deterministically everywhere, and TEXT/NULL
+    values pass through CAST unchanged). The strip pass runs only on
+    candidates. Rows stream in fixed fetchmany batches — an exact count
+    with constant memory, no cap (a cap would silently undercount the
+    report) and no fetchall().
     """
     total = 0
+    cast_patterns = [
+        pattern.replace("title", "CAST(title AS TEXT)", 1)
+        .replace("IFNULL(body, '')", "CAST(IFNULL(body, '') AS TEXT)", 1)
+        .replace("IFNULL(labels_text, '')",
+                 "CAST(IFNULL(labels_text, '') AS TEXT)", 1)
+        for pattern in _MOJIBAKE_LIKE
+    ]
     cur = conn.execute(
         "SELECT title, body, labels_text FROM items WHERE lower(repo) = ? "
-        "AND (" + " OR ".join(_MOJIBAKE_LIKE) + ")",
+        "AND (" + " OR ".join(cast_patterns) + ")",
         (repo_l,),
     )
     while True:
