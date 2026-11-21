@@ -782,7 +782,25 @@ class SiblingGuardrailTest(unittest.TestCase):
                 # text contains "limit": a sibling spelled `fetchmany(n + 1)`
                 # was invisible to the earlier filter.
                 scanned.append("%s:%d" % (path.name, node.lineno))
+                # The census's fixed-batch fetchmany(200) is bounded by
+                # construction; ANY OTHER fetchmany must either carry a
+                # limit-derived (clamped) argument, a positive integer
+                # literal, or a min()/max() bounding expression (the
+                # chunked read at query.py takes min(remaining, _FETCH_CHUNK),
+                # where remaining is clamped upstream). A negative or
+                # missing size is unlimited in SQLite and would silently
+                # materialize the table (review F-006: a 200 -> -1 mutant
+                # passed the suite).
+                args = node.args
+                if (len(args) == 1 and isinstance(args[0], ast.Constant)
+                        and isinstance(args[0].value, int)
+                        and args[0].value > 0):
+                    continue
+                if (len(args) == 1 and isinstance(args[0], ast.Call)
+                        and ast.unparse(args[0].func) in ("min", "max")):
+                    continue
                 if not any("limit" in ast.unparse(a) for a in node.args):
+                    offenders.append("%s:%d" % (path.name, node.lineno))
                     continue
                 fn = self._enclosing_function(path, node.lineno)
                 # Check the function's ASSIGNMENTS, not its unparsed text:

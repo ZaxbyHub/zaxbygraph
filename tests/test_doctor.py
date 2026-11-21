@@ -624,6 +624,35 @@ class GarbledQuotedPatternTests(unittest.TestCase):
         )
         self.assertEqual(report["garbled"], 1)
 
+    def test_fenced_block_mojibake_still_counted(self) -> None:
+        # Cubic thread 4649312969 / review F-001: fenced-code blocks are
+        # BLOCK-level constructs, not inline spans — their contents keep
+        # counting (the base raw-LIKE census counted fenced text, and the
+        # pinned semantics strip only matched inline-code spans). RED
+        # first under the fence-unaware scanner (the fence pair stripped
+        # to a NUL boundary and the census missed the row).
+        report = self._inspect_store(
+            [(1, "clean title", "prose\n```\nreal rÃ©sumÃ© damage\n```\ntail")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
+    def test_inline_span_after_fenced_block_still_excluded(self) -> None:
+        # The discriminating companion: a quoted example AFTER a fenced
+        # block is still an inline span and must not count — the fence
+        # handling must not over-widen the exclusion.
+        report = self._inspect_store(
+            [(1, "clean title", "```\ncode\n```\nsee `Ã` here")]
+        )
+        self.assertEqual(report["garbled"], 0)
+
+    def test_unclosed_fence_keeps_counting(self) -> None:
+        # An unclosed fence is literal content (the unmatched-run rule):
+        # its text keeps counting.
+        report = self._inspect_store(
+            [(1, "clean title", "prose ```\nreal rÃ©sumÃ© damage")]
+        )
+        self.assertEqual(report["garbled"], 1)
+
     def test_blob_field_with_pattern_bytes_is_counted(self) -> None:
         # A BLOB body whose UTF-8 bytes carry a signature matches the LIKE
         # prefilter (executed probe at plan time) and must keep counting
@@ -738,10 +767,12 @@ class StripInlineCodeUnitTests(unittest.TestCase):
         """The SHARED structural guard predicate (review round 8: the
         negative control must call the same code as the production check,
         or it cannot prove the guard rejects anything). Returns the list
-        of violations — empty means the function pairs via the
-        precomputed index and never raw-text-scans for a closer."""
+        of violations for ONE function: a raw-text suffix scan for a
+        closer. The caller aggregates across the scanner's functions and
+        additionally requires the precomputed-index closer assignment to
+        exist somewhere in the pair (the emit walk may live in either
+        after a refactor)."""
         findings: list[str] = []
-        closer_via_index = False
         for node in ast.walk(fn):
             if (isinstance(node, ast.Assign)
                     and isinstance(node.value, ast.IfExp)
@@ -755,11 +786,6 @@ class StripInlineCodeUnitTests(unittest.TestCase):
                         "a raw-text suffix scan for the closer "
                         "(the round-3 defect)"
                     )
-        if not closer_via_index:
-            findings.append(
-                "the emit walk must pair via the precomputed index "
-                "(j = next_shorter[idx] if odd else next_equal[idx])"
-            )
         return findings
 
     def test_many_unmatched_runs_stay_linear(self) -> None:
@@ -783,12 +809,28 @@ class StripInlineCodeUnitTests(unittest.TestCase):
 
         src = (Path(__file__).resolve().parents[1] / "src" / "zaxbygraph"
                / "doctor.py").read_text(encoding="utf-8")
-        fn = next(
+        fns = [
             node for node in ast.walk(ast.parse(src))
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_strip_inline_code"
-        )
-        self.assertEqual(self._linear_guard_findings(fn), [])
+            and node.name in ("_strip_inline_code", "_strip_spans")
+        ]
+        self.assertEqual(len(fns), 2, "scanner functions must both exist")
+        findings: list[str] = []
+        closer_via_index = False
+        for fn in fns:
+            findings.extend(self._linear_guard_findings(fn))
+            for node in ast.walk(fn):
+                if (isinstance(node, ast.Assign)
+                        and isinstance(node.value, ast.IfExp)
+                        and "next_shorter" in ast.unparse(node.value)
+                        and "next_equal" in ast.unparse(node.value)):
+                    closer_via_index = True
+        if not closer_via_index:
+            findings.append(
+                "the emit walk must pair via the precomputed index "
+                "(j = next_shorter[idx] if odd else next_equal[idx])"
+            )
+        self.assertEqual(findings, [])
 
     def test_the_linear_guard_rejects_the_tail_search_plant(self) -> None:
         # Negative control for the structural guard above: planting the

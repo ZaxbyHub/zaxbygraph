@@ -74,18 +74,93 @@ _MOJIBAKE_LIKE = (
 _MOJIBAKE_BYTES = ("Ã", "â€")
 
 
+def _at_fence_position(text: str, i: int) -> bool:
+    """True when the backtick run starting at ``i`` sits at a GFM
+    fenced-code delimiter position: at most 3 leading spaces on its line
+    (fences may be indented up to 3 spaces) and preceded on that line
+    only by whitespace."""
+    line_start = text.rfind("\n", 0, i) + 1
+    return text[line_start:i].strip() == ""
+
+
 def _strip_inline_code(text: str) -> str:
-    """Remove GFM code spans (matched backtick runs) from ``text``.
+    """Split out GFM fenced-code blocks and strip inline code spans
+    from the unfenced remainder.
 
     GitHub-authored issues quote the garbled detector's own byte patterns
-    inside inline code (issues #1/#2 quote ``Ã`` / ``â€`` verbatim), and a
-    quoted example is detector vocabulary, not mojibake content — so the
-    garbled census must not count it (epic #8 gate).
+    inside inline code (issues #1/#2 quote ``\u00c3`` / ``\u00e2\u20ac`` verbatim), and a
+    quoted example is detector vocabulary, not mojibake content \u2014 so the
+    garbled census must not count it (epic #8 gate). Fenced-code blocks
+    are BLOCK-level constructs, NOT inline spans: their contents stay in
+    the census (the base raw-LIKE census counted fenced text, and the
+    pinned semantics strip only matched inline-code spans). Unfenced
+    segments are stripped by _strip_spans; segments are rejoined with the
+    NUL region boundary so a removed span can never synthesize a
+    signature across a segment edge."""
+    n = len(text)
+    if "`" not in text:
+        return text if "\\" not in text else _render_escapes(text)
+    # GFM fenced-code blocks (a run of 3+ backticks starting a line,
+    # indented at most 3 spaces) are BLOCK-level constructs, not inline
+    # spans: their contents stay in the census (the pinned semantics strip
+    # only matched inline-code spans, and the base raw-LIKE census counted
+    # fenced text). Pre-split the field into fenced and unfenced segments;
+    # strip inline spans only from unfenced segments; rejoin with the NUL
+    # region boundary so a removed inline span can never synthesize a
+    # signature across a segment edge.
+    segments: list[tuple[str, bool]] = []  # (segment, is_fenced)
+    seg_start = 0
+    i = 0
+    in_fence = False
+    while i < n:
+        ch = text[i]
+        if ch == "`":
+            j = i
+            while j < n and text[j] == "`":
+                j += 1
+            length = j - i
+            if length >= 3 and _at_fence_position(text, i):
+                if not in_fence:
+                    if i > seg_start:
+                        segments.append((text[seg_start:i], False))
+                    segments.append((text[i:j], True))
+                    seg_start = j
+                    in_fence = True
+                else:
+                    # A run of 3+ backticks inside a fence is content
+                    # unless it closes the fence (a fence is closed by a
+                    # run at least as long as the opener at line start).
+                    if _at_fence_position(text, i):
+                        segments.append((text[seg_start:i], True))
+                        segments.append((text[i:j], True))
+                        seg_start = j
+                        in_fence = False
+                i = j
+                continue
+            i = j
+            continue
+        i += 1
+    if seg_start < n:
+        segments.append((text[seg_start:], in_fence))
+    out_parts: list[str] = []
+    for segment, fenced in segments:
+        if fenced:
+            out_parts.append(segment)
+        else:
+            out_parts.append(_strip_spans(segment))
+    # Rejoin with NUL region boundaries: distinct segments (fenced vs
+    # stripped) must never become adjacent, or the census could synthesize
+    # a signature across the edge.
+    return "\x00".join(out_parts)
 
-    Semantics (GFM §code-spans and §backslash-escapes), single pass:
+def _strip_spans(text: str) -> str:
+    """Strip GFM inline code spans (matched backtick runs) from
+    ``text`` \u2014 the caller has already split out fenced-code blocks.
+
+    Semantics (GFM \u00a7code-spans and \u00a7backslash-escapes):
     - OUTSIDE a code span, a backslash escapes exactly one following
       punctuation character. An escaped backtick (`` \\` ``) is a literal
-      backtick — it can neither open nor close a span, and the rendered
+      backtick \u2014 it can neither open nor close a span, and the rendered
       form keeps the backtick without the backslash (example 361); a
       backslash before anything else is literal. A run of 2k backslashes
       followed by a backtick escapes k of them and leaves k literal
@@ -98,24 +173,20 @@ def _strip_inline_code(text: str) -> str:
       contents are literal, including backslashes), so every backtick run
       inside closes the span when its length matches the opener.
     - An unmatched run emits ONLY that run as literal text and scanning
-      continues after it — later runs remain eligible to form spans
-      (example 359: `` `foo``bar`` `` keeps the first backtick + foo and
-      strips the ``bar`` span); runs of unequal length never pair with
-      each other.
+      continues after it \u2014 later runs remain eligible to form spans
+      (example 359); runs of unequal length never pair with each other.
 
-    Construction (linear, review round 4 final): pass 1 tokenizes
-    backslash runs and backtick runs in one sweep, recording the slash
-    count before each backtick run; a reverse pass precomputes every
-    run's next equal-length run; one forward emit walks ALL runs with
-    span state. An ODD slash count immediately before a run escapes only
-    that run's FIRST backtick (review round 4: a backslash escapes one
-    character, never a run) — the escaped backtick renders as a bare
-    backtick, and the run's REMAINDER (length - 1) is still a real
-    delimiter candidate; an even slash count leaves the whole run
-    eligible. Inside a pairing, escapes never operate: any equal-length
-    run closes. Every character is touched O(1) times: O(n) time, O(n)
-    output + O(runs) auxiliary memory.
-    """
+    Construction (linear): pass 1 tokenizes backslash runs and backtick
+    runs in one sweep, recording the slash count before each backtick
+    run; a reverse pass precomputes every run's next equal-length run
+    (and next one-shorter run, for escaped openers); one forward emit
+    walks ALL runs with span state. An ODD slash count immediately before
+    a run escapes only that run's FIRST backtick \u2014 the escaped backtick
+    renders as a bare backtick, and the run's REMAINDER (length - 1) is
+    still a real delimiter candidate; an even slash count leaves the
+    whole run eligible. Inside a pairing, escapes never operate: any
+    equal-length run closes. Every character is touched O(1) times: O(n)
+    time, O(n) output + O(runs) auxiliary memory."""
     n = len(text)
     if "`" not in text:
         return text if "\\" not in text else _render_escapes(text)
@@ -215,7 +286,6 @@ def _strip_inline_code(text: str) -> str:
         out.append(text[pos:])
         dropped = False
     return _render_escapes("".join(out))
-
 
 def _render_escapes(text: str) -> str:
     """Render outside-span backslash escapes the way the census must see
