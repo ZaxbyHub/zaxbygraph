@@ -150,16 +150,17 @@ class GhApiSource:
             # RFC 8259 §6), so a malformed or hostile probe answer fails
             # the decode instead of slipping past the field guards. Every
             # other path keeps the lenient text decode unchanged.
-            raw = proc.stdout
-            if isinstance(raw, str):  # test doubles hand str; real bytes path decodes
-                raw_text = raw
-            else:
-                try:
-                    raw_text = raw.decode("utf-8")
-                except UnicodeDecodeError as exc:
-                    raise ValueError(
-                        f"rate_limit probe answer is not valid UTF-8: {exc}"
-                    ) from exc
+            try:
+                raw_text = proc.stdout.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(
+                    f"rate_limit probe answer is not valid UTF-8: {exc}"
+                ) from exc
+            except AttributeError as exc:
+                raise TypeError(
+                    "rate_limit probe path requires raw-bytes transport "
+                    "(subprocess.run without encoding=); got decoded text"
+                ) from exc
             return json.loads(raw_text, parse_constant=_reject_nonstandard_constant)
         text = proc.stdout.strip()
         if not text:
