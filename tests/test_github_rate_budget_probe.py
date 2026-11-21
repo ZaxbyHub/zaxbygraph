@@ -51,8 +51,8 @@ class RateBudgetProbeHostileTests(unittest.TestCase):
         self.assertIs(result, original)
         self.assertEqual(str(result), "gh: API rate limit exceeded")
         self.assertEqual(result.status, 429)
-        self.assertIsNone(getattr(result, "rate_limit_remaining", None))
-        self.assertIsNone(getattr(result, "rate_limit_reset", None))
+        self.assertFalse(hasattr(result, "rate_limit_remaining"))
+        self.assertFalse(hasattr(result, "rate_limit_reset"))
 
     def test_bool_remaining_keeps_original(self) -> None:
         src = self._source_with_probe(
@@ -63,8 +63,8 @@ class RateBudgetProbeHostileTests(unittest.TestCase):
         self.assertIs(result, original)
         self.assertEqual(str(result), "gh: API rate limit exceeded")
         self.assertEqual(result.status, 429)
-        self.assertIsNone(getattr(result, "rate_limit_remaining", None))
-        self.assertIsNone(getattr(result, "rate_limit_reset", None))
+        self.assertFalse(hasattr(result, "rate_limit_remaining"))
+        self.assertFalse(hasattr(result, "rate_limit_reset"))
 
     def test_inf_reset_leaves_no_partial_state(self) -> None:
         src = self._source_with_probe(
@@ -75,8 +75,8 @@ class RateBudgetProbeHostileTests(unittest.TestCase):
         self.assertIs(result, original)
         self.assertEqual(str(result), "gh: API rate limit exceeded")
         self.assertEqual(result.status, 429)
-        self.assertIsNone(getattr(result, "rate_limit_remaining", None))
-        self.assertIsNone(getattr(result, "rate_limit_reset", None))
+        self.assertFalse(hasattr(result, "rate_limit_remaining"))
+        self.assertFalse(hasattr(result, "rate_limit_reset"))
 
     def test_wellformed_still_enriches(self) -> None:
         src = self._source_with_probe(
@@ -87,7 +87,7 @@ class RateBudgetProbeHostileTests(unittest.TestCase):
         self.assertIs(enriched, original)
         self.assertEqual(enriched.rate_limit_remaining, 0)
         self.assertIsInstance(enriched.rate_limit_reset, str)
-        self.assertTrue(enriched.rate_limit_reset.endswith("Z"))
+        self.assertEqual(enriched.rate_limit_reset, "2023-11-14T22:13:20Z")
 
 
 if __name__ == "__main__":

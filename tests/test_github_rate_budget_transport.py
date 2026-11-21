@@ -38,8 +38,8 @@ def _run_probe(stdout: str) -> GitHubError:
 
 class _EnrichmentAssertions:
     def assert_unenriched(self, exc: GitHubError) -> None:
-        self.assertIsNone(getattr(exc, "rate_limit_remaining", None))
-        self.assertIsNone(getattr(exc, "rate_limit_reset", None))
+        self.assertFalse(hasattr(exc, "rate_limit_remaining"))
+        self.assertFalse(hasattr(exc, "rate_limit_reset"))
 
 
 class ProbeTransportDecodeTests(_EnrichmentAssertions, unittest.TestCase):
@@ -80,7 +80,7 @@ class ProbeTransportDecodeTests(_EnrichmentAssertions, unittest.TestCase):
             "\n"
         )
         self.assertEqual(exc.rate_limit_remaining, 0)
-        self.assertTrue(str(getattr(exc, "rate_limit_reset", "")).endswith("Z"))
+        self.assertEqual(exc.rate_limit_reset, "2023-11-14T22:13:20Z")
 
 
 if __name__ == "__main__":
