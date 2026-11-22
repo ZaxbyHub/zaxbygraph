@@ -373,22 +373,29 @@ def _actionable_stderr(stderr: bytes) -> str:
 def _check_completeness(conn: sqlite3.Connection, repo: str) -> None:
     """Refuse incomplete stores (issue #34 AC2). Completeness is derived on
     the staged backup (finding 9): full_sync_pending must be 0 and last_error
-    must be NULL, both read from the STAGED connection."""
-    row = conn.execute(
-        "SELECT full_sync_pending, last_error FROM sync_state WHERE repo = ?",
-        (repo,),
-    ).fetchone()
-    if row is None:
+    must be NULL, both read from the STAGED connection.
+
+    Reads are canonical (issue #91): every case-variant state row of the
+    manifest repo participates, and ANY pending marker or error makes the
+    store incomplete (conservative, deterministic)."""
+    rows = conn.execute(
+        "SELECT full_sync_pending, last_error FROM sync_state"
+        " WHERE lower(repo) = ?",
+        (repo.lower(),),
+    ).fetchall()
+    if not rows:
         raise SnapshotError(
             "repo_not_synced",
             f"no sync_state row for {repo}; run sync first",
             hint="snapshot publish moves a synced corpus",
         )
-    if int(row["full_sync_pending"] or 0) != 0 or row["last_error"] is not None:
+    pending = max(int(row["full_sync_pending"] or 0) for row in rows)
+    errors = [row["last_error"] for row in rows if row["last_error"] is not None]
+    if pending or errors:
         raise SnapshotError(
             "store_incomplete",
             f"store for {repo} is incomplete (full_sync_pending="
-            f"{int(row['full_sync_pending'] or 0)}, last_error={row['last_error']!r})",
+            f"{pending}, last_error={errors[0] if errors else None!r})",
             hint="snapshot publish refuses incomplete stores (issue #34 AC2)",
         )
 
@@ -413,6 +420,74 @@ def _parts_from_backup(staged: Path, tmp: Path) -> tuple[list[dict], bytes, int,
     uv = int(sqlite3.connect(str(staged)).execute(
         "PRAGMA user_version").fetchone()[0])
     return parts, gz_bytes, len(raw), uv
+
+
+#: Every table `schema.sql` declares a `repo` column on (issue #91). The
+#: snapshot transport replaces/transfers the WHOLE file, so ownership is
+#: every repo a PRESENT table can carry — not `sync_state` alone (a child
+#: row without its state row is still destroyed by a pull and disclosed by a
+#: publish). A guardrail test derives this set from an initialized database
+#: (fresh and migrated) and fails when a new repo-bearing table appears.
+_REPO_BEARING_TABLES = (
+    "items", "labels", "assignees", "issue_field_values", "comments",
+    "reviews", "pr_files", "releases", "edges", "fetch_log", "sync_state",
+    "revisions", "item_path_refs", "item_signatures", "item_events",
+    "pr_commits", "sync_pending",
+)
+
+
+def _repo_owners(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    """Every repo a PRESENT repo-bearing table carries (issue #91).
+
+    Returns ``lower(repo) -> stored spellings``. Absent tables are tolerated
+    (older schemas); a present table that errors propagates to the caller
+    (pull fails closed via `_dest_uninspectable`, publish via
+    `store_uninspectable`). A repo value that is not a non-empty string is an
+    inspection failure, never a value to skip: the guard's oracle must not
+    silently ignore a row it cannot attribute.
+
+    Table names come from the module constant above, never from input, so the
+    f-string identifier interpolation cannot be injected.
+    """
+    present = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    owners: dict[str, set[str]] = {}
+    for table in _REPO_BEARING_TABLES:
+        if table not in present:
+            continue
+        for (repo,) in conn.execute(f"SELECT DISTINCT repo FROM {table}"):
+            if not isinstance(repo, str) or not repo:
+                raise ValueError(
+                    f"{table}.repo carries a non-string or empty value"
+                )
+            owners.setdefault(repo.lower(), set()).add(repo)
+    return owners
+
+
+def _digest_repo_spellings(
+    conn: sqlite3.Connection, repo: str
+) -> list[str]:
+    """The stored spellings a canonical repo's digest must cover.
+
+    A case-variant store (rows stored as `ACME/x` while the manifest names
+    `acme/x`) must not produce a digest over an empty exact-spelling
+    projection (issue #91); a normal single-spelling store answers exactly
+    the old spelling, so its digest bytes are unchanged.
+    """
+    try:
+        rows = [
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT repo FROM sync_state WHERE lower(repo) = ?",
+                (repo.lower(),),
+            )
+        ]
+    except sqlite3.Error:
+        rows = []
+    spellings = sorted({r for r in rows if isinstance(r, str) and r})
+    return spellings or [repo]
 
 
 def _corpus_digest(staged: Path, repo: str) -> str:
@@ -463,24 +538,63 @@ def publish(db_path: Path, target: str, publisher: str,
     try:
         conn = connect(db_path)
         try:
-            states = conn.execute("SELECT repo FROM sync_state").fetchall()
+            states = [
+                row[0] for row in conn.execute("SELECT repo FROM sync_state")
+            ]
             if not states:
                 raise SnapshotError(
                     "repo_not_synced",
                     "no sync_state rows; run sync first",
                     hint="snapshot publish moves a synced corpus",
                 )
-            if len(states) != 1:
+            canonical = {
+                state.lower() for state in states
+                if isinstance(state, str) and state
+            }
+            if not canonical:
+                raise SnapshotError(
+                    "store_uninspectable",
+                    "sync_state carries no usable repo identity",
+                    hint="repair or re-create the store; the transport"
+                         " cannot certify which repo it holds",
+                )
+            if len(canonical) != 1:
                 raise SnapshotError(
                     "multi_repo_store",
-                    f"snapshot publish needs a single-repo store (found {len(states)})",
+                    "snapshot publish needs a single-repo store (found"
+                    f" {', '.join(sorted(canonical))})",
                     hint="publish from a store holding exactly one repo",
                 )
-            repo = states[0][0]
-            if expected_repo is not None and repo != expected_repo:
-                # the manifest is written from sync_state; an envelope
-                # labelled with a different --repo would report a corpus
-                # this store does not hold (cubic second-round finding)
+            # Issue #91: ownership is every present repo-bearing table, not
+            # sync_state alone — the artifact carries them all.
+            try:
+                owners = _repo_owners(conn)
+            except (sqlite3.Error, ValueError) as exc:
+                raise SnapshotError(
+                    "store_uninspectable",
+                    f"cannot read the store's repo ownership: {exc}",
+                    hint="repair or re-create the store; the transport"
+                         " cannot certify which repos it holds",
+                ) from exc
+            repo = next(iter(canonical))
+            foreign = sorted(
+                spelling
+                for key, spellings in owners.items()
+                if key != repo
+                for spelling in spellings
+            )
+            if foreign:
+                raise SnapshotError(
+                    "multi_repo_store",
+                    f"store also holds {', '.join(foreign)}; publishing it"
+                    " under a single-repo manifest would transfer them",
+                    hint="publish from a store holding exactly one repo",
+                )
+            if expected_repo is not None and repo != expected_repo.lower():
+                # the manifest is written from the store's canonical repo; an
+                # envelope labelled with a different --repo would report a
+                # corpus this store does not hold (cubic second-round
+                # finding); the comparison is canonical (issue #91 AC5)
                 raise SnapshotError(
                     "repo_mismatch",
                     f"store holds {repo!r} but the requested repo is"
@@ -518,8 +632,13 @@ def _publish_staged(staged: Path, tmp: Path, target: str,
         _check_completeness(sc, repo)
         uv = int(sc.execute("PRAGMA user_version").fetchone()[0])
         watermark = sc.execute(
-            "SELECT issues_since FROM sync_state WHERE repo = ?", (repo,)
-        ).fetchone()["issues_since"]
+            "SELECT MIN(issues_since) FROM sync_state WHERE lower(repo) = ?",
+            (repo.lower(),)
+        ).fetchone()[0]
+        # MIN, canonical (issue #91): every case-variant state row of the
+        # manifest repo participates, and the earliest non-NULL watermark is
+        # the conservative one for a puller's continuation (it re-fetches
+        # more, never less). A store with only NULL watermarks has none.
         # The same guard `pull` applies at the manifest boundary, applied here
         # at the producing end. A store for a repository with zero issues and
         # PRs carries a NULL watermark; publishing it produces a snapshot that
@@ -946,7 +1065,7 @@ def _bind_destination(manifest: dict, expected_repo: str | None,
             "snapshot manifest repo must be a non-empty string",
             hint="re-publish and re-pull",
         )
-    if expected_repo is not None and snap_repo != expected_repo:
+    if expected_repo is not None and snap_repo.lower() != expected_repo.lower():
         raise SnapshotError(
             "repo_mismatch",
             f"snapshot holds {snap_repo!r} but the destination is"
@@ -1023,17 +1142,49 @@ def _check_destination_shape(db_path: Path, manifest: dict,
         _reject_unless_not_a_store(exc, db_path)
         return
     try:
-        repos = [r[0] for r in conn.execute("SELECT repo FROM sync_state")]
+        try:
+            # Issue #91: ownership is every PRESENT repo-bearing table,
+            # compared canonically. A destination that is genuinely not a
+            # store keeps its documented replaceable recovery; a store whose
+            # ownership scan faults must REFUSE (fail closed) — an
+            # unreadable table cannot certify that no foreign corpus exists.
+            owners = _repo_owners(conn)
+        except ValueError as exc:
+            raise _dest_uninspectable(db_path) from exc
     except sqlite3.Error as exc:
-        _reject_unless_not_a_store(exc, db_path)
+        if not _is_not_a_store(exc):
+            raise _dest_uninspectable(db_path) from exc
+        # `_is_not_a_store` treats EVERY SQLITE_ERROR as replaceable, which
+        # was correct for the old single-table probe (a schema-less file, a
+        # store whose sync_state lacks a column) but is NOT sufficient here:
+        # a readable destination that HAS repo-bearing tables is a store
+        # whose ownership scan failed, and the scan's failure cannot certify
+        # "no foreign rows". Only a destination with no repo-bearing table
+        # at all is the documented replaceable non-store.
+        try:
+            present = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        except sqlite3.Error:
+            raise _dest_uninspectable(db_path) from exc
+        if any(table in present for table in _REPO_BEARING_TABLES):
+            raise _dest_uninspectable(db_path) from exc
         return
     finally:
         conn.close()
-    others = [r for r in repos if r != manifest["repo"]]
+    wanted = manifest["repo"].lower()
+    others = sorted(
+        spelling
+        for key, spellings in owners.items()
+        if key != wanted
+        for spelling in spellings
+    )
     if others and not force:
         raise SnapshotError(
             "multi_repo_destination",
-            f"destination store also holds {', '.join(sorted(others))};"
+            f"destination store also holds {', '.join(others)};"
             " replacing it would drop those corpora",
             hint="pull into a single-repo store, or pass --force to"
                  " overwrite the whole store",
@@ -1062,9 +1213,13 @@ def _local_watermark(db_path: Path, repo: str) -> str | None:
     try:
         conn = _open_readonly(db_path)
         try:
+            # Issue #91 AC5: canonical identity, and the NEWEST matching
+            # watermark — an exact-spelling lookup could miss a case-variant
+            # newer local state and bypass the `local_newer` refusal.
             row = conn.execute(
-                "SELECT issues_since FROM sync_state WHERE repo = ?",
-                (repo,)).fetchone()
+                "SELECT MAX(issues_since) FROM sync_state"
+                " WHERE lower(repo) = ?",
+                (repo.lower(),)).fetchone()
         finally:
             conn.close()
     except sqlite3.Error as exc:
@@ -1392,8 +1547,13 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
 
 
 def _corpus_digest_conn(conn: sqlite3.Connection, repo: str) -> str:
-    """Corpus digest from an open connection (the post-install check)."""
+    """Corpus digest from an open connection (the post-install check).
+
+    Covers every stored spelling of the canonical repo in sorted order
+    (issue #91): a single-spelling store keeps the old byte stream exactly.
+    """
     hasher = hashlib.sha256()
-    for piece in iter_corpus_content_lines(conn, repo, set()):
-        hasher.update(piece)
+    for spelling in _digest_repo_spellings(conn, repo):
+        for piece in iter_corpus_content_lines(conn, spelling, set()):
+            hasher.update(piece)
     return hasher.hexdigest()

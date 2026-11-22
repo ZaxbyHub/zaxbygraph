@@ -90,6 +90,10 @@ RELEASE_PINS: dict[str, tuple[int, str]] = {
         12,
         "0eb4be5f40db5a88b8ffe9aaff1591a9063197a3361ded7c9ab44af544b8a9fc",
     ),
+    "0.5.1": (
+        12,
+        "0eb4be5f40db5a88b8ffe9aaff1591a9063197a3361ded7c9ab44af544b8a9fc",
+    ),
 }
 #: Back-compat alias for the digest-only membership check.
 TOOLSET_DIGESTS: dict[str, str] = {

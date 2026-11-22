@@ -1371,6 +1371,7 @@ def mark_sync_finished(
     rate_limit_reset_at: str | None = None,
     targeted: bool = False,
     ingested_count: int = 0,
+    malformed_open: bool = False,
 ) -> None:
     """Stamp a clean finish.
 
@@ -1394,6 +1395,14 @@ def mark_sync_finished(
     is still open — the pending set, not the ingest count, is what makes
     the previous error true (issue #66 AC4; PR #76 review PRR-003).
 
+    `malformed_open` (issue #88) joins the obligation count with the pending
+    set: a run that skipped a listing row it could not parse must not stamp a
+    clean finish, clear `last_error`, or clear `full_sync_pending`, exactly
+    like any other durable obligation. A targeted run additionally cannot
+    clear `last_error` while `listing_floor_active = 1` — a targeted refresh
+    never re-drains the listing, so it can never resolve a floor and must not
+    launder one (frozen AC8).
+
     The rate-limit columns carry the window this run slept through (NULL when
     it saw none), verbatim as the source reported it (issue #5 AC4).
     """
@@ -1415,11 +1424,27 @@ def mark_sync_finished(
             "SELECT COUNT(*) FROM sync_pending WHERE repo = ?",
             (repo,),
         ).fetchone()[0]
+    # Issue #88: a malformed listing row this run could not parse is the same
+    # kind of durable obligation as a pending row — it must keep the
+    # incomplete marker and the error until a skip-free run resolves it.
+    obligation = pending_open + (1 if malformed_open else 0)
     if targeted:
+        # Issue #88 AC8: a targeted refresh can never re-drain the listing,
+        # so an active floor it did not resolve must not be laundered into a
+        # clean readiness verdict. Pre-v12 stores have no floor column.
+        state_cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_state)")}
+        floor_active = 0
+        if "listing_floor_active" in state_cols:
+            frow = conn.execute(
+                "SELECT listing_floor_active FROM sync_state WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+            floor_active = 0 if frow is None else int(frow[0] or 0)
         conn.execute(
             """
             UPDATE sync_state SET
-                last_error = CASE WHEN :ingested > 0 AND :pending_open = 0
+                last_error = CASE WHEN :ingested > 0 AND :obligation = 0
+                            AND :floor_active = 0
                             THEN NULL ELSE last_error END,
                 rate_limit_remaining = :rate_remaining,
                 rate_limit_reset_at = :rate_reset_at
@@ -1427,14 +1452,15 @@ def mark_sync_finished(
             """,
             {
                 "ingested": ingested_count,
-                "pending_open": pending_open,
+                "obligation": obligation,
+                "floor_active": floor_active,
                 "repo": repo,
                 "rate_remaining": rate_limit_remaining,
                 "rate_reset_at": rate_limit_reset_at,
             },
         )
         return
-    # (the non-targeted UPDATE below carries :pending_open)
+    # (the non-targeted UPDATE below carries :obligation)
     #
     # The freshness stamps and the incomplete marker move TOGETHER (PR #76
     # review PRR-014): the completion stamp may only advance on a finish
@@ -1443,15 +1469,15 @@ def mark_sync_finished(
     conn.execute(
         """
         UPDATE sync_state SET
-            last_full_sync_at = CASE WHEN :pending_open = 0
+            last_full_sync_at = CASE WHEN :obligation = 0
                                 AND full_sync_pending = 1
                                 THEN :now ELSE last_full_sync_at END,
-            last_incr_sync_at = CASE WHEN :pending_open = 0
+            last_incr_sync_at = CASE WHEN :obligation = 0
                                 AND full_sync_pending = 0
                                 THEN :now ELSE last_incr_sync_at END,
-            full_sync_pending = CASE WHEN :pending_open > 0
+            full_sync_pending = CASE WHEN :obligation > 0
                                 THEN 1 ELSE 0 END,
-            last_error = CASE WHEN :pending_open > 0
+            last_error = CASE WHEN :obligation > 0
                         THEN last_error ELSE NULL END,
             rate_limit_remaining = :rate_remaining,
             rate_limit_reset_at = :rate_reset_at
@@ -1460,7 +1486,7 @@ def mark_sync_finished(
         {
             "now": now,
             "repo": repo,
-            "pending_open": pending_open,
+            "obligation": obligation,
             "rate_remaining": rate_limit_remaining,
             "rate_reset_at": rate_limit_reset_at,
         },

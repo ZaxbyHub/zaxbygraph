@@ -1334,7 +1334,13 @@ class GraphQLSource(GhApiSource):
         for raw in chunk:
             if not isinstance(raw, dict) or "number" not in raw:
                 continue
-            number = int(raw["number"])
+            try:
+                number = int(raw["number"])
+            except (TypeError, ValueError):
+                # Issue #88 AC4: one malformed row must never abort the whole
+                # chunk; the sync layer records the skip and pins the
+                # recovery floor (the per-item branch owns the record).
+                continue
             kind = "pr" if "pull_request" in raw else "issue"
             alias = ("p" if kind == "pr" else "i") + str(number)
             fields = self._fields_for(kind)

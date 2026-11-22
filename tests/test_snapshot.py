@@ -1321,3 +1321,220 @@ class SnapshotReviewFixTests(unittest.TestCase):
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
+
+
+# ==== issue #91 publish ownership (collated trace 88-91) ====================
+#
+# Module-level checks appended for the 88-91 trace. `snapshot publish`'s
+# single-repo oracle must decide which repos the store holds from every
+# present repo-bearing table (compared canonically, lower(repo)) -- not from
+# `sync_state` alone, which is a strict subset of what the whole-file
+# artifact discloses. All three checks are RED at the trace's base commit
+# and GREEN after the fix; the module-level `load_tests` hook below keeps
+# the existing TestCase classes and adds these functions for unittest
+# discovery (pytest collects the functions natively).
+
+from zaxbygraph.snapshot import (  # noqa: E402
+    _bind_destination,
+    _check_destination_shape,
+    _local_watermark,
+)
+
+
+def test_publish_refuses_foreign_corpus():
+    """AC15 (#91): a publish source holding a valid sync_state row for the
+    manifest repo plus foreign items rows (a corpus without its own
+    sync_state row) is refused, and nothing is pushed. RED at base (the
+    sync_state-only oracle sees one repo and publish succeeds); GREEN after
+    the fix."""
+    with tempfile.TemporaryDirectory(prefix="ac15_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        db = _build_store(td)
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO items(id, repo, number, kind, title, state, raw_json)"
+            " VALUES (90001, 'intruder/repo', 901, 'issue', 'foreign',"
+            " 'open', '{}')")
+        conn.commit()
+        conn.close()
+        bare = _bare(td)
+        code = None
+        try:
+            publish(db, str(bare), publisher="t")
+        except SnapshotError as exc:
+            code = exc.code
+        assert code is not None, \
+            "publish must refuse a store with a foreign items corpus"
+        assert code == "multi_repo_store", \
+            f"the refusal names the foreign corpus, got {code!r}"
+        assert _ls_remote(bare, SNAPSHOT_REF) is None, "nothing was pushed"
+
+
+def test_publish_refuses_foreign_rows_with_valid_state():
+    """AC16 (#91): a publish source with a valid sync_state row for the
+    manifest repo plus a foreign row in any other repo-bearing table (here:
+    labels) is refused, and nothing is pushed -- otherwise the manifest
+    names one repo while the whole-file artifact transfers the other's row.
+    RED at base (publish succeeds with the foreign row staged into the
+    artifact); GREEN after the fix."""
+    with tempfile.TemporaryDirectory(prefix="ac16_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        db = _build_store(td)
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "INSERT INTO labels(repo, number, name)"
+            " VALUES ('intruder/repo', 201, 'foreign')")
+        conn.commit()
+        conn.close()
+        bare = _bare(td)
+        code = None
+        try:
+            publish(db, str(bare), publisher="t")
+        except SnapshotError as exc:
+            code = exc.code
+        assert code is not None, \
+            "publish must refuse foreign rows under a single-repo manifest"
+        assert code == "multi_repo_store", \
+            f"the refusal names the foreign corpus, got {code!r}"
+        assert _ls_remote(bare, SNAPSHOT_REF) is None, "nothing was pushed"
+
+
+def test_case_differences_do_not_conflict():
+    """AC17 (#91, DISCRIMINATING per the trace): repos differing only by
+    case compare canonically (lower(repo)) and do not false-refuse -- at
+    the destination-shape guard, the destination bind, the local-watermark
+    lookup, the real pull local_newer refusal, and publish's duplicate
+    canonical state. RED at base (the exact != comparison refuses the
+    direct-guard leg first); GREEN after the fix."""
+    with tempfile.TemporaryDirectory(prefix="ac17_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        dest = td / "dest.db"
+        conn = connect(dest)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        for n in range(201, 205):
+            src.add_issue(issue(n, created_at="2027-06-01T00:00:00Z"))
+        sync_repo(conn, src, REPO)
+        conn.execute(
+            "UPDATE sync_state SET repo = upper(repo) WHERE repo = ?", (REPO,))
+        conn.execute(
+            "UPDATE items SET repo = upper(repo) WHERE repo = ?", (REPO,))
+        conn.commit()
+        conn.close()
+        code = None
+        try:
+            _check_destination_shape(dest, {"repo": REPO}, False)
+        except SnapshotError as exc:
+            code = exc.code
+        assert code is None, \
+            f"same slug in a different case must not be refused, got {code!r}"
+
+    # The destination bind is canonical too: a manifest for the lowercase
+    # slug binds a destination resolved with the uppercase spelling.
+    bind_code = None
+    try:
+        _bind_destination({"repo": REPO}, REPO.upper(), None)
+    except SnapshotError as exc:
+        bind_code = exc.code
+    assert bind_code is None, \
+        f"bind must compare canonically, got {bind_code!r}"
+
+    with tempfile.TemporaryDirectory(prefix="ac17wm_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        dest = td / "dest.db"
+        conn = connect(dest)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        for n in range(201, 205):
+            src.add_issue(issue(n, created_at="2027-06-01T00:00:00Z"))
+        sync_repo(conn, src, REPO)
+        # An uppercase state row carrying a NEWER watermark: the canonical
+        # lookup must still find it (a case-blind miss reads "no local
+        # corpus" and silently overwrites a newer local store).
+        conn.execute(
+            "UPDATE sync_state SET repo = upper(repo), issues_since = ?"
+            " WHERE repo = ?", ("2027-01-01T00:00:00Z", REPO))
+        conn.commit()
+        conn.close()
+        assert _local_watermark(dest, REPO) == "2027-01-01T00:00:00Z", \
+            "the watermark lookup is canonical"
+
+    # Real pull leg: a newer UPPERCASE local state must produce the
+    # local_newer refusal, not a multi_repo refusal and not an install.
+    with tempfile.TemporaryDirectory(prefix="ac17pull_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        src_db = _build_store(td / "src")
+        bare = _bare(td / "src")
+        publish(src_db, str(bare), publisher="t")
+        dest = td / "dst" / "history.db"
+        conn = connect(dest)
+        init_schema(conn)
+        src = FakeGitHubSource()
+        for n in range(201, 205):
+            src.add_issue(issue(n, created_at="2027-06-01T00:00:00Z"))
+        sync_repo(conn, src, REPO)
+        conn.execute(
+            "UPDATE sync_state SET repo = upper(repo), issues_since = ?"
+            " WHERE repo = ?", ("2099-01-01T00:00:00Z", REPO))
+        conn.commit()
+        conn.close()
+        code = None
+        try:
+            pull(dest, str(bare), force=False)
+        except SnapshotError as exc:
+            code = exc.code
+        assert code == "local_newer", \
+            f"a canonically-newer local store refuses local_newer, got {code!r}"
+
+    # Deterministic duplicate canonical state: an uppercase row plus a
+    # lowercase row for the SAME slug are ONE repo -- publish succeeds with
+    # the lowercase manifest spelling and the MIN of the two watermarks.
+    with tempfile.TemporaryDirectory(prefix="ac17dup_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        db = _build_store(td)
+        conn = sqlite3.connect(str(db))
+        conn.execute(
+            "UPDATE sync_state SET repo = upper(repo) WHERE repo = ?", (REPO,))
+        conn.execute(
+            "INSERT INTO sync_state(repo, issues_since) VALUES (?, ?)",
+            (REPO, "2020-01-01T00:00:00Z"))
+        conn.commit()
+        conn.close()
+        bare = _bare(td)
+        code = None
+        manifest = None
+        try:
+            out = publish(db, str(bare), publisher="t")
+            manifest = out["manifest"]
+        except SnapshotError as exc:
+            code = exc.code
+        assert code is None, \
+            f"duplicate canonical state is one repo, not a refusal ({code!r})"
+        assert manifest is not None and manifest["repo"] == REPO, \
+            "the manifest keeps the canonical (lowercase) spelling"
+        assert manifest["watermark"] == "2020-01-01T00:00:00Z", \
+            "the watermark is the MIN of the canonically-equal rows"
+        assert _ls_remote(bare, SNAPSHOT_REF) is not None, \
+            "the duplicate-canonical publish pushed"
+
+
+_TRACE_8891_CHECKS = [
+    test_publish_refuses_foreign_corpus,
+    test_publish_refuses_foreign_rows_with_valid_state,
+    test_case_differences_do_not_conflict,
+]
+
+
+def load_tests(loader, standard_tests, pattern):
+    """Keep the existing TestCase classes and add the trace's module-level
+    checks for unittest discovery (published argv parity with pytest)."""
+    suite = unittest.TestSuite(standard_tests)
+    for fn in _TRACE_8891_CHECKS:
+        suite.addTest(unittest.FunctionTestCase(fn))
+    return suite

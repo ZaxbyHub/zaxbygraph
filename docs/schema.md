@@ -432,8 +432,23 @@ deletion. The mechanism that does close it:
   (`listing_floor`/`listing_floor_active`), keeps
   `full_sync_pending`, and suppresses the clean finish — so, when the
   cap trips, the run never claims coverage it did not achieve.
+- **a listing row that cannot be parsed pins the same floor (issue #88).**
+  A row the sync cannot ingest — a non-dict element, a missing or
+  non-integer `number`, a missing or invalid `id` — is skipped AND
+  recorded, pins the recovery floor at the row's own `updated_at` (or from
+  the beginning when the row has no usable stamp; an earlier active floor
+  is never replaced by a later one), and keeps `last_error` set as
+  `malformed_listing_row: …`. It is never counted as ingested and never
+  bundled into the JSONL sidecar, and the run answers incomplete. The floor
+  clears only on a clean, SKIP-FREE finish; a targeted `sync --numbers` run
+  can never clear it or its `last_error`. A malformed row with a parseable
+  number still counts as a delivered row for the deletion oracle's absence
+  derivation, and a run that saw any malformed row derives no NEW deletion
+  candidates (absence needs complete listing evidence). On a pre-v12 store
+  the floor cannot be persisted, so the run aborts after recording rather
+  than letting the advancing watermark seal the skip.
 - **the next run re-drains from the earlier of the floor and the
-  watermark**, and a clean finish clears the floor. A `NULL` floor
+  watermark**, and a clean, skip-free finish clears the floor. A `NULL` floor
   with the flag set is a full run's floor (re-drain from the
   beginning), and a `NULL` watermark is never raised to a non-NULL
   floor — from-the-beginning already subsumes it, which is what
@@ -586,11 +601,11 @@ One row per repo. What `zaxbygraph status` reads.
 | `edge_count` | INTEGER | |
 | `include_patches` | INTEGER | `1` if patches were stored, so a later run can tell a genuine no-patch state from a not-yet-backfilled one. |
 | `fetch_source` | TEXT | v11. The fetch source this store's profile deliberately uses — `graphql` or `rest` — stamped at listing-sync start whenever a run EXPLICITLY stated a source (`--source`, or the `--max-age` refresh honoring the stored value); a run that did not state one (a plain `sync`, a targeted `--numbers` run without `--source`, the MCP surface) never rewrites the stamp, so a store deliberately kept on `--source rest` stays rest until the operator says otherwise. `NULL` on pre-v11 stores or where never recorded, which every reader treats as the documented graphql default. The `--max-age` refresh re-reads it under the sync lock and re-stamps the concrete value it honored; a mid-run GraphQL→REST degradation is a transient fact of one run and never rewrites the stamp. Consolidation adopts a post-v11 candidate's value with its sync_state row; a pre-v11 candidate leaves the column NULL. |
-| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run, AND whenever any `sync_pending` obligation (torn or deletion) is open — including a torn debt from an incremental run; also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
+| `full_sync_pending` | INTEGER | `1` while a full sync has been started but not completed by any clean run, AND whenever any open obligation exists — a `sync_pending` row (torn or deletion, including a torn debt from an incremental run) or a malformed listing row the run skipped (issue #88); also set by a targeted `sync --numbers` run against a store that has never completed a full sync, so a numbers-only corpus reads incomplete. `status` derives `complete` = `full_sync_pending = 0 AND last_error IS NULL` per repo. |
 | `rate_limit_remaining` | INTEGER | `0` when the last clean run observed its budget at the floor (it slept a window through, or proceeded with the floor already reached); `NULL` when the run saw no rate limit. The reset instant is in `rate_limit_reset_at`. |
 | `rate_limit_reset_at` | TEXT | When that window resets (verbatim from the source); `NULL` when the run saw no rate limit. |
-| `listing_floor` | TEXT | v12. The window a run that never quiesced must re-drain (issue #65 AC1): the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean **non-targeted** finish (`sync --numbers` never re-drains the listing, so it never clears the floor) — the floor tracks LISTING quiescence only, so an item-level `sync_pending` obligation that outlives the same finish is retried through its own seam and does not keep the floor standing — and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
-| `listing_floor_active` | INTEGER | v12. `1` while an unresolved listing floor stands. The next non-targeted run raises a stale watermark to the floor (a targeted refresh never moves the watermark at all); a `NULL` watermark is never narrowed by it (from-the-beginning already covers the floor's window), so `--force` still re-reads everything. |
+| `listing_floor` | TEXT | v12. The window a run that never quiesced — or that skipped a listing row it could not parse (issue #88) — must re-drain: the earlier of this and `issues_since`. `NULL` **with** `listing_floor_active = 1` is a full run's floor — re-drain from the beginning, which subsumes any timestamp. Cleared by the next clean, SKIP-FREE **non-targeted** finish (`sync --numbers` never re-drains the listing, so it never clears the floor, and a run that skipped a malformed row keeps the pin until a skip-free run) — the floor tracks LISTING completeness (quiescence plus parseable rows), so an item-level `sync_pending` obligation that outlives the same finish is retried through its own seam and does not keep the floor standing — and folded by `doctor --consolidate` (earliest of the store's and the candidate's). |
+| `listing_floor_active` | INTEGER | v12. `1` while an unresolved listing floor stands (a quiescence failure or a malformed-row skip, issue #88). The next non-targeted run raises a stale watermark to the floor (a targeted refresh never moves the watermark at all, never clears the floor, and cannot clear `last_error` while the flag is set); a `NULL` watermark is never narrowed by it (from-the-beginning already covers the floor's window), so `--force` still re-reads everything. |
 
 The three counts are recomputed when a sync run finishes (and by
 `doctor --consolidate` and the schema migrations), not per ingested item:
