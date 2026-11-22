@@ -458,7 +458,17 @@ def _repo_owners(conn: sqlite3.Connection) -> dict[str, set[str]]:
     for table in _REPO_BEARING_TABLES:
         if table not in present:
             continue
-        for (repo,) in conn.execute(f"SELECT DISTINCT repo FROM {table}"):
+        # sync_state is read WITHOUT DISTINCT: the documented replaceable
+        # layouts include a sync_state carrying an unregistered collation,
+        # which a bare column read tolerates (the base's identity probe did)
+        # while a DISTINCT comparison raises. Every other table keeps
+        # DISTINCT — a fault there is a real inspection failure.
+        sql = (
+            f"SELECT repo FROM {table}"
+            if table == "sync_state"
+            else f"SELECT DISTINCT repo FROM {table}"
+        )
+        for (repo,) in conn.execute(sql):
             if not isinstance(repo, str) or not repo:
                 raise ValueError(
                     f"{table}.repo carries a non-string or empty value"
@@ -1154,24 +1164,18 @@ def _check_destination_shape(db_path: Path, manifest: dict,
     except sqlite3.Error as exc:
         if not _is_not_a_store(exc):
             raise _dest_uninspectable(db_path) from exc
-        # `_is_not_a_store` treats EVERY SQLITE_ERROR as replaceable, which
-        # was correct for the old single-table probe (a schema-less file, a
-        # store whose sync_state lacks a column) but is NOT sufficient here:
-        # a readable destination that HAS repo-bearing tables is a store
-        # whose ownership scan failed, and the scan's failure cannot certify
-        # "no foreign rows". Only a destination with no repo-bearing table
-        # at all is the documented replaceable non-store.
+        # `_is_not_a_store` treats SQLITE_ERROR/NOTADB/CORRUPT as "readable
+        # but not a usable store", which the base pull replaces. That
+        # recovery applies ONLY when the store-identity table itself is what
+        # cannot be read (a schema-less file, a foreign `sync_state` layout,
+        # a page-corrupt or FTS5-broken store). A USABLE sync_state whose
+        # SIBLING ownership scan failed is a store whose contents cannot be
+        # certified — it must refuse, not be replaced (issue #91).
         try:
-            present = {
-                r[0] for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                )
-            }
+            conn.execute("SELECT repo FROM sync_state LIMIT 1")
         except sqlite3.Error:
-            raise _dest_uninspectable(db_path) from exc
-        if any(table in present for table in _REPO_BEARING_TABLES):
-            raise _dest_uninspectable(db_path) from exc
-        return
+            return
+        raise _dest_uninspectable(db_path) from exc
     finally:
         conn.close()
     wanted = manifest["repo"].lower()

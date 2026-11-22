@@ -185,11 +185,12 @@ class DeletionAbsenceTests(unittest.TestCase):
 
 class OwnershipScanFaultTests(unittest.TestCase):
     def test_scan_fault_on_a_store_refuses(self) -> None:
-        """A readable destination that HAS repo-bearing tables but whose scan
+        """A USABLE store (its sync_state reads) whose SIBLING ownership scan
         faults must refuse, not abort into an allowed replacement (#91)."""
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tdn:
             db = Path(tdn) / "dest.db"
             conn = sqlite3.connect(str(db))
+            conn.execute("CREATE TABLE sync_state (repo TEXT)")
             conn.execute("CREATE TABLE labels (x INTEGER)")  # present, no repo
             conn.commit()
             conn.close()
