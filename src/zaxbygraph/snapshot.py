@@ -502,14 +502,17 @@ def _digest_repo_spellings(
 
 def _corpus_digest(staged: Path, repo: str) -> str:
     """The #28 canonical export digest, computed over the staged db through
-    the same content-line stream the export-corpus command writes."""
+    the same content-line stream the export-corpus command writes.
+
+    Delegates to `_corpus_digest_conn` so the publish side and the
+    post-install check compute the SAME projection: every stored spelling of
+    the canonical repo, in sorted order (issue #91). A single-spelling store
+    keeps the old byte stream exactly.
+    """
     conn = connect(staged)
     conn.row_factory = sqlite3.Row
     try:
-        hasher = hashlib.sha256()
-        for piece in iter_corpus_content_lines(conn, repo, set()):
-            hasher.update(piece)
-        return hasher.hexdigest()
+        return _corpus_digest_conn(conn, repo)
     finally:
         conn.close()
 def _staged_backup(conn: sqlite3.Connection, staged: Path) -> None:
@@ -1446,14 +1449,21 @@ def _payload_projection(payload: dict) -> bytes:
 
 
 def _store_projection(conn: sqlite3.Connection, repo: str, number: int) -> bytes:
-    """The same projection read from the installed store's row + labels."""
+    """The same projection read from the installed store's row + labels.
+
+    Canonical (issue #91): a case-variant stored spelling belongs to the
+    same repo, and a mixed-spelling store could carry the number twice, so
+    the read is deterministic (`ORDER BY repo LIMIT 1`) and labels are
+    deduplicated across spellings."""
     row = conn.execute(
         "SELECT title, body, state, created_at, updated_at, author"
-        " FROM items WHERE repo = ? AND number = ?",
-        (repo, number)).fetchone()
+        " FROM items WHERE lower(repo) = ? AND number = ?"
+        " ORDER BY repo LIMIT 1",
+        (repo.lower(), number)).fetchone()
     labels = sorted(r[0] for r in conn.execute(
-        "SELECT name FROM labels WHERE repo = ? AND number = ? ORDER BY name",
-        (repo, number)))
+        "SELECT DISTINCT name FROM labels WHERE lower(repo) = ? AND number = ?"
+        " ORDER BY name",
+        (repo.lower(), number)))
     core = {
         "title": row["title"],
         "body": row["body"],
@@ -1463,8 +1473,8 @@ def _store_projection(conn: sqlite3.Connection, repo: str, number: int) -> bytes
         "user": row["author"],
         "labels": labels,
         "is_pr": bool(conn.execute(
-            "SELECT 1 FROM items WHERE repo = ? AND number = ?"
-            " AND kind = 'pr'", (repo, number)).fetchone()),
+            "SELECT 1 FROM items WHERE lower(repo) = ? AND number = ?"
+            " AND kind = 'pr' LIMIT 1", (repo.lower(), number)).fetchone()),
     }
     return canonical(core)
 
@@ -1500,8 +1510,12 @@ def _verify_sample(db_path: Path, repo: str, n: int, source_factory=None) -> dic
         conn = connect(db_path)
         conn.row_factory = sqlite3.Row
         try:
-            numbers = [r["number"] for r in conn.execute(
-                "SELECT number FROM items WHERE repo = ?", (repo,))]
+            # Canonical (issue #91): a case-variant stored corpus is still
+            # this repo, so the sample must see its items instead of
+            # silently sampling zero rows.
+            numbers = sorted({r["number"] for r in conn.execute(
+                "SELECT number FROM items WHERE lower(repo) = ?",
+                (repo.lower(),))})
             if not numbers:
                 return {"requested": n, "checked": 0, "matched": 0,
                         "changed": 0, "skipped": 0}

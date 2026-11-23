@@ -23,7 +23,9 @@ from zaxbygraph.snapshot import (
     SNAPSHOT_REF,
     SnapshotError,
     _check_destination_shape,
+    _verify_sample,
     publish,
+    pull,
 )
 from zaxbygraph.sync import SyncError, sync_repo
 
@@ -288,6 +290,74 @@ class PublishScanFaultTests(unittest.TestCase):
             conn.close()
             bare = self._bare(tdn)
             self.assertEqual(self._assert_refused(db, bare), "store_uninspectable")
+
+
+class CaseVariantTransportTests(unittest.TestCase):
+    """Issue #91 review fixes: publish and the post-install check must hash
+    the SAME canonical projection, and sample verification must see a
+    case-variant corpus (the review found the publish digest still used the
+    single lowercase manifest spelling)."""
+
+    @staticmethod
+    def _uppercase_every_repo(conn: sqlite3.Connection) -> None:
+        from zaxbygraph.snapshot import _REPO_BEARING_TABLES
+
+        for table in _REPO_BEARING_TABLES:
+            present = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if present is None:
+                continue
+            conn.execute(
+                f"UPDATE {table} SET repo = upper(repo) WHERE repo = ?", (REPO,)
+            )
+        conn.commit()
+
+    def test_publish_and_pull_agree_on_a_case_variant_store(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tdn:
+            db, conn = _store(tdn)
+            _seed(conn)
+            self._uppercase_every_repo(conn)
+            conn.close()
+            bare = PublishScanFaultTests()._bare(tdn)
+            result = publish(db, str(bare), publisher="t")
+            self.assertEqual(result["manifest"]["repo"], REPO.lower())
+            dest = Path(tdn) / "pulled.db"
+            pulled = pull(dest, str(bare))
+            self.assertTrue(pulled.get("installed", True))
+            check = connect(dest)
+            try:
+                count = check.execute(
+                    "SELECT COUNT(*) FROM items WHERE lower(repo) = ?",
+                    (REPO.lower(),),
+                ).fetchone()[0]
+            finally:
+                check.close()
+            self.assertGreater(count, 0, "the case-variant corpus traveled whole")
+
+    def test_verify_sample_sees_case_variant_items(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tdn:
+            db, conn = _store(tdn)
+            _seed(conn)
+            self._uppercase_every_repo(conn)
+            conn.close()
+
+            class SampleSource(FakeGitHubSource):
+                def get_issues(self, numbers):
+                    return {
+                        n: (self.issues[n], 200)
+                        for n in numbers
+                        if n in self.issues
+                    }
+
+            source = SampleSource()
+            for n in (1, 2, 3):
+                source.add_issue(issue(n))
+            out = _verify_sample(db, REPO, 5, source_factory=lambda: source)
+            self.assertEqual(out["checked"], 3)
+            self.assertEqual(out["changed"], 0)
+            self.assertEqual(out["matched"], 3)
 
 
 class McpSyncRunnerTests(unittest.TestCase):
