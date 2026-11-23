@@ -427,7 +427,7 @@ def _parts_from_backup(staged: Path, tmp: Path) -> tuple[list[dict], bytes, int,
 #: every repo a PRESENT table can carry — not `sync_state` alone (a child
 #: row without its state row is still destroyed by a pull and disclosed by a
 #: publish). A guardrail test derives this set from an initialized database
-#: (fresh and migrated) and fails when a new repo-bearing table appears.
+#: and fails when a new repo-bearing table appears.
 _REPO_BEARING_TABLES = (
     "items", "labels", "assignees", "issue_field_values", "comments",
     "reviews", "pr_files", "releases", "edges", "fetch_log", "sync_state",

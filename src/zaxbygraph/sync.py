@@ -1920,7 +1920,12 @@ def sync_repo(
                                 pass_numbers.add(number)
                                 pass_counts[number] = pass_counts.get(number, 0) + 1
                             _record_malformed_row(
-                                conn, repo, malformed_reason, list_raw, since
+                                conn, repo, malformed_reason, list_raw,
+                                # A targeted run's watermark may be newer than
+                                # the row (its true stamp is unknown here), so
+                                # pin from the beginning like the exact-number
+                                # seam; an ordinary run uses its stable start.
+                                None if numbers is not None else since,
                             )
                             malformed_seen = True
                             continue
@@ -2127,7 +2132,8 @@ def sync_repo(
                                         pass_counts.get(refreshed_number, 0) + 1
                                     )
                                 _record_malformed_row(
-                                    conn, repo, refreshed_reason, list_raw, since
+                                    conn, repo, refreshed_reason, list_raw,
+                                    None if numbers is not None else since,
                                 )
                                 malformed_seen = True
                                 last_number = number

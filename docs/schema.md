@@ -435,9 +435,11 @@ deletion. The mechanism that does close it:
 - **a listing row that cannot be parsed pins the same floor (issue #88).**
   A row the sync cannot ingest — a non-dict element, a missing or
   non-integer `number`, a missing or invalid `id` — is skipped AND
-  recorded, pins the recovery floor at the row's own `updated_at` (or from
-  the beginning when the row has no usable stamp; an earlier active floor
-  is never replaced by a later one), and keeps `last_error` set as
+  recorded, pins the recovery floor at the row's own `updated_at` (else the
+  run's starting floor — the watermark the run started from, or from the
+  beginning on a full or forced run — when the row has no usable stamp; an
+  earlier active floor is never replaced by a later one), and keeps
+  `last_error` set as
   `malformed_listing_row: …`. It is never counted as ingested and never
   bundled into the JSONL sidecar, and the run answers incomplete. The floor
   clears only on a clean, SKIP-FREE finish; a targeted `sync --numbers` run

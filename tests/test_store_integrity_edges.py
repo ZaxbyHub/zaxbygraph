@@ -60,7 +60,7 @@ def _items(conn: sqlite3.Connection) -> list[int]:
 
 def _state(conn: sqlite3.Connection) -> sqlite3.Row:
     return conn.execute(
-        "SELECT last_error, issues_since, listing_floor_active"
+        "SELECT last_error, issues_since, listing_floor, listing_floor_active"
         " FROM sync_state WHERE repo = ?", (REPO,)
     ).fetchone()
 
@@ -358,6 +358,45 @@ class CaseVariantTransportTests(unittest.TestCase):
             self.assertEqual(out["checked"], 3)
             self.assertEqual(out["changed"], 0)
             self.assertEqual(out["matched"], 3)
+
+
+class TargetedMalformedFloorTests(unittest.TestCase):
+    """Final-critic probe A fix: a targeted run that meets a malformed row in
+    the MAIN loop pins the floor from the beginning (its true stamp is
+    unknown), not at the run-start watermark, so the next ordinary run can
+    re-serve the row instead of clearing the floor without it."""
+
+    def test_targeted_main_loop_malformed_pins_from_the_beginning(self) -> None:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tdn:
+            _db, conn = _store(tdn)
+            _seed(conn)
+
+            class ExactSource(FakeGitHubSource):
+                def get_issues(self, numbers):
+                    row = dict(issue(2))
+                    row["id"] = "bad"
+                    row.pop("updated_at", None)
+                    return {n: (row, 200) for n in numbers}
+
+            result = sync_repo(conn, ExactSource(), REPO, numbers=[2])
+            state = _state(conn)
+            self.assertEqual(state["listing_floor_active"], 1)
+            self.assertIsNone(
+                state["listing_floor"],
+                "a targeted main-loop malformed row pins from the beginning",
+            )
+            self.assertIsNotNone(result["last_error"])
+
+            class SinceAware(FakeGitHubSource):
+                def list_issues(self, since):
+                    row = issue(2)  # true stamp ts(20), older than the watermark
+                    if since is None or row["updated_at"] >= since:
+                        yield [row]
+
+            second = sync_repo(conn, SinceAware(), REPO)
+            self.assertEqual(second["ingested"], 1, "the row was re-served")
+            self.assertEqual(_state(conn)["listing_floor_active"], 0)
+            self.assertIsNone(second["last_error"])
 
 
 class McpSyncRunnerTests(unittest.TestCase):

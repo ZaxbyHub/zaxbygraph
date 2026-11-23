@@ -7,8 +7,9 @@ Bug fix on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the
 
 - **#88** A listing row the sync cannot parse no longer vanishes behind the
   advancing watermark. The row is skipped AND recorded, pins the issue-#65
-  recovery floor (at the row's own `updated_at`, or from the beginning when
-  it has none; an earlier floor is never replaced), and keeps the run
+  recovery floor (at the row's own `updated_at`, else the run's starting
+  floor — the watermark the run started from, or from the beginning on a
+  full or forced run; an earlier floor is never replaced), and keeps the run
   answering incomplete until a skip-free run re-drains and clears it. The
   fix covers the real REST page (non-dict elements are preserved by
   `GhApiSource.list_issues` instead of filtered out), the bulk GraphQL chunk
