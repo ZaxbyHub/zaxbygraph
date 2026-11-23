@@ -19,6 +19,43 @@ GH_TIMEOUT_S = 300
 
 _ISO_Z = "%Y-%m-%dT%H:%M:%SZ"
 
+_DIGITS_RE = re.compile(r"[0-9]+")
+
+#: Longest digit string accepted as an integer field. GitHub ids are ~10
+#: digits; the bound keeps `int()` total for hostile input (CPython raises
+#: ValueError on very long strings) and keeps the value inside SQLite's
+#: signed-64-bit range.
+_MAX_ID_DIGITS = 19
+_MAX_ID_VALUE = 2**63 - 1
+
+
+def strict_int(value: object) -> int | None:
+    """The integer a listing field carries, or ``None`` when it is not one.
+
+    Issue #88 requires a ``number``/``id`` that is not an integer to be
+    treated as a malformed row. ``int()`` is not that check: it accepts
+    ``True`` as 1 and truncates ``12.5`` to 12, so a malformed row could
+    overwrite or MOVE a real item while the run certified completeness.
+    Digit-only strings stay accepted (some sources serialize ids as
+    strings); booleans, floats, padded/signed strings, oversized strings
+    and out-of-range values do not. The function is TOTAL for any JSON
+    value: validation runs on untrusted payloads and must answer ``None``,
+    never raise (Stage B review finding).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = value
+    elif (
+        isinstance(value, str)
+        and len(value) <= _MAX_ID_DIGITS
+        and _DIGITS_RE.fullmatch(value)
+    ):
+        number = int(value)
+    else:
+        return None
+    return number if 0 <= number <= _MAX_ID_VALUE else None
+
 
 def _reject_nonstandard_constant(name: str) -> float:
     """json.loads parse_constant hook (issue #86): NaN/Infinity are not
@@ -288,8 +325,8 @@ class GhApiSource:
             check = self._api(f"repos/{self.slug}/issues?{qs}&page={page}")
             if not isinstance(check, list):
                 raise GitHubError("unexpected issues payload")
-            if {item.get("number") for item in check if isinstance(item, dict)} != {
-                item.get("number") for item in data if isinstance(item, dict)
+            if {repr(item.get("number")) for item in check if isinstance(item, dict)} != {
+                repr(item.get("number")) for item in data if isinstance(item, dict)
             }:
                 raise ListingShiftedError(
                     f"listing order shifted across page {page} during the walk"

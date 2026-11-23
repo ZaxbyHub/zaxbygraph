@@ -880,5 +880,36 @@ class IncludePatchesForcesRestTests(TempDBTest):
         self.assertEqual(self.src.files_fallback_numbers, [])
 
 
+class StrictNumberAliasingTests(unittest.TestCase):
+    """Review finding G1 (GraphQL seam): a boolean or float `number` must
+    NOT be aliased as an item number. `int(True)` used to alias item 1 and
+    `int(2.7)` item 2 — both through the kinds map and the chunk builder —
+    so a malformed listing row could be classified as a different item."""
+
+    def test_bool_and_float_numbers_are_not_aliased(self) -> None:
+        host = _FakeGraphQLHost()
+        host.write_graphql_responses([_graphql_payload_for([3])])
+        with host:
+            src = host.source()
+            children = src.fetch_children([
+                {"id": 1, "number": True, "title": "bool"},
+                {"id": 2, "number": 2.7, "title": "float"},
+                {
+                    "id": 10_003, "number": 3, "title": "ok",
+                    "state": "open", "user": {"login": "alice"},
+                    "labels": [], "comments": 0,
+                    "updated_at": "2026-01-01T00:00:03Z",
+                    "html_url": f"https://github.com/{REPO}/issues/3",
+                    "url": f"https://api.github.com/repos/{REPO}/issues/3",
+                },
+            ])
+            calls = host.graphql_calls()
+        self.assertEqual(set(children), {3})
+        query = " ".join(str(part) for call in calls for part in call)
+        self.assertNotIn("i1:", query)
+        self.assertNotIn("i2:", query)
+        self.assertIn("i3:", query)
+
+
 if __name__ == "__main__":
     unittest.main()

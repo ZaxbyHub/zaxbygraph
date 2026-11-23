@@ -183,6 +183,21 @@ class EnvelopeContractTests(unittest.TestCase):
         self.assertIn("TEXT", doc)
         self.assertIn("include-patches", doc)
 
+    def test_listing_floor_notes_cover_the_malformed_trigger(self) -> None:
+        """Issue #88 extended the floor: a malformed-row skip pins it and
+        only a skip-free non-targeted finish clears it. The printed notes
+        must say so — the pre-#88 "LISTING quiescence only" wording
+        contradicted docs/schema.md and the code (review finding G5)."""
+        floor = COLUMN_NOTES["sync_state"]["listing_floor"]
+        active = COLUMN_NOTES["sync_state"]["listing_floor_active"]
+        pending = COLUMN_NOTES["sync_state"]["full_sync_pending"]
+        self.assertIn("malformed", floor)
+        self.assertIn("SKIP-FREE", floor)
+        self.assertIn("malformed", active)
+        self.assertIn("malformed", pending)
+        doc = (REPO_ROOT / "docs" / "schema.md").read_text(encoding="utf-8")
+        self.assertIn("skipped a listing row it could not parse", doc)
+
     def test_schema_command_text_mode_smoke(self) -> None:
         """Text mode renders bare data and never envelope keys (plan item 4):
         no ok:/freshness:/truncated: lines leak into the text rendering."""

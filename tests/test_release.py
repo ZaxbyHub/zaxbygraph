@@ -857,6 +857,34 @@ class PackagedSkillTests(_HermeticCliTest):
             / "skills" / "zaxbygraph" / "SKILL.md"
         )
 
+    def test_checked_in_stamps_match_their_bodies(self) -> None:
+        """The CHECKED-IN stamps must be self-consistent.
+
+        ``skill --install`` REWRITES the stamp it writes, so the install-path
+        check below never sees a stale checked-in hash (cubic CUB-7 / review
+        finding): this test reads the committed bytes of both copies and
+        recomputes the body hash the same way the installer does."""
+        for rel in (
+            "skills/zaxbygraph/SKILL.md",
+            "src/zaxbygraph/skills/zaxbygraph/SKILL.md",
+        ):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            match = _STAMP_RE.search(text)
+            self.assertIsNotNone(match, f"{rel} carries no stamp")
+            body = _skill_body(text)
+            candidates = {
+                hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+                for candidate in (
+                    body, body.rstrip("\n") + "\n", body.rstrip("\n")
+                )
+            }
+            self.assertIn(
+                match.group("hash"),
+                candidates,
+                f"{rel}: the checked-in stamp hash must equal sha256 of the"
+                " body minus the stamp line",
+            )
+
     def test_skill_ships_with_the_package(self) -> None:
         """RED at base (no packaged skill, no package-data entry, no skill
         subcommand), GREEN after the fix. The package CONTAINS the skill;

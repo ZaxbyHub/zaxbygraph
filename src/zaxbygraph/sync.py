@@ -17,6 +17,7 @@ from zaxbygraph.github import (
     GitHubSource,
     GitHubTransportError,
     ListingShiftedError,
+    strict_int,
 )
 from zaxbygraph.graphql import GH_TIMEOUT_S
 from zaxbygraph.repo import validate_slug
@@ -124,31 +125,45 @@ def _fail_not_quiescent(
 _MALFORMED_ROW_PREFIX = "malformed_listing_row"
 
 
+def _bounded_text(value: object, limit: int = 100) -> str:
+    """A length-bounded rendering that is TOTAL for hostile values.
+
+    ``repr()``/``str()`` of an oversized integer raises in CPython (the
+    int-to-decimal digit limit), which would abort the very path that exists
+    to record malformed rows (Stage B review finding). The fallback names
+    the type instead of the value."""
+    try:
+        text = repr(value)
+    except Exception:
+        text = f"<unprintable {type(value).__name__}>"
+    return text[:limit]
+
+
 def _malformed_listing(list_raw: object) -> tuple[str | None, int | None]:
     """(reason, parsed number) for a listing row issue #88 must skip.
 
     A well-formed row returns ``(None, its number)``. The four malformed
-    shapes: a non-dict element, a missing ``number``, a ``number`` ``int()``
-    cannot parse, and a missing/invalid ``id``. Every embedded repr is
-    bounded to 100 characters (the pre-fix bound) so a hostile token cannot
-    bloat ``fetch_log``/``last_error`` on every pass. The reason order
-    matches the pre-fix branches (number before id), so a row carrying both
-    faults reports the number fault first.
+    shapes: a non-dict element, a missing ``number``, a ``number`` that is
+    not a GENUINE integer, and a missing/invalid ``id``. The strict check
+    matters: ``int()`` accepts ``True`` and truncates ``12.5``, and either
+    coercion would let a malformed row overwrite or move a real item while
+    the run certified completeness (review finding G1). Every embedded repr
+    is bounded to 100 characters (the pre-fix bound) so a hostile token
+    cannot bloat ``fetch_log``/``last_error`` on every pass. The reason
+    order matches the pre-fix branches (number before id), so a row
+    carrying both faults reports the number fault first.
     """
     if not isinstance(list_raw, dict):
         return f"non-dict listing element ({type(list_raw).__name__})", None
     if "number" not in list_raw:
         return "missing number", None
-    try:
-        number = int(list_raw["number"])
-    except (TypeError, ValueError):
-        return f"non-integer number {str(list_raw['number'])[:100]!r}"[:160], None
+    number = strict_int(list_raw["number"])
+    if number is None:
+        return f"non-integer number {_bounded_text(list_raw['number'])}"[:160], None
     if "id" not in list_raw:
         return "missing id", number
-    try:
-        int(list_raw["id"])
-    except (TypeError, ValueError):
-        return f"invalid id {str(list_raw['id'])[:100]!r}"[:160], number
+    if strict_int(list_raw["id"]) is None:
+        return f"invalid id {_bounded_text(list_raw['id'])}"[:160], number
     return None, number
 
 
@@ -265,9 +280,8 @@ def _batch_fully_covered(
     for raw in batch:
         if not isinstance(raw, dict) or "number" not in raw:
             return False
-        try:
-            number = int(raw["number"])
-        except (TypeError, ValueError):
+        number = strict_int(raw["number"])
+        if number is None:
             return False
         counts[number] = counts.get(number, 0) + 1
         stamp = raw.get("updated_at")
@@ -909,10 +923,7 @@ def _assert_repository_readable(source: GitHubSource, repo: str) -> None:
 
 def _number_of(raw: object) -> int | None:
     if isinstance(raw, dict) and "number" in raw:
-        try:
-            return int(raw["number"])
-        except (TypeError, ValueError):
-            return None
+        return strict_int(raw["number"])
     return None
 
 
@@ -924,7 +935,6 @@ def _numbered_payloads(
     include_patches: bool,
     jsonl_handle: TextIO | None,
     *,
-    run_floor: str | None,
     state: dict,
 ):
     """Listing payloads for a targeted refresh (issue #23).
@@ -1022,12 +1032,36 @@ def _numbered_payloads(
     found: set[int] = set()
     malformed_seen = False
     for page in source.list_issues(None):
-        batch = [raw for raw in _batch(page) if _number_of(raw) in wanted]
-        if any(_number_of(raw) is None and isinstance(raw, dict) for raw in _batch(page)):
-            # A listing shell we cannot match could be a requested number:
-            # absence evidence is then incomplete, so no deletion verdict is
-            # drawn this run (PR #37 review — false-deletion guard).
-            malformed_seen = True
+        batch = []
+        for raw in _batch(page):
+            number = _number_of(raw)
+            if number is None:
+                # Issue #88: a listing element without a genuine integer
+                # number is malformed on EVERY source, not only the
+                # exact-number seam. Record it (one transaction), pin the
+                # recovery floor and route the flag into the run state so
+                # the finalizer cannot certify completeness; the local flag
+                # still suppresses deletion verdicts for this run — a shell
+                # that cannot be matched may BE a requested number, so
+                # absence evidence is incomplete (PR #37 review).
+                #
+                # The run_floor argument is None — never this targeted
+                # run's start: the fallback lists from the beginning, so a
+                # row with no usable timestamp may be OLDER than the stored
+                # watermark, and a run-start pin would let the next ordinary
+                # walk skip it. A dict row's own non-empty updated_at stays
+                # the precise candidate inside _pin_malformed_floor (the
+                # established #88 rule); None is the unattributable case.
+                reason, _row_number = _malformed_listing(raw)
+                _record_malformed_row(
+                    conn, repo, reason or "unmatchable listing row", raw,
+                    None,
+                )
+                malformed_seen = True
+                state["malformed_seen"] = True
+                continue
+            if number in wanted:
+                batch.append(raw)
         found.update(n for n in (_number_of(raw) for raw in batch) if n is not None)
         if batch:
             yield batch
@@ -1154,6 +1188,34 @@ def _retry_torn_pending(
                 malformed_seen = True
                 continue
         if not isinstance(row, dict):
+            if status is None and entry is not None:
+                # PRR-004: a torn-retry failure is never silent. A response
+                # for an owed number that is not a listing row (a non-dict
+                # 200 payload maps to exactly this (None, None) shape) leaves
+                # the pending row standing — it already holds the durable
+                # debt, so no floor pin is needed — but the fault gets a log
+                # row and last_error so the readiness verdict cannot read
+                # clean while every retry of the owed number is failing.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    log_fetch(
+                        conn, repo, "item", str(n),
+                        note="torn retry: exact-number response was not a"
+                             " listing row",
+                        status=None,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                set_last_error(
+                    conn, repo,
+                    "torn retry: the source returned no usable listing row"
+                    f" for #{n}; the pending obligation survives",
+                )
+                # set_last_error's upsert opens an implicit transaction;
+                # commit it before the next write_pending (BEGIN IMMEDIATE).
+                conn.commit()
             if status in (404, 410):
                 _assert_repository_readable(source, repo)
                 gone_note = (
@@ -1869,7 +1931,7 @@ def sync_repo(
                     # items, never the whole listing.
                     payloads = _numbered_payloads(
                         conn, source, repo, {int(n) for n in numbers}, include_patches,
-                        jsonl_handle, run_floor=since, state=run_state,
+                        jsonl_handle, state=run_state,
                     )
                 else:
                     payloads = source.list_issues(walk_since)

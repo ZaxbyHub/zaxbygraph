@@ -482,22 +482,36 @@ def _digest_repo_spellings(
 ) -> list[str]:
     """The stored spellings a canonical repo's digest must cover.
 
-    A case-variant store (rows stored as `ACME/x` while the manifest names
-    `acme/x`) must not produce a digest over an empty exact-spelling
-    projection (issue #91); a normal single-spelling store answers exactly
-    the old spelling, so its digest bytes are unchanged.
+    Case-variant ownership is exactly what issue #91 unifies, so the digest
+    must derive its spellings from the SAME oracle the ownership guard uses
+    (`_repo_owners`, every present repo-bearing table), not from sync_state
+    alone: an `ACME/x` item beside an `acme/x` state row is a row publish
+    accepts, and a digest that skipped it would certify a corpus it never
+    read (review finding G3). A single-spelling store answers exactly the
+    old spelling, so its digest bytes are unchanged.
+
+    An inspection failure PROPAGATES — a fallback to the bare manifest
+    spelling would digest an empty projection and let publish and the
+    post-install check silently agree on a corpus neither read.
     """
     try:
-        rows = [
-            r[0] for r in conn.execute(
-                "SELECT DISTINCT repo FROM sync_state WHERE lower(repo) = ?",
-                (repo.lower(),),
-            )
-        ]
-    except sqlite3.Error:
-        rows = []
-    spellings = sorted({r for r in rows if isinstance(r, str) and r})
-    return spellings or [repo]
+        owners = _repo_owners(conn)
+    except (sqlite3.Error, ValueError) as exc:
+        raise SnapshotError(
+            "store_uninspectable",
+            f"cannot read the store's repo ownership for the corpus digest: {exc}",
+            hint="repair or re-create the store; the transport cannot"
+                 " certify the corpus it would publish",
+        ) from exc
+    spellings = sorted(owners.get(repo.lower(), set()))
+    if not spellings:
+        raise SnapshotError(
+            "repo_not_synced",
+            f"no stored rows for repo {repo!r}; the corpus digest has"
+            " nothing to certify",
+            hint="run sync first",
+        )
+    return spellings
 
 
 def _corpus_digest(staged: Path, repo: str) -> str:

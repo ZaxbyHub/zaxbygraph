@@ -17,9 +17,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from fixtures import REPO, FakeGitHubSource, issue
 
+from zaxbygraph import snapshot
 from zaxbygraph.db import connect, init_schema
 from zaxbygraph.snapshot import _REPO_BEARING_TABLES
 from zaxbygraph.sync import sync_repo
@@ -55,17 +57,42 @@ class RepoBearingTableGuardrailTests(unittest.TestCase):
         )
 
     def test_a_dropped_member_is_detectable(self) -> None:
-        """The comparison above bites: a degraded oracle (a missing member)
-        does not equal the derived set."""
+        """A degraded production oracle is caught BEHAVIOURALLY: with
+        `labels` dropped from `_REPO_BEARING_TABLES`, the ownership scan no
+        longer sees a repo only that table carries — so the schema-derived
+        comparison fails. This mutates the real constant instead of doing
+        set arithmetic on a hand-built degraded copy (cubic finding)."""
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tdn:
             conn = connect(Path(tdn) / "history.db")
+            conn.row_factory = sqlite3.Row
             try:
                 init_schema(conn)
-                actual = _repo_bearing_tables(conn)
+                conn.execute(
+                    "INSERT INTO labels(repo, number, name)"
+                    " VALUES ('only/here', 1, 'x')"
+                )
+                conn.commit()
+                real = snapshot._repo_owners(conn)
+                self.assertIn(
+                    "only/here", real,
+                    "the real oracle must see a repo only labels carries",
+                )
+                degraded = tuple(
+                    t for t in snapshot._REPO_BEARING_TABLES if t != "labels"
+                )
+                with mock.patch(
+                    "zaxbygraph.snapshot._REPO_BEARING_TABLES", degraded
+                ):
+                    mutated = snapshot._repo_owners(conn)
+                self.assertNotIn(
+                    "only/here", mutated,
+                    "a dropped member must make its rows invisible",
+                )
+                # ...and the guard's schema-derived comparison is what catches
+                # that omission (labels is in the initialized schema).
+                self.assertNotEqual(set(degraded), _repo_bearing_tables(conn))
             finally:
                 conn.close()
-        degraded = set(_REPO_BEARING_TABLES) - {"issue_field_values"}
-        self.assertNotEqual(degraded, actual)
 
 
 class CombinedMalformedPageTests(unittest.TestCase):
