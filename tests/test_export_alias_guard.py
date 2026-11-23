@@ -351,5 +351,53 @@ class EndToEndWriteTests(unittest.TestCase):
         self.assertFalse(os.path.samefile(out, db))
 
 
+# ==== #90 AC2: DOS device names are refused by a portable predicate ========
+#
+# The guard matched only the `\\.\` and `/dev/` prefixes, so a WINDOWS device
+# name in its ordinary spelling (CON, PRN, AUX, COM1-9, LPT1-9, case variants,
+# extension forms such as CON.txt and CON.tar.gz, and absolute paths) passed
+# the guard, spooled the corpus, and died late at os.replace with a generic
+# runtime error instead of the documented out_is_database refusal.
+#
+# The refusal is gated on the platform (a POSIX file may legitimately be named
+# CON), so this check patches os.name to make each branch reachable on every CI
+# leg. Every path is built BEFORE the patch: pathlib consults os.name when a
+# Path is instantiated, so a Path built under a patched value would raise
+# NotImplementedError on the other platform.
+#
+# RED at e6c8f41: the device names pass the guard. GREEN after the fix.
+
+def test_dos_device_names_refused() -> None:
+    names = (
+        "CON", "con", "CON.txt", "CON.tar.gz", "PRN", "AUX", "NUL",
+        "COM1", "COM9", "LPT1", "LPT9", "CON ", "CON.",
+    )
+    with tempfile.TemporaryDirectory() as td:
+        db_path = str(Path(td) / "history.db")
+        Path(db_path).write_bytes(b"store bytes")
+        # Absolute and mixed-separator spellings, built before any patch.
+        absolute_nul = td.rstrip("/\\") + os.sep + "NUL"
+        mixed_nul = td.replace("\\", "/").rstrip("/") + "/NUL"
+        with mock.patch.object(os, "name", "nt"):
+            for name in names + (absolute_nul, mixed_nul):
+                try:
+                    _reject_database_alias(name, db_path)
+                except ExportError as exc:
+                    assert exc.code == "out_is_database", (
+                        f"--out {name!r} must be refused with the documented"
+                        f" out_is_database code; got {exc.code!r}"
+                    )
+                else:
+                    raise AssertionError(
+                        f"--out {name!r} names a DOS device path and must be"
+                        " refused before the corpus is spooled"
+                    )
+        with mock.patch.object(os, "name", "posix"):
+            # POSIX does not reserve these names: a file legitimately called
+            # CON must not be refused.
+            _reject_database_alias("CON", db_path)
+            _reject_database_alias(absolute_nul, db_path)
+
+
 if __name__ == "__main__":
     unittest.main()

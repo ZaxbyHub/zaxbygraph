@@ -93,7 +93,11 @@ def _status_from_stderr(stderr: str) -> int | None:
     # Digit matches are word-boundary anchored: a bare "404"/"403"/"429"
     # inside a larger number (an issue number, a URL, a request id) must not
     # drive classification — the 404/410 verdicts durably flip items.state.
-    if "429" in text or "rate limit" in text or "secondary rate" in text:
+    if (
+        re.search(r"\b429\b", text)
+        or "rate limit" in text
+        or "secondary rate" in text
+    ):
         return 429
     if re.search(r"\b403\b", text) or "forbidden" in text:
         return 403

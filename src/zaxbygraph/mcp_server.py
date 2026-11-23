@@ -882,23 +882,28 @@ def _int_cursor(raw, tool: str) -> int:
             f"{tool} cursor must be a string",
             hint="pass the next_cursor value from the previous page verbatim",
         )
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ToolError(
-            "bad_request",
-            f"{tool} cursor is malformed: {raw!r}",
-            hint="pass the next_cursor value from the previous page verbatim",
-        ) from None
-    if value < 0:
-        # The producer mints only non-negative offsets: a negative cursor is
-        # hand-crafted input, answered as bad_request rather than the silent
-        # page-1 reset this function's own docstring forbids (FB-010).
+    # Producer-symmetric shape: the producer mints str(offset), so only plain
+    # ASCII decimal is a cursor. int() would also accept "1_0", "+5", " 5" and
+    # non-ASCII numerics -- representations the producer never mints -- and
+    # silently normalize them (issue #89). A negative cursor is hand-crafted
+    # input for the same reason (FB-010); the digit-only match rejects it
+    # instead of resetting to page 1, which this function's docstring forbids.
+    if re.fullmatch(r"[0-9]+", raw) is None:
         raise ToolError(
             "bad_request",
             f"{tool} cursor is malformed: {raw!r}",
             hint="pass the next_cursor value from the previous page verbatim",
         )
+    try:
+        value = int(raw)
+    except ValueError:
+        # An oversized digit run (CPython's int-string limit): still the coded
+        # refusal, never a traceback.
+        raise ToolError(
+            "bad_request",
+            f"{tool} cursor is malformed: {raw!r}",
+            hint="pass the next_cursor value from the previous page verbatim",
+        ) from None
     if value == 0:
         return 0
     return min(value, _MAX_CURSOR)
@@ -1469,6 +1474,13 @@ def _int_array_csv(arguments: dict, key: str) -> str | None:
             "quadratically; narrow the pool)",
             hint=f"pass at most {_MAX_NUMBERS} issue numbers",
         )
+    if any(value < 1 for value in values):
+        # Items publish minimum 1: an issue number is >= 1 (issue #90).
+        raise ToolError(
+            "bad_request",
+            f"{key} entries must be issue numbers >= 1",
+            hint=f"pass {key} as an array of positive issue numbers",
+        )
     return ",".join(str(v) for v in values)
 
 
@@ -1548,6 +1560,15 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
     if size is not None and not isinstance(size, str):
         raise ToolError("bad_request", "size must be a string like '2-3'", hint="pass size as a string")
     count = _int_arg(arguments, "count", 5)
+    if count < 1:
+        # The published inputSchema declares minimum 1; a handler that answers
+        # zero bundles for count=0 is a schema lie (issue #90). The CLI's
+        # documented `--count 0` path is a separate surface and stays.
+        raise ToolError(
+            "bad_request",
+            "count must be at least 1",
+            hint="pass count as a positive integer",
+        )
     # pool/exclude are capped like pr_overlap's numbers (pr49 review PRR-006):
     # the derive pair fan is quadratic in pool size, and an uncapped
     # client-chosen pool stalls the whole serialized server.
@@ -1557,6 +1578,13 @@ def _tool_bundle(arguments: dict, ctx) -> dict:
     max_files = arguments.get("max_files")
     if max_files is not None and (isinstance(max_files, bool) or not isinstance(max_files, int)):
         raise ToolError("bad_request", "max_files must be an integer", hint="pass max_files as an integer")
+    if max_files is not None and max_files < 1:
+        # The published inputSchema declares minimum 1 (issue #90).
+        raise ToolError(
+            "bad_request",
+            "max_files must be at least 1",
+            hint="pass max_files as a positive integer",
+        )
     # The no-args one-call selection (issue #70 AC6): the DEFAULT budget
     # is the documented 4000 tokens, so a no-argument bundle call returns
     # the enriched selection inside a real budget.
@@ -3047,8 +3075,8 @@ _TOOLS: list[dict] = [
             {
                 "size": {"type": "string", "description": "Bundle size range like '2-3'"},
                 "count": {"type": "integer", "minimum": 1, "description": "At most K bundles"},
-                "pool": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Restrict the pool to these issue numbers (at most {_MAX_NUMBERS})"},
-                "exclude": {"type": "array", "items": {"type": "integer"}, "maxItems": _MAX_NUMBERS, "description": f"Remove these numbers from the pool (at most {_MAX_NUMBERS})"},
+                "pool": {"type": "array", "items": {"type": "integer", "minimum": 1}, "maxItems": _MAX_NUMBERS, "description": f"Restrict the pool to these issue numbers (at most {_MAX_NUMBERS})"},
+                "exclude": {"type": "array", "items": {"type": "integer", "minimum": 1}, "maxItems": _MAX_NUMBERS, "description": f"Remove these numbers from the pool (at most {_MAX_NUMBERS})"},
                 "allow_shared_files": {"type": "boolean"},
                 "max_files": {"type": "integer", "minimum": 1},
                 "budget_tokens": {"type": "integer", "minimum": 1},

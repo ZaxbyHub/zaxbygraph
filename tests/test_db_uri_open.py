@@ -861,5 +861,42 @@ class SiblingGuardrailTest(unittest.TestCase):
         self.assertFalse(clamped, "a docstring mention satisfied the guard")
 
 
+# ==== #90 AC1: the read-only authorizer's function deny-list ================
+#
+# `connect_readonly_query` installs `_deny_write_authorizer` as the second,
+# independent guard layer behind `PRAGMA query_only` and `mode=ro`. Its
+# function branch denied exactly one name (`load_extension`), so every other
+# SQL function reached the engine -- including `fts3_tokenizer`, whose
+# two-argument form registers a tokenizer (code execution on a build compiled
+# with ENABLE_FTS3_TOKENIZER). The denial is build-independent; only the
+# exploitability is conditional.
+#
+# RED at e6c8f41: the callback answers SQLITE_OK for `fts3_tokenizer`.
+# GREEN after the deny-set fix. The check drives the callback directly, so it
+# is build-independent and needs no store.
+
+def test_authorizer_denies_fts3_tokenizer() -> None:
+    from zaxbygraph import db
+
+    denied = db._deny_write_authorizer(
+        sqlite3.SQLITE_FUNCTION, None, "fts3_tokenizer", None, None
+    )
+    assert denied == sqlite3.SQLITE_DENY, (
+        "the read-only authorizer must deny fts3_tokenizer regardless of build;"
+        f" the callback answered {denied!r} (SQLITE_OK is 0)"
+    )
+    still_denied = db._deny_write_authorizer(
+        sqlite3.SQLITE_FUNCTION, None, "load_extension", None, None
+    )
+    assert still_denied == sqlite3.SQLITE_DENY, "load_extension must stay denied"
+    ordinary = db._deny_write_authorizer(
+        sqlite3.SQLITE_FUNCTION, None, "length", None, None
+    )
+    assert ordinary == sqlite3.SQLITE_OK, (
+        "an ordinary scalar function must stay allowed; a deny-everything"
+        f" authorizer would answer {ordinary!r} (SQLITE_OK is 0)"
+    )
+
+
 if __name__ == "__main__":
     unittest.main()

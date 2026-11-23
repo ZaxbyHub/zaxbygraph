@@ -29,3 +29,19 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Documented pytest form
         run: python -m pytest tests/test_store.py -q
+      # unittest discovery never executes module-level pytest functions, so the
+      # function-style regression checks below would otherwise not run in CI at
+      # all (and the Windows-gated device fix would never be exercised on the
+      # ubuntu legs). Every new check file is named explicitly.
+      - name: Seam regression checks (pytest form)
+        run: >-
+          python -m pytest
+          tests/test_seam_honesty.py
+          tests/test_seams_extended.py
+          tests/test_mcp_server.py
+          tests/test_cursor_grammar.py
+          tests/test_triage_bounds.py
+          tests/test_db_uri_open.py::test_authorizer_denies_fts3_tokenizer
+          tests/test_export_alias_guard.py::test_dos_device_names_refused
+          -q
+

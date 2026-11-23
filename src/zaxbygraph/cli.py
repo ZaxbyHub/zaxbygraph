@@ -838,7 +838,9 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
     try:
         repo, host = _resolved_repo(args)
     except RepoError as exc:
-        raise _ReadFailure(2, f"could not determine repo ({exc}); pass --repo OWNER/REPO")
+        # RepoError's own message already ends with the remedy; appending it
+        # here named it twice (issue #89).
+        raise _ReadFailure(2, f"could not determine repo ({exc})")
     explicit = getattr(args, "db", None)
     try:
         db_path, _chain = resolve_db(repo, explicit=explicit, host=host)
@@ -1024,9 +1026,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     numbers_raw = getattr(args, "numbers", None)
     if numbers_raw is not None:
         try:
-            numbers = [int(x) for x in str(numbers_raw).replace(" ", "").split(",") if x != ""]
-        except ValueError:
-            return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
+            numbers = _canonical_issue_numbers(numbers_raw, "--numbers")
+        except ValueError as exc:
+            return emit_failure(args, 2, str(exc))
         if not numbers:
             return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
         if getattr(args, "force", False):
@@ -1828,21 +1830,50 @@ def _brief_query(
     )
 
 
+#: ASCII digits only: int() also accepts "1_0", "+5", "-5" and non-ASCII
+#: numerics, silently reinterpreting a mistyped issue number. The same rule
+#: _parse_max_age documents for its budget (issue #89).
+_ISSUE_NUMBER_TOKEN_RE = re.compile(r"[0-9]+")
+
+
+def _canonical_issue_numbers(raw: str | None, flag: str) -> list[int] | None:
+    """Parse a comma-separated issue-number list, canonically.
+
+    A blank value is treated as absent (``None`` -> the default pool). Every
+    token must be ASCII digits and every value must be >= 1. Conversion is
+    guarded because CPython refuses to convert a digit run past its
+    integer-string limit -- an oversized token is a coded refusal, never a
+    traceback. A malformed token raises ``ValueError`` carrying the original
+    text so the caller's existing coded-error path applies unchanged.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).replace(" ", "")
+    tokens = [token for token in text.split(",") if token]
+    if not tokens:
+        raise ValueError(f"invalid {flag} value: {raw!r}")
+    for token in tokens:
+        if _ISSUE_NUMBER_TOKEN_RE.fullmatch(token) is None:
+            raise ValueError(f"invalid {flag} value: {raw!r}")
+    try:
+        numbers = [int(token) for token in tokens]
+    except ValueError:
+        # An oversized digit run (CPython's int-string limit): still a coded
+        # refusal, not a traceback.
+        raise ValueError(f"invalid {flag} value: {raw!r}") from None
+    if any(number < 1 for number in numbers):
+        raise ValueError(
+            f"invalid {flag} value: {raw!r} (issue numbers start at 1)"
+        )
+    return numbers
+
+
 def _csv_numbers(raw: str | None, flag: str) -> list[int] | None:
     """Parse a comma-separated number list. A BLANK value is treated as
     absent (None -> the default pool), so `--pool ""` cannot silently mean
-    "an explicit empty pool" (pr45 review CUB#b08069ad)."""
-    if raw is None or not str(raw).strip():
-        return None
-    out: list[int] = []
-    for piece in str(raw).replace(" ", "").split(","):
-        if not piece:
-            continue
-        try:
-            out.append(int(piece))
-        except ValueError:
-            raise ValueError(f"invalid {flag} value: {raw!r}") from None
-    return out
+    "an explicit empty pool" (pr45 review CUB#b08069ad). The token grammar is
+    the same canonical one `--numbers` uses (issue #89): ASCII digits, >= 1."""
+    return _canonical_issue_numbers(raw, flag)
 
 
 def cmd_triage(args: argparse.Namespace) -> int:
@@ -2056,7 +2087,8 @@ def _run_claims_live(
         return emit_failure(
             args,
             2,
-            f"could not determine repo ({exc}); pass --repo OWNER/REPO",
+            # RepoError's message already ends with the remedy (issue #89).
+            f"could not determine repo ({exc})",
             slug=getattr(args, "repo", None) or fallback_slug,
         )
     if not repo:
@@ -4038,8 +4070,19 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
     # --limit (frozen C21). A cross-command nearest flag (item --number ->
     # sync's --numbers) is mildly confusing but names a real flag; left as
     # documented behavior (final-critic r1 note).
+    unrecognized = message.lstrip().lower().startswith("unrecognized arguments:")
     for token in tokens:
-        match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
+        # An "unrecognized arguments" message names a flag this command does
+        # not have, so suggesting that same token back is useless -- it was
+        # just rejected. Every OTHER message shape ("argument --x: invalid
+        # value") names a flag the command DOES have, where naming it is the
+        # useful hint, so the pool is left alone there (issue #90).
+        pool = [
+            candidate
+            for candidate in known
+            if not (unrecognized and candidate == token)
+        ]
+        match = difflib.get_close_matches(token, pool, n=1, cutoff=0.55)
         if match:
             return f"did you mean {match[0]}? (see `{help_ref}`)"
     return f"see `{help_ref}` for this command's arguments"
