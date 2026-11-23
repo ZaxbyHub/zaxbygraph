@@ -10,11 +10,13 @@ Bug fixes on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the
   registers a tokenizer, i.e. code execution on a build compiled with
   `ENABLE_FTS3_TOKENIZER`) passed both guard layers; the deny is now a named
   set and is build-independent. `export-corpus --out` refuses DOS device
-  names (`CON`, `PRN`, `AUX`, `NUL`, `COM1-9`, `LPT1-9`, any case, extension
-  forms such as `CON.txt`/`CON.tar.gz`, and absolute paths) with the
-  documented `out_is_database` refusal through a portable predicate instead of
-  dying late at `os.replace`; the refusal stays Windows-only because a POSIX
-  file may legitimately be named `CON`. `release --tokenless` finds a
+  names with the documented `out_is_database` refusal through a portable
+  predicate instead of dying late at `os.replace`: the reserved names
+  (`CON`, `PRN`, `AUX`, `NUL`, `CLOCK$`, `CONIN$`, `CONOUT$`, `COM1-9`,
+  `LPT1-9`), any case, extension forms such as `CON.txt`/`CON.tar.gz`,
+  colon-suffixed device spellings (`CON:`, `NUL:`), the superscript COM/LPT
+  spellings, and absolute paths. The refusal stays Windows-only because a
+  POSIX file may legitimately be named `CON`. `release --tokenless` finds a
   tokenless claim even when an older tokened holder is active on the same
   issue. The nearest-flag hint no longer suggests the very flag argparse just
   rejected (the bad-value hint still names its own flag, and cross-command
