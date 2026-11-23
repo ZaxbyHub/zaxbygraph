@@ -4072,17 +4072,18 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
     # documented behavior (final-critic r1 note).
     unrecognized = message.lstrip().lower().startswith("unrecognized arguments:")
     for token in tokens:
-        # An "unrecognized arguments" message names a flag this command does
-        # not have, so suggesting that same token back is useless -- it was
-        # just rejected. Every OTHER message shape ("argument --x: invalid
-        # value") names a flag the command DOES have, where naming it is the
-        # useful hint, so the pool is left alone there (issue #90).
-        pool = [
-            candidate
-            for candidate in known
-            if not (unrecognized and candidate == token)
-        ]
-        match = difflib.get_close_matches(token, pool, n=1, cutoff=0.55)
+        match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
+        # When the nearest "valid flag" IS the token argparse just rejected,
+        # suggesting it (or an arbitrary neighbour once it is excluded) is not
+        # a usable hint: point at the command's help instead. This is the
+        # issue-#90 case (`sql --max-age` used to answer "did you mean
+        # --max-age?"); it also keeps `sql --max-files` from being answered
+        # with a nonsense `--ls-files` neighbour. Cross-command hints for a
+        # DIFFERENT, valid flag (`item --number` -> `--numbers`, `--limt` ->
+        # `--limit`) are unchanged, and every non-unrecognized message shape
+        # ("argument --x: invalid value") keeps naming its own flag.
+        if match and unrecognized and match[0] == token:
+            return f"see `{help_ref}` for this command's arguments"
         if match:
             return f"did you mean {match[0]}? (see `{help_ref}`)"
     return f"see `{help_ref}` for this command's arguments"
