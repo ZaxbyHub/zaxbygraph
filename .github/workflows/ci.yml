@@ -43,6 +43,7 @@ jobs:
           tests/test_triage_bounds.py
           tests/test_hint_fallback.py
           tests/test_token_canonicalization.py
+          tests/test_device_names_extended.py
           tests/test_db_uri_open.py::test_authorizer_denies_fts3_tokenizer
           tests/test_export_alias_guard.py::test_dos_device_names_refused
           -q

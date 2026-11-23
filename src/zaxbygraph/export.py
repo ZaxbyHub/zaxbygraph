@@ -113,11 +113,12 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 #: The DOS device names Win32 reserves in EVERY directory and with ANY
-#: extension (``CON``, ``CON.txt``, ``C:\work\CON.tar.gz``), plus the
+#: extension (``CON``, ``CON.txt``, ``C:\work\CON.tar.gz``), the colon-suffixed
+#: device spellings (``NUL:``, ``CON:``), the console aliases, plus the
 #: superscript COM/LPT spellings Windows also reserves. ``CLOCK$`` is the
 #: historical clock device.
 _RESERVED_DOS_DEVICE_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
+    {"CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"}
     | {f"COM{n}" for n in range(1, 10)}
     | {f"LPT{n}" for n in range(1, 10)}
     | {"COM\u00b9", "COM\u00b2", "COM\u00b3", "LPT\u00b9", "LPT\u00b2", "LPT\u00b3"}
@@ -131,15 +132,17 @@ def _dos_device_name(path: str) -> str | None:
     the check takes the final component -- split on BOTH separators, never via
     host ``Path``/``os.path.basename``, because this predicate must be usable
     while a test has patched ``os.name`` -- cuts it at its FIRST dot
-    (``splitext`` would miss ``CON.tar.gz``), right-strips the spaces and dots
-    Win32 also ignores, and upper-cases it.
+    (``splitext`` would miss ``CON.tar.gz``) and then at its first colon (the
+    ``NUL:``/``CON:`` device spellings), right-strips the spaces and dots Win32
+    also ignores, and upper-cases it.
 
     This is pure string logic: the CALLER decides whether the platform reserves
     the name (POSIX does not -- a file legitimately named ``CON`` is ordinary
     there).
     """
     component = str(path).replace("\\", "/").split("/")[-1]
-    candidate = component.split(".", 1)[0].rstrip(" .").upper()
+    candidate = component.split(".", 1)[0]
+    candidate = candidate.split(":", 1)[0].rstrip(" .").upper()
     return candidate if candidate in _RESERVED_DOS_DEVICE_NAMES else None
 
 
