@@ -888,7 +888,10 @@ def _int_cursor(raw, tool: str) -> int:
     # silently normalize them (issue #89). A negative cursor is hand-crafted
     # input for the same reason (FB-010); the digit-only match rejects it
     # instead of resetting to page 1, which this function's docstring forbids.
-    if re.fullmatch(r"[0-9]+", raw) is None:
+    if re.fullmatch(r"[0-9]+", raw) is None or (len(raw) > 1 and raw[0] == "0"):
+        # Producer-symmetric: str(offset) never mints a leading zero beyond
+        # "0" itself, so "00"/"01" are hand-crafted aliases that int() would
+        # silently normalize (issue #89 review).
         raise ToolError(
             "bad_request",
             f"{tool} cursor is malformed: {raw!r}",

@@ -1848,8 +1848,11 @@ def _canonical_issue_numbers(raw: str | None, flag: str) -> list[int] | None:
     """
     if raw is None or not str(raw).strip():
         return None
-    text = str(raw).replace(" ", "")
-    tokens = [token for token in text.split(",") if token]
+    # Split on commas FIRST, then strip each entry's surrounding whitespace.
+    # A blanket replace(" ", "") would join digits across a malformed entry
+    # (`1 0` -> 10) and silently select a different issue (issue #89 review).
+    tokens = [piece.strip() for piece in str(raw).split(",")]
+    tokens = [token for token in tokens if token]
     if not tokens:
         raise ValueError(f"invalid {flag} value: {raw!r}")
     for token in tokens:
