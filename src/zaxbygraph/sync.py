@@ -17,6 +17,7 @@ from zaxbygraph.github import (
     GitHubSource,
     GitHubTransportError,
     ListingShiftedError,
+    strict_int,
 )
 from zaxbygraph.graphql import GH_TIMEOUT_S
 from zaxbygraph.repo import validate_slug
@@ -120,6 +121,140 @@ def _fail_not_quiescent(
     )
 
 
+#: Prefix of the last_error a malformed listing row records (issue #88).
+_MALFORMED_ROW_PREFIX = "malformed_listing_row"
+
+
+def _bounded_text(value: object, limit: int = 100) -> str:
+    """A length-bounded rendering that is TOTAL for hostile values.
+
+    ``repr()``/``str()`` of an oversized integer raises in CPython (the
+    int-to-decimal digit limit), which would abort the very path that exists
+    to record malformed rows (Stage B review finding). The fallback names
+    the type instead of the value."""
+    try:
+        text = repr(value)
+    except Exception:
+        text = f"<unprintable {type(value).__name__}>"
+    return text[:limit]
+
+
+def _malformed_listing(list_raw: object) -> tuple[str | None, int | None]:
+    """(reason, parsed number) for a listing row issue #88 must skip.
+
+    A well-formed row returns ``(None, its number)``. The four malformed
+    shapes: a non-dict element, a missing ``number``, a ``number`` that is
+    not a GENUINE integer, and a missing/invalid ``id``. The strict check
+    matters: ``int()`` accepts ``True`` and truncates ``12.5``, and either
+    coercion would let a malformed row overwrite or move a real item while
+    the run certified completeness (review finding G1). Every embedded repr
+    is bounded to 100 characters (the pre-fix bound) so a hostile token
+    cannot bloat ``fetch_log``/``last_error`` on every pass. The reason
+    order matches the pre-fix branches (number before id), so a row
+    carrying both faults reports the number fault first.
+    """
+    if not isinstance(list_raw, dict):
+        return f"non-dict listing element ({type(list_raw).__name__})", None
+    if "number" not in list_raw:
+        return "missing number", None
+    number = strict_int(list_raw["number"])
+    if number is None:
+        return f"non-integer number {_bounded_text(list_raw['number'])}"[:160], None
+    if "id" not in list_raw:
+        return "missing id", number
+    if strict_int(list_raw["id"]) is None:
+        return f"invalid id {_bounded_text(list_raw['id'])}"[:160], number
+    return None, number
+
+
+def _pin_malformed_floor(
+    conn: sqlite3.Connection,
+    repo: str,
+    list_raw: object,
+    run_floor: str | None,
+) -> bool:
+    """Persist the recovery floor for a malformed listing row (issue #88).
+
+    The candidate is the row's own non-empty string ``updated_at`` (the next
+    run's inclusive since-walk re-serves it), else the STABLE run-start floor
+    ``run_floor`` (a rate-window restart may have advanced the mutable walk
+    floor past an earlier malformed row, so that one is not safe), else
+    ``None`` (from the beginning, which subsumes any timestamp). An
+    already-active floor is kept when it is earlier: ``None`` subsumes any
+    value and a smaller timestamp is never replaced by a larger one. Returns
+    False on a pre-v12 store (no floor columns); the caller still records and
+    keeps the error.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_state)")}
+    if "listing_floor_active" not in cols:
+        return False
+    stamp = list_raw.get("updated_at") if isinstance(list_raw, dict) else None
+    candidate = stamp if isinstance(stamp, str) and stamp else run_floor
+    row = conn.execute(
+        "SELECT listing_floor, listing_floor_active FROM sync_state WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    if row is not None and row["listing_floor_active"]:
+        current = row["listing_floor"]
+        if current is None or candidate is None:
+            candidate = None
+        else:
+            candidate = min(current, candidate)
+    conn.execute(
+        "UPDATE sync_state SET listing_floor = ?, listing_floor_active = 1"
+        " WHERE repo = ?",
+        (candidate, repo),
+    )
+    return True
+
+
+def _record_malformed_row(
+    conn: sqlite3.Connection,
+    repo: str,
+    reason: str,
+    list_raw: object,
+    run_floor: str | None,
+) -> None:
+    """Record a malformed listing row and pin the #65 recovery floor.
+
+    ONE transaction, so a crash between the record, the pin and the error can
+    never leave a recorded skip with no obligation (issue #88). On a pre-v12
+    store the floor cannot be persisted: the record and the error commit and
+    the run then ABORTS before a later row's watermark bump can seal the skip
+    — the issue's "fail loudly rather than finish clean".
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        log_fetch(
+            conn, repo, "item", None,
+            note=f"skipped malformed listing row: {reason}",
+            status=None,
+        )
+        pinned = _pin_malformed_floor(conn, repo, list_raw, run_floor)
+        set_last_error(
+            conn,
+            repo,
+            f"{_MALFORMED_ROW_PREFIX}: skipped a listing row that cannot be"
+            f" parsed ({reason}); the run is incomplete and"
+            + (" re-drains from the recovery floor"
+               if pinned else
+               " the next run re-lists the window (recovery floor not"
+               " persisted: pre-v12 store)"),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    if not pinned:
+        raise SyncError(
+            f"{_MALFORMED_ROW_PREFIX}: a listing row cannot be parsed"
+            f" ({reason}) and this pre-v12 store cannot persist a recovery"
+            " floor; the run stopped before the advancing watermark could"
+            " seal the row — run any ordinary sync command once to migrate"
+            " the store, then re-run"
+        )
+
+
 def _batch_fully_covered(
     batch: list,
     ingested_versions: dict[int, str],
@@ -145,9 +280,8 @@ def _batch_fully_covered(
     for raw in batch:
         if not isinstance(raw, dict) or "number" not in raw:
             return False
-        try:
-            number = int(raw["number"])
-        except (TypeError, ValueError):
+        number = strict_int(raw["number"])
+        if number is None:
             return False
         counts[number] = counts.get(number, 0) + 1
         stamp = raw.get("updated_at")
@@ -270,13 +404,14 @@ _CHILD_FALLBACK = {
 }
 
 
-def _batch(payload: object) -> list[dict]:
+def _batch(payload: object) -> list:
     """Normalize one yielded listing payload: an item dict is a one-item
-    batch, a page list is itself, anything else is skipped."""
+    batch, a page list is itself AS DELIVERED (a non-dict element is kept so
+    the caller can record it — issue #88), anything else is skipped."""
     if isinstance(payload, dict):
         return [payload]
     if isinstance(payload, list):
-        return [raw for raw in payload if isinstance(raw, dict)]
+        return payload
     return []
 
 
@@ -788,10 +923,7 @@ def _assert_repository_readable(source: GitHubSource, repo: str) -> None:
 
 def _number_of(raw: object) -> int | None:
     if isinstance(raw, dict) and "number" in raw:
-        try:
-            return int(raw["number"])
-        except (TypeError, ValueError):
-            return None
+        return strict_int(raw["number"])
     return None
 
 
@@ -802,6 +934,8 @@ def _numbered_payloads(
     wanted: set[int],
     include_patches: bool,
     jsonl_handle: TextIO | None,
+    *,
+    state: dict,
 ):
     """Listing payloads for a targeted refresh (issue #23).
 
@@ -848,6 +982,22 @@ def _numbered_payloads(
             status = entry[1] if isinstance(entry, tuple) and len(entry) > 1 else None
             if isinstance(payload, dict):
                 continue
+            if status is None and entry is not None:
+                # Issue #88: a response for a REQUESTED number that is not a
+                # listing row (get_issues maps a non-dict 200 payload to
+                # exactly this (None, None) shape). It is a malformed
+                # observation: record it, pin the recovery floor from the
+                # beginning (a targeted run's watermark may be newer than
+                # the row, so it is not a safe candidate) and keep the run
+                # incomplete. An entry the source did not return at all
+                # (entry is None) keeps the legacy missing-number notes.
+                _record_malformed_row(
+                    conn, repo,
+                    f"exact-number response was not a listing row ({n})",
+                    None, None,
+                )
+                state["malformed_seen"] = True
+                continue
             exists = conn.execute(
                 "SELECT 1 FROM items WHERE repo = ? AND number = ?", (repo, n)
             ).fetchone() is not None
@@ -882,12 +1032,36 @@ def _numbered_payloads(
     found: set[int] = set()
     malformed_seen = False
     for page in source.list_issues(None):
-        batch = [raw for raw in _batch(page) if _number_of(raw) in wanted]
-        if any(_number_of(raw) is None and isinstance(raw, dict) for raw in _batch(page)):
-            # A listing shell we cannot match could be a requested number:
-            # absence evidence is then incomplete, so no deletion verdict is
-            # drawn this run (PR #37 review — false-deletion guard).
-            malformed_seen = True
+        batch = []
+        for raw in _batch(page):
+            number = _number_of(raw)
+            if number is None:
+                # Issue #88: a listing element without a genuine integer
+                # number is malformed on EVERY source, not only the
+                # exact-number seam. Record it (one transaction), pin the
+                # recovery floor and route the flag into the run state so
+                # the finalizer cannot certify completeness; the local flag
+                # still suppresses deletion verdicts for this run — a shell
+                # that cannot be matched may BE a requested number, so
+                # absence evidence is incomplete (PR #37 review).
+                #
+                # The run_floor argument is None — never this targeted
+                # run's start: the fallback lists from the beginning, so a
+                # row with no usable timestamp may be OLDER than the stored
+                # watermark, and a run-start pin would let the next ordinary
+                # walk skip it. A dict row's own non-empty updated_at stays
+                # the precise candidate inside _pin_malformed_floor (the
+                # established #88 rule); None is the unattributable case.
+                reason, _row_number = _malformed_listing(raw)
+                _record_malformed_row(
+                    conn, repo, reason or "unmatchable listing row", raw,
+                    None,
+                )
+                malformed_seen = True
+                state["malformed_seen"] = True
+                continue
+            if number in wanted:
+                batch.append(raw)
         found.update(n for n in (_number_of(raw) for raw in batch) if n is not None)
         if batch:
             yield batch
@@ -971,7 +1145,8 @@ def _retry_torn_pending(
     include_patches: bool,
     seen_numbers: set[int],
     jsonl_handle: TextIO | None,
-) -> int:
+    run_floor: str | None,
+) -> tuple[int, bool]:
     """Refresh the torn-pending numbers through the exact-number seam
     (issue #66 AC5): a listing row that has caught up ingests normally and
     leaves the pending set; one still skewed against its pull payload
@@ -984,11 +1159,18 @@ def _retry_torn_pending(
     repository-read gate first (an unreadable repository must never
     fabricate a deletion), then the same ingest-and-mark + sidecar bundle
     every other deletion shape writes, then the pending row clears so the
-    number stops costing an exact-number fetch on every future run."""
+    number stops costing an exact-number fetch on every future run.
+
+    Returns ``(ingested, malformed_seen)``: a refreshed row that cannot be
+    parsed (issue #88) is recorded and pinned, its pending row SURVIVES, and
+    the malformed flag reaches the caller's finalization so the run cannot
+    certify completeness. A pre-v12 store aborts loudly inside the recorder
+    rather than finishing clean."""
     getter = getattr(source, "get_issues", None)
     if not callable(getter):
-        return 0
+        return 0, False
     ingested = 0
+    malformed_seen = False
     for n in numbers:
         results = _call_with_rate_retry(getter, [n]) or {}
         entry = results.get(n)
@@ -996,7 +1178,44 @@ def _retry_torn_pending(
             entry if isinstance(entry, dict) else None
         )
         status = entry[1] if isinstance(entry, tuple) and len(entry) > 1 else None
+        if isinstance(row, dict):
+            reason, _row_number = _malformed_listing(row)
+            if reason is not None:
+                # Issue #88: validate immediately before ingest on the torn
+                # retry path too. The pending row keeps the durable debt; the
+                # floor + error keep the run from certifying completeness.
+                _record_malformed_row(conn, repo, reason, row, run_floor)
+                malformed_seen = True
+                continue
         if not isinstance(row, dict):
+            if status is None and entry is not None:
+                # PRR-004: a torn-retry failure is never silent. A response
+                # for an owed number that is not a listing row (a non-dict
+                # 200 payload maps to exactly this (None, None) shape) leaves
+                # the pending row standing — it already holds the durable
+                # debt, so no floor pin is needed — but the fault gets a log
+                # row and last_error so the readiness verdict cannot read
+                # clean while every retry of the owed number is failing.
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    log_fetch(
+                        conn, repo, "item", str(n),
+                        note="torn retry: exact-number response was not a"
+                             " listing row",
+                        status=None,
+                    )
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+                    raise
+                set_last_error(
+                    conn, repo,
+                    "torn retry: the source returned no usable listing row"
+                    f" for #{n}; the pending obligation survives",
+                )
+                # set_last_error's upsert opens an implicit transaction;
+                # commit it before the next write_pending (BEGIN IMMEDIATE).
+                conn.commit()
             if status in (404, 410):
                 _assert_repository_readable(source, repo)
                 gone_note = (
@@ -1101,7 +1320,7 @@ def _retry_torn_pending(
         clear_pending(conn, repo, [n], "torn")
         seen_numbers.add(n)
         ingested += 1
-    return ingested
+    return ingested, malformed_seen
 
 
 def _deletion_corroborator(seen_numbers: set[int], candidates: list[int]):
@@ -1610,6 +1829,11 @@ def sync_repo(
             full = since is None or pending_at_start
             started_full = since is None
         seen_numbers: set[int] = set()
+        # Issue #88: the run-local malformed-row obligation. `malformed_seen`
+        # gates the deletion oracle, the clean-finish stamps and the floor
+        # clear; `run_state` carries the flag out of the targeted generator.
+        malformed_seen = False
+        run_state: dict = {"malformed_seen": False}
         rate_window: tuple[int, str] | None = None
         # Sidecar setup is a failure path too (e.g. the target path is a
         # regular file). The finally guard tolerates a half-failed setup
@@ -1626,10 +1850,12 @@ def sync_repo(
         if numbers is None:
             pending_torn = pending_numbers(conn, repo, "torn")["torn"]
             if pending_torn:
-                ingested += _retry_torn_pending(
+                added, torn_malformed = _retry_torn_pending(
                     conn, source, repo, pending_torn, include_patches,
-                    seen_numbers, jsonl_handle,
+                    seen_numbers, jsonl_handle, since,
                 )
+                ingested += added
+                malformed_seen = malformed_seen or torn_malformed
                 for n in pending_torn:
                     if n in seen_numbers and n not in ingested_numbers:
                         ingested_numbers.add(n)
@@ -1705,12 +1931,15 @@ def sync_repo(
                     # items, never the whole listing.
                     payloads = _numbered_payloads(
                         conn, source, repo, {int(n) for n in numbers}, include_patches,
-                        jsonl_handle,
+                        jsonl_handle, state=run_state,
                     )
                 else:
                     payloads = source.list_issues(walk_since)
                 for payload in payloads:
                     batch = _batch(payload)
+                    # A non-dict element cannot contribute bulk children; the
+                    # per-item loop below records it (issue #88).
+                    child_batch = [raw for raw in batch if isinstance(raw, dict)]
                     # One bulk children call per listing page when the source
                     # offers it (issue #5 AC2); items the source did not
                     # answer fall through to the per-item REST path. A page
@@ -1722,15 +1951,15 @@ def sync_repo(
                     fetch = getattr(source, "fetch_children", None)
                     if (
                         callable(fetch)
-                        and batch
+                        and child_batch
                         and not rest_degraded
                         and not _batch_fully_covered(
-                            batch, ingested_versions, ingested_numbers,
+                            child_batch, ingested_versions, ingested_numbers,
                             prev_pass_counts,
                         )
                     ):
                         try:
-                            provided_map = fetch(batch) or {}
+                            provided_map = fetch(child_batch) or {}
                         except GitHubError as exc:
                             if _rate_attrs(exc) is not None:
                                 raise  # a window: the attempt loop sleeps it out
@@ -1742,23 +1971,27 @@ def sync_repo(
                             rest_degraded = True
                             _log_graphql_unavailable(conn, repo, exc)
                     for list_raw in batch:
-                        if not isinstance(list_raw, dict) or "number" not in list_raw:
+                        malformed_reason, number = _malformed_listing(list_raw)
+                        if malformed_reason is not None:
+                            if number is not None:
+                                # A DELIVERED row: absence evidence for the
+                                # deletion oracle (a delivered-but-skipped
+                                # row must never read as absent), never an
+                                # ingest.
+                                seen_numbers.add(number)
+                                pass_numbers.add(number)
+                                pass_counts[number] = pass_counts.get(number, 0) + 1
+                            _record_malformed_row(
+                                conn, repo, malformed_reason, list_raw,
+                                # A targeted run's watermark may be newer than
+                                # the row (its true stamp is unknown here), so
+                                # pin from the beginning like the exact-number
+                                # seam; an ordinary run uses its stable start.
+                                None if numbers is not None else since,
+                            )
+                            malformed_seen = True
                             continue
-                        try:
-                            number = int(list_raw["number"])
-                        except (TypeError, ValueError):
-                            conn.execute("BEGIN IMMEDIATE")
-                            try:
-                                log_fetch(
-                                    conn, repo, "item", None,
-                                    note=f"skipped malformed listing number: "
-                                    f"{str(list_raw['number'])[:100]!r}",
-                                )
-                                conn.commit()
-                            except Exception:
-                                conn.rollback()
-                                raise
-                            continue
+                        assert number is not None
                         seen_numbers.add(number)
                         pass_numbers.add(number)
                         pass_counts[number] = pass_counts.get(number, 0) + 1
@@ -1945,6 +2178,28 @@ def sync_repo(
                                 last_number = number
                                 continue
                             list_raw = refreshed
+                            # Issue #88: the refreshed replacement lands at
+                            # the final ingest boundary, so it is validated
+                            # HERE, after the swap and before ingest_item —
+                            # a refreshed row with a bad id must record and
+                            # pin, never raise out of the transaction.
+                            refreshed_reason, refreshed_number = _malformed_listing(
+                                list_raw
+                            )
+                            if refreshed_reason is not None:
+                                if refreshed_number is not None:
+                                    seen_numbers.add(refreshed_number)
+                                    pass_numbers.add(refreshed_number)
+                                    pass_counts[refreshed_number] = (
+                                        pass_counts.get(refreshed_number, 0) + 1
+                                    )
+                                _record_malformed_row(
+                                    conn, repo, refreshed_reason, list_raw,
+                                    None if numbers is not None else since,
+                                )
+                                malformed_seen = True
+                                last_number = number
+                                continue
 
                         conn.execute("BEGIN IMMEDIATE")
                         try:
@@ -2150,12 +2405,20 @@ def sync_repo(
         # otherwise-complete run. A targeted refresh never runs it (issue
         # #23): absence from its filtered view is meaningless for every
         # other item, and its own retry seam is the torn set.
+        # A targeted generator may have recorded an exact-number malformed
+        # observation (issue #88); fold its flag into the run's for BOTH
+        # finish paths (a targeted run never enters the deletion block below).
+        malformed_seen = malformed_seen or bool(run_state["malformed_seen"])
         if numbers is None:
             pending_deletion = pending_numbers(conn, repo, "deletion")["deletion"]
             if started_full or pending_deletion:
                 _deletion_pass(
                     conn, source, repo, seen_numbers, jsonl_handle,
-                    derive_new=started_full,
+                    # Issue #88: absence derivation needs COMPLETE listing
+                    # evidence. A run that could not parse a row never marks
+                    # stored items absent; independently pending deletion
+                    # retries (derive_new=False) keep their own semantics.
+                    derive_new=started_full and not malformed_seen,
                 )
 
         # Fields the capability probe dropped from the page queries
@@ -2200,11 +2463,14 @@ def sync_repo(
                 rate_limit_reset_at=None if rate_window is None else rate_window[1],
                 targeted=numbers is not None,
                 ingested_count=ingested,
+                malformed_open=malformed_seen,
             )
-            if numbers is None and floor_cols:
-                # The listing quiesced and the run finished clean: the
-                # recovery floor is resolved and cleared (a targeted refresh
-                # never re-drains the listing, so it never clears it).
+            if numbers is None and floor_cols and not malformed_seen:
+                # The listing quiesced, every row parsed, and the run
+                # finished clean: the recovery floor is resolved and cleared
+                # (a targeted refresh never re-drains the listing, so it
+                # never clears it; a run that skipped a malformed row keeps
+                # the pin until a skip-free run, issue #88).
                 conn.execute(
                     "UPDATE sync_state SET listing_floor = NULL,"
                     " listing_floor_active = 0 WHERE repo = ?",
@@ -2283,7 +2549,7 @@ def sync_repo(
         "repo": repo,
         "ingested": ingested,
         "last_number": last_number,
-        "full": full,
+        "full": full and not malformed_seen,
         "finished_at": utcnow(),
         "issues_since": None if state is None else state["issues_since"],
         "item_count": None if state is None else state["item_count"],

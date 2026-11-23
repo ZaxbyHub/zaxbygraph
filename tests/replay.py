@@ -165,11 +165,14 @@ class JsonlReplaySource:
         """Exact-number shells from the recorded bundles (numbers mode).
 
         A number absent from the recording is `(None, None)` — unknown, not
-        an HTTP 404 — so sync skips it with a note instead of marking a
-        deletion reason the replay never observed. The LATEST bundle per
-        number is the shell, and the same latest bundles (gone included) are
-        registered as the next cursor entry so the targeted path re-ingests
-        with its own children."""
+        an HTTP 404 — so sync never fabricates a deletion reason the replay
+        did not observe. Since issue #88 that shape is also a recorded
+        malformed observation: the skip is logged, the recovery floor is
+        pinned and the run answers incomplete instead of silently passing
+        (a replay recording is a listing this seam cannot parse). The LATEST
+        bundle per number is the shell, and the same latest bundles (gone
+        included) are registered as the next cursor entry so the targeted
+        path re-ingests with its own children."""
         out: dict[int, tuple[dict | None, int | None]] = {}
         registered: list[dict] = []
         for number in numbers:

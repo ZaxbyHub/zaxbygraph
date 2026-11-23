@@ -90,6 +90,10 @@ RELEASE_PINS: dict[str, tuple[int, str]] = {
         12,
         "0eb4be5f40db5a88b8ffe9aaff1591a9063197a3361ded7c9ab44af544b8a9fc",
     ),
+    "0.5.1": (
+        12,
+        "0eb4be5f40db5a88b8ffe9aaff1591a9063197a3361ded7c9ab44af544b8a9fc",
+    ),
 }
 #: Back-compat alias for the digest-only membership check.
 TOOLSET_DIGESTS: dict[str, str] = {
@@ -852,6 +856,34 @@ class PackagedSkillTests(_HermeticCliTest):
             Path(zaxbygraph.__file__).resolve().parent
             / "skills" / "zaxbygraph" / "SKILL.md"
         )
+
+    def test_checked_in_stamps_match_their_bodies(self) -> None:
+        """The CHECKED-IN stamps must be self-consistent.
+
+        ``skill --install`` REWRITES the stamp it writes, so the install-path
+        check below never sees a stale checked-in hash (cubic CUB-7 / review
+        finding): this test reads the committed bytes of both copies and
+        recomputes the body hash the same way the installer does."""
+        for rel in (
+            "skills/zaxbygraph/SKILL.md",
+            "src/zaxbygraph/skills/zaxbygraph/SKILL.md",
+        ):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            match = _STAMP_RE.search(text)
+            self.assertIsNotNone(match, f"{rel} carries no stamp")
+            body = _skill_body(text)
+            candidates = {
+                hashlib.sha256(candidate.encode("utf-8")).hexdigest()
+                for candidate in (
+                    body, body.rstrip("\n") + "\n", body.rstrip("\n")
+                )
+            }
+            self.assertIn(
+                match.group("hash"),
+                candidates,
+                f"{rel}: the checked-in stamp hash must equal sha256 of the"
+                " body minus the stamp line",
+            )
 
     def test_skill_ships_with_the_package(self) -> None:
         """RED at base (no packaged skill, no package-data entry, no skill

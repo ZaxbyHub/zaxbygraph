@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.5.1] - 2026-11-22
+
+Bug fix on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the
+20-tool MCP registry digest is unchanged from 0.5.0).
+
+- **#88** A listing row the sync cannot parse no longer vanishes behind the
+  advancing watermark. The row is skipped AND recorded, pins the issue-#65
+  recovery floor (at the row's own `updated_at`, else the run's starting
+  floor — the watermark the run started from, or from the beginning on a
+  full or forced run; an earlier floor is never replaced), and keeps the run
+  answering incomplete until a skip-free run re-drains and clears it. The
+  fix covers the real REST page (non-dict elements are preserved by
+  `GhApiSource.list_issues` instead of filtered out), the bulk GraphQL chunk
+  builder, the main per-item path, the post-torn-refresh replacement, the
+  pending torn-retry path, and targeted `--numbers` exact-number responses.
+  A malformed row with a parseable number remains delivery evidence for the
+  deletion oracle, and a run that saw any malformed row derives no new
+  deletion candidates (absence needs complete listing evidence). A targeted
+  run can no longer launder an active floor or its `last_error`, and a
+  pre-v12 store now aborts loudly after recording instead of finishing
+  clean.
+- **#91** `snapshot publish` and `snapshot pull` decide which repos a store
+  holds from every PRESENT repo-bearing table (all 17 tables `schema.sql`
+  declares `repo` on, including `issue_field_values`), compared canonically
+  (`lower(repo)`), not from `sync_state` alone — a destination or source
+  carrying a foreign corpus (even child-only rows, even without its
+  `sync_state` row) is refused instead of silently replaced or transferred
+  under a single-repo manifest. Canonical identity now also governs
+  `_bind_destination`, the local-watermark `local_newer` guard (newest
+  matching watermark), publish completeness (ANY matching state row
+  incomplete) and watermark (earliest non-NULL), the corpus digest (every
+  stored spelling of the canonical repo), and `--repo` binding. Ownership
+  scans fail closed: a present table that faults or a NULL/non-string repo
+  value refuses with a coded error instead of aborting the scan into an
+  allowed replacement.
+
 ## [0.5.0] - 2026-11-16
 
 Ships schema v12 (CURRENT_USER_VERSION 12) with the 20-tool MCP registry

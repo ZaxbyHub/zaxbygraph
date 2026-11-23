@@ -631,5 +631,100 @@ class ReadableDestinationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "dest_open")
 
 
+# ==== issue #91 (collated trace 88-91): ownership from the stored corpus ====
+#
+# Module-level checks appended for the 88-91 trace. The destination guard's
+# ownership oracle must read the STORED CORPUS (every present repo-bearing
+# table, compared canonically), not `sync_state` alone: `sync_state` is a
+# strict subset of the data `_install`'s whole-file `os.replace` destroys.
+# Both checks are RED at the trace's base commit and GREEN after the fix;
+# the module-level `load_tests` bridge below keeps them running under
+# `python -m unittest discover -s tests` alongside the TestCase classes
+# above (pytest collects the functions natively).
+
+
+def _guard_verdict(dest: Path, manifest: dict) -> str | None:
+    """The guard's outcome as a code: None when it does not refuse."""
+    try:
+        _check_destination_shape(dest, manifest, False)
+    except SnapshotError as exc:
+        return exc.code
+    return None
+
+
+def _intruder_dest(td: Path, *, child_only: bool) -> Path:
+    """A destination store built by syncing `intruder/repo`, then
+    hand-emptied of its sync_state rows (and, for child_only, of its items
+    rows too, leaving one labels row as the only surviving foreign data)."""
+    db = td / f"intruder_{'child' if child_only else 'items'}.db"
+    conn = connect(db)
+    init_schema(conn)
+    src = FakeGitHubSource()
+    for n in range(11, 14):
+        src.add_issue(issue(n, created_at="2027-06-01T00:00:00Z"))
+    sync_repo(conn, src, "intruder/repo")
+    conn.execute("DELETE FROM sync_state")
+    if child_only:
+        conn.execute("DELETE FROM items")
+        conn.execute(
+            "INSERT INTO labels(repo, number, name)"
+            " VALUES ('intruder/repo', 7, 'x')")
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_foreign_items_without_state_row_refuse():
+    """AC13 (#91): a pull destination holding items for another repo with
+    no `sync_state` row for it is refused with `multi_repo_destination`
+    (the foreign rows are not silently replaceable). RED at base (the
+    sync_state-only oracle answers no refusal); GREEN after the fix."""
+    with tempfile.TemporaryDirectory(prefix="ac13_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        dest = _intruder_dest(td, child_only=False)
+        code = _guard_verdict(dest, {"repo": REPO})
+        assert code == "multi_repo_destination", \
+            f"expected multi_repo_destination, got {code!r}"
+        check = sqlite3.connect(str(dest))
+        try:
+            remaining = check.execute(
+                "SELECT COUNT(*) FROM items WHERE repo = 'intruder/repo'"
+            ).fetchone()[0]
+        finally:
+            check.close()
+        assert remaining > 0, "foreign items rows still exist"
+
+
+def test_foreign_child_rows_without_state_row_refuse():
+    """AC14 (#91): a pull destination whose only foreign row sits in a
+    non-items table (a labels row; no items, no sync_state) is refused --
+    `items UNION sync_state` is an incomplete oracle because every
+    per-repo table carries `repo`. RED at base (the union is empty, no
+    refusal); GREEN after the fix."""
+    with tempfile.TemporaryDirectory(prefix="ac14_",
+                                     ignore_cleanup_errors=True) as tdn:
+        td = Path(tdn)
+        dest = _intruder_dest(td, child_only=True)
+        code = _guard_verdict(dest, {"repo": REPO})
+        assert code == "multi_repo_destination", \
+            f"expected multi_repo_destination, got {code!r}"
+
+
+_TRACE_8891_CHECKS = [
+    test_foreign_items_without_state_row_refuse,
+    test_foreign_child_rows_without_state_row_refuse,
+]
+
+
+def load_tests(loader, standard_tests, pattern):
+    """Bridge so unittest discovery runs the trace's module-level checks
+    alongside the TestCase classes above (published argv parity)."""
+    suite = unittest.TestSuite(standard_tests)
+    for fn in _TRACE_8891_CHECKS:
+        suite.addTest(unittest.FunctionTestCase(fn))
+    return suite
+
+
 if __name__ == "__main__":
     unittest.main()

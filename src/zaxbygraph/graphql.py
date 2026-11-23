@@ -22,6 +22,7 @@ from zaxbygraph.github import (
     GitHubTransportError,
     GhApiSource,
     _status_from_stderr,
+    strict_int,
 )
 
 #: Numbers per aliased children query (issue + pullRequest aliases each).
@@ -1173,10 +1174,11 @@ class GraphQLSource(GhApiSource):
         self.last_fetch_drops = {}
         for raw in items:
             if isinstance(raw, dict) and "number" in raw:
-                try:
-                    kinds[int(raw["number"])] = "pr" if "pull_request" in raw else "issue"
-                except (TypeError, ValueError):
-                    pass  # malformed listing numbers are skipped per item in sync
+                number = strict_int(raw["number"])
+                if number is not None:
+                    # A boolean/float number is not another item's number
+                    # (review finding G1); sync records it as malformed.
+                    kinds[number] = "pr" if "pull_request" in raw else "issue"
             chunk.append(raw)
             if len(chunk) >= GRAPHQL_CHILDREN_PAGE or self._chunk_query_len(chunk) >= _MAX_QUERY_CHARS:
                 children.update(self._fetch_children_chunk(chunk))
@@ -1334,7 +1336,13 @@ class GraphQLSource(GhApiSource):
         for raw in chunk:
             if not isinstance(raw, dict) or "number" not in raw:
                 continue
-            number = int(raw["number"])
+            number = strict_int(raw["number"])
+            if number is None:
+                # Issue #88 AC4: one malformed row must never abort the whole
+                # chunk; the sync layer records the skip and pins the
+                # recovery floor (the per-item branch owns the record). A
+                # boolean/float is malformed too (review finding G1).
+                continue
             kind = "pr" if "pull_request" in raw else "issue"
             alias = ("p" if kind == "pr" else "i") + str(number)
             fields = self._fields_for(kind)
