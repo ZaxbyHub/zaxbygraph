@@ -392,9 +392,16 @@ def test_dos_device_names_refused() -> None:
                         f"--out {name!r} names a DOS device path and must be"
                         " refused before the corpus is spooled"
                     )
-        with mock.patch.object(os, "name", "posix"):
+        with mock.patch.object(os, "name", "posix"), mock.patch.object(
+            os.path, "realpath", lambda path: str(path)
+        ):
             # POSIX does not reserve these names: a file legitimately called
-            # CON must not be refused.
+            # CON must not be refused. realpath is stubbed to an identity
+            # because the HOST'S ntpath may resolve CON to the \\\\.\\CON
+            # device path (observed on GitHub's windows-latest runner on
+            # 3.13/3.14), which the UNCONDITIONAL device-prefix arm correctly
+            # refuses regardless of os.name; a faithful POSIX simulation must
+            # not inherit that host-specific resolution.
             _reject_database_alias("CON", db_path)
             _reject_database_alias(absolute_nul, db_path)
 
