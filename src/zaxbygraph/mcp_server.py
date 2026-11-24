@@ -3039,8 +3039,10 @@ _TOOLS: list[dict] = [
                 "force": {"type": "boolean", "description": "Ignore the watermark; full pull"},
                 "numbers": {
                     "type": "array",
-                    "items": {"type": "integer", "minimum": 1},
+                    "items": {"type": "integer", "minimum": 1,
+                              "maximum": 2**63 - 1},
                     "description": f"Refresh exactly these items; the watermark is untouched (at most {_MAX_NUMBERS})",
+                    "minItems": 1,
                     "maxItems": _MAX_NUMBERS,
                 },
                 "include_patches": {"type": "boolean", "description": "Store pull file patches"},

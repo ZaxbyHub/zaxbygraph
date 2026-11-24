@@ -32,7 +32,9 @@ jobs:
       # unittest discovery never executes module-level pytest functions, so the
       # function-style regression checks below would otherwise not run in CI at
       # all (and the Windows-gated device fix would never be exercised on the
-      # ubuntu legs). Every new check file is named explicitly.
+      # ubuntu legs). Only module-level pins are listed here; class-based check
+      # modules (e.g. tests/test_feedback_round_bounds.py) are NOT listed
+      # because the unittest step above already runs every test in them.
       - name: Seam regression checks (pytest form)
         run: >-
           python -m pytest
