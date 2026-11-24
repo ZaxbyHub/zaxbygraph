@@ -85,7 +85,15 @@ def _run_cli(argv: list[str]) -> tuple[int, str, str]:
 
 def _mcp_call(db_path: Path, tool: str, arguments: dict) -> dict:
     case = unittest.TestCase()
-    session = McpSession(case, repo=REPO, db=str(db_path), stale_after_s=10**9)
+    # A no-op sync runner: before the fix, the ``sync`` handler accepted an
+    # out-of-range number and SPAWNED a real background sync, which raced the
+    # TemporaryDirectory teardown and surfaced as a Windows ``PermissionError``
+    # instead of the assertion under test (review round 1 finding). The pin
+    # must fail on its own contract, not on cleanup.
+    session = McpSession(
+        case, repo=REPO, db=str(db_path), stale_after_s=10**9,
+        sync_runner=lambda _db, _repo: None,
+    )
     try:
         session.initialize()
         return session.call_tool(tool, arguments)
