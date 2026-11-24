@@ -1754,7 +1754,12 @@ def release_claims(
                 if token is None:
                     if entry.get("token") is None:
                         matching.append(number)
-                    break
+                        break
+                    # A tokened holder is not the claim this tokenless release
+                    # targets. Keep scanning: a NEWER tokenless claim on the
+                    # same issue can still match -- the race loser withdrawing
+                    # while the winner holds the issue (issue #90).
+                    continue
                 if entry.get("token") == token:
                     matching.append(number)
                     break

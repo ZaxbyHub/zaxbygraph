@@ -1,5 +1,46 @@
 # Changelog
 
+## [0.5.2] - 2026-11-23
+
+Bug fixes on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the
+20-tool MCP registry digest is unchanged from 0.5.1).
+
+- **#90** Guard seams. The read-only `sql` authorizer's function deny-list
+  named exactly one function, so `fts3_tokenizer` (whose two-argument form
+  registers a tokenizer, i.e. code execution on a build compiled with
+  `ENABLE_FTS3_TOKENIZER`) passed both guard layers; the deny is now a named
+  set and is build-independent. `export-corpus --out` refuses DOS device
+  names with the documented `out_is_database` refusal through a portable
+  predicate instead of dying late at `os.replace`: the reserved names
+  (`CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1-9`, `LPT1-9`),
+  any case, extension forms such as `CON.txt`/`CON.tar.gz`,
+  colon-suffixed device spellings (`CON:`, `NUL:`), the superscript COM/LPT
+  spellings, and absolute paths. The refusal stays Windows-only because a
+  POSIX file may legitimately be named `CON`. `release --tokenless` finds a
+  tokenless claim even when an older tokened holder is active on the same
+  issue. The nearest-flag hint no longer suggests the very flag argparse just
+  rejected (the bad-value hint still names its own flag, and cross-command
+  hints for a valid flag are unchanged). The MCP `bundle` tool enforces its
+  published bounds (`count`, `max_files`, and `pool`/`exclude` entries, all
+  `>= 1`, with the item minima now published in the inputSchema), and the CLI
+  `bundle --max-files` override refuses a value below 1 the way the
+  `[triage] max_files` config key already did.
+- **#89** Refusals and classifications. The `gh` stderr 429 verdict needs a
+  status context (`HTTP 429`, `status code 429`) or the `too many requests`
+  reason phrase, so an exact issue number such as "issue 429 ... (HTTP 404)"
+  no longer shadows the real 404; genuine rate-limit messages still classify
+  429. `sync --numbers` (and `bundle --pool`/`--exclude`) accept canonical
+  ASCII decimal issue numbers only; a sign, underscore, non-ASCII digit, a
+  value below 1, a value past the signed 64-bit range, or an oversized digit
+  run is a coded `bad_request` before any fetch (the MCP `sync` and `bundle`
+  number sinks enforce the same range, so no accepted number can reach a SQL
+  bind and fail as an uncoded runtime error). The
+  no-corpus test names its repo explicitly, so it no longer depends on the
+  working directory being a git checkout. The repo-resolution error names the
+  `--repo OWNER/REPO` remedy exactly once. The MCP paging cursor enforces the
+  producer's own ASCII-decimal shape (`1_0`, `+5`, ` 5`, and non-ASCII digits
+  are `bad_request`; `"0"` and ordinary offsets still page).
+
 ## [0.5.1] - 2026-11-22
 
 Bug fix on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the

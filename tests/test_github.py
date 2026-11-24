@@ -244,5 +244,52 @@ class TransportTypingTests(unittest.TestCase):
                 gql._graphql("query { viewer { login } }")
 
 
+class TestStatusFromStderr(unittest.TestCase):
+    """#89 AC1/AC2: the 429 verdict is word-boundary anchored like its
+    siblings, and the genuine rate-limit shapes still classify as 429.
+
+    `_status_from_stderr`'s own comment states the invariant -- a bare
+    status inside a larger number (an issue number, a URL, a request id)
+    must not drive classification, because the 404/410 verdicts durably flip
+    items.state. The 429 branch was the one branch that tested an unanchored
+    substring, checked FIRST, so any digit run embedding 429 shadowed a real
+    403/404/410/401.
+
+    RED at e6c8f41: `issue 1429 not found (HTTP 404)` classifies as 429.
+    GREEN after anchoring; the phrase-based rate-limit verdicts (AC2) stay.
+    """
+
+    def test_embedded_429_digits_do_not_classify(self) -> None:
+        embedded = _status_from_stderr("gh: issue 1429 not found (HTTP 404)")
+        self.assertEqual(
+            embedded, 404,
+            "a 429 digit run inside an issue number must not shadow the"
+            f" anchored 404 verdict; got {embedded!r}",
+        )
+        forbidden = _status_from_stderr(
+            "gh: HTTP 403: forbidden talking about issue 4291"
+        )
+        self.assertEqual(
+            forbidden, 403,
+            "a 429 digit run inside an issue number must not shadow the"
+            f" anchored 403 verdict; got {forbidden!r}",
+        )
+
+    def test_real_rate_limits_still_classify(self) -> None:
+        # A plain loop, not subTest: pytest can report a test whose failures
+        # all sit inside subTests as PASSED, which would make this pin mute.
+        for text in (
+            "gh: HTTP 429: too many requests",
+            "gh: API rate limit exceeded for 1.2.3.4",
+            "gh: You have exceeded a secondary rate limit",
+        ):
+            got = _status_from_stderr(text)
+            self.assertEqual(
+                got, 429,
+                f"a genuine rate-limit stderr must still classify 429;"
+                f" {text!r} answered {got!r}",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

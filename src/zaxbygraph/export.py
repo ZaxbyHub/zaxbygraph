@@ -112,6 +112,42 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
         conn.isolation_level = previous_isolation
 
 
+#: The DOS device names Win32 reserves in EVERY directory and with ANY
+#: extension (``CON``, ``CON.txt``, ``C:\work\CON.tar.gz``), the colon-suffixed
+#: device spellings (``NUL:``, ``CON:``), the console aliases, plus the
+#: superscript COM/LPT spellings Windows also reserves. ``CLOCK$`` is NOT in
+#: the set: it is not a current Win32 reserved name (CPython's
+#: ``os.path.isreserved`` answers False on 3.13/3.14) and is creatable as an
+#: ordinary file/directory, so refusing it would reject a valid export path.
+_RESERVED_DOS_DEVICE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+    | {"COM\u00b9", "COM\u00b2", "COM\u00b3", "LPT\u00b9", "LPT\u00b2", "LPT\u00b3"}
+)
+
+
+def _dos_device_name(path: str) -> str | None:
+    """The reserved DOS device name ``path`` spells, or None.
+
+    Win32 resolves a reserved name in any directory and with any extension, so
+    the check takes the final component -- split on BOTH separators, never via
+    host ``Path``/``os.path.basename``, because this predicate must be usable
+    while a test has patched ``os.name`` -- cuts it at its FIRST dot
+    (``splitext`` would miss ``CON.tar.gz``) and then at its first colon (the
+    ``NUL:``/``CON:`` device spellings), right-strips the spaces and dots Win32
+    also ignores, and upper-cases it.
+
+    This is pure string logic: the CALLER decides whether the platform reserves
+    the name (POSIX does not -- a file legitimately named ``CON`` is ordinary
+    there).
+    """
+    component = str(path).replace("\\", "/").split("/")[-1]
+    candidate = component.split(".", 1)[0]
+    candidate = candidate.split(":", 1)[0].rstrip(" .").upper()
+    return candidate if candidate in _RESERVED_DOS_DEVICE_NAMES else None
+
+
 def _reject_database_alias(out_path: str, db_path: str) -> None:
     """--out must never name the database or its sidecars.
 
@@ -158,6 +194,17 @@ def _reject_database_alias(out_path: str, db_path: str) -> None:
         raise ExportError(
             "out_is_database",
             f"--out {out_path} resolves to a device, not a file;"
+            " refusing to discard the corpus",
+        )
+    # A DOS device name is refused by PREDICATE, not by a late Windows error
+    # class: os.replace fails with a generic runtime error for these paths, so
+    # the documented out_is_database refusal was unreachable (issue #90). The
+    # refusal is Windows-only -- POSIX permits a regular file named CON.
+    device = _dos_device_name(out_real) or _dos_device_name(str(out_path))
+    if device is not None and os.name == "nt":
+        raise ExportError(
+            "out_is_database",
+            f"--out {out_path} names the reserved DOS device {device!r};"
             " refusing to discard the corpus",
         )
     # The guard PROVES what it can before it reports what it cannot. A

@@ -47,8 +47,14 @@ class CliTests(unittest.TestCase):
         # JSON with exit 0; behavior intentionally changed, see PR notes.)
         # Issue #3: the failure additionally answers on stdout with the
         # structured error envelope (stderr keeps the one-line echo).
+        # Issue #89: the repo is named EXPLICITLY. Without it, repo resolution
+        # ran first and the verdict depended on the working directory being a
+        # git checkout (a non-git cwd answered exit 2 instead of exit 3); the
+        # exit-3 contract itself is unchanged.
         fresh = Path(self._td.name) / "missing" / "history.db"
-        code, out, err = self.run_cmd(["status", "--db", str(fresh), "--format", "json"])
+        code, out, err = self.run_cmd(
+            ["status", "--db", str(fresh), "--repo", REPO, "--format", "json"]
+        )
         self.assertEqual(code, 3, err)
         payload = json.loads(out)
         self.assertIs(payload["ok"], False)

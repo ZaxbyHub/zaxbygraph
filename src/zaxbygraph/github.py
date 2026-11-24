@@ -90,10 +90,23 @@ class ListingShiftedError(RuntimeError):
 
 def _status_from_stderr(stderr: str) -> int | None:
     text = stderr.lower()
-    # Digit matches are word-boundary anchored: a bare "404"/"403"/"429"
-    # inside a larger number (an issue number, a URL, a request id) must not
-    # drive classification — the 404/410 verdicts durably flip items.state.
-    if "429" in text or "rate limit" in text or "secondary rate" in text:
+    # Digit matches are anchored: a "404"/"403" inside a larger number (an
+    # issue number, a URL, a request id) must not drive classification — the
+    # 404/410 verdicts durably flip items.state. 429 needs a STATUS context
+    # (HTTP 429 / status code 429), because an exact issue number ("issue 429
+    # ... (HTTP 404)") is a word-bounded 429 too and used to shadow the real
+    # 404 (post-publication review); a bare "429 Too Many Requests" still
+    # classifies through its reason phrase.
+    if (
+        re.search(
+            r"\bhttp(?:/\d+(?:\.\d+)?)?\s*:?\s*429\b"
+            r"|\bstatus(?:\s+code)?\s*[:=]?\s*429\b",
+            text,
+        )
+        or "rate limit" in text
+        or "secondary rate" in text
+        or "too many requests" in text
+    ):
         return 429
     if re.search(r"\b403\b", text) or "forbidden" in text:
         return 403

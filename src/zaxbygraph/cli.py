@@ -838,7 +838,9 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
     try:
         repo, host = _resolved_repo(args)
     except RepoError as exc:
-        raise _ReadFailure(2, f"could not determine repo ({exc}); pass --repo OWNER/REPO")
+        # RepoError's own message already ends with the remedy; appending it
+        # here named it twice (issue #89).
+        raise _ReadFailure(2, f"could not determine repo ({exc})")
     explicit = getattr(args, "db", None)
     try:
         db_path, _chain = resolve_db(repo, explicit=explicit, host=host)
@@ -1024,9 +1026,9 @@ def cmd_sync(args: argparse.Namespace) -> int:
     numbers_raw = getattr(args, "numbers", None)
     if numbers_raw is not None:
         try:
-            numbers = [int(x) for x in str(numbers_raw).replace(" ", "").split(",") if x != ""]
-        except ValueError:
-            return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
+            numbers = _canonical_issue_numbers(numbers_raw, "--numbers")
+        except ValueError as exc:
+            return emit_failure(args, 2, str(exc))
         if not numbers:
             return emit_failure(args, 2, f"invalid --numbers value: {numbers_raw!r}")
         if getattr(args, "force", False):
@@ -1783,6 +1785,12 @@ def _bundle_query(
     # traceback — the same contract --size already has through _parse_size).
     pool = _csv_numbers(pool_raw, "--pool")
     exclude = _csv_numbers(exclude_raw, "--exclude")
+    if max_files is not None and max_files < 1:
+        # The [triage] max_files config key already requires a positive
+        # integer (derive's own validation) and the MCP handler refuses
+        # max_files < 1; the CLI override honoured neither, so `--max-files 0`
+        # answered ok with an empty bundle list (review finding D1).
+        raise ValueError("max-files must be a positive integer")
     store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
     weights = _derive.load_weights(store_cfg, cwd_cfg, explicit)
     return _derive.bundle(
@@ -1828,21 +1836,64 @@ def _brief_query(
     )
 
 
+#: ASCII digits only: int() also accepts "1_0", "+5", "-5" and non-ASCII
+#: numerics, silently reinterpreting a mistyped issue number. The same rule
+#: _parse_max_age documents for its budget (issue #89).
+_ISSUE_NUMBER_TOKEN_RE = re.compile(r"[0-9]+")
+
+
+def _canonical_issue_numbers(raw: str | None, flag: str) -> list[int] | None:
+    """Parse a comma-separated issue-number list, canonically.
+
+    A blank value is treated as absent (``None`` -> the default pool). Every
+    token must be ASCII digits and every value must satisfy
+    ``1 <= n <= 2**63 - 1`` -- the database's signed 64-bit range, so no
+    accepted number can reach a SQL bind and surface as an
+    ``OverflowError``/runtime failure. Conversion is guarded because CPython
+    refuses to convert a digit run past its integer-string limit -- an
+    oversized token is a coded refusal, never a traceback. A malformed token
+    raises ``ValueError`` carrying the original text so the caller's existing
+    coded-error path applies unchanged.
+    """
+    if raw is None or not str(raw).strip():
+        return None
+    # Split on commas FIRST, then strip each entry's surrounding whitespace.
+    # A blanket replace(" ", "") would join digits across a malformed entry
+    # (`1 0` -> 10) and silently select a different issue (issue #89 review).
+    tokens = [piece.strip() for piece in str(raw).split(",")]
+    tokens = [token for token in tokens if token]
+    if not tokens:
+        raise ValueError(f"invalid {flag} value: {raw!r}")
+    for token in tokens:
+        if _ISSUE_NUMBER_TOKEN_RE.fullmatch(token) is None:
+            raise ValueError(f"invalid {flag} value: {raw!r}")
+    try:
+        numbers = [int(token) for token in tokens]
+    except ValueError:
+        # An oversized digit run (CPython's int-string limit): still a coded
+        # refusal, not a traceback.
+        raise ValueError(f"invalid {flag} value: {raw!r}") from None
+    if any(number < 1 for number in numbers):
+        raise ValueError(
+            f"invalid {flag} value: {raw!r} (issue numbers start at 1)"
+        )
+    if any(number > 2**63 - 1 for number in numbers):
+        # SQLite binds signed 64-bit integers: a larger value raises
+        # OverflowError inside the query, which escapes as a runtime failure
+        # (or a traceback on the CLI). Refuse it in the grammar instead.
+        raise ValueError(
+            f"invalid {flag} value: {raw!r}"
+            " (issue numbers fit the signed 64-bit range)"
+        )
+    return numbers
+
+
 def _csv_numbers(raw: str | None, flag: str) -> list[int] | None:
     """Parse a comma-separated number list. A BLANK value is treated as
     absent (None -> the default pool), so `--pool ""` cannot silently mean
-    "an explicit empty pool" (pr45 review CUB#b08069ad)."""
-    if raw is None or not str(raw).strip():
-        return None
-    out: list[int] = []
-    for piece in str(raw).replace(" ", "").split(","):
-        if not piece:
-            continue
-        try:
-            out.append(int(piece))
-        except ValueError:
-            raise ValueError(f"invalid {flag} value: {raw!r}") from None
-    return out
+    "an explicit empty pool" (pr45 review CUB#b08069ad). The token grammar is
+    the same canonical one `--numbers` uses (issue #89): ASCII digits, >= 1."""
+    return _canonical_issue_numbers(raw, flag)
 
 
 def cmd_triage(args: argparse.Namespace) -> int:
@@ -2056,7 +2107,8 @@ def _run_claims_live(
         return emit_failure(
             args,
             2,
-            f"could not determine repo ({exc}); pass --repo OWNER/REPO",
+            # RepoError's message already ends with the remedy (issue #89).
+            f"could not determine repo ({exc})",
             slug=getattr(args, "repo", None) or fallback_slug,
         )
     if not repo:
@@ -4038,8 +4090,20 @@ def _nearest_flag_hint(message: str, parser: argparse.ArgumentParser) -> str | N
     # --limit (frozen C21). A cross-command nearest flag (item --number ->
     # sync's --numbers) is mildly confusing but names a real flag; left as
     # documented behavior (final-critic r1 note).
+    unrecognized = message.lstrip().lower().startswith("unrecognized arguments:")
     for token in tokens:
         match = difflib.get_close_matches(token, known, n=1, cutoff=0.55)
+        # When the nearest "valid flag" IS the token argparse just rejected,
+        # suggesting it (or an arbitrary neighbour once it is excluded) is not
+        # a usable hint: point at the command's help instead. This is the
+        # issue-#90 case (`sql --max-age` used to answer "did you mean
+        # --max-age?"); it also keeps `sql --max-files` from being answered
+        # with a nonsense `--ls-files` neighbour. Cross-command hints for a
+        # DIFFERENT, valid flag (`item --number` -> `--numbers`, `--limt` ->
+        # `--limit`) are unchanged, and every non-unrecognized message shape
+        # ("argument --x: invalid value") keeps naming its own flag.
+        if match and unrecognized and match[0] == token:
+            return f"see `{help_ref}` for this command's arguments"
         if match:
             return f"did you mean {match[0]}? (see `{help_ref}`)"
     return f"see `{help_ref}` for this command's arguments"

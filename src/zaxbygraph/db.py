@@ -147,6 +147,14 @@ def _readonly_uri(db_path: Path) -> str:
     return p.as_uri() + "?mode=ro"
 
 
+#: SQL functions the read-only escape hatch refuses outright. ``load_extension``
+#: is the extension-loading door; ``fts3_tokenizer``'s two-argument form
+#: REGISTERS a tokenizer, which is code execution on a build compiled with
+#: ENABLE_FTS3_TOKENIZER -- so the name is denied regardless of build, and the
+#: denial does not depend on this interpreter's compile options (issue #90).
+_DENIED_SQL_FUNCTIONS = frozenset({"load_extension", "fts3_tokenizer"})
+
+
 def _deny_write_authorizer(
     action: int,
     arg1: str | None,
@@ -172,7 +180,11 @@ def _deny_write_authorizer(
         return sqlite3.SQLITE_OK
     if action == sqlite3.SQLITE_FUNCTION:
         name = (arg2 or arg1 or "").lower()
-        return sqlite3.SQLITE_DENY if name == "load_extension" else sqlite3.SQLITE_OK
+        return (
+            sqlite3.SQLITE_DENY
+            if name in _DENIED_SQL_FUNCTIONS
+            else sqlite3.SQLITE_OK
+        )
     if action == sqlite3.SQLITE_PRAGMA:
         name = (arg1 or "").lower()
         return (

@@ -1179,6 +1179,53 @@ class TokenlessClaimReleaseTests(_LiveCmdTest):
             "C16 (issue #77 AC17): the holder is still the tokenless claim (token null)",
         )
 
+    def test_tokenless_release_finds_older_tokened_holder(self) -> None:
+        """#90 AC3: `release --tokenless` must find the tokenless claim even
+        when an OLDER tokened claim is also active on the named issue.
+
+        Claims are scanned oldest-first and the earliest active claim is the
+        holder, so a race loser's tokenless claim is normally the NEWER one.
+        The release loop broke out of the scan at the first active entry, so a
+        tokened holder hid the tokenless claim: the command answered `taken`
+        ("no active claim matches this release") and posted nothing, breaking
+        the documented release contract.
+
+        RED at e6c8f41: outcome `taken`, zero posts.
+        GREEN after the scan continues past a non-matching active entry.
+        """
+        argv = ["--repo", REPO, "--format", "json"]
+
+        fake = FakeGh()
+        # The tokened claim is ELDEST; the tokenless claim is the newer
+        # race loser trying to withdraw.
+        fake.add_claim(5, "OLDER-TOKENED-HOLDER-0001", hours_ago=3.0)
+        fake.add_claim(5, None, hours_ago=1.0)
+
+        with _patched_gh(self, "C3", fake):
+            code, out, err = _run_cli(["release", "5", "--tokenless", *argv])
+        env = _parse_env(self, out, code, err, "#90 AC3: the `release` command")
+        self.assertEqual(
+            code, 0,
+            "#90 AC3: the tokenless release over an older tokened holder must"
+            f" succeed; exit {code}, stderr {err.strip()[:200]!r}",
+        )
+        self.assertEqual(
+            _outcome(env), "claimed",
+            f"#90 AC3: the release outcome is `claimed`; got {_outcome(env)!r}",
+        )
+        releases = [(n, b) for n, b in fake.posts if "**Claim released" in b]
+        self.assertEqual(
+            [n for n, _ in releases], [5],
+            "#90 AC3: exactly ONE release posts on the named issue;"
+            f" posts {fake.posts}",
+        )
+        for _n, body in releases:
+            self.assertNotIn(
+                "session=", body,
+                "#90 AC3: a --tokenless release carries no token;"
+                f" got {body!r}",
+            )
+
 
 class PostOrderRetryTests(_LiveCmdTest):
     """C17 (issue #77 AC18): a multi-issue claim posts in ascending issue
