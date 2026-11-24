@@ -98,6 +98,24 @@ def test_cursor_rejects_leading_zero_aliases() -> None:
                     f"cursor {bad!r} is not producer-minted (leading zero) and"
                     f" must be refused; got {str(result)[:300]}"
                 )
+                text = "".join(
+                    part.get("text", "")
+                    for part in (result.get("content") or [])
+                    if isinstance(part, dict)
+                )
+                # isError alone would also accept a generic internal failure;
+                # the contract is the CODED bad_request (post-publication review).
+                try:
+                    code = json.loads(text)["error"]["code"]
+                except (ValueError, KeyError, TypeError):
+                    raise AssertionError(
+                        f"cursor {bad!r} must answer a JSON failure envelope;"
+                        f" got {text[:400]!r}"
+                    ) from None
+                assert code == "bad_request", (
+                    f"cursor {bad!r} must answer the coded bad_request; got"
+                    f" {code!r} ({text[:400]!r})"
+                )
             for good in ("0", "10"):
                 result = (session.call_tool("search", {"query": "issue", "cursor": good})
                           .get("result") or {})

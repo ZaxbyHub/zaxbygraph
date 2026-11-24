@@ -1,12 +1,17 @@
 """Frozen acceptance check for #90 AC18: the MCP triage tool's `top_k` bound.
 
-`tools/list` publishes `top_k` with `minimum: 1`, but the handler only clamped
-the UPPER end (`min(top_k, _MAX_TOP_K)`), so `top_k: 0` reached the ranking and
-answered an empty row set -- the same schema/handler disagreement the issue
-names for `bundle count`, found by the Phase-4.2 published-bound sweep.
+`tools/list` publishes `top_k` with `minimum: 1`. The handler clamps only the
+UPPER end (`min(top_k, _MAX_TOP_K)`) and deliberately carries no duplicate
+lower bound: the shared derive layer rejects `top_k < 1` with a ValueError,
+which the MCP translation helper maps to a coded `bad_request`. This check
+pins that refusal end to end, so a future change that lets `top_k: 0` reach
+the ranking turns it RED.
 
-RED at e6c8f41: `top_k: 0` answers `isError: false` with no rows.
-GREEN after the handler bound.
+PRESERVING at e6c8f41: the derive-layer refusal already answered
+`bad_request`, so the check records the contract rather than discriminating a
+handler change. It was originally authored as DISCRIMINATING on the belief
+that `top_k: 0` reached the ranking; the base replay disproved that, and the
+manifest AMEND (expect `-`) records the correction.
 """
 from __future__ import annotations
 

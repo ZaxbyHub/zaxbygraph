@@ -115,10 +115,12 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
 #: The DOS device names Win32 reserves in EVERY directory and with ANY
 #: extension (``CON``, ``CON.txt``, ``C:\work\CON.tar.gz``), the colon-suffixed
 #: device spellings (``NUL:``, ``CON:``), the console aliases, plus the
-#: superscript COM/LPT spellings Windows also reserves. ``CLOCK$`` is the
-#: historical clock device.
+#: superscript COM/LPT spellings Windows also reserves. ``CLOCK$`` is NOT in
+#: the set: it is not a current Win32 reserved name (CPython's
+#: ``os.path.isreserved`` answers False on 3.13/3.14) and is creatable as an
+#: ordinary file/directory, so refusing it would reject a valid export path.
 _RESERVED_DOS_DEVICE_NAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"}
+    {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
     | {f"COM{n}" for n in range(1, 10)}
     | {f"LPT{n}" for n in range(1, 10)}
     | {"COM\u00b9", "COM\u00b2", "COM\u00b3", "LPT\u00b9", "LPT\u00b2", "LPT\u00b3"}

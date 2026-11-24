@@ -1374,11 +1374,16 @@ def _tool_sync(arguments: dict, ctx) -> dict:
                 hint="a targeted refresh never touches the watermark; drop force",
             )
         if not isinstance(numbers_raw, list) or not numbers_raw or not all(
-            isinstance(n, int) and not isinstance(n, bool) and n > 0 for n in numbers_raw
+            isinstance(n, int) and not isinstance(n, bool)
+            and 1 <= n <= 2**63 - 1
+            for n in numbers_raw
         ):
+            # Same signed-64-bit range as the CLI's --numbers grammar: a
+            # larger value would reach a SQL bind and fail uncoded.
             raise ToolError(
                 "bad_request",
-                "numbers must be a non-empty list of positive integers",
+                "numbers must be a non-empty list of positive signed"
+                " 64-bit integers",
                 hint='e.g. "numbers": [12, 34]',
             )
         if len(numbers_raw) > _MAX_NUMBERS:
@@ -1477,12 +1482,16 @@ def _int_array_csv(arguments: dict, key: str) -> str | None:
             "quadratically; narrow the pool)",
             hint=f"pass at most {_MAX_NUMBERS} issue numbers",
         )
-    if any(value < 1 for value in values):
-        # Items publish minimum 1: an issue number is >= 1 (issue #90).
+    if any(value < 1 or value > 2**63 - 1 for value in values):
+        # Items publish minimum 1 (issue #90), and SQLite binds signed 64-bit
+        # integers: a larger issue number would reach the SQL IN bind, raise
+        # OverflowError, and answer the uncoded `runtime` envelope with no
+        # repo/db identity (post-publication review). Both ends belong here,
+        # matching _item_number / _claim_numbers.
         raise ToolError(
             "bad_request",
-            f"{key} entries must be issue numbers >= 1",
-            hint=f"pass {key} as an array of positive issue numbers",
+            f"{key} entries must be positive signed 64-bit issue numbers",
+            hint=f"pass {key} as an array of issue numbers in 1..2**63-1",
         )
     return ",".join(str(v) for v in values)
 

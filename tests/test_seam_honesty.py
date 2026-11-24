@@ -27,8 +27,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
@@ -222,4 +220,9 @@ def test_resolution_error_names_remedy_once() -> None:
 
 
 if __name__ == "__main__":
+    # Imported HERE, not at module scope: `python -m unittest discover` (the
+    # documented stdlib-only command) imports every test module, and pytest is
+    # not a runtime dependency (post-publication review).
+    import pytest
+
     raise SystemExit(pytest.main([__file__, "-q"]))
