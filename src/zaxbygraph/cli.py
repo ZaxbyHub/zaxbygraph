@@ -417,6 +417,22 @@ def _render_json(env: dict, indent: int | None) -> None:
     _write_stdout("\n")
 
 
+def _echo_stderr(text: str) -> None:
+    """One best-effort stderr write (review F1, issues #92/#93 AC1): the
+    human echo must never decide the process outcome. A dead stderr pipe
+    — BrokenPipeError, or the same Windows OSError(EINVAL)/POSIX EPIPE
+    shape _write_stdout translates — is absorbed HERE so the command still
+    renders its envelope on a live stdout and returns its OWN exit code
+    instead of feeding the dispatch-level dead-pipe arm a bare 0."""
+    try:
+        print(text, file=sys.stderr)
+    except BrokenPipeError:
+        pass
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.EPIPE):
+            raise
+
+
 def emit_result(
     args: argparse.Namespace,
     data: Any,
@@ -505,7 +521,9 @@ def emit_result(
         freshness=freshness,
     )
     if error is not None and echo:
-        print(f"error: {error.get('message', '')}", file=sys.stderr)
+        # Review F1: the echo is best-effort — a dead stderr must not stop
+        # the envelope rendering on a live stdout below.
+        _echo_stderr(f"error: {error.get('message', '')}")
     fmt = _format_of(args)
     global _STDOUT_DEAD
     try:
@@ -537,8 +555,10 @@ def emit_result(
         # safe under merged-stream captures. The json/compact envelope still
         # carries db, repo and freshness (not the items count the line
         # printed); jsonl list payloads print rows only, so on that surface
-        # the identity data is simply absent.
-        print(identity_line, file=sys.stderr)
+        # the identity data is simply absent. Best-effort (review F1): the
+        # line rides after the render, so a dead stderr cannot cost the
+        # caller its (successful) answer either.
+        _echo_stderr(identity_line)
 
 
 def _emit_text(data: Any) -> None:
@@ -2090,9 +2110,11 @@ def _emit_claims_envelope(
     )
     if error is not None:
         # The data-preserving override (see claims_command_envelope): the
-        # claim outcome's data survives the failure envelope.
+        # claim outcome's data survives the failure envelope. The echo is
+        # best-effort (review F1): a dead stderr must not cost the claim
+        # outcome its OWN exit code.
         env["data"] = payload
-        print(f"error: {error.get('message', '')}", file=sys.stderr)
+        _echo_stderr(f"error: {error.get('message', '')}")
     fmt = _format_of(args)
     global _STDOUT_DEAD
     try:
@@ -3453,10 +3475,11 @@ def cmd_export_corpus(args: argparse.Namespace) -> int:
         if ok and _format_of(args) == "text":
             # The same stderr trust summary every read prints in text mode
             # (issue #17 contract); machine formats stay silent so piped
-            # captures parse.
+            # captures parse. Best-effort (review F1): a finally-block echo
+            # must never replace the command's own outcome.
             line = _identity_line(conn, repo, db_path)
             if line:
-                print(line, file=sys.stderr)
+                _echo_stderr(line)
         try:
             conn.close()
         except sqlite3.Error:
@@ -4429,7 +4452,7 @@ def _usage_envelope_exit(
         )
         _render_json(env, indent=None)
     else:
-        print(f"error: {exc.message}", file=sys.stderr)
+        _echo_stderr(f"error: {exc.message}")
     return 2
 
 
@@ -4483,13 +4506,15 @@ def _runtime_catchall(args: argparse.Namespace, exc: Exception) -> int:
         freshness=_INVOCATION.get("freshness"),
     )
     try:
-        print(f"error: {error['message']}", file=sys.stderr)
+        _echo_stderr(f"error: {error['message']}")
         fmt = _format_of(args)
         if fmt != "text":
             # Failures answer through the stderr echo in text mode (the
             # emit_result contract); machine formats get the envelope.
             _render_json(env, indent=2 if fmt == "json" else None)
     except BrokenPipeError:
+        # Review F1: the echo itself is best-effort now, so this arm only
+        # covers a dead STDOUT render — the coded envelope still exits 1.
         _STDOUT_DEAD = True
     return 1
 
@@ -4529,14 +4554,22 @@ def main(argv: list[str] | None = None) -> int:
                 code = 2
             return code
     try:
+        # `code` is pre-bound (review F1): a pipe death that escapes the
+        # render/echo boundaries before dispatch returns has no code of
+        # its own, and the arm below must return what IS known rather
+        # than unconditionally 0 — with the boundaries absorbing dead
+        # pipes, dispatch normally completes and this stays the quiet
+        # success exit.
+        code = 0
         try:
             code = int(args.func(args))
         except BrokenPipeError:
-            # The reader went away (`| head` exited): the quiet success
-            # exit. Failures are absorbed at the render boundary and keep
-            # their own code; this arm is the defense in depth for a pipe
-            # death the boundary did not see.
-            return _silence_broken_stdout()
+            # The reader went away (`| head` exited): the quiet exit.
+            # Failures are absorbed at the render AND echo boundaries and
+            # keep their own code; this arm is the defense in depth for a
+            # pipe death neither boundary saw.
+            _silence_broken_stdout()
+            return code
         except Exception as exc:  # issues #92/#93 AC2: the coded catch-all
             return _runtime_catchall(args, exc)
         try:

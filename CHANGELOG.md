@@ -9,10 +9,12 @@ digest is unchanged from 0.5.2).
 - **#92** Exits, envelopes and freshness agree. An `ok:false` answer now
   always exits nonzero and an `ok:true` answer exits 0 (the documented
   claim outcomes `4`/`5`/`6` keep their own exits): a dead stdout is
-  absorbed at the render boundary so every failure-emitter class returns
+  absorbed at the render boundary — and, since review F1, a dead STDERR
+  at the one-line echo boundary — so every failure-emitter class returns
   its OWN exit code (usage 2, sql 1/2, no-corpus 3, claim outcomes 4/5/6,
   snapshot failures their code, successes 0) instead of a flattened
-  quiet-0, and the shutdown-flush death preserves the dispatched command's
+  quiet-0, the envelope still rendering on the live pipe, and the
+  shutdown-flush death preserves the dispatched command's
   code. An unexpected exception escaping a command is a coded
   `runtime` envelope (`{TypeName}: {message}`), nonzero exit and no
   traceback, reported through a per-invocation context so a fault after
