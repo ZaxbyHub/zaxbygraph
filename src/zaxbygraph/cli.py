@@ -327,15 +327,29 @@ def _single_repo_freshness(conn: sqlite3.Connection | None) -> dict:
     return _freshness(conn, repos[0])
 
 
+def _open_freshness(conn: sqlite3.Connection | None, slug: str | None) -> dict:
+    """Best-effort freshness of an OPEN connection for the failure arms
+    that must close it before emitting (issues #92/#93 AC3): the resolved
+    slug's block, the single-stored-repo fallback when no slug resolved,
+    or the null block when there is no connection to read — or when the
+    read itself faults (a guard rejection must not become a traceback,
+    so the capture inside a failing arm degrades to the null block)."""
+    null: dict[str, Any] = {"synced_at": None, "age_s": None, "complete": False}
+    if conn is None:
+        return null
+    try:
+        return _freshness(conn, slug) if slug else _single_repo_freshness(conn)
+    except Exception:
+        return null
+
+
 def _note_open(conn: sqlite3.Connection, slug: str | None, db_path: Path) -> None:
     """Record the invocation context at open time (AC3): the resolved
     identity plus the freshness read while the connection is open, so the
     failure arms that close first still answer it."""
     _INVOCATION["repo"] = slug
     _INVOCATION["db"] = str(db_path) if db_path else None
-    _INVOCATION["freshness"] = (
-        _freshness(conn, slug) if slug else _single_repo_freshness(conn)
-    )
+    _INVOCATION["freshness"] = _open_freshness(conn, slug)
 
 
 def build_envelope(
@@ -1129,13 +1143,19 @@ def cmd_sync(args: argparse.Namespace) -> int:
         init_schema(conn)
     except RuntimeError as exc:
         # Environment guards (SQLite floor, database newer than this build)
-        # can never succeed on retry — README's exit-2 contract.
+        # can never succeed on retry — README's exit-2 contract. The store's
+        # real freshness is captured while the connection is open (AC3), so
+        # the refusal still says what the store last synced.
+        fresh = _open_freshness(conn, slug)
         if conn is not None:
             conn.close()
-        return emit_failure(args, 2, str(exc), slug=slug, db_path=db_path)
+        return emit_failure(
+            args, 2, str(exc), slug=slug, db_path=db_path, freshness=fresh
+        )
     except Exception as exc:
         # A storage fault before the sync starts is reported as the same
         # result object, not a traceback (AGENTS.md: reported, not swallowed).
+        fresh = _open_freshness(conn, slug)
         if conn is not None:
             conn.close()
         emit_result(
@@ -1145,6 +1165,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             db_path=db_path,
             error=_error_for("runtime", str(exc)),
             identity=False,
+            freshness=fresh,
         )
         return 1
     lock: SyncLock | None = None
@@ -1153,6 +1174,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     except OSError as exc:
         # A lock-file storage fault (unreadable directory, permissions) is a
         # failed sync, reported as the same result object - never a traceback.
+        fresh = _open_freshness(conn, slug)
         conn.close()
         emit_result(
             args,
@@ -1161,6 +1183,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             db_path=db_path,
             error=_error_for("runtime", str(exc)),
             identity=False,
+            freshness=fresh,
         )
         return 1
     if lock is None:
@@ -2611,13 +2634,19 @@ def cmd_init(args: argparse.Namespace) -> int:
         init_schema(conn)
     except RuntimeError as exc:
         # Environment guards (SQLite floor, database newer than this build):
-        # never retryable — the same exit-2 contract as cmd_sync.
+        # never retryable — the same exit-2 contract as cmd_sync. The
+        # store's real freshness is captured while the connection is open
+        # (AC3), mirroring cmd_sync's arms.
+        fresh = _open_freshness(conn, slug)
         if conn is not None:
             conn.close()
-        return emit_failure(args, 2, str(exc), slug=slug, db_path=db_path)
+        return emit_failure(
+            args, 2, str(exc), slug=slug, db_path=db_path, freshness=fresh
+        )
     except Exception as exc:
         # A storage fault before the sync starts is a result object, not a
         # traceback (AGENTS.md: reported, not swallowed).
+        fresh = _open_freshness(conn, slug)
         if conn is not None:
             conn.close()
         emit_result(
@@ -2627,12 +2656,14 @@ def cmd_init(args: argparse.Namespace) -> int:
             db_path=db_path,
             error=_error_for("runtime", str(exc)),
             identity=False,
+            freshness=fresh,
         )
         return 1
     lock: SyncLock | None = None
     try:
         lock = acquire_sync_lock(db_path, wait=False)
     except OSError as exc:
+        fresh = _open_freshness(conn, slug)
         conn.close()
         emit_result(
             args,
@@ -2641,6 +2672,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             db_path=db_path,
             error=_error_for("runtime", str(exc)),
             identity=False,
+            freshness=fresh,
         )
         return 1
     if lock is None:
