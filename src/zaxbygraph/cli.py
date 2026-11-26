@@ -293,6 +293,51 @@ def _selected_rows(payload: Any, list_key: str | None) -> list[Any] | None:
     return None
 
 
+#: The envelope contract version (issues #92/#93 AC12): every envelope names
+#: the contract it answers with, additively after `truncated`.
+ENVELOPE_VERSION = "0.3"
+
+#: Per-invocation context (issues #92/#93 AC3): whatever _open_for_read
+#: resolved and the freshness captured WHILE the connection was open, so
+#: every post-open failure arm (and main's catch-all) reports the opened
+#: store's truthful identity/freshness even after the connection closed.
+#: Reset at the start of main() and cleared when main() returns.
+_INVOCATION: dict[str, Any] = {}
+
+#: Set once a stdout write died (issues #92/#93 AC1): later writes no-op so
+#: the command still returns its OWN exit code instead of a traceback.
+_STDOUT_DEAD = False
+
+
+def _single_repo_freshness(conn: sqlite3.Connection | None) -> dict:
+    """The no-filter fallback (plan round-3 clarification): a post-open
+    failure that resolved no repo filter reports the freshness of the
+    store's SINGLE stored repo (exactly one distinct repo in sync_state);
+    with zero or several stored repos the null block is the honest answer
+    (no guessing among repos)."""
+    out: dict[str, Any] = {"synced_at": None, "age_s": None, "complete": False}
+    if conn is None:
+        return out
+    try:
+        repos = [row["repo"] for row in conn.execute("SELECT DISTINCT repo FROM sync_state")]
+    except sqlite3.Error:
+        return out
+    if len(repos) != 1:
+        return out
+    return _freshness(conn, repos[0])
+
+
+def _note_open(conn: sqlite3.Connection, slug: str | None, db_path: Path) -> None:
+    """Record the invocation context at open time (AC3): the resolved
+    identity plus the freshness read while the connection is open, so the
+    failure arms that close first still answer it."""
+    _INVOCATION["repo"] = slug
+    _INVOCATION["db"] = str(db_path) if db_path else None
+    _INVOCATION["freshness"] = (
+        _freshness(conn, slug) if slug else _single_repo_freshness(conn)
+    )
+
+
 def build_envelope(
     data: Any,
     *,
@@ -304,9 +349,17 @@ def build_envelope(
     freshness: dict | None = None,
 ) -> dict:
     """The one envelope shape (issue #3 AC2): ok, db, repo, freshness,
-    data, truncated — plus error on failures."""
+    data, truncated, version — plus error on failures."""
     if freshness is None:
-        freshness = _freshness(conn, slug)
+        if conn is not None:
+            freshness = _freshness(conn, slug)
+        elif error is not None and _INVOCATION.get("freshness") is not None:
+            # A post-open failure arm that closed the connection (or never
+            # passed it) still reports the freshness captured at open
+            # (issues #92/#93 AC3); pre-open refusals keep the null block.
+            freshness = _INVOCATION["freshness"]
+        else:
+            freshness = _freshness(None, slug)
     env: dict[str, Any] = {
         "ok": error is None,
         "db": str(db_path) if db_path else None,
@@ -314,6 +367,7 @@ def build_envelope(
         "freshness": freshness,
         "data": None if error is not None else data,
         "truncated": bool(truncated),
+        "version": ENVELOPE_VERSION,
     }
     if error is not None:
         env["error"] = error
@@ -325,12 +379,22 @@ def _write_stdout(text: str) -> None:
     pipe as plain OSError(EINVAL) from the buffered writer, which main()'s
     dispatch-level BrokenPipeError catch would never see - a mid-render
     failure on a large output must reach the quiet-exit handler (final-critic
-    r1 f2; check C24's small-output leg cannot discriminate this)."""
+    r1 f2; check C24's small-output leg cannot discriminate this).
+    Issues #92/#93 AC1: the boundary now ABSORBS the dead pipe - the write
+    is dropped, the invocation's stdout is marked dead (later writes
+    no-op), and the caller returns normally so the command keeps its OWN
+    exit code instead of a flattened 0."""
+    global _STDOUT_DEAD
+    if _STDOUT_DEAD:
+        return
     try:
         sys.stdout.write(text)
+    except BrokenPipeError:
+        _STDOUT_DEAD = True
     except OSError as exc:
         if exc.errno in (errno.EINVAL, errno.EPIPE):
-            raise BrokenPipeError(str(exc)) from exc
+            _STDOUT_DEAD = True
+            return
         raise
 
 
@@ -429,22 +493,29 @@ def emit_result(
     if error is not None and echo:
         print(f"error: {error.get('message', '')}", file=sys.stderr)
     fmt = _format_of(args)
-    if fmt == "text":
-        # Failures answer through the stderr echo; rendering the null payload
-        # would print a literal "None" to stdout (4.5 review finding 2).
-        if error is None:
-            _emit_text(payload)
-    elif fmt == "jsonl":
-        stream = None if error is not None else _selected_rows(payload, list_key)
-        if stream is not None:
-            for row in stream:
-                _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        else:
+    global _STDOUT_DEAD
+    try:
+        if fmt == "text":
+            # Failures answer through the stderr echo; rendering the null payload
+            # would print a literal "None" to stdout (4.5 review finding 2).
+            if error is None:
+                _emit_text(payload)
+        elif fmt == "jsonl":
+            stream = None if error is not None else _selected_rows(payload, list_key)
+            if stream is not None:
+                for row in stream:
+                    _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            else:
+                _render_json(env, indent=None)
+        elif fmt == "compact":
             _render_json(env, indent=None)
-    elif fmt == "compact":
-        _render_json(env, indent=None)
-    else:
-        _render_json(env, indent=2)
+        else:
+            _render_json(env, indent=2)
+    except BrokenPipeError:
+        # The render boundary (issues #92/#93 AC1): a dead stdout is
+        # absorbed here - the command returns its OWN exit code (failures
+        # their nonzero code, successes 0); later writes no-op.
+        _STDOUT_DEAD = True
     if identity_line is None and identity and error is None and slug:
         identity_line = _identity_line(conn, slug, db_path)
     if identity_line and fmt == "text":
@@ -484,9 +555,14 @@ def emit_failure(
     db_path: Path | str | None = None,
     code_key: str | None = None,
     hint: str | None = None,
+    freshness: dict | None = None,
+    conn: sqlite3.Connection | None = None,
 ) -> int:
     """Post-parse failure: structured error envelope on stdout, the one-line
-    human echo on stderr, exit code unchanged."""
+    human echo on stderr, exit code unchanged. `freshness` is used verbatim
+    when given; else it is built from `conn`; else (issues #92/#93 AC3) the
+    per-invocation context captured at open answers for arms that already
+    closed the connection."""
     err = (
         _error_for(code_key, message, hint)
         if code_key
@@ -495,10 +571,12 @@ def emit_failure(
     emit_result(
         args,
         None,
+        conn=conn,
         slug=slug,
         db_path=db_path,
         error=err,
         identity=False,
+        freshness=freshness,
     )
     return code
 
@@ -854,7 +932,7 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
     if repo is None:
         # Explicit no-filter: open whatever file was named, guards skipped.
         try:
-            return open_existing(db_path), None, db_path
+            conn = open_existing(db_path)
         except FileNotFoundError:
             raise _ReadFailure(
                 3,
@@ -873,6 +951,8 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
                 1, f"no database at {db_path}: {exc}",
                 code_key="store_unreadable",
             )
+        _note_open(conn, None, db_path)
+        return conn, None, db_path
     slug = repo
     try:
         conn = open_existing(db_path)
@@ -948,6 +1028,7 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
     except BaseException:
         conn.close()
         raise
+    _note_open(conn, slug, db_path)
     return conn, slug, db_path
 
 
@@ -1990,24 +2071,30 @@ def _emit_claims_envelope(
         env["data"] = payload
         print(f"error: {error.get('message', '')}", file=sys.stderr)
     fmt = _format_of(args)
-    if fmt == "text":
-        if error is None:
-            _emit_text(payload)
-    elif fmt == "jsonl":
-        claims_list = (
-            payload.get("claims")
-            if isinstance(payload, dict) and error is None
-            else None
-        )
-        if isinstance(claims_list, list):
-            for row in claims_list:
-                _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-        else:
+    global _STDOUT_DEAD
+    try:
+        if fmt == "text":
+            if error is None:
+                _emit_text(payload)
+        elif fmt == "jsonl":
+            claims_list = (
+                payload.get("claims")
+                if isinstance(payload, dict) and error is None
+                else None
+            )
+            if isinstance(claims_list, list):
+                for row in claims_list:
+                    _write_stdout(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+            else:
+                _render_json(env, indent=None)
+        elif fmt == "compact":
             _render_json(env, indent=None)
-    elif fmt == "compact":
-        _render_json(env, indent=None)
-    else:
-        _render_json(env, indent=2)
+        else:
+            _render_json(env, indent=2)
+    except BrokenPipeError:
+        # The render boundary (issues #92/#93 AC1): a dead stdout is
+        # absorbed so the claim outcome keeps its OWN exit code.
+        _STDOUT_DEAD = True
 
 
 def _claims_config_for(args: argparse.Namespace, db_path: Path | None) -> dict:
@@ -2360,6 +2447,24 @@ def cmd_what_closed(args: argparse.Namespace) -> int:
 #: at a working agent surface, not just a populated store.
 MCP_REGISTRATION_LINE = "claude mcp add zaxbygraph -- zaxbygraph mcp"
 
+#: Per-client MCP registration snippets (issues #92/#93 AC6): init (healthy
+#: AND joined) and doctor carry all three documented clients through this
+#: one shared dict. Claude Code is the unchanged command line; zcode and
+#: opencode are JSON config strings parsing to the documented shapes
+#: (opencode per the current official mcp.servers.<name> form — the older
+#: mcp.<name> shape is replaced).
+MCP_REGISTRATION_SNIPPETS = {
+    "claude": MCP_REGISTRATION_LINE,
+    "zcode": (
+        '{"mcp": {"servers": {"zaxbygraph":'
+        ' {"command": "zaxbygraph", "args": ["mcp"], "type": "stdio"}}}}'
+    ),
+    "opencode": (
+        '{"mcp": {"servers": {"zaxbygraph":'
+        ' {"type": "local", "command": ["zaxbygraph", "mcp"]}}}}'
+    ),
+}
+
 #: gh-presence markers: a failed ``gh --version`` whose combined output says
 #: the BINARY could not run (vs. any other nonzero exit — e.g. an
 #: unauthenticated host) classifies as gh-missing.
@@ -2546,7 +2651,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         conn.close()
         emit_result(
             args,
-            {"repo": slug, "joined": True, "mcp": MCP_REGISTRATION_LINE},
+            {
+                "repo": slug,
+                "joined": True,
+                "mcp": MCP_REGISTRATION_LINE,
+                "mcp_clients": dict(MCP_REGISTRATION_SNIPPETS),
+            },
             slug=slug,
             db_path=db_path,
             freshness=fresh,
@@ -2611,6 +2721,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "repo": slug,
             "sync": sync_summary,
             "mcp": MCP_REGISTRATION_LINE,
+            "mcp_clients": dict(MCP_REGISTRATION_SNIPPETS),
             "skill_hint": "zaxbygraph skill --install DIR installs the"
             " packaged agent skill",
         },
@@ -2922,6 +3033,10 @@ def cmd_sql(args: argparse.Namespace) -> int:
         # top level so they survive --fields projection (which only touches
         # rows/columns).
         payload["warnings"] = data["warnings"]
+    if data.get("hints"):
+        # Issues #92/#93 AC14: the annotate-only zero-row vocabulary hint
+        # rides the payload top level the same way.
+        payload["hints"] = data["hints"]
     emit_result(
         args,
         payload,
@@ -3069,6 +3184,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     # doctor's own ok/True is dead weight under the envelope (root ok is the
     # contract); dropping it keeps one source of truth for success.
     data.pop("ok", None)
+    # The per-client registration guidance rides doctor like init (issues
+    # #92/#93 AC6), through the same shared snippet dict.
+    data.setdefault("mcp_clients", dict(MCP_REGISTRATION_SNIPPETS))
     emit_result(args, data, slug=repo, db_path=store_db, identity=False)
     return 0
 
@@ -3393,11 +3511,13 @@ def _schema_output_shape(args: argparse.Namespace, command: str) -> int:
     command's declared result shape — the SAME shape the shape registry in
     mcp_server.py declares for that command's MCP twin (single source of
     truth: tools/list outputSchemas, this command and the SKILL.md shape
-    table all read it). The shape is static, so no store is opened and no
-    corpus guard applies; an unknown or undeclared command name is a
-    bad_request naming the commands that do declare shapes (the CLI-only
-    derived commands — explain, coupling, eval — are read commands whose
-    shape declarations land with #70's registry extension)."""
+    table all read it) — plus, since issues #92/#93 (AC10/AC11), the FULL
+    envelope JSON Schema the real success and failure envelopes validate
+    against. The shape is static, so no store is opened and no corpus guard
+    applies; an unknown or undeclared command name is a bad_request naming
+    the commands that do declare shapes (the CLI-only derived commands —
+    explain, coupling, eval — are read commands whose shape declarations
+    land with #70's registry extension)."""
     # Lazy import: mcp_server imports this module at scope, so the CLI only
     # pulls the registry (and its heavier imports) when --output runs.
     from zaxbygraph.mcp_server import CLI_OUTPUT_SHAPES
@@ -3423,12 +3543,130 @@ def _schema_output_shape(args: argparse.Namespace, command: str) -> int:
             "data_kind": entry.get("data_kind", "object"),
             "description": entry["description"],
             "mcp_tool": entry.get("mcp_tool"),
+            "schema": _full_envelope_schema(command),
         },
         slug=getattr(args, "repo", None) or None,
         db_path=getattr(args, "db", None),
         identity=False,
     )
     return 0
+
+
+#: Types for the item columns the registry's get_item data schema leaves
+#: open (additionalProperties): the full-envelope schema for `item` still
+#: describes every declared data key with a real type.
+_ITEM_COLUMN_TYPES = {
+    "additions": {"type": ["integer", "null"]},
+    "api_url": {"type": ["string", "null"]},
+    "author_association": {"type": ["string", "null"]},
+    "base_ref": {"type": ["string", "null"]},
+    "branch_token": {"type": ["string", "null"]},
+    "changed_files": {"type": ["integer", "null"]},
+    "closed_at": {"type": ["string", "null"]},
+    "comment_count": {"type": "integer"},
+    "commits": {"type": ["integer", "null"]},
+    "deletions": {"type": ["integer", "null"]},
+    "dependencies_blocked_by": {"type": ["integer", "null"]},
+    "dependencies_blocking": {"type": ["integer", "null"]},
+    "dependencies_total_blocked_by": {"type": ["integer", "null"]},
+    "dependencies_total_blocking": {"type": ["integer", "null"]},
+    "draft": {"type": ["boolean", "integer", "null"]},
+    "head_ref": {"type": ["string", "null"]},
+    "id": {"type": "integer"},
+    "item_type": {"type": ["string", "null"]},
+    "labels_text": {"type": ["string", "null"]},
+    "locked": {"type": ["boolean", "integer", "null"]},
+    "merge_commit": {"type": ["object", "null"]},
+    "merged_at": {"type": ["string", "null"]},
+    "merged_by": {"type": ["object", "null"]},
+    "milestone": {"type": ["object", "null"]},
+    "node_id": {"type": ["string", "null"]},
+    "paths_text": {"type": ["string", "null"]},
+    "reactions_total": {"type": ["integer", "null"]},
+    "state_reason": {"type": ["string", "null"]},
+    "sub_issues_completed": {"type": ["integer", "null"]},
+    "sub_issues_total": {"type": ["integer", "null"]},
+}
+
+
+def _full_envelope_schema(command: str) -> dict:
+    """The FULL-envelope JSON Schema for `schema --output COMMAND` (issues
+    #92/#93 AC10/AC11): one object describing the whole answer envelope —
+    every required envelope key (version included), the error object
+    (required string code/message, optional string hint; failure envelopes
+    validate against the SAME schema with data:null), and the command's
+    data member derived from the shape registry. CLI-specific derivations:
+    `open` is the bare row list; `item` is the union object | array | null
+    covering the single-number object and the multi-number row list
+    (per-row not_found rows included)."""
+    import copy
+
+    from zaxbygraph.mcp_server import CLI_OUTPUT_SHAPES, _TOOL_SHAPES
+
+    entry = CLI_OUTPUT_SHAPES[command]
+    tool = entry.get("mcp_tool")
+    data_schema: dict = {}
+    if tool is not None and tool in _TOOL_SHAPES:
+        data_schema = copy.deepcopy(_TOOL_SHAPES[tool].get("data") or {})
+    declared = data_schema.get("type")
+    names = declared if isinstance(declared, list) else ([declared] if declared else [])
+    if command == "open":
+        # The CLI streams the bare row list the open_items tool wraps under
+        # data.items (typed rows: labels/assignees arrays of string,
+        # linked_open_prs array of integer).
+        row_props: dict = {}
+        for field in _TOOL_SHAPES["open_items"]["row_fields"]["items"]:
+            if field == "number":
+                row_props[field] = {"type": "integer"}
+            elif field in ("labels", "assignees"):
+                row_props[field] = {"type": "array", "items": {"type": "string"}}
+            elif field == "linked_open_prs":
+                row_props[field] = {"type": "array", "items": {"type": "integer"}}
+            else:
+                row_props[field] = {"type": "string"}
+        data_schema = {
+            "type": ["array", "null"],
+            "items": {"type": "object", "properties": row_props},
+        }
+    elif command == "item":
+        # The union (single-number object | multi-number row list | null):
+        # both arms carry the same typed row fields, the additional
+        # always-present columns the registry leaves open included.
+        obj_props = dict(data_schema.get("properties") or {})
+        for key, prop in _ITEM_COLUMN_TYPES.items():
+            obj_props.setdefault(key, prop)
+        data_schema = {
+            "type": ["object", "array", "null"],
+            "properties": obj_props,
+            "items": {"type": "object", "properties": dict(obj_props)},
+        }
+    elif "null" not in names:
+        data_schema["type"] = [*names, "null"] if names else ["object", "null"]
+    return {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": [
+            "ok", "db", "repo", "freshness", "data", "truncated", "version",
+        ],
+        "properties": {
+            "ok": {"type": "boolean"},
+            "db": {"type": ["string", "null"]},
+            "repo": {"type": ["string", "null"]},
+            "freshness": {"type": ["object", "null"]},
+            "data": data_schema,
+            "truncated": {"type": "boolean"},
+            "version": {"type": "string"},
+            "error": {
+                "type": ["object", "null"],
+                "required": ["code", "message"],
+                "properties": {
+                    "code": {"type": "string"},
+                    "message": {"type": "string"},
+                    "hint": {"type": "string"},
+                },
+            },
+        },
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4194,10 +4432,43 @@ def _is_broken_stdout_flush(exc: OSError) -> bool:
     return exc.errno in (errno.EINVAL, errno.EPIPE)
 
 
+def _runtime_catchall(args: argparse.Namespace, exc: Exception) -> int:
+    """Issues #92/#93 AC2: an unexpected exception escaping a command is a
+    coded `runtime` envelope ("{TypeName}: {message}"), nonzero exit, no
+    traceback — using the per-invocation context so a fault AFTER the store
+    was opened still reports the store's db/repo identity and the freshness
+    captured at open (AC3)."""
+    global _STDOUT_DEAD
+    error = {
+        "code": "runtime",
+        "message": f"{type(exc).__name__}: {exc}",
+    }
+    env = build_envelope(
+        None,
+        slug=_INVOCATION.get("repo"),
+        db_path=_INVOCATION.get("db"),
+        error=error,
+        freshness=_INVOCATION.get("freshness"),
+    )
+    try:
+        print(f"error: {error['message']}", file=sys.stderr)
+        fmt = _format_of(args)
+        if fmt != "text":
+            # Failures answer through the stderr echo in text mode (the
+            # emit_result contract); machine formats get the envelope.
+            _render_json(env, indent=2 if fmt == "json" else None)
+    except BrokenPipeError:
+        _STDOUT_DEAD = True
+    return 1
+
+
 def main(argv: list[str] | None = None) -> int:
+    global _INVOCATION, _STDOUT_DEAD
     # Pin the streams before argparse runs: its usage/error text is the first
     # user-facing output and can carry non-ASCII from bad arguments.
     _force_utf8_streams()
+    _INVOCATION = {}
+    _STDOUT_DEAD = False
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
@@ -4205,11 +4476,14 @@ def main(argv: list[str] | None = None) -> int:
         # A failed parse answers the structured envelope under a machine
         # format (issue #72 AC12); text mode on a TTY keeps the human line.
         try:
-            return _usage_envelope_exit(exc, argv)
+            code = _usage_envelope_exit(exc, argv)
         except BrokenPipeError:
             # The usage envelope itself can hit the dead pipe (FB-022):
-            # the quiet exit is the same contract the dispatch path has.
-            return _silence_broken_stdout()
+            # quiet, and the usage failure keeps its OWN exit code 2
+            # (issues #92/#93 AC1).
+            _silence_broken_stdout()
+            code = 2
+        return code
     if getattr(args, "repo", None):
         try:
             args.repo = validate_slug(args.repo)
@@ -4217,20 +4491,34 @@ def main(argv: list[str] | None = None) -> int:
             # Post-parse validation: still answers with the structured
             # envelope on stdout (argparse's own usage errors stay on stderr).
             try:
-                return emit_failure(args, 2, str(exc))
+                code = emit_failure(args, 2, str(exc))
             except BrokenPipeError:
-                return _silence_broken_stdout()
+                _silence_broken_stdout()
+                code = 2
+            return code
     try:
-        code = int(args.func(args))
-    except BrokenPipeError:
-        # The reader went away (`| head` exited): the quiet success exit.
-        return _silence_broken_stdout()
-    try:
-        sys.stdout.flush()
-    except (BrokenPipeError, OSError) as exc:
-        # The shutdown-time shape: the output sat buffered past dispatch and
-        # the interpreter's exit flush hit the dead pipe (Windows EINVAL).
-        if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+        try:
+            code = int(args.func(args))
+        except BrokenPipeError:
+            # The reader went away (`| head` exited): the quiet success
+            # exit. Failures are absorbed at the render boundary and keep
+            # their own code; this arm is the defense in depth for a pipe
+            # death the boundary did not see.
             return _silence_broken_stdout()
-        raise
+        except Exception as exc:  # issues #92/#93 AC2: the coded catch-all
+            return _runtime_catchall(args, exc)
+        try:
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError) as exc:
+            # The shutdown-time shape: the output sat buffered past dispatch
+            # and the interpreter's exit flush hit the dead pipe (Windows
+            # EINVAL). The dispatched command's OWN code survives the dead
+            # flush (issues #92/#93 AC1): a failure keeps 1/2/3/4/5/6, a
+            # success 0.
+            if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+                _silence_broken_stdout()
+                return code
+            raise
+    finally:
+        _INVOCATION = {}
     return code

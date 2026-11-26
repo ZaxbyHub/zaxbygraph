@@ -103,5 +103,6 @@
     "comments_omitted": 0,
     "reviews_omitted": 0
   },
-  "truncated": false
+  "truncated": false,
+  "version": "0.3"
 }

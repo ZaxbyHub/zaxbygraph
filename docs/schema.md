@@ -962,9 +962,19 @@ Verified behavior:
 | `SELECT 1; DELETE FROM items` | rejected by layer 1 (exit 2) |
 | `SELECT '--'; DELETE FROM items` | rejected by layer 1 (exit 2) |
 | `SELECT load_extension('x')` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) UPDATE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) DELETE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN INSERT …` / `EXPLAIN QUERY PLAN INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN UPDATE …` / `EXPLAIN QUERY PLAN UPDATE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN DELETE …` / `EXPLAIN QUERY PLAN DELETE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN QUERY PLAN DELETE FROM items` | **passes layer 1**, denied by layer 2 (exit 1) |
 
-That last row is the reason both layers exist: `load_extension` is a function
-call inside a legitimate-looking `SELECT`, so no keyword check can catch it.
+Those last rows are the reason both layers exist: `load_extension` is a
+function call inside a legitimate-looking `SELECT`, and the WITH- and
+EXPLAIN-prefixed DML shapes are statements whose first keyword passes the
+statement guard while the authorizer still refuses the write, so no keyword
+check alone can catch either class.
 Do not simplify this to "the guard blocks extension loading" — it does not.
 
 Before relying on any of this, re-derive the current layers from

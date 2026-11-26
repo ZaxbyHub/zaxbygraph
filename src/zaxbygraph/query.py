@@ -2174,6 +2174,81 @@ def _vocabulary_warnings(
     return warnings
 
 
+#: The CANONICAL closed vocabularies for the zero-row hint (issues
+#: #92/#93 AC14): valid_values is this constant set, independent of stored
+#: rows (an empty table still hints).
+_HINT_VOCABULARIES = {
+    ("items", "kind"): ["issue", "pr"],
+    ("items", "state"): ["open", "closed"],
+    ("comments", "kind"): ["issue_comment", "review_comment"],
+}
+
+
+def _zero_row_hints(conn: sqlite3.Connection, sql: str) -> list[dict]:
+    """The annotate-only hints block (issues #92/#93 AC14): fires ONLY on a
+    zero-row answer whose filter used a known closed-vocabulary column with
+    a literal OUTSIDE the canonical set. The statement is never rewritten;
+    each hint names the column, the literal, the stored DISTINCT values and
+    the canonical valid_values."""
+    stripped = _strip_sql_comments(sql)
+    if "'" not in stripped:
+        return []
+    schema = _store_schema(conn)
+    if not schema:
+        return []
+    scope, aliases = _scope_tables(sql, schema)
+    if not scope:
+        return []
+    hints: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for (table, column), valid in _HINT_VOCABULARIES.items():
+        if table not in scope or column not in schema.get(table, ()):
+            continue
+        refs: list[str] = [table]
+        refs.extend(alias for alias, target in aliases.items() if target == table)
+        patterns = [
+            rf"\b{re.escape(ref)}\s*\.\s*{re.escape(column)}\s*=\s*'([^']*)'"
+            for ref in refs
+        ]
+        # A bare reference is attributed only when this table alone in
+        # scope owns the column (mirrors _vocabulary_warnings).
+        owners = [t for t in scope if column in schema.get(t, ())]
+        if owners == [table]:
+            patterns.append(rf"(?<![\w.]){re.escape(column)}\s*=\s*'([^']*)'")
+        for pattern in patterns:
+            for m in re.finditer(pattern, stripped, re.IGNORECASE):
+                if stripped[m.end(): m.end() + 1] == "'":
+                    continue  # the escaped 'it''s' prefix shape
+                literal = m.group(1)[:_SQL_CELL_CAP]
+                if not literal or literal in valid:
+                    continue
+                key = (f"{table}.{column}", literal)
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    stored = [
+                        row[0]
+                        for row in conn.execute(
+                            f"SELECT DISTINCT {_quote_ident(column)} FROM"
+                            f" {_quote_ident(table)}"
+                            f" WHERE {_quote_ident(column)} IS NOT NULL"
+                            f" LIMIT {_VOCAB_DISTINCT_LIMIT}"
+                        ).fetchall()
+                    ]
+                except sqlite3.Error:
+                    stored = []
+                hints.append(
+                    {
+                        "column": f"{table}.{column}",
+                        "literal": literal,
+                        "stored_values": stored,
+                        "valid_values": list(valid),
+                    }
+                )
+    return hints
+
+
 def run_sql(
     conn: sqlite3.Connection,
     sql: str,
@@ -2275,6 +2350,12 @@ def run_sql(
         result: dict = {"columns": cols, "rows": rows, "truncated": truncated}
         if warnings:
             result["warnings"] = warnings
+        if rows == []:
+            # Issues #92/#93 AC14: the annotate-only zero-row vocabulary
+            # hint (never a rewrite, never a suppression on empty tables).
+            hints = _zero_row_hints(conn, sql)
+            if hints:
+                result["hints"] = hints
         if truncated:
             total = _completion_count(conn, sql, deadline_at, deadline)
             if total is not None:

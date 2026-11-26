@@ -868,8 +868,9 @@ even for item numbers, `patch` is NULL without `--include-patches`).
 Read-only is enforced in two independent layers: a statement guard
 (`SELECT`/`WITH`/`EXPLAIN` only, single statement, string-literal aware) and a
 default-deny SQLite authorizer on the connection. `docs/schema.md` has the
-verified accept/reject table, including the one case that passes the first layer
-and is stopped by the second.
+verified accept/reject table, including every statement class that passes the
+first layer and is stopped by the second (`load_extension` inside a SELECT,
+plus the WITH-prefixed and EXPLAIN-prefixed DML shapes).
 
 Results are capped (default 200 rows) and fetched incrementally, so matching a
 million rows does not materialize a million rows.
@@ -960,8 +961,10 @@ zaxbygraph mcp [--stale-seconds N]
   block (issue #32). The one exception is the modern (2026-07-28)
   `input_required` answer, whose shape is `{resultType, requestState,
   content}` — no structuredContent, by protocol design. The work-selection/derived tools call the same query
-  layer as their CLI commands, so data payloads match the CLI exactly on the
-  same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
+  layer as their CLI commands, so data payloads match the CLI within the
+  bundle's immutable defaults: a 4000-token answer budget and briefs always
+  on (the CLI's per-call budget/brief knobs do not cross the bundle
+  boundary; identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
   it returns a job id and `graph_status` reports progress. The `sync` tool accepts the same `source` (`graphql`/`rest`) argument the CLI flag takes and honors the store's recorded profile when it is omitted.
   The claim tools mirror their CLI commands: `claim`/`release` write
   GitHub comments (readOnlyHint false), `pr_guard` and `claims`
@@ -987,8 +990,8 @@ zaxbygraph mcp [--stale-seconds N]
   (`zaxbygraph mcp --repo OWNER/REPO`; `--db PATH` pins the database file, not the repo), then — legacy clients
   only — the client's MCP roots, then (still legacy-only) the server cwd's git origin;
   modern (2026-07-28) requests resolve without Roots and answer
-  `input_required` when nothing pins a repo. All paths resolve to the same
-  slug-keyed store as the CLI, so a worktree and its main checkout share one
+  `input_required` when nothing pins a repo. All paths resolve to the one
+  slug-keyed store the CLI uses, so a worktree and its main checkout share one
   graph.
 - **Staleness**: when a read answers and `freshness.age_s` exceeds the
   threshold (`--stale-seconds`, default 900, env
@@ -1008,10 +1011,16 @@ Register it (Claude Code):
 claude mcp add zaxbygraph -- zaxbygraph mcp
 ```
 
-opencode (`~/.config/opencode/opencode.json`):
+ZCode (`~/.zcode/cli/config.json`):
 
 ```json
-{"mcp": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}
+{"mcp": {"servers": {"zaxbygraph": {"command": "zaxbygraph", "args": ["mcp"], "type": "stdio"}}}}
+```
+
+opencode (`opencode.json` or `opencode.jsonc`):
+
+```json
+{"mcp": {"servers": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}}
 ```
 
 ## Remote use: snapshot transport
@@ -1138,6 +1147,18 @@ Machine-readable rules, worth knowing before scripting against this:
   names the path and the exact `sync` command. The distinction matters for
   retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
   request, or sync first), while a `1` sometimes will.
+  The exit-code contract in one table (branch on the envelope's `ok`,
+  never the digit alone):
+
+  | exit | script on `ok` | meaning |
+  | --- | --- | --- |
+  | 0 | yes | the command succeeded |
+  | 1 | no | a runtime failure; an unchanged retry sometimes fixes it |
+  | 2 | no | a usage or guard rejection; an unchanged retry never fixes it |
+  | 3 | no | no corpus for the resolved repo; an unchanged retry never fixes it |
+  | 4/5/6 | no | the claim outcomes are the contract: `4` taken, `5` lost_race, `6` github_unreachable |
+  | any | branch on `ok` | callers branch on the envelope's `ok` and its `error.code`, never the exit digit alone |
+
   The claim commands add three of their own, one per nonzero outcome
   (issues #77/#74): **`4`** — `taken` (the issue is held by an active
   claim, is not an open issue, an open PR already closes it, a partial

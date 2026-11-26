@@ -6,7 +6,7 @@ description: >
   history question, recurrence hunt, regression archaeology, or "what touched this file"
   task for a GitHub repo.
 ---
-<!-- zaxbygraph skill-version: 0.5.2 hash=3e09dacd3fd9ce4af28989074346120d309066e21a4dc469ae05a9ad5a6d5d32 -->
+<!-- zaxbygraph skill-version: 0.6.0 hash=d83dd9193fdf404b0619f71b35c7d63b9b79f47dcf1591c262c3c730c687d7b0 -->
 
 # ZaxbyGraph
 
@@ -308,9 +308,10 @@ The `[claims]` values in effect (`enabled`, `patterns`, `release_prefix`,
 
 ## Output shapes
 
-Every command's JSON output is one self-describing **envelope** (v0.2):
-`{ok, db, repo, freshness:{synced_at, age_s, complete, refreshed?}, data, truncated}` —
-plus `error:{code, message, hint?}` on failures. The per-command payload lives
+Every command's JSON output is one self-describing **envelope** (v0.3):
+`{ok, db, repo, freshness:{synced_at, age_s, complete, refreshed?}, data, truncated, version}` —
+plus `error:{code, message, hint?}` on failures; `version` names the envelope
+contract (issues #92/#93). The per-command payload lives
 under `data`; `ok` is at the root. **Sole exception: `export-corpus` writes
 the corpus artifact bytes (manifest line + JSONL content) instead of an
 envelope**; its failures still answer with the standard envelope. Errors
@@ -394,7 +395,7 @@ always-present keys are.
 
 | command | data keys |
 | --- | --- |
-| brief | analog, body, comments, config_source, content_trust, derived, features, files, formula_version, linked_prs, number, repo, weights |
+| brief | analog, author, body, comments, config_source, content_trust, created_at, derived, features, files, formula_version, html_url, labels, linked_prs, number, repo, updated_at, weights |
 | bundle | bundles, claims_config, closeable_trackers, config_source, derived, dropped, excluded, formula_version, gated, merge_candidates, pool, related_not_bundleable, repo, unbundled, weights |
 | churn | additions, deletions, path, prs |
 | claim | claims_config, config_source, outcome |
