@@ -100,7 +100,8 @@ envelope root):
     "rate_limit_remaining": null, "rate_limit_reset_at": null,
     "source": "graphql", "graphql_probe_failed": false
   },
-  "truncated": false
+  "truncated": false,
+  "version": "0.3"
 }
 ```
 
@@ -1079,12 +1080,16 @@ own repository, apart from zmem's sync repos.
 
 Machine-readable rules, worth knowing before scripting against this:
 
-- **One envelope (v0.2, breaking).** Every command's JSON output is a single
+- **One envelope (v0.3; the v0.2 shape was the breaking one).** Every command's
+  JSON output is a single
   self-describing object: `{"ok": true|false, "db": "<path>", "repo": "<slug>",
   "freshness": {"synced_at": iso|null, "age_s": secs|null, "complete": bool,
                  "refreshed": true only after a --max-age refresh},
-  "data": <payload>, "truncated": bool}` - plus `"error": {"code", "message",
-  "hint"?}` on failures. The payload you used to get at the top level now lives
+  "data": <payload>, "truncated": bool, "version": "0.3"}` - plus
+  `"error": {"code", "message",
+  "hint"?}` on failures. `version` names the envelope contract (added
+  additively in v0.3, issues #92/#93). The payload you used to get at the top
+  level now lives
   under `data`; `ok` is still at the root. `churn` and `open` payloads are
   JSON arrays under `data`. In **text mode** every successful read that
   resolves a repo also writes exactly one identity line to stderr (slug-less

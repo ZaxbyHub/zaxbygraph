@@ -4519,6 +4519,25 @@ def _runtime_catchall(args: argparse.Namespace, exc: Exception) -> int:
     return 1
 
 
+def _quiet_flush_exit(code: int) -> int:
+    """The final-stdout-flush guard for main()'s early-return arms
+    (final-critic FC-1): the same shutdown-shape handling the dispatch
+    path applies. An arm that returns before the dispatch block never
+    reaches that block's flush guard, so with a dead stdout the
+    interpreter's own exit flush hit the dead pipe as an unraisable
+    OSError ('Exception ignored ... [Errno 22]') and the process exited
+    120 instead of the arm's code. Here the dead flush is silenced
+    (devnull on fd 1) and the arm's OWN code returns."""
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError) as exc:
+        if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+            _silence_broken_stdout()
+            return code
+        raise
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     global _INVOCATION, _STDOUT_DEAD
     # Pin the streams before argparse runs: its usage/error text is the first
@@ -4540,7 +4559,7 @@ def main(argv: list[str] | None = None) -> int:
             # (issues #92/#93 AC1).
             _silence_broken_stdout()
             code = 2
-        return code
+        return _quiet_flush_exit(code)
     if getattr(args, "repo", None):
         try:
             args.repo = validate_slug(args.repo)
@@ -4552,7 +4571,7 @@ def main(argv: list[str] | None = None) -> int:
             except BrokenPipeError:
                 _silence_broken_stdout()
                 code = 2
-            return code
+            return _quiet_flush_exit(code)
     try:
         # `code` is pre-bound (review F1): a pipe death that escapes the
         # render/echo boundaries before dispatch returns has no code of
@@ -4571,7 +4590,11 @@ def main(argv: list[str] | None = None) -> int:
             _silence_broken_stdout()
             return code
         except Exception as exc:  # issues #92/#93 AC2: the coded catch-all
-            return _runtime_catchall(args, exc)
+            # FC-1 sweep: this return also skips the dispatch block's flush
+            # guard — route it through the same quiet flush so a dead stdout
+            # cannot turn the coded runtime exit 1 into the interpreter's
+            # unraisable-flush 120.
+            return _quiet_flush_exit(_runtime_catchall(args, exc))
         try:
             sys.stdout.flush()
         except (BrokenPipeError, OSError) as exc:

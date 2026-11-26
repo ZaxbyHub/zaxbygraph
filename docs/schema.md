@@ -11,7 +11,7 @@ Tip: `zaxbygraph schema [TABLE]` prints this same shape (DDL plus per-column
 notes) from the live database you are querying, so an installed copy of the
 skill never needs a file path to this document. Every command's JSON output is
 the self-describing envelope documented in the README ("Output and error
-contract"): `{ok, db, repo, freshness, data, truncated}`, plus
+contract"): `{ok, db, repo, freshness, data, truncated, version}`, plus
 `error: {code, message, hint?}` on failures.
 
 ## Conventions
@@ -967,8 +967,7 @@ Verified behavior:
 | `WITH x AS (SELECT 1) DELETE …` | **passes layer 1**, denied by layer 2 (exit 1) |
 | `EXPLAIN INSERT …` / `EXPLAIN QUERY PLAN INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |
 | `EXPLAIN UPDATE …` / `EXPLAIN QUERY PLAN UPDATE …` | **passes layer 1**, denied by layer 2 (exit 1) |
-| `EXPLAIN DELETE …` / `EXPLAIN QUERY PLAN DELETE …` | **passes layer 1**, denied by layer 2 (exit 1) |
-| `EXPLAIN QUERY PLAN DELETE FROM items` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN DELETE …` / `EXPLAIN QUERY PLAN DELETE FROM items` | **passes layer 1**, denied by layer 2 (exit 1) |
 
 Those last rows are the reason both layers exist: `load_extension` is a
 function call inside a legitimate-looking `SELECT`, and the WITH- and

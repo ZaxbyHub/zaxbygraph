@@ -15,7 +15,11 @@ digest is unchanged from 0.5.2).
   snapshot failures their code, successes 0) instead of a flattened
   quiet-0, the envelope still rendering on the live pipe, and the
   shutdown-flush death preserves the dispatched command's
-  code. An unexpected exception escaping a command is a coded
+  code — including main()'s early-return arms (final-critic FC-1: a
+  usage error or an invalid repo slug on a dead stdout no longer exits
+  120 with 'Exception ignored' noise; the arms answer their own code 2,
+  and the coded runtime catch-all keeps 1).
+  An unexpected exception escaping a command is a coded
   `runtime` envelope (`{TypeName}: {message}`), nonzero exit and no
   traceback, reported through a per-invocation context so a fault after
   the store opened still names the store's db/repo identity. CLI failure
