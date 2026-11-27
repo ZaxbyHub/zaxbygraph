@@ -2255,13 +2255,13 @@ def _zero_row_hints(
             prefixes.append(rf"(?<![\w.]){re.escape(column)}")
         literals: list[str] = []
         for prefix in prefixes:
-            for m in re.finditer(prefix + r"\s*=\s*'([^']*)'", stripped, re.IGNORECASE):
+            for m in re.finditer(prefix + r"\s*==?\s*'([^']*)'", stripped, re.IGNORECASE):
                 if stripped[m.end(): m.end() + 1] == "'":
                     continue  # the escaped 'it''s' prefix shape
                 literals.append(m.group(1))
             # The reversed equality `'x' = col` names the same filter.
             for m in re.finditer(
-                r"(?<![\w'])'([^']*)'\s*=\s*" + prefix + r"(?![\w(])",
+                r"(?<![\w'])'([^']*)'\s*==?\s*" + prefix + r"(?![\w(])",
                 stripped,
                 re.IGNORECASE,
             ):

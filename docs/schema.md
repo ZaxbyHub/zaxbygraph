@@ -986,6 +986,29 @@ query that *matches* millions of rows does not materialize them all. A
 non-positive `--limit` is clamped rather than passed through, because a negative
 `LIMIT` means *unlimited* in SQLite.
 
+### Zero-row vocabulary `hints` (issues #92, #93)
+
+When a `sql` read matches **zero rows** and its filter compares a
+closed-vocabulary column (`items.kind`, `items.state`, `comments.kind`) with
+a literal outside the canonical set, the success envelope carries an
+annotate-only `hints` array in `data`. Each entry has `column`
+(`table.column`), `literal` (as written), `stored_values` (the distinct
+values actually stored) and `valid_values` (the canonical set; for
+`items.state` that is `open`, `closed`, `deleted`, `transferred`). The
+statement is never rewritten and the rows are unchanged; an answer with rows
+or only in-vocabulary literals carries no `hints`.
+
+The literal is found in a text scan of the statement, so only these
+spellings are recognised: `col = 'x'` and `col == 'x'`, the reversed
+`'x' = col`, and `col IN ('a', 'b', …)` where every member is a quoted
+literal, with the column bare, `table.col` or `alias.col`. Any other
+spelling (`IS`, `LIKE`, `GLOB`, `BETWEEN`, range comparisons, double-quoted
+strings, bound parameters, subqueries, or an IN member containing an escaped
+quote) gets no hint rather than a guess. `<>`, `!=` and `NOT IN` with an
+out-of-vocabulary literal return rows, not zero rows, so they never reach
+this pass. The pass shares the statement's deadline: an expiry converts to
+the coded `timeout`, never a hint computed after the budget ended.
+
 ## Derived reads (issues #29, #30)
 
 Seven commands are **derived reads**: `similar`, `explain`, `coupling`,

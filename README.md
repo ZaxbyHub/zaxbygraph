@@ -1227,6 +1227,11 @@ rejected the open; exit 2) when the store cannot be opened, and a
   envelope: the artifact bytes are the output (see its section above).
 - `sync` failures also persist to `sync_state.last_error`, so a later `status`
   still reports a sync that failed hours ago.
+- A zero-row `sql` read that filters `items.kind`, `items.state` or
+  `comments.kind` with an out-of-vocabulary literal answers an annotate-only
+  `hints` array (`column`, `literal`, `stored_values`, `valid_values`). Only
+  `=`, `==`, the reversed `'x' = col` and literal-only `IN (...)` spellings
+  are recognised; see `docs/schema.md` ("Zero-row vocabulary `hints`").
 
 ## Agent usage
 

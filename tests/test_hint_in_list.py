@@ -100,6 +100,13 @@ class TestHintInList(unittest.TestCase):
         self.assertEqual(out["rows"], [], "HIN-PRECOND7")
         self.assertEqual(hints, [], "HIN-7")
 
+    def test_double_equals_hints(self) -> None:
+        out, hints = self._hints(
+            "SELECT number FROM items WHERE kind == 'pull_request'"
+        )
+        self.assertEqual(out["rows"], [], "HIN-PRECOND8")
+        self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-8")
+
     def test_equality_form_still_hints(self) -> None:
         _, hints = self._hints("SELECT number FROM items WHERE kind = 'pull_request'")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-5")
