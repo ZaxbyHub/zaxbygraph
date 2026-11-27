@@ -85,6 +85,21 @@ class TestHintInList(unittest.TestCase):
         self.assertEqual(out["rows"], [], "HIN-PRECOND4")
         self.assertEqual(hints, [], "HIN-4")
 
+    def test_reversed_equality_hints(self) -> None:
+        out, hints = self._hints(
+            "SELECT number FROM items WHERE 'pull_request' = kind"
+        )
+        self.assertEqual(out["rows"], [], "HIN-PRECOND6")
+        self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-6")
+        self.assertEqual(hints[0]["column"], "items.kind", "HIN-6b")
+
+    def test_reversed_equality_valid_literal_no_hint(self) -> None:
+        out, hints = self._hints(
+            "SELECT number FROM items WHERE 'pr' = kind"
+        )
+        self.assertEqual(out["rows"], [], "HIN-PRECOND7")
+        self.assertEqual(hints, [], "HIN-7")
+
     def test_equality_form_still_hints(self) -> None:
         _, hints = self._hints("SELECT number FROM items WHERE kind = 'pull_request'")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-5")

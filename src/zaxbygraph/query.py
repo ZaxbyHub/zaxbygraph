@@ -2259,6 +2259,13 @@ def _zero_row_hints(
                 if stripped[m.end(): m.end() + 1] == "'":
                     continue  # the escaped 'it''s' prefix shape
                 literals.append(m.group(1))
+            # The reversed equality `'x' = col` names the same filter.
+            for m in re.finditer(
+                r"(?<![\w'])'([^']*)'\s*=\s*" + prefix + r"(?![\w(])",
+                stripped,
+                re.IGNORECASE,
+            ):
+                literals.append(m.group(1))
             # IN-lists (AC14 is not limited to equality): only a list made
             # solely of quoted literals is read; a subquery or an escaped
             # member contributes nothing rather than a guess.
