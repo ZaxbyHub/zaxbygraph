@@ -133,6 +133,16 @@ class TestHintInList(unittest.TestCase):
         self.assertEqual(out["rows"], [], "HIN-11-PRECOND")
         self.assertEqual(hints, [], "HIN-11")
 
+    def test_hints_are_capped_per_column(self) -> None:
+        # PR #98 cubic round 2: a long IN list of distinct bogus literals
+        # must not yield one hint object per literal (the warnings pass
+        # caps at 32 per column).
+        members = ", ".join(f"'bogus{n}'" for n in range(40))
+        out, hints = self._hints(f"SELECT number FROM items WHERE kind IN ({members})")
+        self.assertEqual(out["rows"], [], "HIN-12-PRECOND")
+        self.assertEqual(len(hints), 32, "HIN-12")
+        self.assertEqual(hints[0]["literal"], "bogus0", "HIN-12b")
+
     def test_equality_form_still_hints(self) -> None:
         _, hints = self._hints("SELECT number FROM items WHERE kind = 'pull_request'")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-5")

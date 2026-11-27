@@ -461,7 +461,17 @@ def emit_result(
     # freshness block here, the one shared envelope builder.
     if getattr(args, "_refreshed", False):
         if freshness is None:
-            freshness = _freshness(conn, slug)
+            if (
+                conn is None
+                and error is not None
+                and _INVOCATION.get("freshness") is not None
+            ):
+                # A post-open failure arm that closed the connection first:
+                # keep the freshness captured at open (issues #92/#93 AC3),
+                # not the null block (PR #98 cubic round 2).
+                freshness = _INVOCATION["freshness"]
+            else:
+                freshness = _freshness(conn, slug)
         if freshness is not None:
             freshness = {**freshness, "refreshed": True}
     fields = _fields_of(args)

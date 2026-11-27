@@ -28,6 +28,8 @@ ROUND 5 (review F-3/F-4): mixed-case sync_state refusals (open/sql/status,
 exit 2 bad_request) carry the store's real freshness, and the catch-all
 after a --max-age refresh merges freshness.refreshed = true like
 emit_result. Pre-open failures keep the null block (PRESERVING).
+WAVE 6 (cubic P1): the post-open legs' problems are ACCUMULATED into the
+asserted list (a rebound list dropped them, so the legs could never fail).
 
 Hermetic: FakeGitHubSource, tempfile stores, patched seams; no network.
 Failures carry OC-AC1..OC-AC3 tags.
@@ -298,9 +300,7 @@ class TestAc3CliFailureFreshness(StoreCase):
     def _check_real_freshness(self, env: dict, note: str, synced_at: str, problems: list) -> None:
         fresh = env.get("freshness") or {}
         if fresh.get("synced_at") != synced_at:
-            problems.append(
-                f"{note}: freshness.synced_at {fresh.get('synced_at')!r}, want the store's real {synced_at!r}"
-            )
+            problems.append(f"{note}: freshness.synced_at {fresh.get('synced_at')!r}, want the store's real {synced_at!r}")
         if not isinstance(fresh.get("age_s"), int):
             problems.append(f"{note}: freshness.age_s must be an int, got {fresh.get('age_s')!r}")
         if fresh.get("complete") is not True:
@@ -326,6 +326,8 @@ class TestAc3CliFailureFreshness(StoreCase):
             (["overlap", "99999", "3"], [], "not_found", "ghost overlap number"),
             (["file-history", "src/store.py", "--limit", "99999999999"], [], "bad_request", "bad limit"),
         ]
+        # WAVE 6 (cubic P1): the leg table must keep ALL EIGHT documented legs (an emptied table would make the freshness sweep vacuous).
+        self.assertEqual(len(legs), 8, "OC-AC3: the post-open leg table must keep all eight documented legs (an emptied table makes the freshness sweep vacuous)")
         problems: list[str] = []
         for pre, post, want_code, note in legs:
             code, out, err = run_cli([*pre, *self.base, *post])
@@ -340,15 +342,17 @@ class TestAc3CliFailureFreshness(StoreCase):
         # ROUND 3 (finding 2a, the zero/multi sub-legs; round 5: displaced
         # into the _f helper at the line cap): with ZERO or SEVERAL stored
         # repos a no-filter post-open failure cannot pick one repo, so the
-        # null block is the honest answer.
-        problems = repo_filter_freshness_problems(self, str(self.root))
+        # null block is the honest answer. WAVE 6 (cubic P1): the helper's
+        # problems are ACCUMULATED (+=), never rebound -- the old rebinding
+        # dropped the loop's legs, so those assertions could never fail.
+        problems += repo_filter_freshness_problems(self, str(self.root))
         self.assertFalse(
             problems,
-            "OC-AC3: zero/multi-repo --repo '' refusals keep the null block:\n- "
-            + "\n- ".join(problems),
+            "OC-AC3: every post-open failure leg must carry the store's real"
+            " freshness, and the zero/multi-repo --repo '' refusals keep the"
+            " null block:\n- " + "\n- ".join(problems),
         )
-        # An unexpected RuntimeError AFTER the store opened: the catch-all
-        # must report the store's real freshness AND db/repo identity.
+        # An unexpected RuntimeError AFTER the store opened: the catch-all must report the store's real freshness AND db/repo identity.
         def _boom(conn, *a, **kw):
             raise RuntimeError("query exploded after open")
 
@@ -387,18 +391,16 @@ class TestAc3CliFailureFreshness(StoreCase):
         # PRESERVING: pre-open failures keep the null block (round 5:
         # displaced into the _f helper at the line cap; the executed codes
         # were verified at base: missing-db no-corpus -> 3, invalid slug
-        # -> 2, mismatch -> 2).
-        problems = preopen_null_freshness_problems(self)
+        # -> 2, mismatch -> 2). WAVE 6 (cubic P1): accumulated (+=), never
+        # rebound -- a rebinding here would drop the earlier legs again.
+        problems += preopen_null_freshness_problems(self)
         self.assertFalse(
             problems,
-            "OC-AC3: pre-open failures keep the null freshness block:\n- "
-            + "\n- ".join(problems),
+            "OC-AC3: pre-open failures keep the null freshness block (and the"
+            " post-open legs above stay green):\n- " + "\n- ".join(problems),
         )
 
-        # Reopen rejection: after the command's FIRST successful open, any
-        # SECOND open of the store raises -- the failing read must open the
-        # store exactly once and still report the ORIGINAL freshness values
-        # captured at that open (critic round 2, finding 2).
+        # Reopen rejection: after the command's FIRST successful open, any SECOND open of the store raises -- the failing read must open the store exactly once and still report the ORIGINAL freshness values captured at that open (critic round 2, finding 2).
         real_open = cli_mod.open_existing
         calls = {"n": 0}
 
@@ -416,20 +418,14 @@ class TestAc3CliFailureFreshness(StoreCase):
         env = parse_envelope(self, out, "OC-AC3") if out.strip() else {}
         self.assertEqual(
             calls["n"], 1,
-            f"OC-AC3: a failing read must open the store exactly once (no reopen"
-            f" to stamp freshness); got {calls['n']} opens",
+            f"OC-AC3: a failing read must open the store exactly once (no reopen to stamp freshness); got {calls['n']} opens",
         )
         self.assertIs(env.get("ok"), False, "OC-AC3: the reopen-rejection leg must still fail")
-        # ROUND 3 (finding 2b): the reopen arm's freshness is DEDICATEDLY
-        # asserted (the wave-2 problems list was already emptied above), so
-        # a null-freshness-on-reopen mutant FAILS here.
+        # ROUND 3 (finding 2b): the reopen arm's freshness is DEDICATEDLY asserted, so a null-freshness-on-reopen mutant FAILS here.
         fresh = env.get("freshness") or {}
         self.assertEqual(
             fresh.get("synced_at"), synced_at,
-            f"OC-AC3: reopen rejection: freshness.synced_at must stay the value"
-            f" captured at the ORIGINAL open {synced_at!r}; got"
-            f" {fresh.get('synced_at')!r} (a null-freshness-on-reopen mutant"
-            " must fail here)",
+            f"OC-AC3: reopen rejection: freshness.synced_at must stay the value captured at the ORIGINAL open {synced_at!r}; got {fresh.get('synced_at')!r} (a null-freshness-on-reopen mutant must fail here)",
         )
         self.assertIs(fresh.get("complete"), True, "OC-AC3: reopen rejection: freshness.complete must stay true")
         self.assertIsInstance(fresh.get("age_s"), int, "OC-AC3: reopen rejection: freshness.age_s must stay an int")
@@ -446,6 +442,11 @@ class TestAc3CliFailureFreshness(StoreCase):
         cli_mod.status = lambda conn, *a, **kw: (_ for _ in ()).throw(RuntimeError("boom after refresh"))
         try:
             code, out, err = run_cli(["status", "--max-age", "0", *self.base])
+        except Exception as exc:
+            # WAVE 6: an escaping exception is a TAGGED failure, not a raw
+            # traceback (the base must fail on the OC-AC3 text, not on an
+            # incidental error).
+            self.fail(f"OC-AC3: the refreshed catch-all must contain the unexpected exception as a coded envelope; it escaped as {type(exc).__name__}: {exc}")
         finally:
             cli_mod._refresh_if_stale = saved_refresh
             cli_mod.status = saved_status

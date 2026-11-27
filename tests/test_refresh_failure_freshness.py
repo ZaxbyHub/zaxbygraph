@@ -10,8 +10,9 @@ The fix under test: ``_refresh_if_stale`` records the invocation context
 (``_note_open``) the moment its read-only probe opens the store, so every
 later _ReadFailure falls back to the captured pre-refresh freshness
 through build_envelope. A SUCCESSFUL refresh is still reported
-post-refresh (``_open_for_read``'s own open re-records over it), which
-the control leg keeps honest by asserting the reference block directly.
+post-refresh (``_open_for_read``'s own open re-records over it); the
+success-then-failure leg below keeps that honest with the refresh seam
+patched to succeed and a ghost-item failure after it.
 
 Legs (all hermetic — the refresh seam is patched, the sync stamp is
 backdated so the budget is always exceeded):
@@ -174,6 +175,29 @@ class TestRefreshFailureFreshness(unittest.TestCase):
             " store's real freshness on its coded refusal:\n- "
             + "\n- ".join(problems),
         )
+
+    def test_failure_after_a_successful_refresh_keeps_real_freshness(self) -> None:
+        # PR #98 cubic round 2: a read whose refresh SUCCEEDS and whose
+        # answer then fails on an arm that closed the connection first
+        # (a ghost item number) must carry the store's real freshness plus
+        # refreshed: true, never the null block emit_result built when it
+        # overwrote the captured invocation freshness.
+        reference = self._reference()
+        saved = cli_mod._run_refresh_sync
+        cli_mod._run_refresh_sync = lambda conn, slug, **kw: 0
+        try:
+            code, out, err = run_cli(["item", "99999", "--max-age", "1", *self.base])
+        finally:
+            cli_mod._run_refresh_sync = saved
+        env = json.loads(out)
+        self.assertNotEqual(code, 0, f"RFF-S: the ghost item must fail; stderr {err[:120]!r}")
+        self.assertIs(env.get("ok"), False, f"RFF-S: the ghost item must fail; got {out[:160]!r}")
+        fresh = env.get("freshness") or {}
+        self.assertEqual(
+            fresh.get("synced_at"), reference["synced_at"],
+            f"RFF-S: freshness must be the opened store's real block, got {fresh!r}",
+        )
+        self.assertIs(fresh.get("refreshed"), True, f"RFF-S: refreshed must be true; got {fresh!r}")
 
     def test_missing_store_keeps_the_null_block(self) -> None:
         # PRESERVING control: --max-age on a store that does not exist

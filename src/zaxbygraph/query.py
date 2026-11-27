@@ -2301,10 +2301,13 @@ def _zero_row_hints(
                 if any("''" in member for member in members):
                     continue  # one escaped member rejects the whole list
                 literals.extend(members)
-        for raw in literals:
+        # At most 32 distinct literals per column, as _vocabulary_warnings
+        # caps, so a long IN list cannot grow the hints block unbounded.
+        out_of_vocab = [
+            raw for raw in dict.fromkeys(literals) if raw[:_SQL_CELL_CAP] not in valid
+        ]
+        for raw in out_of_vocab[:32]:
             literal = raw[:_SQL_CELL_CAP]
-            if literal in valid:
-                continue
             key = (f"{table}.{column}", literal)
             if key in seen:
                 continue

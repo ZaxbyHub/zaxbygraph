@@ -992,7 +992,8 @@ When a `sql` read matches **zero rows** and its filter compares a
 closed-vocabulary column (`items.kind`, `items.state`, `comments.kind`) with
 a literal outside the canonical set, the success envelope carries an
 annotate-only `hints` array in `data`. Each entry has `column`
-(`table.column`), `literal` (as written), `stored_values` (the distinct
+(`table.column`), `literal` (as written, truncated to 4,096 characters; at most 32 distinct
+literals are reported per column), `stored_values` (the distinct
 values actually stored) and `valid_values` (the canonical set; for
 `items.state` that is `open`, `closed`, `deleted`, `transferred`). The
 statement is never rewritten and the rows are unchanged; an answer with rows
@@ -1003,7 +1004,9 @@ spellings are recognised: `col = 'x'` and `col == 'x'`, the reversed
 `'x' = col`, and `col IN ('a', 'b', …)` where every member is a quoted
 literal, with the column `table.col` or `alias.col`, or bare when exactly
 one table in scope owns that column. Text inside a string literal is never
-scanned. Any other spelling (`IS`, `LIKE`, `GLOB`, `BETWEEN`, `<>`, `!=`,
+scanned. The scan reads the whole statement and does not tell a filter from
+a projected comparison, so a zero-row read such as
+`SELECT kind = 'x' FROM items WHERE 0` also hints. Any other spelling (`IS`, `LIKE`, `GLOB`, `BETWEEN`, `<>`, `!=`,
 `NOT IN`, range comparisons, double-quoted strings, quoted table
 qualifiers, bound parameters, subqueries, or an IN list any of whose
 members contains an escaped quote) gets no hint rather than a guess. Only
