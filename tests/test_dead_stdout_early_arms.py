@@ -32,6 +32,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -84,20 +85,8 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
             cwd=str(_WORKTREE),
             env=env,
         )
-        proc.stdout.close()  # the reader goes away; the child's flush must stay quiet
-        try:
-            proc.wait(timeout=120)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=30)
-            raise AssertionError("DSEA: the child did not exit (deadlock?)")
-        # stderr is drained AFTER wait (PR #98 review P11): the child's
-        # few lines fit the pipe buffer, and reading first could race a
-        # child that fills stderr while we wait.
-        stderr = proc.stderr.read() if proc.stderr else b""
-        proc.stderr.close()
-        text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
-        return proc.returncode, text
+        return _finish(proc)
+
 
     def _assert_quiet_own_code(
         self, code: int, err: str, want: int, note: str, problems: list
@@ -169,6 +158,57 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
             + "\n- ".join(problems),
         )
 
+    def test_finish_helper_times_out_a_wedged_child(self) -> None:
+        # FB-10 (Stage-B probe): a child that hangs must be KILLED and
+        # reported within the helper's timeout — never a silent stall and
+        # never an orphan. The child writes nothing and sleeps 30 s, so
+        # the AssertionError can only come from the bounded wait; a
+        # drain-BEFORE-wait ordering would block on the open stderr pipe
+        # for the full sleep instead (the mutant demonstration).
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(proc.kill)  # no-op once _finish reaped it
+        started = time.monotonic()
+        with self.assertRaises(
+            AssertionError,
+            msg="DSEA: the wedged child must be killed and reported",
+        ):
+            _finish(proc, timeout=3)
+        elapsed = time.monotonic() - started
+        self.assertLess(
+            elapsed,
+            15.0,
+            f"DSEA: the wedged-child report must fire fast; took {elapsed:.1f}s",
+        )
+        self.assertIsNotNone(
+            proc.poll(),
+            "DSEA: the wedged child must be dead after the report (no orphans)",
+        )
+
+
+
+def _finish(proc: subprocess.Popen, timeout: float = 120) -> tuple[int, str]:
+    """Kill the pipe, WAIT (bounded), then drain: stdout's read end closes
+    FIRST (the dead-pipe shape under test), the wait is bounded (a wedged
+    child is killed and reported — never a silent 30s stall and never an
+    orphan), and stderr is drained only AFTER the wait returns (the
+    child's few lines fit the pipe buffer; draining first would block on
+    a child that keeps its stderr open, which is exactly the ordering the
+    FB-10 probe discriminates)."""
+    proc.stdout.close()  # the reader goes away; the child's flush must stay quiet
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=30)
+        raise AssertionError("DSEA: the child did not exit (deadlock?)")
+    stderr = proc.stderr.read() if proc.stderr else b""
+    proc.stderr.close()
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
+    return proc.returncode, text
 
 if __name__ == "__main__":
     unittest.main()
