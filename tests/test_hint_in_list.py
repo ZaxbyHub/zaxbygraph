@@ -124,6 +124,15 @@ class TestHintInList(unittest.TestCase):
         _, hints = self._hints("SELECT i.number FROM items i WHERE 'pull_request' == i.kind")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-10")
 
+    def test_in_list_with_an_escaped_member_is_rejected_whole(self) -> None:
+        # Pass 4: an IN list containing an escaped-quote member contributes
+        # nothing (the documented list-level rule), not just that member.
+        out, hints = self._hints(
+            "SELECT number FROM items WHERE kind IN ('it''s', 'bogus')"
+        )
+        self.assertEqual(out["rows"], [], "HIN-11-PRECOND")
+        self.assertEqual(hints, [], "HIN-11")
+
     def test_equality_form_still_hints(self) -> None:
         _, hints = self._hints("SELECT number FROM items WHERE kind = 'pull_request'")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-5")

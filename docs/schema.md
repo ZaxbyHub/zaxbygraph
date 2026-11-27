@@ -1004,10 +1004,13 @@ spellings are recognised: `col = 'x'` and `col == 'x'`, the reversed
 literal, with the column `table.col` or `alias.col`, or bare when exactly
 one table in scope owns that column. Text inside a string literal is never
 scanned. Any other spelling (`IS`, `LIKE`, `GLOB`, `BETWEEN`, `<>`, `!=`,
-`NOT IN`, range comparisons, double-quoted strings, bound parameters,
-subqueries, comma-joined tables, or an IN member containing an escaped
-quote) gets no hint rather than a guess. The pass shares the statement's deadline: an expiry converts to
-the coded `timeout`, never a hint computed after the budget ended.
+`NOT IN`, range comparisons, double-quoted strings, quoted table
+qualifiers, bound parameters, subqueries, or an IN list any of whose
+members contains an escaped quote) gets no hint rather than a guess. Only
+tables named after `FROM` or `JOIN` are in scope, so a table that appears
+only as a later member of a comma-joined `FROM` list is not attributed. The
+pass shares the statement's deadline: an expiry converts to the coded
+`timeout`, never a hint computed after the budget ended.
 
 ## Derived reads (issues #29, #30)
 

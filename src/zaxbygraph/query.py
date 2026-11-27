@@ -2292,11 +2292,15 @@ def _zero_row_hints(
             # solely of quoted literals is read; a subquery or an escaped
             # member contributes nothing rather than a guess.
             for m in re.finditer(prefix + r"\s+IN\s*\(([^()]*)\)", masked, re.IGNORECASE):
-                if re.fullmatch(r"\s*'[^']*'(?:\s*,\s*'[^']*')*\s*", m.group(1)):
-                    for lit in re.finditer(r"'([^']*)'", m.group(1)):
-                        raw = stripped[m.start(1) + lit.start(1): m.start(1) + lit.end(1)]
-                        if "''" not in raw:
-                            literals.append(raw)
+                if not re.fullmatch(r"\s*'[^']*'(?:\s*,\s*'[^']*')*\s*", m.group(1)):
+                    continue
+                members = [
+                    stripped[m.start(1) + lit.start(1): m.start(1) + lit.end(1)]
+                    for lit in re.finditer(r"'([^']*)'", m.group(1))
+                ]
+                if any("''" in member for member in members):
+                    continue  # one escaped member rejects the whole list
+                literals.extend(members)
         for raw in literals:
             literal = raw[:_SQL_CELL_CAP]
             if literal in valid:
