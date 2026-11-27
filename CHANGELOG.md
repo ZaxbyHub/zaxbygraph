@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.6.0] - 2026-11-25
+
+Output-contract honesty and the self-describing surface on schema v12
+(CURRENT_USER_VERSION 12; no schema change, and the 20-tool MCP registry
+digest is unchanged from 0.5.2).
+
+- **#92** Exits, envelopes and freshness agree. An `ok:false` answer now
+  always exits nonzero and an `ok:true` answer exits 0 (the documented
+  claim outcomes `4`/`5`/`6` keep their own exits): a dead stdout or a
+  dead stderr no longer turns a failing command's exit code into 0 (the
+  render and echo boundaries absorb the dead pipe, so every
+  failure-emitter class returns
+  its OWN exit code — usage 2, sql 1/2, no-corpus 3, claim outcomes 4/5/6,
+  snapshot failures their code, successes 0 — instead of a flattened
+  quiet-0, the envelope still rendering on the live pipe), and the
+  shutdown-flush death preserves the dispatched command's
+  code — including main()'s early-return arms: a
+  usage error or an invalid repo slug on a dead stdout no longer exits
+  120 with 'Exception ignored' noise; the arms answer their own code 2,
+  and the coded runtime catch-all keeps 1).
+  An unexpected exception escaping a command is a coded
+  `runtime` envelope (`{TypeName}: {message}`), nonzero exit and no
+  traceback, reported through a per-invocation context so a fault after
+  the store opened still names the store's db/repo identity. CLI failure
+  envelopes emitted after the store opened carry that store's real
+  freshness — including the arms that close the connection before
+  emitting, and the read/sync/init guard refusals that fire right after
+  the open — with a no-filter post-open failure falling back to the
+  store's single stored repo (zero or several stored repos keep the null
+  block). MCP failures get the same guarantee through per-call
+  thread-local state (reset at the start of every `tools/call`, so no
+  stale identity leaks between calls or concurrent sessions). A `--max-age`
+  read whose refresh FAILS carries the same real freshness: the staleness
+  probe records the store the moment it opens, so the `refresh_failed` /
+  `environment_guard` refusals say what the store last synced instead of
+  the null block. The README
+  now carries the one exit-contract table (branch on the envelope's `ok`),
+  states the MCP bundle's defaults beside every payload-parity claim
+  (a 4000-token answer budget and briefs always on, the budget overridable
+  per call via `budget_tokens`, no briefs knob over MCP), and the MCP
+  registration guidance names all three documented clients (Claude Code,
+  ZCode, opencode, the latter per the current `mcp.servers.<name>` shape).
+  `docs/schema.md` now lists the WITH-prefixed and EXPLAIN/EXPLAIN QUERY
+  PLAN DML statement classes that pass the statement guard and are denied
+  by the authorizer, beside the retained `load_extension` row.
+- **#93** The CLI's answers describe themselves. Every envelope carries
+  `version: "0.3"` naming the envelope contract (additive; existing keys
+  and payload shapes preserved), the MCP tool outputSchemas declare the
+  `version` key in their required lists, and `schema --output COMMAND`
+  emits a full-envelope JSON Schema for every registry command — derived
+  from the one shape registry, covering the CLI-specific `open` bare list
+  and the `item` object|array|null union — that real success AND failure
+  envelopes validate against (shape drift corrected in passing: `brief`
+  declares its real always-present keys including author/created_at/
+  html_url/labels/updated_at; `triage` declares `features_missing`;
+  `pr_guard` no longer requires the conditional `collisions` key; SQL
+  positional row cells and the new `hints` are typed; the `open` row
+  schema types the genuinely nullable identity columns —
+  author/html_url/updated_at — as string-or-null). A zero-row `sql`
+  read whose filter used a closed-vocabulary column (`items.kind`,
+  `items.state`, `comments.kind`) with an out-of-vocabulary literal
+  answers an annotate-only `hints` block naming the stored values and the
+  canonical valid set (`items.state`'s canonical set is the production
+  order open, closed, deleted, transferred — the gone-marker states sync
+  writes; the empty literal hints too); the hint pass shares the
+  statement's deadline, converts a deadline interrupt to the coded
+  timeout exactly as the warnings pass does, and never fabricates an
+  empty `stored_values` for a probe it could not run; in-vocabulary
+  answers are byte-identical and
+  filtered reads refuse invalid literals up front.
+
 ## [0.5.2] - 2026-11-23
 
 Bug fixes on schema v12 (CURRENT_USER_VERSION 12; no schema change, and the

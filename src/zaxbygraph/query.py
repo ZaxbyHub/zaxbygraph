@@ -2174,6 +2174,158 @@ def _vocabulary_warnings(
     return warnings
 
 
+#: The CANONICAL closed vocabularies for the zero-row hint (issues
+#: #92/#93 AC14): valid_values is this constant set, independent of stored
+#: rows (an empty table still hints). items.state carries deleted and
+#: transferred too — sync's gone-marker writes them (see _mark_gone) and
+#: docs/schema.md documents the column — so the canonical set is the
+#: production order of all four values.
+_HINT_VOCABULARIES = {
+    ("items", "kind"): ["issue", "pr"],
+    ("items", "state"): ["open", "closed", "deleted", "transferred"],
+    ("comments", "kind"): ["issue_comment", "review_comment"],
+}
+
+
+def _zero_row_hints(
+    conn: sqlite3.Connection, sql: str, deadline_at: float, deadline: float
+) -> list[dict]:
+    """The annotate-only hints block (issues #92/#93 AC14): fires ONLY on a
+    zero-row answer whose filter used a known closed-vocabulary column with
+    a literal OUTSIDE the canonical set (the EMPTY literal '' is outside
+    every vocabulary too). The statement is never rewritten; each hint
+    names the column, the literal, the stored DISTINCT values and the
+    canonical valid_values. Stored values are cached per (table, column)
+    within one call, and the pass shares the statement's deadline: an
+    expiry or a deadline interrupt converts to SqlTimeoutError exactly as
+    the warnings pass does — never a hint whose stored_values lies about
+    why it is empty."""
+    stripped = _strip_sql_comments(sql)
+    if "'" not in stripped:
+        return []
+    # `masked` has the same length as `stripped` with the CONTENT of every
+    # string and quoted identifier blanked, so the filter scan reads SQL
+    # structure and never text inside a literal (a LIKE pattern naming
+    # "kind = 'bug'" is not a filter on kind).
+    masked_parts: list[str] = []
+    for kind, text in _sql_tokens(sql):
+        if kind == "comment":
+            masked_parts.append(" ")
+        elif kind == "string" and text.startswith("'") and len(text) >= 2 and text.endswith("'"):
+            masked_parts.append("'" + "\x00" * (len(text) - 2) + "'")
+        elif kind == "string":
+            masked_parts.append("\x00" * len(text))
+        else:
+            masked_parts.append(text)
+    masked = "".join(masked_parts)
+    schema = _store_schema(conn)
+    if time.monotonic() >= deadline_at:
+        # The pass runs only on a live deadline (PR #98 review P1): a hint
+        # computed after the budget expired is an answer the caller paid
+        # for and never received permission to compute.
+        raise SqlTimeoutError(deadline)
+    if not schema:
+        return []
+    scope, aliases = _scope_tables(sql, schema)
+    if not scope:
+        return []
+    hints: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    stored_cache: dict[tuple[str, str], list | None] = {}
+
+    def _stored(table: str, column: str) -> list | None:
+        key = (table, column)
+        if key not in stored_cache:
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT {_quote_ident(column)} FROM"
+                    f" {_quote_ident(table)}"
+                    f" WHERE {_quote_ident(column)} IS NOT NULL"
+                    f" LIMIT {_VOCAB_DISTINCT_LIMIT}"
+                ).fetchall()
+                stored_cache[key] = [row[0] for row in rows]
+            except sqlite3.OperationalError as exc:
+                if "interrupted" in str(exc).lower() and time.monotonic() >= deadline_at:
+                    raise SqlTimeoutError(deadline) from exc
+                # A probe we cannot run must not fabricate an empty
+                # stored_values (mirrors _vocabulary_warnings._stored):
+                # skip the column instead.
+                stored_cache[key] = None
+            except sqlite3.Error:
+                stored_cache[key] = None
+        return stored_cache[key]
+
+    for (table, column), valid in _HINT_VOCABULARIES.items():
+        if table not in scope or column not in schema.get(table, ()):
+            continue
+        refs: list[str] = [table]
+        refs.extend(alias for alias, target in aliases.items() if target == table)
+        prefixes = [
+            rf"\b{re.escape(ref)}\s*\.\s*{re.escape(column)}" for ref in refs
+        ]
+        # A bare reference is attributed only when this table alone in
+        # scope owns the column (mirrors _vocabulary_warnings).
+        owners = [t for t in scope if column in schema.get(t, ())]
+        if owners == [table]:
+            prefixes.append(rf"(?<![\w.]){re.escape(column)}")
+        literals: list[str] = []
+
+        def _take(m: re.Match, group: int = 1) -> None:
+            # The match ran on `masked`; the literal text is read from the
+            # same span of `stripped`. An escaped member ('it''s') names no
+            # vocabulary value and is skipped rather than guessed.
+            raw = stripped[m.start(group): m.end(group)]
+            if "''" not in raw:
+                literals.append(raw)
+
+        for prefix in prefixes:
+            for m in re.finditer(prefix + r"\s*==?\s*'([^']*)'", masked, re.IGNORECASE):
+                _take(m)
+            # The reversed equality `'x' = col` names the same filter.
+            for m in re.finditer(
+                r"(?<![\w'\x00])'([^']*)'\s*==?\s*" + prefix + r"(?![\w(])",
+                masked,
+                re.IGNORECASE,
+            ):
+                _take(m)
+            # IN-lists (AC14 is not limited to equality): only a list made
+            # solely of quoted literals is read; a subquery or an escaped
+            # member contributes nothing rather than a guess.
+            for m in re.finditer(prefix + r"\s+IN\s*\(([^()]*)\)", masked, re.IGNORECASE):
+                if not re.fullmatch(r"\s*'[^']*'(?:\s*,\s*'[^']*')*\s*", m.group(1)):
+                    continue
+                members = [
+                    stripped[m.start(1) + lit.start(1): m.start(1) + lit.end(1)]
+                    for lit in re.finditer(r"'([^']*)'", m.group(1))
+                ]
+                if any("''" in member for member in members):
+                    continue  # one escaped member rejects the whole list
+                literals.extend(members)
+        # At most 32 distinct literals per column, as _vocabulary_warnings
+        # caps, so a long IN list cannot grow the hints block unbounded.
+        out_of_vocab = [
+            raw for raw in dict.fromkeys(literals) if raw[:_SQL_CELL_CAP] not in valid
+        ]
+        for raw in out_of_vocab[:32]:
+            literal = raw[:_SQL_CELL_CAP]
+            key = (f"{table}.{column}", literal)
+            if key in seen:
+                continue
+            seen.add(key)
+            stored = _stored(table, column)
+            if stored is None:
+                continue
+            hints.append(
+                {
+                    "column": f"{table}.{column}",
+                    "literal": literal,
+                    "stored_values": list(stored),
+                    "valid_values": list(valid),
+                }
+            )
+    return hints
+
+
 def run_sql(
     conn: sqlite3.Connection,
     sql: str,
@@ -2275,6 +2427,12 @@ def run_sql(
         result: dict = {"columns": cols, "rows": rows, "truncated": truncated}
         if warnings:
             result["warnings"] = warnings
+        if rows == []:
+            # Issues #92/#93 AC14: the annotate-only zero-row vocabulary
+            # hint (never a rewrite, never a suppression on empty tables).
+            hints = _zero_row_hints(conn, sql, deadline_at, deadline)
+            if hints:
+                result["hints"] = hints
         if truncated:
             total = _completion_count(conn, sql, deadline_at, deadline)
             if total is not None:

@@ -691,6 +691,12 @@ def _resolve_target(arguments: dict, ctx) -> tuple[str, Path]:
             hint="pass a repo argument with --db spelling",
             slug=slug,
         ) from exc
+    # Issues #92/#93 AC4: record the resolved identity on the per-call
+    # thread-local state (freshness joins at open).
+    _CALL_STATE.slug = slug
+    _CALL_STATE.db_path = db_path
+    _CALL_STATE.freshness = None
+    _CALL_STATE.resolved = True
     return slug, db_path
 
 
@@ -699,6 +705,12 @@ def _open_corpus(slug: str, db_path: Path) -> sqlite3.Connection:
     ToolError (never creates a file or directory)."""
     try:
         conn = open_existing(db_path)
+        # Issues #92/#93 AC4: capture the store's freshness WHILE the
+        # connection is open, so a later failure in this call reports it
+        # without reopening (recorded only when this call resolved the
+        # identity itself; a concurrent session's state is its own).
+        if getattr(_CALL_STATE, "resolved", False) and _CALL_STATE.slug == slug:
+            _CALL_STATE.freshness = _freshness(conn, slug)
     except FileNotFoundError:
         raise ToolError(
             "no_corpus",
@@ -787,11 +799,54 @@ def _open_corpus(slug: str, db_path: Path) -> sqlite3.Connection:
 # Envelope assembly
 
 
+#: Per-call resolution state (issues #92/#93 AC4): thread-local, reset at
+#: the start of EVERY tools/call, so a handler that resolved/opened the
+#: store reports its real identity/freshness on failure while a call that
+#: fails before resolution (or another concurrent session) never sees a
+#: previous call's state. Process-global state here would cross-leak
+#: between concurrent sessions.
+_CALL_STATE = threading.local()
+
+
+def _reset_call_state() -> None:
+    _CALL_STATE.slug = None
+    _CALL_STATE.db_path = None
+    _CALL_STATE.freshness = None
+    _CALL_STATE.resolved = False
+
+
+def _call_state() -> dict:
+    return {
+        "slug": getattr(_CALL_STATE, "slug", None),
+        "db_path": getattr(_CALL_STATE, "db_path", None),
+        "freshness": getattr(_CALL_STATE, "freshness", None),
+        "resolved": getattr(_CALL_STATE, "resolved", False),
+    }
+
+
 def _error_envelope(code_key: str, message: str, hint: str | None, slug, db_path) -> dict:
+    state = _call_state()
+    if state["resolved"]:
+        # The call resolved (and opened) a store: report ITS identity and
+        # the freshness captured at open, never a stale reopen — the
+        # caller's slug/db_path are the same call's anyway, and the generic
+        # arms pass none.
+        slug = state["slug"]
+        db_path = state["db_path"]
     error: dict = {"code": code_key, "message": message}
     if hint:
         error["hint"] = hint
-    return build_envelope(None, slug=slug, db_path=db_path, error=error)
+    return build_envelope(
+        None,
+        slug=slug,
+        db_path=db_path,
+        error=error,
+        freshness=(
+            state["freshness"]
+            if state["resolved"]
+            else {"synced_at": None, "age_s": None, "complete": False}
+        ),
+    )
 
 
 def _read_envelope(conn, slug, db_path, data, truncated, ctx) -> dict:
@@ -1942,8 +1997,9 @@ _CURSOR = {"type": "string", "description": "Opaque cursor from a previous trunc
 # _output_schema_for: failure envelopes carry data:null against the same
 # schema.
 
-#: envelope keys every result carries ("error" joins them on failures)
-_ENVELOPE_KEYS = ("ok", "db", "repo", "freshness", "data", "truncated")
+#: envelope keys every result carries ("error" joins them on failures;
+#: "version" names the envelope contract, issues #92/#93 AC12/AC13)
+_ENVELOPE_KEYS = ("ok", "db", "repo", "freshness", "data", "truncated", "version")
 
 _STR = {"type": "string"}
 _STR_NULL = {"type": ["string", "null"]}
@@ -2316,6 +2372,9 @@ _TOOL_SHAPES: dict[str, dict] = {
                     "type": "array",
                     "items": {
                         "type": ["array", "object"],
+                        "items": {
+                            "type": ["string", "number", "boolean", "null"]
+                        },
                         "description": "positional cells (MCP) or objects"
                         " keyed by column (CLI default)",
                     },
@@ -2343,6 +2402,33 @@ _TOOL_SHAPES: dict[str, dict] = {
                     "description": "out-of-vocabulary literal warnings"
                     " ({column, literal, stored_values}; query.run_sql"
                     " emits one object per warning)",
+                },
+                "hints": {
+                    "type": "array",
+                    "items": _props(
+                        {
+                            "column": _STR,
+                            "literal": _STR,
+                            "stored_values": {
+                                "type": "array",
+                                "items": _STR,
+                                "description": "the stored DISTINCT"
+                                " vocabulary of that column (bounded)",
+                            },
+                            "valid_values": {
+                                "type": "array",
+                                "items": _STR,
+                                "description": "the CANONICAL closed set for"
+                                " that column, independent of stored rows"
+                                " (issues #92/#93 AC14)",
+                            },
+                        },
+                        ("column", "literal", "stored_values", "valid_values"),
+                    ),
+                    "description": "annotate-only zero-row vocabulary hints:"
+                    " present when the answer has no rows and a filter"
+                    " literal falls outside the column's canonical closed"
+                    " set (issues #92/#93 AC14)",
                 },
                 "total_rows": {
                     "type": "integer",
@@ -2465,6 +2551,12 @@ _TOOL_SHAPES: dict[str, dict] = {
                 "cursor": _STR_NULL,
                 "truncated": _BOOL,
                 "derived": _BOOL,
+                "features_missing": {
+                    "type": "object",
+                    "additionalProperties": True,
+                    "description": "every triage feature this store cannot"
+                    " rank (feature name -> why it is missing)",
+                },
                 "as_of": {
                     "type": "string",
                     "description": "present when answered from a prepared"
@@ -2585,14 +2677,20 @@ _TOOL_SHAPES: dict[str, dict] = {
         " triage features, bounded body and comments, implicated files,"
         " closest analog and linked PRs (derived, read-only; live=true adds"
         " live CI/review state via gh).",
-        "data_keys": ("analog", "body", "comments", "config_source",
-                      "content_trust", "derived", "features", "files",
-                      "formula_version", "linked_prs", "number", "repo",
-                      "weights"),
+        "data_keys": ("analog", "author", "body", "comments",
+                      "config_source", "content_trust", "created_at",
+                      "derived", "features", "files", "formula_version",
+                      "html_url", "labels", "linked_prs", "number", "repo",
+                      "updated_at", "weights"),
         "data": _props(
             {
                 "repo": _STR,
                 "number": _INT,
+                "author": _STR_NULL,
+                "created_at": _STR_NULL,
+                "updated_at": _STR_NULL,
+                "html_url": _STR_NULL,
+                "labels": _open_objects("label rows {name, color}"),
                 "features": dict(
                     _OPEN_OBJ,
                     description="the triage row for this issue"
@@ -2658,9 +2756,10 @@ _TOOL_SHAPES: dict[str, dict] = {
                     " packet",
                 },
             },
-            ("analog", "body", "comments", "config_source", "content_trust",
-             "derived", "features", "files", "formula_version",
-             "linked_prs", "number", "repo", "weights"),
+            ("analog", "author", "body", "comments", "config_source",
+             "content_trust", "created_at", "derived", "features", "files",
+             "formula_version", "html_url", "labels", "linked_prs",
+             "number", "repo", "updated_at", "weights"),
         ),
     },
     "churn": {
@@ -2793,7 +2892,7 @@ _TOOL_SHAPES: dict[str, dict] = {
                 ),
                 "config_source": _STR,
             },
-            ("claims_config", "collisions", "config_source", "outcome"),
+            ("claims_config", "config_source", "outcome"),
         ),
     },
     "claims": {
@@ -2884,6 +2983,11 @@ def _output_schema_for(tool_name: str) -> dict:
             },
             "data": data,
             "truncated": _BOOL,
+            "version": dict(
+                _STR,
+                description="the envelope contract version (cli"
+                ".ENVELOPE_VERSION; issues #92/#93 AC12/AC13)",
+            ),
             "error": {
                 "type": ["object", "null"],
                 "properties": {
@@ -3628,6 +3732,10 @@ def _dispatch(msg: dict, method: str, has_id: bool, req_id, ctx: _Context) -> No
         arguments = params.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
+        # Issues #92/#93 AC4: per-call state is reset at the START of every
+        # tools/call (thread-local, so concurrent sessions never share it)
+        # and consumed by the failure arms below.
+        _reset_call_state()
         try:
             env = handler(arguments, ctx)
         except _InputRequired as required:

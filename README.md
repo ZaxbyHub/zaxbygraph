@@ -100,7 +100,8 @@ envelope root):
     "rate_limit_remaining": null, "rate_limit_reset_at": null,
     "source": "graphql", "graphql_probe_failed": false
   },
-  "truncated": false
+  "truncated": false,
+  "version": "0.3"
 }
 ```
 
@@ -868,8 +869,9 @@ even for item numbers, `patch` is NULL without `--include-patches`).
 Read-only is enforced in two independent layers: a statement guard
 (`SELECT`/`WITH`/`EXPLAIN` only, single statement, string-literal aware) and a
 default-deny SQLite authorizer on the connection. `docs/schema.md` has the
-verified accept/reject table, including the one case that passes the first layer
-and is stopped by the second.
+verified accept/reject table, including every statement class that passes the
+first layer and is stopped by the second (`load_extension` inside a SELECT,
+plus the WITH-prefixed and EXPLAIN-prefixed DML shapes).
 
 Results are capped (default 200 rows) and fetched incrementally, so matching a
 million rows does not materialize a million rows.
@@ -960,10 +962,15 @@ zaxbygraph mcp [--stale-seconds N]
   block (issue #32). The one exception is the modern (2026-07-28)
   `input_required` answer, whose shape is `{resultType, requestState,
   content}` — no structuredContent, by protocol design. The work-selection/derived tools call the same query
-  layer as their CLI commands, so data payloads match the CLI exactly on the
-  same store (identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
+  layer as their CLI commands, so data payloads match the CLI up to the
+  bundle tool's defaults: a 4000-token answer budget and briefs always on;
+  the budget is overridable per call via `budget_tokens` (the `brief` tool
+  takes it too), while there is no briefs knob over MCP; the CLI `bundle`
+  command ships no budget and turns briefs off unless `--with-briefs`
+  (`brief` defaults to 4000), so exact parity needs a matching CLI call;
+  identity/freshness fields are per-surface by construction; `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
   it returns a job id and `graph_status` reports progress. The `sync` tool accepts the same `source` (`graphql`/`rest`) argument the CLI flag takes and honors the store's recorded profile when it is omitted.
-  The claim tools mirror their CLI commands: `claim`/`release` write
+  The claim tools follow their CLI commands: `claim`/`release` write
   GitHub comments (readOnlyHint false), `pr_guard` and `claims`
   (`live: bool` for the live view) are reads, and a nonzero claim outcome
   answers `isError: true` with the FULL outcome envelope — data preserved.
@@ -987,8 +994,8 @@ zaxbygraph mcp [--stale-seconds N]
   (`zaxbygraph mcp --repo OWNER/REPO`; `--db PATH` pins the database file, not the repo), then — legacy clients
   only — the client's MCP roots, then (still legacy-only) the server cwd's git origin;
   modern (2026-07-28) requests resolve without Roots and answer
-  `input_required` when nothing pins a repo. All paths resolve to the same
-  slug-keyed store as the CLI, so a worktree and its main checkout share one
+  `input_required` when nothing pins a repo. All paths resolve to the one
+  slug-keyed store the CLI uses, so a worktree and its main checkout share one
   graph.
 - **Staleness**: when a read answers and `freshness.age_s` exceeds the
   threshold (`--stale-seconds`, default 900, env
@@ -1008,10 +1015,16 @@ Register it (Claude Code):
 claude mcp add zaxbygraph -- zaxbygraph mcp
 ```
 
-opencode (`~/.config/opencode/opencode.json`):
+ZCode (`~/.zcode/cli/config.json`):
 
 ```json
-{"mcp": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}
+{"mcp": {"servers": {"zaxbygraph": {"command": "zaxbygraph", "args": ["mcp"], "type": "stdio"}}}}
+```
+
+opencode (`opencode.json` or `opencode.jsonc`):
+
+```json
+{"mcp": {"servers": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}}
 ```
 
 ## Remote use: snapshot transport
@@ -1070,12 +1083,16 @@ own repository, apart from zmem's sync repos.
 
 Machine-readable rules, worth knowing before scripting against this:
 
-- **One envelope (v0.2, breaking).** Every command's JSON output is a single
+- **One envelope (v0.3; the v0.2 shape was the breaking one).** Every command's
+  JSON output is a single
   self-describing object: `{"ok": true|false, "db": "<path>", "repo": "<slug>",
   "freshness": {"synced_at": iso|null, "age_s": secs|null, "complete": bool,
                  "refreshed": true only after a --max-age refresh},
-  "data": <payload>, "truncated": bool}` - plus `"error": {"code", "message",
-  "hint"?}` on failures. The payload you used to get at the top level now lives
+  "data": <payload>, "truncated": bool, "version": "0.3"}` - plus
+  `"error": {"code", "message",
+  "hint"?}` on failures. `version` names the envelope contract (added
+  additively in v0.3, issues #92/#93). The payload you used to get at the top
+  level now lives
   under `data`; `ok` is still at the root. `churn` and `open` payloads are
   JSON arrays under `data`. In **text mode** every successful read that
   resolves a repo also writes exactly one identity line to stderr (slug-less
@@ -1138,6 +1155,18 @@ Machine-readable rules, worth knowing before scripting against this:
   names the path and the exact `sync` command. The distinction matters for
   retry logic: a `2` or `3` will never succeed on retry unchanged (fix the
   request, or sync first), while a `1` sometimes will.
+  The exit-code contract in one table (branch on the envelope's `ok`,
+  never the digit alone):
+
+  | exit | script on `ok` | meaning |
+  | --- | --- | --- |
+  | 0 | yes | the command succeeded |
+  | 1 | no | a runtime failure; an unchanged retry sometimes fixes it |
+  | 2 | no | a usage or guard rejection; an unchanged retry never fixes it |
+  | 3 | no | no corpus for the resolved repo; an unchanged retry never fixes it |
+  | 4/5/6 | no | the claim outcomes are the contract: `4` taken, `5` lost_race, `6` github_unreachable |
+  | any | branch on `ok` | callers branch on the envelope's `ok` and its `error.code`, never the exit digit alone |
+
   The claim commands add three of their own, one per nonzero outcome
   (issues #77/#74): **`4`** — `taken` (the issue is held by an active
   claim, is not an open issue, an open PR already closes it, a partial
@@ -1198,6 +1227,11 @@ rejected the open; exit 2) when the store cannot be opened, and a
   envelope: the artifact bytes are the output (see its section above).
 - `sync` failures also persist to `sync_state.last_error`, so a later `status`
   still reports a sync that failed hours ago.
+- A zero-row `sql` read that filters `items.kind`, `items.state` or
+  `comments.kind` with an out-of-vocabulary literal answers an annotate-only
+  `hints` array (`column`, `literal`, `stored_values`, `valid_values`). Only
+  `=`, `==`, the reversed `'x' = col` and literal-only `IN (...)` spellings
+  are recognised; see `docs/schema.md` ("Zero-row vocabulary `hints`").
 
 ## Agent usage
 

@@ -1,5 +1,8 @@
 """Review-feedback hardening tests for the issue #6 edge contract (PR #14
-swarm-pr-review round). These live in a NEW module because the four
+swarm-pr-review round), and — since PR #98 — the Stage-B feedback probes
+(FB-01 hint-probe caching, FB-07 README bundle wording, FB-15 retry
+negation, FB-17 clean-exit mapping) appended below the original classes.
+These live in a NEW module because the four
 checkpoint-frozen files (test_edges.py, test_migrations.py, test_extract.py,
 test_store.py) are byte-locked by the trace manifest — the counterparts these
 tests strengthen live there, and the manifest anchors whole-file blobs.
@@ -340,6 +343,144 @@ class TitleRevertReversePassTests(TempDBTest):
         self.assertEqual(
             self.count("SELECT COUNT(*) FROM edges WHERE rel = 'merged_by'"), 0
         )
+
+
+# ==== PR #98 Stage-B feedback probes (FB-01/FB-07/FB-15/FB-17) ===============
+#
+# The discriminating checks the Stage-B engineer graded FAIL (no test of
+# their own) at c36a90e. Helpers are imported from the frozen modules
+# where they live (never edited). FB-10's wait-then-drain probe lives in
+# tests/test_dead_stdout_early_arms.py beside the subprocess machinery.
+
+import sys
+import tempfile
+from pathlib import Path
+
+import zaxbygraph
+from test_output_contract_docs_92_93 import (
+    _mcp_server_section,
+    _retry_wording_problems,
+)
+from test_output_contract_92_93_f import run_with_dead_flush, run_with_dead_stdout
+from zaxbygraph import cli as cli_mod
+
+_WORKTREE = Path(__file__).resolve().parents[1]
+
+
+class Fb01HintProbeCachingTests(unittest.TestCase):
+    """FB-01: the hint pass issues ONE DISTINCT probe per (table, column)
+    however many out-of-vocabulary literals the statement compares on that
+    column (an uncached pass probes once per literal)."""
+
+    def test_one_distinct_probe_per_column_not_per_literal(self) -> None:
+        from test_output_contract_92_93_e import seed_corpus
+        from zaxbygraph import query as query_mod
+        from zaxbygraph.db import connect_readonly_query
+
+        td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(td.cleanup)
+        db = Path(td.name) / "history.db"
+        seed_corpus(db)
+        conn = connect_readonly_query(db)
+        self.addCleanup(conn.close)
+
+        def run_counted(sql: str) -> tuple[int, list]:
+            probes = {"n": 0}
+
+            def _trace(statement: str) -> None:
+                flat = " ".join(statement.split()).upper()
+                if flat.startswith("SELECT DISTINCT") and '"ITEMS"' in flat:
+                    probes["n"] += 1
+
+            conn.set_trace_callback(_trace)
+            try:
+                hints = query_mod.run_sql(conn, sql).get("hints") or []
+                return probes["n"], hints
+            finally:
+                conn.set_trace_callback(None)
+
+        single_n, single_hints = run_counted(
+            "SELECT number FROM items WHERE state = 'nope'"
+        )
+        two_n, two_hints = run_counted(
+            "SELECT number FROM items WHERE state = 'nope' OR state = 'huh'"
+        )
+        self.assertEqual(len(single_hints), 1, "FB-01: fixture sanity — single literal hints")
+        self.assertEqual(
+            sorted(h["literal"] for h in two_hints),
+            ["huh", "nope"],
+            f"FB-01: both literals must be answered from the cached probe; got {two_hints!r}",
+        )
+        self.assertEqual(
+            single_n, 2, f"FB-01: HEAD = warnings probe + ONE hint probe; got {single_n}"
+        )
+        self.assertEqual(
+            two_n,
+            single_n,
+            f"FB-01: the two-literal read must issue the SAME probe count"
+            f" ({single_n}) — one probe per (table, column), never per"
+            f" literal; got {two_n} (an uncached pass answers 3)",
+        )
+
+
+class Fb07ReadmeBundleWordingTests(unittest.TestCase):
+    """FB-07: the MCP-server section states the per-call budget override
+    and no longer claims immutable defaults or the bundle boundary."""
+
+    def test_budget_overridable_and_no_false_default_claims(self) -> None:
+        readme = (_WORKTREE / "README.md").read_text(encoding="utf-8")
+        section = _mcp_server_section(readme)
+        self.assertTrue(section, "FB-07: the README must keep an '## MCP server' section")
+        flat = " ".join(section.split())
+        low = flat.lower()
+        self.assertIn("budget_tokens", flat, "FB-07: the per-call budget override must be named")
+        self.assertIn("overridable per call", low, "FB-07: the budget must be called overridable per call")
+        self.assertNotIn(
+            "immutable defaults", low,
+            "FB-07: no 'immutable defaults' claim (the budget is overridable)",
+        )
+        self.assertNotIn(
+            "do not cross the bundle boundary", low,
+            "FB-07: the stale bundle-boundary claim must be gone",
+        )
+
+
+class Fb15RetryWordingNegationTests(unittest.TestCase):
+    """FB-15: the exit-2/3 retry wording needs a REAL negation word —
+    'notes on retry behavior' must not count (substring 'not')."""
+
+    def test_notes_is_not_a_negation_word(self) -> None:
+        problems = _retry_wording_problems(
+            {
+                "2": ["2", "no", "notes on retry behavior"],
+                "3": ["3", "no", "never fixed by an unchanged retry"],
+            }
+        )
+        self.assertTrue(
+            any("exit-2" in p for p in problems),
+            f"FB-15: 'notes on retry behavior' must be reported; got {problems!r}",
+        )
+        self.assertFalse(
+            any("exit-3" in p for p in problems),
+            f"FB-15: the genuinely negated row 3 must stay clean; got {problems!r}",
+        )
+
+
+class Fb17CleanExitMappingTests(unittest.TestCase):
+    """FB-17: a bare SystemExit(None) (`sys.exit()`) is a CLEAN exit — the
+    frozen dead-run helpers must map it to 0, never a synthetic 2."""
+
+    def test_bare_system_exit_maps_to_zero(self) -> None:
+        saved_main = cli_mod.main
+        self.addCleanup(setattr, cli_mod, "main", saved_main)
+        cli_mod.main = lambda argv: sys.exit()
+        argv = ["status", "--format", "json"]
+        code_out, _err, escaped = run_with_dead_stdout(argv)
+        self.assertFalse(escaped, f"FB-17: dead-stdout leg escaped: {escaped!r}")
+        self.assertEqual(code_out, 0, f"FB-17: dead-stdout runner must map None to 0; got {code_out!r}")
+        code_flush, _err2, escaped2 = run_with_dead_flush(argv, BrokenPipeError("dead pipe"))
+        self.assertFalse(escaped2, f"FB-17: dead-flush leg escaped: {escaped2!r}")
+        self.assertEqual(code_flush, 0, f"FB-17: dead-flush runner must map None to 0; got {code_flush!r}")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ Tip: `zaxbygraph schema [TABLE]` prints this same shape (DDL plus per-column
 notes) from the live database you are querying, so an installed copy of the
 skill never needs a file path to this document. Every command's JSON output is
 the self-describing envelope documented in the README ("Output and error
-contract"): `{ok, db, repo, freshness, data, truncated}`, plus
+contract"): `{ok, db, repo, freshness, data, truncated, version}`, plus
 `error: {code, message, hint?}` on failures.
 
 ## Conventions
@@ -962,9 +962,18 @@ Verified behavior:
 | `SELECT 1; DELETE FROM items` | rejected by layer 1 (exit 2) |
 | `SELECT '--'; DELETE FROM items` | rejected by layer 1 (exit 2) |
 | `SELECT load_extension('x')` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) UPDATE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `WITH x AS (SELECT 1) DELETE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN INSERT …` / `EXPLAIN QUERY PLAN INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN UPDATE …` / `EXPLAIN QUERY PLAN UPDATE …` | **passes layer 1**, denied by layer 2 (exit 1) |
+| `EXPLAIN DELETE …` / `EXPLAIN QUERY PLAN DELETE FROM items` | **passes layer 1**, denied by layer 2 (exit 1) |
 
-That last row is the reason both layers exist: `load_extension` is a function
-call inside a legitimate-looking `SELECT`, so no keyword check can catch it.
+Those last rows are the reason both layers exist: `load_extension` is a
+function call inside a legitimate-looking `SELECT`, and the WITH- and
+EXPLAIN-prefixed DML shapes are statements whose first keyword passes the
+statement guard while the authorizer still refuses the write, so no keyword
+check alone can catch either class.
 Do not simplify this to "the guard blocks extension loading" — it does not.
 
 Before relying on any of this, re-derive the current layers from
@@ -976,6 +985,35 @@ Results are capped (default 200 rows) and rows are fetched incrementally, so a
 query that *matches* millions of rows does not materialize them all. A
 non-positive `--limit` is clamped rather than passed through, because a negative
 `LIMIT` means *unlimited* in SQLite.
+
+### Zero-row vocabulary `hints` (issues #92, #93)
+
+When a `sql` read matches **zero rows** and its filter compares a
+closed-vocabulary column (`items.kind`, `items.state`, `comments.kind`) with
+a literal outside the canonical set, the success envelope carries an
+annotate-only `hints` array in `data`. Each entry has `column`
+(`table.column`), `literal` (as written, truncated to 4,096 characters; at most 32 distinct
+literals are reported per column), `stored_values` (the distinct
+values actually stored) and `valid_values` (the canonical set; for
+`items.state` that is `open`, `closed`, `deleted`, `transferred`). The
+statement is never rewritten and the rows are unchanged; an answer with rows
+or only in-vocabulary literals carries no `hints`.
+
+The literal is found in a text scan of the statement, so only these
+spellings are recognised: `col = 'x'` and `col == 'x'`, the reversed
+`'x' = col`, and `col IN ('a', 'b', …)` where every member is a quoted
+literal, with the column `table.col` or `alias.col`, or bare when exactly
+one table in scope owns that column. Text inside a string literal is never
+scanned. The scan reads the whole statement and does not tell a filter from
+a projected comparison, so a zero-row read such as
+`SELECT kind = 'x' FROM items WHERE 0` also hints. Any other spelling (`IS`, `LIKE`, `GLOB`, `BETWEEN`, `<>`, `!=`,
+`NOT IN`, range comparisons, double-quoted strings, quoted table
+qualifiers, bound parameters, subqueries, or an IN list any of whose
+members contains an escaped quote) gets no hint rather than a guess. Only
+tables named after `FROM` or `JOIN` are in scope, so a table that appears
+only as a later member of a comma-joined `FROM` list is not attributed. The
+pass shares the statement's deadline: an expiry converts to the coded
+`timeout`, never a hint computed after the budget ended.
 
 ## Derived reads (issues #29, #30)
 
