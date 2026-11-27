@@ -148,6 +148,66 @@ class TestHintDeadline(unittest.TestCase):
             f"HD: the control hint block must stay unchanged; got {result.get('hints')!r}",
         )
 
+    def test_non_interrupt_probe_error_skips_the_hint(self) -> None:
+        # A2 (closeout): a DISTINCT probe failing with a NON-interrupt
+        # OperationalError must SKIP that column's hint — a hint whose
+        # stored_values is [] would lie (the table holds rows). The seam
+        # poisons only the probe identifier quoting for the state column;
+        # _store_schema quotes table names, so discovery stays intact.
+        saved_quote = query_mod._quote_ident
+
+        def _poisoned(name):
+            return "nope(" if name == "state" else saved_quote(name)
+
+        query_mod._quote_ident = _poisoned
+        try:
+            result = query_mod.run_sql(self.conn, _STATEMENT, deadline=60.0)
+        finally:
+            query_mod._quote_ident = saved_quote
+        self.assertEqual(result["rows"], [], "HD: fixture sanity — zero rows")
+        self.assertNotIn(
+            "hints",
+            result,
+            f"HD: a probe that cannot run must skip the hint, never emit"
+            f" stored_values == []; got {result.get('hints')!r}",
+        )
+
+    def test_interrupt_with_live_deadline_skips_the_hint(self) -> None:
+        # A2 (closeout): an interrupt-shaped OperationalError raised while
+        # the deadline is STILL LIVE (someone else interrupted us) is a
+        # probe failure, not a timeout: the hint is skipped and the read
+        # answers normally — no raise, no fabricated empty stored_values.
+        import sqlite3
+
+        class _InterruptingConn:
+            """Delegates everything; the DISTINCT probe reports an
+            interrupt from elsewhere while our clock stays healthy."""
+
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            def execute(self, sql, *args):
+                if " ".join(sql.split()).upper().startswith("SELECT DISTINCT"):
+                    raise sqlite3.OperationalError("interrupted")
+                return self._inner.execute(sql, *args)
+
+            def set_progress_handler(self, *args):
+                return self._inner.set_progress_handler(*args)
+
+            def cursor(self):
+                return self._inner.cursor()
+
+        result = query_mod.run_sql(
+            _InterruptingConn(self.conn), _STATEMENT, deadline=60.0
+        )
+        self.assertEqual(result["rows"], [], "HD: fixture sanity — zero rows")
+        self.assertNotIn(
+            "hints",
+            result,
+            f"HD: a live-deadline interrupt must skip the hint, never emit"
+            f" stored_values == []; got {result.get('hints')!r}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,7 +64,10 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
         self.db = str(self.root / "history.db")
 
     def _child_dead_stdout(self, argv: list[str], prelude: str = "") -> tuple[int, str]:
-        """One subprocess with a dead stdout pipe: (returncode, stderr)."""
+        """One subprocess with a dead stdout pipe: (returncode, stderr).
+        The child's stderr goes to a TEMP FILE (closeout A3): a chatty
+        child cannot wedge the parent on a full stderr pipe, and the file
+        is drained only after the bounded wait."""
         env = dict(os.environ)
         env["PYTHONUTF8"] = "1"
         env["ZAXBYGRAPH_HOME"] = self.zhome
@@ -78,14 +81,15 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
         child = _CHILD_TEMPLATE.format(
             src=str(_WORKTREE / "src"), prelude=prelude, argv=list(argv)
         )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", child],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=str(_WORKTREE),
-            env=env,
-        )
-        return _finish(proc)
+        with tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", child],
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                cwd=str(_WORKTREE),
+                env=env,
+            )
+            return _finish(proc, stderr_file)
 
 
     def _assert_quiet_own_code(
@@ -162,42 +166,64 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
         # FB-10 (Stage-B probe): a child that hangs must be KILLED and
         # reported within the helper's timeout — never a silent stall and
         # never an orphan. The child writes nothing and sleeps 30 s, so
-        # the AssertionError can only come from the bounded wait; a
-        # drain-BEFORE-wait ordering would block on the open stderr pipe
-        # for the full sleep instead (the mutant demonstration).
-        proc = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        # the AssertionError can only come from the bounded wait.
+        with tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+            )
+            self.addCleanup(proc.kill)  # no-op once _finish reaped it
+            started = time.monotonic()
+            with self.assertRaises(
+                AssertionError,
+                msg="DSEA: the wedged child must be killed and reported",
+            ):
+                _finish(proc, stderr_file, timeout=3)
+            elapsed = time.monotonic() - started
+            self.assertLess(
+                elapsed,
+                15.0,
+                f"DSEA: the wedged-child report must fire fast; took {elapsed:.1f}s",
+            )
+            self.assertIsNotNone(
+                proc.poll(),
+                "DSEA: the wedged child must be dead after the report (no orphans)",
+            )
+
+    def test_chatty_child_cannot_wedge_the_helper(self) -> None:
+        # Closeout A3: the child's stderr is a FILE, not a pipe — a child
+        # writing far more than a pipe buffer (256 KiB here) exits and is
+        # reaped normally, the full text still readable after the wait.
+        chatter = "x" * 256 * 1024
+        with tempfile.TemporaryFile() as stderr_file:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import sys; sys.stderr.write('x' * 262144)"],
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+            )
+            started = time.monotonic()
+            code, err = _finish(proc, stderr_file, timeout=30)
+            elapsed = time.monotonic() - started
+        self.assertEqual(code, 0, "DSEA: the chatty child exits 0")
+        self.assertEqual(
+            len(err), 256 * 1024,
+            f"DSEA: the full stderr must be captured; got {len(err)} bytes",
         )
-        self.addCleanup(proc.kill)  # no-op once _finish reaped it
-        started = time.monotonic()
-        with self.assertRaises(
-            AssertionError,
-            msg="DSEA: the wedged child must be killed and reported",
-        ):
-            _finish(proc, timeout=3)
-        elapsed = time.monotonic() - started
         self.assertLess(
             elapsed,
-            15.0,
-            f"DSEA: the wedged-child report must fire fast; took {elapsed:.1f}s",
-        )
-        self.assertIsNotNone(
-            proc.poll(),
-            "DSEA: the wedged child must be dead after the report (no orphans)",
+            20.0,
+            f"DSEA: a chatty child must not wedge the helper; took {elapsed:.1f}s",
         )
 
 
-
-def _finish(proc: subprocess.Popen, timeout: float = 120) -> tuple[int, str]:
+def _finish(proc: subprocess.Popen, stderr_file, timeout: float = 120) -> tuple[int, str]:
     """Kill the pipe, WAIT (bounded), then drain: stdout's read end closes
     FIRST (the dead-pipe shape under test), the wait is bounded (a wedged
     child is killed and reported — never a silent 30s stall and never an
-    orphan), and stderr is drained only AFTER the wait returns (the
-    child's few lines fit the pipe buffer; draining first would block on
-    a child that keeps its stderr open, which is exactly the ordering the
-    FB-10 probe discriminates)."""
+    orphan), and stderr — a TEMP FILE handle (closeout A3), so a child
+    writing more than any pipe buffer cannot wedge the parent — is read
+    only AFTER the wait returns."""
     proc.stdout.close()  # the reader goes away; the child's flush must stay quiet
     try:
         proc.wait(timeout=timeout)
@@ -205,10 +231,11 @@ def _finish(proc: subprocess.Popen, timeout: float = 120) -> tuple[int, str]:
         proc.kill()
         proc.wait(timeout=30)
         raise AssertionError("DSEA: the child did not exit (deadlock?)")
-    stderr = proc.stderr.read() if proc.stderr else b""
-    proc.stderr.close()
+    stderr_file.seek(0)
+    stderr = stderr_file.read()
     text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
     return proc.returncode, text
+
 
 if __name__ == "__main__":
     unittest.main()

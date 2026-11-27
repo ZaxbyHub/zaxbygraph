@@ -1,5 +1,8 @@
 """Review-feedback hardening tests for the issue #6 edge contract (PR #14
-swarm-pr-review round). These live in a NEW module because the four
+swarm-pr-review round), and — since PR #98 — the Stage-B feedback probes
+(FB-01 hint-probe caching, FB-07 README bundle wording, FB-15 retry
+negation, FB-17 clean-exit mapping) appended below the original classes.
+These live in a NEW module because the four
 checkpoint-frozen files (test_edges.py, test_migrations.py, test_extract.py,
 test_store.py) are byte-locked by the trace manifest — the counterparts these
 tests strengthen live there, and the manifest anchors whole-file blobs.

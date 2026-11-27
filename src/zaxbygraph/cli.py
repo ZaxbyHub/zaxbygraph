@@ -805,6 +805,13 @@ def _refresh_if_stale(args: argparse.Namespace, db_path: Path, slug: str | None)
         return False
     try:
         ro = open_existing(db_path)
+        # Closeout NF-1: the store opened — record the invocation context
+        # NOW (pre-refresh), so every _ReadFailure this probe raises later
+        # (held lock, refresh fault, environment guard, storage fault)
+        # carries the store's real freshness. A SUCCESSFUL refresh is
+        # still reported post-refresh: _open_for_read's own open below
+        # re-records over this with the fresh state.
+        _note_open(ro, slug, db_path)
     except RuntimeError as exc:
         raise _ReadFailure(2, str(exc), code_key="environment_guard")
     except sqlite3.DatabaseError as exc:

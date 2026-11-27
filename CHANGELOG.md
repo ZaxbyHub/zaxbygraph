@@ -31,7 +31,11 @@ digest is unchanged from 0.5.2).
   store's single stored repo (zero or several stored repos keep the null
   block). MCP failures get the same guarantee through per-call
   thread-local state (reset at the start of every `tools/call`, so no
-  stale identity leaks between calls or concurrent sessions). The README
+  stale identity leaks between calls or concurrent sessions). A `--max-age`
+  read whose refresh FAILS carries the same real freshness: the staleness
+  probe records the store the moment it opens, so the `refresh_failed` /
+  `environment_guard` refusals say what the store last synced instead of
+  the null block. The README
   now carries the one exit-contract table (branch on the envelope's `ok`),
   states the MCP bundle's defaults beside every payload-parity claim
   (a 4000-token answer budget and briefs always on, the budget overridable
