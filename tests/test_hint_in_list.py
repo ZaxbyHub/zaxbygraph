@@ -107,6 +107,23 @@ class TestHintInList(unittest.TestCase):
         self.assertEqual(out["rows"], [], "HIN-PRECOND8")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-8")
 
+    def test_text_inside_string_literals_is_never_scanned(self) -> None:
+        # Critic finding (PR #98 final head): the text scan must read SQL
+        # structure, not the contents of a string literal.
+        for tag, sql in (
+            ("HIN-9a", "SELECT number FROM items WHERE title LIKE '%kind = ''bug''%'"),
+            ("HIN-9b", "SELECT number FROM items WHERE title = 'a.' OR title = ' = kind'"),
+            ("HIN-9c", "SELECT number FROM items WHERE title = 'kind IN (''zzz'')'"),
+            ("HIN-9d", "SELECT number FROM items WHERE title = 'state == ''nope'''"),
+        ):
+            out, hints = self._hints(sql)
+            self.assertEqual(out["rows"], [], f"{tag}-PRECOND")
+            self.assertEqual(hints, [], tag)
+
+    def test_double_equals_reversed_and_aliased_hint(self) -> None:
+        _, hints = self._hints("SELECT i.number FROM items i WHERE 'pull_request' == i.kind")
+        self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-10")
+
     def test_equality_form_still_hints(self) -> None:
         _, hints = self._hints("SELECT number FROM items WHERE kind = 'pull_request'")
         self.assertEqual([h["literal"] for h in hints], ["pull_request"], "HIN-5")

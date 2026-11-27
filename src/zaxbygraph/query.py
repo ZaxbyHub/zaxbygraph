@@ -2203,6 +2203,21 @@ def _zero_row_hints(
     stripped = _strip_sql_comments(sql)
     if "'" not in stripped:
         return []
+    # `masked` has the same length as `stripped` with the CONTENT of every
+    # string and quoted identifier blanked, so the filter scan reads SQL
+    # structure and never text inside a literal (a LIKE pattern naming
+    # "kind = 'bug'" is not a filter on kind).
+    masked_parts: list[str] = []
+    for kind, text in _sql_tokens(sql):
+        if kind == "comment":
+            masked_parts.append(" ")
+        elif kind == "string" and text.startswith("'") and len(text) >= 2 and text.endswith("'"):
+            masked_parts.append("'" + "\x00" * (len(text) - 2) + "'")
+        elif kind == "string":
+            masked_parts.append("\x00" * len(text))
+        else:
+            masked_parts.append(text)
+    masked = "".join(masked_parts)
     schema = _store_schema(conn)
     if time.monotonic() >= deadline_at:
         # The pass runs only on a live deadline (PR #98 review P1): a hint
@@ -2254,24 +2269,34 @@ def _zero_row_hints(
         if owners == [table]:
             prefixes.append(rf"(?<![\w.]){re.escape(column)}")
         literals: list[str] = []
+
+        def _take(m: re.Match, group: int = 1) -> None:
+            # The match ran on `masked`; the literal text is read from the
+            # same span of `stripped`. An escaped member ('it''s') names no
+            # vocabulary value and is skipped rather than guessed.
+            raw = stripped[m.start(group): m.end(group)]
+            if "''" not in raw:
+                literals.append(raw)
+
         for prefix in prefixes:
-            for m in re.finditer(prefix + r"\s*==?\s*'([^']*)'", stripped, re.IGNORECASE):
-                if stripped[m.end(): m.end() + 1] == "'":
-                    continue  # the escaped 'it''s' prefix shape
-                literals.append(m.group(1))
+            for m in re.finditer(prefix + r"\s*==?\s*'([^']*)'", masked, re.IGNORECASE):
+                _take(m)
             # The reversed equality `'x' = col` names the same filter.
             for m in re.finditer(
-                r"(?<![\w'])'([^']*)'\s*==?\s*" + prefix + r"(?![\w(])",
-                stripped,
+                r"(?<![\w'\x00])'([^']*)'\s*==?\s*" + prefix + r"(?![\w(])",
+                masked,
                 re.IGNORECASE,
             ):
-                literals.append(m.group(1))
+                _take(m)
             # IN-lists (AC14 is not limited to equality): only a list made
             # solely of quoted literals is read; a subquery or an escaped
             # member contributes nothing rather than a guess.
-            for m in re.finditer(prefix + r"\s+IN\s*\(([^()]*)\)", stripped, re.IGNORECASE):
+            for m in re.finditer(prefix + r"\s+IN\s*\(([^()]*)\)", masked, re.IGNORECASE):
                 if re.fullmatch(r"\s*'[^']*'(?:\s*,\s*'[^']*')*\s*", m.group(1)):
-                    literals.extend(re.findall(r"'([^']*)'", m.group(1)))
+                    for lit in re.finditer(r"'([^']*)'", m.group(1)):
+                        raw = stripped[m.start(1) + lit.start(1): m.start(1) + lit.end(1)]
+                        if "''" not in raw:
+                            literals.append(raw)
         for raw in literals:
             literal = raw[:_SQL_CELL_CAP]
             if literal in valid:

@@ -191,6 +191,22 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
                 "DSEA: the wedged child must be dead after the report (no orphans)",
             )
 
+    def test_real_child_helper_survives_a_chatty_stderr(self) -> None:
+        # PR #98 pass 3: the same chatty shape through the REAL
+        # _child_dead_stdout construction (a child that writes 256 KiB to
+        # stderr before main() runs), so changing the caller's stderr
+        # destination to a pipe wedges the bounded wait and fails here.
+        code, err = self._child_dead_stdout(
+            ["where", "--repo", "acme/nosuch", "--format", "json"],
+            prelude="import sys; sys.stderr.write('x' * 262144)\n",
+        )
+        self.assertEqual(code, 0, f"DSEA: chatty real child exits 0; got {code}")
+        self.assertGreaterEqual(
+            err.count("x"),
+            256 * 1024,
+            "DSEA: the full chatty stderr must be captured by the real helper",
+        )
+
     def test_chatty_child_cannot_wedge_the_helper(self) -> None:
         # Closeout A3: the child's stderr is a FILE, not a pipe — a child
         # writing far more than a pipe buffer (256 KiB here) exits and is
