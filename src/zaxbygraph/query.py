@@ -2245,37 +2245,45 @@ def _zero_row_hints(
             continue
         refs: list[str] = [table]
         refs.extend(alias for alias, target in aliases.items() if target == table)
-        patterns = [
-            rf"\b{re.escape(ref)}\s*\.\s*{re.escape(column)}\s*=\s*'([^']*)'"
-            for ref in refs
+        prefixes = [
+            rf"\b{re.escape(ref)}\s*\.\s*{re.escape(column)}" for ref in refs
         ]
         # A bare reference is attributed only when this table alone in
         # scope owns the column (mirrors _vocabulary_warnings).
         owners = [t for t in scope if column in schema.get(t, ())]
         if owners == [table]:
-            patterns.append(rf"(?<![\w.]){re.escape(column)}\s*=\s*'([^']*)'")
-        for pattern in patterns:
-            for m in re.finditer(pattern, stripped, re.IGNORECASE):
+            prefixes.append(rf"(?<![\w.]){re.escape(column)}")
+        literals: list[str] = []
+        for prefix in prefixes:
+            for m in re.finditer(prefix + r"\s*=\s*'([^']*)'", stripped, re.IGNORECASE):
                 if stripped[m.end(): m.end() + 1] == "'":
                     continue  # the escaped 'it''s' prefix shape
-                literal = m.group(1)[:_SQL_CELL_CAP]
-                if literal in valid:
-                    continue
-                key = (f"{table}.{column}", literal)
-                if key in seen:
-                    continue
-                seen.add(key)
-                stored = _stored(table, column)
-                if stored is None:
-                    continue
-                hints.append(
-                    {
-                        "column": f"{table}.{column}",
-                        "literal": literal,
-                        "stored_values": list(stored),
-                        "valid_values": list(valid),
-                    }
-                )
+                literals.append(m.group(1))
+            # IN-lists (AC14 is not limited to equality): only a list made
+            # solely of quoted literals is read; a subquery or an escaped
+            # member contributes nothing rather than a guess.
+            for m in re.finditer(prefix + r"\s+IN\s*\(([^()]*)\)", stripped, re.IGNORECASE):
+                if re.fullmatch(r"\s*'[^']*'(?:\s*,\s*'[^']*')*\s*", m.group(1)):
+                    literals.extend(re.findall(r"'([^']*)'", m.group(1)))
+        for raw in literals:
+            literal = raw[:_SQL_CELL_CAP]
+            if literal in valid:
+                continue
+            key = (f"{table}.{column}", literal)
+            if key in seen:
+                continue
+            seen.add(key)
+            stored = _stored(table, column)
+            if stored is None:
+                continue
+            hints.append(
+                {
+                    "column": f"{table}.{column}",
+                    "literal": literal,
+                    "stored_values": list(stored),
+                    "valid_values": list(valid),
+                }
+            )
     return hints
 
 
