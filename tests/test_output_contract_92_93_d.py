@@ -35,13 +35,14 @@ import unittest
 from pathlib import Path
 
 import zaxbygraph
+import os
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402

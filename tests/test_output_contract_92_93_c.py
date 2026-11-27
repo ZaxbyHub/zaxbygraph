@@ -54,13 +54,14 @@ import unittest
 from pathlib import Path
 
 import zaxbygraph
+import os
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402
@@ -343,80 +344,64 @@ class TestAc10SuccessSchemaSweep(_SweepCase):
         )
 
     def test_validator_rejects_vacuous_and_wrong_envelopes(self) -> None:
-        # (2)+(6) SELF-TEST of the check itself: the falsifier must reject a
-        # vacuous schema and every named mutation, and the validator must
-        # reject an obviously wrong envelope against a real schema — a
-        # mutation-style guard that this sweep cannot pass itself on an
-        # empty declaration.
-        registry = self._registry()
-        self.assertTrue(registry, "OC-AC10: fixture sanity: the registry is non-empty")
-        vacuous = {"type": "object", "properties": {}, "required": []}
-        defects = schema_defects(vacuous, "selftest", ["number"], "object")
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the schema-defect falsifier must REJECT a"
-            f" vacuous schema (empty properties, empty required); got {defects!r}",
-        )
-        defects = schema_defects(
-            {"type": "object", "properties": {"data": {}}, "required": ["ok"]},
-            "selftest", ["number"], "object",
-        )
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the falsifier must reject an empty data"
-            f" declaration and a truncated required list; got {defects!r}",
-        )
-        # (6-i) a list items schema with no type/properties is REJECTED, and
-        # list-row properties omitting the declared row fields are rejected.
-        defects = schema_defects(
-            {"type": "object", "properties": {"data": {"type": "array", "items": {"description": "x"}}}, "required": ["ok"]},
-            "selftest", ["path", "prs"], "list",
-        )
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the falsifier must reject a list items schema"
-            f" without type/properties ({{'description': 'x'}}); got {defects!r}",
-        )
-        defects = schema_defects(
-            {"type": "object", "properties": {"data": {"type": "array", "items": {"type": "object", "properties": {"unrelated": {"type": "string"}}}}}, "required": ["ok"]},
-            "selftest", ["path", "prs"], "list",
-        )
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the falsifier must reject list-row properties"
-            f" that omit the declared row fields; got {defects!r}",
-        )
-        # (6-ii) empty declared data_keys is a defect for EVERY command.
-        defects = schema_defects(
-            {"type": "object", "properties": {"data": {"type": "object", "properties": {"number": {"type": "integer"}}}}, "required": ["ok"]},
-            "selftest", [], "object",
-        )
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the falsifier must reject empty declared"
-            f" data_keys; got {defects!r}",
-        )
-        # (6-iii) an error object without required string code/message, and a
-        # schema with NO error declaration, are rejected.
-        defects = schema_defects(
-            {"type": "object", "properties": {"error": {"type": ["object", "null"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}, "required": ["ok"]},
-            "selftest", ["number"], "object",
-        )
-        self.assertTrue(
-            defects,
-            "OC-AC10: SELF-TEST: the falsifier must reject an error object"
-            f" without required string code/message; got {defects!r}",
-        )
-        no_error = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}
-        self.assertTrue(
-            schema_defects(no_error, "selftest", ["number"], "object"),
-            "OC-AC10: SELF-TEST: the falsifier must reject a schema with NO error declaration",
-        )
+        # (2)+(6) SELF-TEST of the check itself: the falsifier must reject
+        # every vacuous/named-mutant schema, and the validator must reject
+        # an obviously wrong envelope against a real schema.
+        self.assertTrue(self._registry(), "OC-AC10: fixture sanity: the registry is non-empty")
+        for note, mutated, keys, kind in (
+            ("a vacuous schema (empty properties, empty required)", {"type": "object", "properties": {}, "required": []}, ["number"], "object"),
+            ("an empty data declaration and truncated required", {"type": "object", "properties": {"data": {}}, "required": ["ok"]}, ["number"], "object"),
+            ("list items without type/properties", {"type": "object", "properties": {"data": {"type": "array", "items": {"description": "x"}}}, "required": ["ok"]}, ["path", "prs"], "list"),
+            ("list rows omitting the declared fields", {"type": "object", "properties": {"data": {"type": "array", "items": {"type": "object", "properties": {"unrelated": {"type": "string"}}}}}, "required": ["ok"]}, ["path", "prs"], "list"),
+            ("empty declared data_keys", {"type": "object", "properties": {"data": {"type": "object", "properties": {"number": {"type": "integer"}}}}, "required": ["ok"]}, [], "object"),
+            ("an error object without required code/message", {"type": "object", "properties": {"error": {"type": ["object", "null"], "properties": {"code": {"type": "string"}, "message": {"type": "string"}}}}, "required": ["ok"]}, ["number"], "object"),
+            ("a schema with NO error declaration", {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"]}, ["number"], "object"),
+        ):
+            defects = schema_defects(mutated, "selftest", keys, kind)
+            self.assertTrue(defects, f"OC-AC10: SELF-TEST: the falsifier must reject {note}; got {defects!r}")
+        problems = wrong_envelope_rejections()
         self.assertFalse(
-            wrong_envelope_rejections(),
+            problems,
             "OC-AC10: SELF-TEST: the validator must reject every obviously"
-            " wrong envelope against the real registry schema:\n- "
-            + "\n- ".join(wrong_envelope_rejections()),
+            f" wrong envelope against the real registry schema:\n- " + "\n- ".join(problems),
+        )
+
+    def test_open_rows_with_null_identity_fields_validate(self) -> None:
+        # ROUND 5 (review F-2): a synced store can hold open items whose
+        # author/html_url/updated_at are NULL; the real `open` envelope
+        # must still validate against the emitted `schema --output open`
+        # schema (those fields are genuinely nullable, so the declaration
+        # must type them ["string", "null"]).
+        from zaxbygraph.db import connect as _connect
+
+        conn = _connect(self.db)
+        try:
+            conn.execute(
+                "UPDATE items SET author = NULL, html_url = NULL,"
+                " updated_at = NULL WHERE repo = ? AND number = 1 AND"
+                " state = 'open'",
+                (REPO,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        schema = self._declared_schema("open")
+        code, out, err = run_cli(["open", *self.base])
+        self.assertEqual(code, 0, f"OC-AC10: the NULL-identity open read must succeed: {err[:160]}")
+        env = parse_envelope(self, out, "OC-AC10")
+        self.assertIs(env.get("ok"), True, f"OC-AC10: the NULL-identity open read must answer ok:true; got {env.get('error')!r}")
+        rows = env.get("data") or []
+        nulled = [row for row in rows if row.get("number") == 1]
+        self.assertTrue(
+            nulled and all(nulled[0].get(key) is None for key in ("author", "html_url", "updated_at")),
+            f"OC-AC10: fixture sanity: the NULLed row must ride the open answer; got {nulled!r}",
+        )
+        errors: list = []
+        validate(schema, env, "open-null-identity", errors)
+        self.assertFalse(
+            errors,
+            "OC-AC10: the real open envelope with NULL author/html_url/"
+            f"updated_at must validate against the emitted schema: {errors[:6]}",
         )
 
     def test_amendment_negative_selftests(self) -> None:

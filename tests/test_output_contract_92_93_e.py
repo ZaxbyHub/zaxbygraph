@@ -3,14 +3,14 @@ argv TestCase here; the sweep classes keep their frozen dotted ids inside
 test_output_contract_92_93_c.py).
 
 Contents: the union-aware validator (unrecognized type names are ERRORS),
-the schema-defect falsifier (a vacuous emitted schema is a defect, never a
-pass; round 3: the error object required unconditionally, list rows typed
-object; round 4: items typed object whenever the data schema permits an
-array, array properties must type their items), the negative-selftest
-helpers, and the pinned per-command production tables. The hermetic seed,
-the envelope parser, the gh seams, the dead-stream runners and the
-valid-schema fixtures live in test_output_contract_92_93_f.py and are
-re-exported below. Hermetic, offline; failures carry OC-ACn tags.
+the schema-defect falsifier (a vacuous emitted schema is a defect — round
+3: error required unconditionally, list rows typed object; round 4: items
+typed object whenever the data schema permits an array, array properties
+type their items; round 5/F-5: items.properties non-empty and typed), the
+negative-selftest helpers, and the pinned per-command production tables.
+The hermetic seeds, the parser, the gh seams, the dead-stream runners, the
+valid-schema fixtures and the round-5 C3 sub-leg helpers live in _f.py and
+are re-exported below. Hermetic, offline; failures carry OC-ACn tags.
 """
 
 from __future__ import annotations
@@ -21,13 +21,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import zaxbygraph
+import os
 
 _WORKTREE = Path(__file__).resolve().parents[1]
 if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402  (the sweep tables key on the slug)
@@ -35,9 +36,11 @@ from test_output_contract_92_93_f import (  # noqa: E402,F401  (re-exported help
     CANONICAL_VOCABULARIES, DEAD_PIPE_FAILURES, OTHER_REPO, RELEASE_TOKEN,
     VALID_ITEM_UNION_SCHEMA, VALID_LIST_SCHEMA, VALID_OBJECT_SCHEMA,
     DeadFlushStream, DeadGh, StoreCase, dead_flush_and_success_render_problems,
-    hint_problems, live_gh_seam, parse_envelope, readme_json_fences,
-    resolve_leg_arg, run_with_dead_flush, run_with_dead_stdout, seed_corpus,
-    seed_multi_repo_store, seed_zero_repo_store,
+    hint_problems, live_gh_seam, parse_envelope,
+    preopen_null_freshness_problems, readme_json_fences,
+    repo_filter_freshness_problems, resolve_leg_arg, run_with_dead_flush,
+    run_with_dead_stdout, seed_corpus, seed_multi_repo_store,
+    seed_zero_repo_store,
 )
 
 # The union-aware validator, HARDENED (critic round 1): an unrecognized
@@ -214,66 +217,45 @@ def schema_defects(schema, command: str, declared_data_keys, data_kind: str) -> 
                     f" carries items, regardless of data_kind); got"
                     f" {items.get('type')!r}"
                 )
+            # ROUND 5 (review F-5): whenever the data schema carries items,
+            # the row properties must be non-empty and every emitted row
+            # property must be a real (typed) declaration.
+            row_props = items.get("properties")
+            if not isinstance(row_props, dict) or not row_props:
+                defects.append(
+                    f"{command}: data.items.properties is empty — the row objects"
+                    " are not described (round 5, review F-5: whenever the data"
+                    " schema carries items, regardless of data_kind)"
+                )
+            else:
+                untyped_rows = sorted(k for k, p in row_props.items() if not _real_declaration(p))
+                if untyped_rows:
+                    defects.append(f"{command}: data.items.properties emits untyped row properties (round 5, review F-5): {untyped_rows}")
+    def _prop_defects(props: dict, where: str) -> None:
+        untyped_arrays = [k for k in declared_data_keys if _array_items_untyped(props.get(k))]
+        if untyped_arrays:
+            defects.append(f"{command}: {where} permits arrays without typing their items (round 4 sweep): {untyped_arrays}")
+        undescribed = [k for k in declared_data_keys if not _real_declaration(props.get(k))]
+        if undescribed:
+            defects.append(f"{command}: {where} does not describe the declared fields {undescribed} with real types")
+
     if data_kind == "list":
         if "array" not in names:
-            defects.append(
-                f"{command}: a list-kind payload must declare data as an array; declared type {data.get('type')!r}"
-            )
+            defects.append(f"{command}: a list-kind payload must declare data as an array; declared type {data.get('type')!r}")
         row_props = (data.get("items") or {}) if isinstance(data.get("items"), dict) else {}
         row_props = row_props.get("properties")
         if not isinstance(row_props, dict) or not row_props:
-            defects.append(
-                f"{command}: data.items.properties is empty — the declared row"
-                " fields are not described with real types"
-            )
+            defects.append(f"{command}: data.items.properties is empty — the declared row fields are not described with real types")
         else:
-            untyped_arrays = [
-                key for key in declared_data_keys
-                if _array_items_untyped(row_props.get(key))
-            ]
-            if untyped_arrays:
-                defects.append(
-                    f"{command}: data.items.properties permits arrays without"
-                    f" typing their items (round 4 sweep): {untyped_arrays}"
-                )
-            undescribed = [
-                key for key in declared_data_keys
-                if not _real_declaration(row_props.get(key))
-            ]
-            if undescribed:
-                defects.append(
-                    f"{command}: data.items.properties does not describe the"
-                    f" declared row fields {undescribed} with real types"
-                )
+            _prop_defects(row_props, "data.items.properties")
     else:
         if "object" not in names:
-            defects.append(
-                f"{command}: an object-kind payload must declare data as an object; declared type {data.get('type')!r}"
-            )
+            defects.append(f"{command}: an object-kind payload must declare data as an object; declared type {data.get('type')!r}")
         data_props = data.get("properties")
         if not isinstance(data_props, dict) or not data_props:
-            defects.append(
-                f"{command}: data.properties is empty — the declared data keys are not described with real types"
-            )
+            defects.append(f"{command}: data.properties is empty — the declared data keys are not described with real types")
         else:
-            untyped_arrays = [
-                key for key in declared_data_keys
-                if _array_items_untyped(data_props.get(key))
-            ]
-            if untyped_arrays:
-                defects.append(
-                    f"{command}: data.properties permits arrays without typing"
-                    f" their items (round 4 sweep): {untyped_arrays}"
-                )
-            undescribed = [
-                key for key in declared_data_keys
-                if not _real_declaration(data_props.get(key))
-            ]
-            if undescribed:
-                defects.append(
-                    f"{command}: data.properties does not describe the declared"
-                    f" data keys {undescribed} with real types"
-                )
+            _prop_defects(data_props, "data.properties")
     return defects
 
 
@@ -322,11 +304,15 @@ def amendment_selftest_problems() -> list:
     row_typeless = {**VALID_LIST_SCHEMA, "properties": {**VALID_LIST_SCHEMA["properties"], "data": {**list_data, "items": {k: v for k, v in list_data["items"].items() if k != "type"}}}}
     union_typeless = {**VALID_ITEM_UNION_SCHEMA, "properties": {**VALID_ITEM_UNION_SCHEMA["properties"], "data": {**union_data, "items": {k: v for k, v in union_data["items"].items() if k != "type"}}}}
     array_untyped = {**VALID_LIST_SCHEMA, "properties": {**VALID_LIST_SCHEMA["properties"], "data": {**list_data, "items": {**list_data["items"], "properties": {"path": {"type": "string"}, "prs": {"type": "array"}}}}}}
+    union_rows_emptied = {**VALID_ITEM_UNION_SCHEMA, "properties": {**VALID_ITEM_UNION_SCHEMA["properties"], "data": {**union_data, "items": {"type": "object", "properties": {}}}}}
+    union_row_untyped = {**VALID_ITEM_UNION_SCHEMA, "properties": {**VALID_ITEM_UNION_SCHEMA["properties"], "data": {**union_data, "items": {"type": "object", "properties": {"number": {"description": "x"}}}}}}
     for note, mutated, keys, kind, needle in (
         ("missing error", no_error, ["number", "title"], "object", "error"),
         ("row type removed", row_typeless, ["path", "prs"], "list", "type object"),
         ("item-union row type removed", union_typeless, ["number"], "object", "type object"),
         ("untyped array property", array_untyped, ["path", "prs"], "list", "without typing their items"),
+        ("item-union row properties emptied", union_rows_emptied, ["number"], "object", "data.items.properties is empty"),
+        ("item-union untyped row property", union_row_untyped, ["number"], "object", "untyped row"),
     ):
         defects = schema_defects(mutated, "selftest", keys, kind)
         if not defects or not any(needle in d for d in defects):
@@ -371,6 +357,8 @@ def wrong_envelope_rejections() -> list:
         if not errors:
             problems.append(f"the validator must reject the obviously wrong envelope ({label}); it passed!")
     return problems
+
+
 
 
 SUCCESS_CALLS: dict[str, tuple[list[str], bool, str]] = {
@@ -494,6 +482,4 @@ OPENCODE_CONFIG = {
         "servers": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}
     }
 }
-ZCODE_CONFIG_PATH = "~/.zcode/cli/config.json"
-OPENCODE_CONFIG_PATH = "opencode.json"
 

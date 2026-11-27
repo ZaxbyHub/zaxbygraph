@@ -33,6 +33,7 @@ writes outside temp roots. Stdlib only; unittest; Windows + Linux.
 from __future__ import annotations
 
 import copy
+import os
 import json
 import tempfile
 import unittest
@@ -45,7 +46,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"SAIT-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402
@@ -89,10 +90,10 @@ def array_items_defects(schema, path: str, stats: dict) -> list:
                 f" its rows type object; got {items!r}"
             )
 
-    def walk(node, at: str) -> None:
+    def walk(node, at: str, in_properties: bool = False) -> None:
         if isinstance(node, list):
             for index, child in enumerate(node):
-                walk(child, f"{at}[{index}]")
+                walk(child, f"{at}[{index}]", in_properties)
             return
         if not isinstance(node, dict):
             return
@@ -115,9 +116,13 @@ def array_items_defects(schema, path: str, stats: dict) -> list:
                     f"{at}.items: items must declare a real type; got {items!r}"
                 )
         for key, child in node.items():
-            if key in _NON_SCHEMA_KEYS:
+            if key in _NON_SCHEMA_KEYS and not in_properties:
+                # PR #98 review P11: a key with a non-schema NAME still
+                # carries schema when its parent is a `properties` map —
+                # a property may be named "description". Only skip these
+                # names where they are actual annotations.
                 continue
-            walk(child, f"{at}.{key}" if at else key)
+            walk(child, f"{at}.{key}" if at else key, in_properties=key == "properties")
 
     walk(schema, path)
     return defects
@@ -213,6 +218,29 @@ class TestSchemaArrayItemsTyped(_SeededStoreCase):
             any("data.items.properties.labels" in p for p in problems),
             f"SAIT: SELF-TEST — the labels items mutation (the round-5"
             f" survivor) must be rejected naming the path; got {problems!r}",
+        )
+
+    def test_property_named_description_is_still_walked(self) -> None:
+        # PR #98 review P11: `description` is a schema ANNOTATION name, but
+        # a property NAMED description inside a properties map is a real
+        # declaration — an array-typed one without items must be flagged.
+        schema = {
+            "type": "object",
+            "properties": {
+                "data": {
+                    "type": "object",
+                    "properties": {"description": {"type": "array"}},
+                }
+            },
+        }
+        problems = array_items_defects(schema, "selftest", {"visited": 0})
+        self.assertTrue(
+            any(
+                "data.properties.description" in p and "items" in p
+                for p in problems
+            ),
+            f"SAIT: SELF-TEST — an array property named 'description' with"
+            f" no items must be rejected naming the path; got {problems!r}",
         )
 
 

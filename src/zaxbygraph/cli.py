@@ -967,6 +967,7 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
         # Explicit no-filter: open whatever file was named, guards skipped.
         try:
             conn = open_existing(db_path)
+            _note_open(conn, None, db_path)
         except FileNotFoundError:
             raise _ReadFailure(
                 3,
@@ -985,11 +986,15 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
                 1, f"no database at {db_path}: {exc}",
                 code_key="store_unreadable",
             )
-        _note_open(conn, None, db_path)
         return conn, None, db_path
     slug = repo
     try:
         conn = open_existing(db_path)
+        # PR #98 review P5: recorded the moment the open succeeds, BEFORE
+        # any guard below can refuse — a guard refusal (mismatched casing,
+        # no-corpus) is still a post-open failure whose envelope deserves
+        # the opened store's identity/freshness.
+        _note_open(conn, slug, db_path)
     except FileNotFoundError:
         raise _ReadFailure(
             3,
@@ -1062,7 +1067,6 @@ def _open_for_read(args: argparse.Namespace) -> tuple[sqlite3.Connection, str | 
     except BaseException:
         conn.close()
         raise
-    _note_open(conn, slug, db_path)
     return conn, slug, db_path
 
 
@@ -1188,6 +1192,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
             freshness=fresh,
         )
         return 1
+    # PR #98 review P6: the store is open and schema-checked — record the
+    # invocation context so an unexpected exception from here on (the lock
+    # section, the sync itself) keeps the catch-all's db/repo identity and
+    # the freshness captured at open.
+    _note_open(conn, slug, db_path)
     lock: SyncLock | None = None
     try:
         lock = acquire_sync_lock(db_path, wait=bool(getattr(args, "wait", False)))
@@ -2681,6 +2690,9 @@ def cmd_init(args: argparse.Namespace) -> int:
             freshness=fresh,
         )
         return 1
+    # PR #98 review P6: mirror cmd_sync — record the invocation context so
+    # an unexpected exception from here on keeps the catch-all's identity.
+    _note_open(conn, slug, db_path)
     lock: SyncLock | None = None
     try:
         lock = acquire_sync_lock(db_path, wait=False)
@@ -3677,7 +3689,13 @@ def _full_envelope_schema(command: str) -> dict:
                 row_props[field] = {"type": "array", "items": {"type": "string"}}
             elif field == "linked_open_prs":
                 row_props[field] = {"type": "array", "items": {"type": "integer"}}
+            elif field in ("author", "html_url", "updated_at"):
+                # PR #98 review P7: genuinely nullable columns (schema.sql
+                # leaves them without NOT NULL) — a ghost/legacy row with
+                # NULL identity fields must still validate.
+                row_props[field] = {"type": ["string", "null"]}
             else:
+                # state is NOT NULL in schema.sql; title/kind/repo too.
                 row_props[field] = {"type": "string"}
         data_schema = {
             "type": ["array", "null"],
@@ -4498,12 +4516,19 @@ def _runtime_catchall(args: argparse.Namespace, exc: Exception) -> int:
         "code": "runtime",
         "message": f"{type(exc).__name__}: {exc}",
     }
+    freshness = _INVOCATION.get("freshness")
+    if getattr(args, "_refreshed", False) and freshness is not None:
+        # PR #98 review P8: a --max-age refresh that ran keeps its marker
+        # in the catch-all exactly as emit_result merges it — the fault
+        # happened after a refresh this invocation performed, and hiding
+        # that would understate what ran.
+        freshness = {**freshness, "refreshed": True}
     env = build_envelope(
         None,
         slug=_INVOCATION.get("repo"),
         db_path=_INVOCATION.get("db"),
         error=error,
-        freshness=_INVOCATION.get("freshness"),
+        freshness=freshness,
     )
     try:
         _echo_stderr(f"error: {error['message']}")

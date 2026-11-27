@@ -1,54 +1,39 @@
 """Acceptance checks for issue-trace 92-93-output-contract-honesty (issues
-#92+#93, decisions D5/D6/D7/D9), amended after plan-critic rounds 1-2.
-Companions: _92_93.py (D1-D3), _d.py (D4), _c.py (D8), contract data in
-_e.py, runtime helpers in _f.py. Pinned decisions:
+#92+#93, decisions D5/D6/D7/D9), amended through plan-critic rounds 1-2
+and review wave 5. Companions: _92_93.py (D1-D3), _d.py (D4), _c.py (D8),
+contract data in _e.py, runtime helpers in _f.py. Pinned decisions:
 
-- D5 (AC6) EXACT snippets, independent of production strings:
-  MCP_REGISTRATION_SNIPPETS[client] is a str -- claude is the unchanged
-  command line `claude mcp add zaxbygraph -- zaxbygraph mcp`; zcode and
-  opencode are JSON strings parsing to {"mcp": {"servers": {"zaxbygraph":
-  {...stdio / local command...}}}} (opencode per the current official
-  docs shape; README's old mcp.<name> shape is replaced). Healthy `init`,
-  JOINED `init` (joins a running sync) and `doctor` all carry
-  data['mcp_clients'] equal to the snippets; init's existing `mcp` key
-  stays the unchanged Claude line (PRESERVING). README fidelity: the
-  registration section's fenced JSON blocks must EQUAL the pinned zcode
-  and opencode config objects, the stale mcp.<name> shape must be ABSENT,
-  the claude command appears verbatim, and all three clients are named
-  (the target config file may be stated in prose; no path registry).
-- D6 (AC12): every envelope carries "version": "0.3" -- a string equal to
-  cli.ENVELOPE_VERSION -- on CLI json success/failure/usage-error, CLI
-  compact, and MCP success/failure; jsonl list payloads print rows only
-  and must simply keep parsing.
+- D5 (AC6) EXACT snippets, independent of production strings: claude is
+  the unchanged command line; zcode/opencode are JSON strings parsing to
+  the mcp.servers.zaxbygraph shapes. Healthy init, JOINED init and doctor
+  carry data['mcp_clients'] == the snippets; init's `mcp` key stays the
+  Claude line (PRESERVING; round 5: the endswith('init') pin actually
+  runs now). README fidelity (round 5: the section slice is BOUNDED at
+  the next level-2 heading): the registration section's fenced JSON
+  blocks EQUAL the pinned configs, the stale mcp.<name> shape is ABSENT,
+  the claude command appears verbatim, all three clients are named.
+- D6 (AC12): every envelope carries "version": "0.3" == cli.ENVELOPE_VERSION
+  (CLI json success/failure/usage-error, compact, MCP both ways; jsonl
+  rows keep parsing).
 - D7 (AC13): _ENVELOPE_KEYS includes "version"; every tool's outputSchema
-  -- from BOTH the module registry and the ADVERTISED tools/list of a
-  live session -- lists "version" in required and declares it a string;
-  all existing envelope keys retained (PRESERVING).
-- D9 (AC14): zero-row out-of-vocabulary reads answer an annotate-only
-  "hints" key ({column, literal, stored_values, valid_values});
-  valid_values is the CANONICAL closed set (items.kind -> [issue, pr],
-  items.state -> [open, closed], comments.kind ->
-  [issue_comment, review_comment]), compared as sets, independent of
-  stored rows. The hint fires on zero rows + a literal outside the
-  canonical set on CLI sql AND MCP sql INCLUDING an empty-table corpus;
-  no hint when rows are non-empty (incl. a mixed OR query) or the literal
-  is valid; `warnings` unchanged (PRESERVING). Filtered reads refuse
-  rather than answer zero rows silently: `open --kind pull_request`
-  (CLI, at parse) and query.open_items(kind=...) raise (executed
-  directly); MCP open_items exposes NO kind filter, so an invalid literal
-  cannot reach it -- no MCP leg by design. Both the emitted CLI
-  `schema --output sql` schema and the MCP sql outputSchema must DECLARE
-  an optional hints array (items require column, literal, stored_values,
-  valid_values).
+  (registry AND advertised tools/list) requires it as a string; existing
+  keys retained (PRESERVING).
+- D9 (AC14): zero-row out-of-vocabulary reads answer the annotate-only
+  "hints" key; valid_values EQUALS the CANONICAL closed set in production
+  order (round 5: items.state is [open, closed, deleted, transferred] —
+  sync._mark_gone writes the extra two). The hint fires on zero rows + a
+  literal outside the canonical set, INCLUDING the empty literal ('',
+  round 5) and empty-table corpora, on CLI sql AND MCP sql; no hint when
+  rows are non-empty or the literal is valid (round 5: deleted/
+  transferred are valid); `warnings` unchanged (PRESERVING). Filtered
+  reads refuse (`open --kind` at parse; query.open_items raises; MCP
+  open_items has no kind filter — no MCP leg by design). Both surfaces
+  DECLARE the optional typed hints array (see _f).
 - D9 (AC15): in-vocabulary behavior stays byte-identical to base
-  (tests.test_query + tests.test_search still pass) plus exact-row pins:
-  a valid literal matching zero rows answers rows == [] with NO hints
-  key, and one matching rows answers the exact expected row list.
+  (tests.test_query + tests.test_search green) plus exact-row pins.
 
 Hermetic: FakeGitHubSource, tempfile stores, patched seams; no network,
-no gh, no writes outside temp roots. Stdlib only; unittest. Every failure
-message carries a distinctive single-line tag (OC-AC5 / OC-AC6 / OC-AC12 /
-OC-AC13 / OC-AC14 / OC-AC15).
+no gh. Failures carry OC-AC5/6/12/13/14/15 tags.
 """
 
 from __future__ import annotations
@@ -69,7 +54,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO, FakeGitHubSource, issue  # noqa: E402
@@ -84,6 +69,33 @@ from zaxbygraph import cli as cli_mod  # noqa: E402
 
 _NO_REFRESH_S = 10**9
 
+
+def registration_readme_problems(readme: str) -> list:
+    """The README registration-section fidelity problems (round 5, cubic
+    #14: the slice is BOUNDED at the next level-2 heading, so fences that
+    moved to a later section are missing here and stale shapes in later
+    sections never flag)."""
+
+    match = re.search(r"^## MCP server\s*$", readme, re.M)
+    section = re.split(r"^## ", readme[match.end():], maxsplit=1, flags=re.M)[0] if match else ""
+    problems: list = []
+    low = re.sub(r"\s+", " ", section).lower()
+    for client in ("claude", "zcode", "opencode"):
+        if client not in low:
+            problems.append(f"the README MCP registration guidance must name the {client!r} client")
+    if CLAUDE_SNIPPET not in section:
+        problems.append(f"the README must carry the claude command verbatim: {CLAUDE_SNIPPET!r}")
+    fences = readme_json_fences(section)
+    for client, expected in (("zcode", ZCODE_CONFIG), ("opencode", OPENCODE_CONFIG)):
+        if not any(fence == expected for fence in fences):
+            problems.append(f"the README registration section must carry a fenced JSON block exactly equal to the {client} config {json.dumps(expected)}; parsed blocks: {fences}")
+    for fence in fences:
+        mcp_block = fence.get("mcp")
+        if isinstance(mcp_block, dict) and "servers" not in mcp_block:
+            problems.append(f"the stale opencode shape (mcp.<name> without the servers level) must be ABSENT from the README; found {json.dumps(fence)}")
+    return problems
+
+
 class _StoreCase(unittest.TestCase):
     def setUp(self) -> None:
         self._td = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -97,10 +109,7 @@ class _StoreCase(unittest.TestCase):
     def _mcp(self):
         from test_output_contract_92_93_f import NoopRunner
 
-        session = McpSession(
-            self, cwd=str(self.root), repo=REPO, db=str(self.db),
-            stale_after_s=_NO_REFRESH_S, sync_runner=NoopRunner(),
-        )
+        session = McpSession(self, cwd=str(self.root), repo=REPO, db=str(self.db), stale_after_s=_NO_REFRESH_S, sync_runner=NoopRunner())
         self.addCleanup(session.stop)
         session.initialize()
         return session
@@ -114,8 +123,7 @@ class TestAc6RegistrationSnippets(_StoreCase):
         snippets = getattr(cli_mod, "MCP_REGISTRATION_SNIPPETS", None)
         self.assertIsInstance(
             snippets, dict,
-            "OC-AC6: cli must expose MCP_REGISTRATION_SNIPPETS as a dict"
-            f" mapping client key -> command/config string; got {snippets!r}",
+            f"OC-AC6: cli must expose MCP_REGISTRATION_SNIPPETS as a dict of client -> command/config string; got {snippets!r}",
         )
         problems: list[str] = []
         low_keys = {str(key).lower() for key in (snippets or {})}
@@ -137,7 +145,7 @@ class TestAc6RegistrationSnippets(_StoreCase):
                 except ValueError:
                     parsed = None
                 if parsed != expected:
-                    problems.append(f"the {client} snippet must be a JSON string parsing to {json.dumps(expected)}; got {value!r} (parsed {parsed!r})")
+                    problems.append(f"the {client} snippet must parse to {json.dumps(expected)}; got {value!r} (parsed {parsed!r})")
         # Healthy init (offline), JOINED init (joins a running sync), and
         # doctor: all three payloads carry mcp_clients == the shared dict;
         # the init `mcp` key stays the Claude line (PRESERVING).
@@ -162,7 +170,7 @@ class TestAc6RegistrationSnippets(_StoreCase):
             ("joined init", ["init", "--repo", REPO, "--db", str(self.db), "--format", "json"], True),
             ("doctor", ["doctor", *self.base], False),
         ):
-            saved_gh, saved_core, saved_lock = claims_mod.run_gh, getattr(cli_mod, "_sync_core", None), cli_mod.acquire_sync_lock
+            saved = (claims_mod.run_gh, getattr(cli_mod, "_sync_core", None), cli_mod.acquire_sync_lock)
             claims_mod.run_gh = _AuthedGh()
             cli_mod._sync_core = _fake_sync_core
             if patch_lock:
@@ -170,10 +178,9 @@ class TestAc6RegistrationSnippets(_StoreCase):
             try:
                 code, out, err = run_cli(argv)
             finally:
-                claims_mod.run_gh = saved_gh
-                if saved_core is not None:
-                    cli_mod._sync_core = saved_core
-                cli_mod.acquire_sync_lock = saved_lock
+                claims_mod.run_gh, cli_mod.acquire_sync_lock = saved[0], saved[2]
+                if saved[1] is not None:
+                    cli_mod._sync_core = saved[1]
             env = parse_envelope(self, out, "OC-AC6")
             data = env.get("data") or {}
             if code != 0:
@@ -182,37 +189,46 @@ class TestAc6RegistrationSnippets(_StoreCase):
                 problems.append(f"joined init: data.joined must be true; got {data.get('joined')!r}")
             if data.get("mcp_clients") != snippets:
                 problems.append(f"{label}: data['mcp_clients'] must equal MCP_REGISTRATION_SNIPPETS; got {data.get('mcp_clients')!r}")
-            if label.startswith("init") and data.get("mcp") != MCP_LINE:
-                problems.append(
-                    f"{label}: the init `mcp` key stays the unchanged Claude line (PRESERVING); got {data.get('mcp')!r}"
-                )
+            if label.endswith("init") and data.get("mcp") != MCP_LINE:
+                problems.append(f"{label}: the init `mcp` key stays the unchanged Claude line (PRESERVING); got {data.get('mcp')!r}")
 
-        # README fidelity (critic round 2, finding 9): the registration
-        # section's fenced JSON blocks must carry the NEW zcode and opencode
-        # config objects (exact equality with the pinned objects), the stale
-        # mcp.<name> shape must be ABSENT, and the claude command appears
-        # verbatim (the target file may be prose; no path registry).
-        readme = (_WORKTREE / "README.md").read_text(encoding="utf-8")
-        match = re.search(r"^## MCP server\s*$", readme, re.M)
-        section = readme[match.end():] if match else ""
-        low = re.sub(r"\s+", " ", section).lower()
-        for client in ("claude", "zcode", "opencode"):
-            if client not in low:
-                problems.append(f"the README MCP registration guidance must name the {client!r} client")
-        if CLAUDE_SNIPPET not in section:
-            problems.append(f"the README must carry the claude command verbatim: {CLAUDE_SNIPPET!r}")
-        fences = readme_json_fences(section)
-        for client, expected in (("zcode", ZCODE_CONFIG), ("opencode", OPENCODE_CONFIG)):
-            if not any(fence == expected for fence in fences):
-                problems.append(f"the README registration section must carry a fenced JSON block exactly equal to the {client} config {json.dumps(expected)}; parsed blocks: {fences}")
-        for fence in fences:
-            mcp_block = fence.get("mcp")
-            if isinstance(mcp_block, dict) and "servers" not in mcp_block:
-                problems.append(f"the stale opencode shape (mcp.<name> without the servers level) must be ABSENT from the README; found {json.dumps(fence)}")
+        # README fidelity: the registration section (BOUNDED, round 5)
+        # carries the pinned zcode/opencode fences, no stale mcp.<name>
+        # shape, and the verbatim claude command (see the helper + its
+        # self-test).
+        problems += registration_readme_problems((_WORKTREE / "README.md").read_text(encoding="utf-8"))
         self.assertFalse(
             problems,
             "OC-AC6: exact per-client registration snippets and their surfaces:\n- "
             + "\n- ".join(problems),
+        )
+
+    def test_ac6_registration_section_bounded_selftest(self) -> None:
+        # ROUND 5 (cubic #14): the fidelity scan covers ONLY the '## MCP
+        # server' section (bounded at the next level-2 heading). Fences
+        # moved under a later heading must be flagged MISSING, and a stale
+        # mcp.<name> fence in a later section must NOT flag.
+        moved = (
+            "## MCP server\n\nRegister it (Claude Code):\n\n```bash\n"
+            + CLAUDE_SNIPPET + "\n```\n\n## License\n\n```json\n"
+            + json.dumps(ZCODE_CONFIG) + "\n```\n\n```json\n"
+            + json.dumps(OPENCODE_CONFIG) + "\n```\n"
+        )
+        problems = registration_readme_problems(moved)
+        self.assertTrue(
+            any("zcode" in p for p in problems) and any("opencode" in p for p in problems),
+            f"OC-AC6: SELF-TEST: fences under a later heading must be flagged missing; got {problems!r}",
+        )
+        stale_later = (
+            "## MCP server\n\nRegister it (Claude Code; ZCode and opencode below):\n\n```bash\n"
+            + CLAUDE_SNIPPET + "\n```\n\n```json\n" + json.dumps(ZCODE_CONFIG)
+            + "\n```\n\n```json\n" + json.dumps(OPENCODE_CONFIG) + "\n```\n\n"
+            "## License\n\n```json\n" + json.dumps({"mcp": {"zaxbygraph": {"type": "local", "command": ["zaxbygraph", "mcp"]}}}) + "\n```\n"
+        )
+        problems = registration_readme_problems(stale_later)
+        self.assertEqual(
+            problems, [],
+            f"OC-AC6: SELF-TEST: a stale mcp.<name> fence in a LATER section must not flag; got {problems!r}",
         )
 
 
@@ -221,10 +237,8 @@ class TestAc12EnvelopeVersion(_StoreCase):
 
     def test_ac12_envelope_carries_version(self) -> None:
         self.assertEqual(
-            getattr(cli_mod, "ENVELOPE_VERSION", None),
-            "0.3",
-            "OC-AC12: cli.ENVELOPE_VERSION must be the contract version '0.3'"
-            f"; got {getattr(cli_mod, 'ENVELOPE_VERSION', None)!r}",
+            getattr(cli_mod, "ENVELOPE_VERSION", None), "0.3",
+            f"OC-AC12: cli.ENVELOPE_VERSION must be '0.3'; got {getattr(cli_mod, 'ENVELOPE_VERSION', None)!r}",
         )
         problems: list[str] = []
 
@@ -241,11 +255,7 @@ class TestAc12EnvelopeVersion(_StoreCase):
 
         check("CLI json success", ["status", *self.base], 0, True)
         check("CLI json failure", ["item", "99999", *self.base], 1, False)
-        check(
-            "CLI usage error",
-            ["status", "--format", "json", "--definitely-not-a-flag", "--db", str(self.db)],
-            2, False,
-        )
+        check("CLI usage error", ["status", "--format", "json", "--definitely-not-a-flag", "--db", str(self.db)], 2, False)
         check("CLI compact", ["status", *self.base, "--format", "compact"], 0, True)
         # jsonl list payloads print rows only: jsonl must simply not break.
         code, out, err = run_cli(["open", *self.base, "--format", "jsonl"])
@@ -351,32 +361,37 @@ class TestAc14ZeroRowVocabularyHint(_StoreCase):
             result, env = tool_envelope(self, session.call_tool("sql", {"repo": REPO, "statement": statement}), "OC-AC14")
             return None, env.get("ok"), (env.get("data") or {})
 
-        # HINT legs: zero rows + a literal outside the CANONICAL set (on
-        # items.kind / items.state / comments.kind, INCLUDING the empty
-        # comments table -- no empty-table suppression).
+        # HINT legs: zero rows + a literal outside the CANONICAL set,
+        # INCLUDING the empty comments table and (round 5, cubic #12) the
+        # EMPTY literal '' — outside every vocabulary; state='merged'
+        # hints with the 4-value set in production order.
         for surface, statement, column, literal in (
             ("CLI", "SELECT number FROM items WHERE kind = 'pull_request'", "items.kind", "pull_request"),
             ("MCP", "SELECT number FROM items WHERE kind = 'pull_request'", "items.kind", "pull_request"),
             ("CLI", "SELECT number FROM items WHERE state = 'merged'", "items.state", "merged"),
             ("CLI", "SELECT pk FROM comments WHERE kind = 'zzz'", "comments.kind", "zzz"),
             ("MCP", "SELECT pk FROM comments WHERE kind = 'zzz'", "comments.kind", "zzz"),
+            ("CLI", "SELECT number FROM items WHERE kind = ''", "items.kind", ""),
+            ("CLI", "SELECT number FROM items WHERE state = ''", "items.state", ""),
         ):
             code, ok, data = run_sql(surface, statement)
             if code == 1 or ok is not True or data.get("rows") != []:
-                problems.append(f"{surface} {literal}: exit {code}, ok {ok!r}, rows {data.get('rows')!r}")
+                problems.append(f"{surface} {literal!r}: exit {code}, ok {ok!r}, rows {data.get('rows')!r}")
             problems += hint_problems(data.get("hints"), f"OC-AC14: {surface} {column}={literal!r}", column, literal)
         # PRESERVING: the existing warnings key stays on the warning-bearing
         # CLI read.
         _code, _ok, data = run_sql("CLI", "SELECT number FROM items WHERE kind = 'pull_request'")
         if not (isinstance(data.get("warnings"), list) and data.get("warnings")):
             problems.append("OC-AC14: the existing warnings key is retained unchanged (PRESERVING)")
-        # NO-HINT legs: rows non-empty (kind='issue'; the mixed OR query),
-        # a valid literal with zero rows, and a valid literal on the empty
-        # comments table (critic round 2, finding 7b).
+        # NO-HINT legs: rows non-empty, valid literals with zero rows
+        # (round 5: deleted/transferred are VALID state literals), and a
+        # valid literal on the empty comments table.
         for surface, statement, why in (
             ("CLI", "SELECT number FROM items WHERE kind = 'issue'", "rows non-empty"),
             ("MCP", "SELECT number FROM items WHERE kind = 'issue'", "rows non-empty"),
             ("CLI", "SELECT number FROM items WHERE kind = 'pr' AND number = 999", "valid literal, zero rows"),
+            ("CLI", "SELECT number FROM items WHERE state = 'deleted'", "valid state literal, zero rows"),
+            ("CLI", "SELECT number FROM items WHERE state = 'transferred'", "valid state literal, zero rows"),
             ("CLI", "SELECT pk FROM comments WHERE kind = 'issue_comment'", "valid literal (empty table)"),
             ("MCP", "SELECT pk FROM comments WHERE kind = 'issue_comment'", "valid literal (empty table)"),
             ("CLI", "SELECT number FROM items WHERE kind = 'pull_request' OR kind = 'issue'", "mixed OR query"),
@@ -391,19 +406,17 @@ class TestAc14ZeroRowVocabularyHint(_StoreCase):
             if "hints" in data:
                 problems.append(f"{surface}: hints must be ABSENT when {why}; got {data.get('hints')!r}")
 
-        # Filtered reads cannot reach a silent zero-row answer (critic
-        # round 2, finding 7a): the CLI refuses an invalid --kind at parse,
-        # and the QUERY LAYER itself refuses an invalid kind literal
-        # (executed directly against query.open_items). MCP open_items
-        # exposes NO kind filter at all, so an invalid literal cannot reach
-        # it -- there is no MCP leg by design.
+        # Filtered reads refuse rather than answer zero rows silently:
+        # the CLI refuses an invalid --kind at parse, and the QUERY LAYER
+        # refuses it directly (query.open_items). MCP open_items has NO
+        # kind filter — no MCP leg by design.
         code, out, err = run_cli(["open", "--kind", "pull_request", *self.base])
         env = parse_envelope(self, out, "OC-AC14") if out.strip().startswith("{") else {}
         message = str((env.get("error") or {}).get("message", ""))
         if code != 2 or (env.get("error") or {}).get("code") != "bad_request":
             problems.append(f"CLI open --kind pull_request: exit {code}, error {(env.get('error') or {}).get('code')!r}")
         if not (re.search("(?<![a-z_])issue(?![a-z_])", message) and re.search("(?<![a-z_])pr(?![a-z_])", message)):
-            problems.append(f"CLI open --kind refusal must name the valid kinds (issue, pr); got {message[:160]!r}")
+            problems.append(f"CLI open --kind refusal must name issue/pr; got {message[:160]!r}")
         from zaxbygraph.db import connect_readonly_query
 
         conn = connect_readonly_query(self.db)
@@ -411,19 +424,14 @@ class TestAc14ZeroRowVocabularyHint(_StoreCase):
             from zaxbygraph import query as query_mod
 
             query_mod.open_items(conn, kind="pull_request")
-            problems.append(
-                "query.open_items(conn, kind='pull_request') must raise"
-                " ValueError (the query layer refuses invalid kind literals)"
-            )
+            problems.append("query.open_items(conn, kind='pull_request') must raise ValueError (the query layer refuses invalid kind literals)")
         except ValueError:
             pass
         finally:
             conn.close()
 
-        # The emitted CLI `schema --output sql` schema AND the MCP sql tool
-        # outputSchema must both DECLARE an optional `hints` array property
-        # whose items require column, literal, stored_values, valid_values
-        # with real types (critic round 2, finding 7c).
+        # Both surfaces must DECLARE the optional typed hints array (see
+        # _f.hints_declaration_problems, rounds 2-5).
         problems += hints_declaration_problems(self, "OC-AC14")
         session.stop()
         self.assertFalse(
@@ -477,12 +485,7 @@ class TestAc15InVocabularyAnswerUnchanged(unittest.TestCase):
         )
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", "tests.test_query", "tests.test_search", "-b"],
-            capture_output=True,
-            text=True,
-            cwd=str(_WORKTREE),
-            env=env_vars,
-            timeout=600,
-            check=False,
+            capture_output=True, text=True, cwd=str(_WORKTREE), env=env_vars, timeout=600, check=False,
         )
         tail = (proc.stderr or "")[-800:]
         self.assertEqual(

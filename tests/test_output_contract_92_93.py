@@ -1,51 +1,36 @@
 """Acceptance checks for issue-trace 92-93-output-contract-honesty (issues
 #92+#93, decisions D1-D3: the CLI exit/envelope conformance contract),
-amended after plan-critic rounds 1-3. D4 lives in _d.py; D5/D6/D7/D9 in
-_b.py; D8 in _c.py; shared infrastructure in _e.py/_f.py (same stem,
-tests/).
+amended through plan-critic rounds 1-3 and review wave 5. D4 lives in
+_d.py; D5/D6/D7/D9 in _b.py; D8 in _c.py; shared infrastructure in
+_e.py/_f.py (same stem, tests/).
 
-D1 (AC1): a dead stdout or dead flush must NOT flatten the exit code. A
-matrix over EVERY failure-emitter class (cli._write_stdout raising
-BrokenPipeError; the usage envelope writes through the same boundary):
-item ghost -> 1; usage error -> 2; sql bad_sql -> 2 and no_such_table -> 1;
-a snapshot pull with an unreachable source (a nonexistent local path) -> 1
-(source_unreachable); a no-corpus read -> 3; a dead-gh claim failure -> 6.
-Each leg first proves its argv on a LIVE stdout (own exit + error code),
-then under the dead pipe; ROUND 3: the dead-gh seam is installed BEFORE
-the live precondition and kept through the dead-pipe leg, so no leg ever
-invokes a real gh. FLUSH legs: a failing command whose render succeeds but
-whose sys.stdout.flush() raises BrokenPipeError / OSError(EINVAL) -> main
-returns 1; a successful command (where) -> 0 (wrapper stream, never
-production edits). ROUND 3: a SUCCESSFUL command whose stdout WRITE dies
-(the _write_stdout seam) still returns 0 — an exit-7 mutant must fail.
-Plus the conformance sweep: exit==0 iff ok:true (claim outcomes 4/5/6 keep
-their documented exits beside ok:false).
+D1 (AC1): a dead stdout or dead flush must NOT flatten the exit code. The
+dead-pipe matrix covers every failure-emitter class (item ghost -> 1,
+usage -> 2, sql bad_sql -> 2 / no_such_table -> 1, snapshot unreachable ->
+1, no-corpus -> 3, dead-gh claim -> 6); each leg is proven on a LIVE
+stdout first, under the dead-gh seam installed BEFORE it (round 3); flush
+failures return the command's OWN code; a successful command whose WRITE
+dies still exits 0. Plus the exit==0-iff-ok:true conformance sweep (claim
+outcomes 4/5/6 keep their documented exits).
 
-D2 (AC2): an unexpected exception inside a command (cmd_status patched to
-raise RuntimeError; also a plain ValueError reaching main) must yield a
-nonzero exit, a parseable ok:false envelope on stdout with error.code
-"runtime" naming the exception type, NO 'Traceback' on stdout or stderr --
-in a subprocess AND in-process.
+D2 (AC2): an unexpected exception inside a command must yield a nonzero
+exit, a parseable ok:false envelope with error.code "runtime" naming the
+exception type, and NO traceback — in a subprocess AND in-process.
 
 D3 (AC3): a CLI failure after the store opened carries the store's real
-freshness (synced_at equal to a success envelope's on the same store,
-age_s int, complete true) -- including the close-before-emit arms (item
-ghost, invalid --as-of, export-corpus refusals that close the connection
-first, the schema no-such-table arm) AND an unexpected RuntimeError raised
-AFTER the store opened: main's catch-all must report the store's real
-freshness AND db/repo identity. ROUND 3: a post-open failure that resolves
-NO repo filter (export-corpus --repo '') reports the SINGLE stored repo's
-real freshness; zero- or multi-repo stores keep the null block. Reopen
-rejection: with any SECOND open patched to raise, the failing read opens
-the store exactly once and still reports the ORIGINAL freshness -- ROUND 3
-adds the dedicated final assertion so a null-freshness-on-reopen mutant
-FAILS. Pre-open failures (no corpus with a missing db -> 3, invalid slug
--> 2, repo/db mismatch -> 2; overrides ride AFTER the common flags) keep
-the null block (PRESERVING).
+freshness (synced_at as the success envelope's on the same store, age_s
+int, complete true) — including the close-before-emit arms AND the
+catch-all after an unexpected RuntimeError (db/repo identity too). A
+no-filter post-open failure reports the SINGLE stored repo's freshness
+(zero/multi-repo: null block; round-5 helpers in _f). Reopen rejection:
+exactly one open, the ORIGINAL freshness (dedicated final assertions).
+ROUND 5 (review F-3/F-4): mixed-case sync_state refusals (open/sql/status,
+exit 2 bad_request) carry the store's real freshness, and the catch-all
+after a --max-age refresh merges freshness.refreshed = true like
+emit_result. Pre-open failures keep the null block (PRESERVING).
 
-Hermetic: FakeGitHubSource, tempfile stores, patched seams; no network, no
-gh, no writes outside temp roots. Stdlib only; unittest. Every failure
-message carries a distinctive single-line tag (OC-AC1..OC-AC3).
+Hermetic: FakeGitHubSource, tempfile stores, patched seams; no network.
+Failures carry OC-AC1..OC-AC3 tags.
 """
 
 from __future__ import annotations
@@ -65,15 +50,15 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402
 from test_mcp import run_cli  # noqa: E402
 from test_output_contract_92_93_e import (  # noqa: E402
     DEAD_PIPE_FAILURES, DeadGh, StoreCase, dead_flush_and_success_render_problems,
-    parse_envelope, resolve_leg_arg, run_with_dead_stdout, seed_multi_repo_store,
-    seed_zero_repo_store,
+    parse_envelope, preopen_null_freshness_problems,
+    repo_filter_freshness_problems, resolve_leg_arg, run_with_dead_stdout,
 )
 from zaxbygraph import cli as cli_mod  # noqa: E402
 
@@ -225,37 +210,18 @@ class TestAc2RuntimeEnvelope(StoreCase):
     def _assert_runtime_envelope(
         self, code: int | None, out: str, err: str, escaped: str | None, type_name: str
     ) -> None:
-        self.assertIsNone(
-            escaped,
-            f"OC-AC2: the unexpected {type_name} escaped main() uncaught"
-            f" (must be contained as a coded envelope); escaped as {escaped}",
-        )
+        self.assertIsNone(escaped, f"OC-AC2: the unexpected {type_name} escaped main() uncaught (must be contained as a coded envelope); escaped as {escaped}")
         self.assertIsInstance(code, int, "OC-AC2: main() must return an exit code")
         self.assertNotEqual(code, 0, f"OC-AC2: the {type_name} failure must exit nonzero")
         env = parse_envelope(self, out, "OC-AC2")
         self.assertIs(env.get("ok"), False, f"OC-AC2: the {type_name} envelope must answer ok:false")
         error = env.get("error")
-        self.assertIsInstance(
-            error, dict, f"OC-AC2: the {type_name} envelope must carry an error object"
-        )
-        self.assertEqual(
-            error.get("code"),
-            "runtime",
-            f"OC-AC2: the unexpected {type_name} must be coded 'runtime', got {error.get('code')!r}",
-        )
+        self.assertIsInstance(error, dict, f"OC-AC2: the {type_name} envelope must carry an error object")
+        self.assertEqual(error.get("code"), "runtime", f"OC-AC2: the unexpected {type_name} must be coded 'runtime', got {error.get('code')!r}")
         message = str(error.get("message", ""))
-        self.assertIn(
-            type_name,
-            message,
-            f"OC-AC2: the runtime message must name the exception type"
-            f" {type_name}; got {message!r}",
-        )
-        self.assertNotIn(
-            "Traceback", out, f"OC-AC2: no traceback text on stdout for the {type_name} envelope"
-        )
-        self.assertNotIn(
-            "Traceback", err, f"OC-AC2: no traceback text on stderr for the {type_name} envelope"
-        )
+        self.assertIn(type_name, message, f"OC-AC2: the runtime message must name the exception type {type_name}; got {message!r}")
+        self.assertNotIn("Traceback", out, f"OC-AC2: no traceback text on stdout for the {type_name} envelope")
+        self.assertNotIn("Traceback", err, f"OC-AC2: no traceback text on stderr for the {type_name} envelope")
 
     def test_ac2_unexpected_exception_is_coded_envelope(self) -> None:
         # In-process: RuntimeError inside a command.
@@ -371,28 +337,16 @@ class TestAc3CliFailureFreshness(StoreCase):
             if error.get("code") != want_code:
                 problems.append(f"{note}: error.code {error.get('code')!r}, want {want_code}")
             self._check_real_freshness(env, note, synced_at, problems)
-        # ROUND 3 (finding 2a, the zero/multi sub-legs): with ZERO or
-        # SEVERAL stored repos a no-filter post-open failure cannot pick
-        # one repo, so the null block is the honest answer.
-        zero_db = self.root / "zero-repo.db"
-        seed_zero_repo_store(zero_db)
-        multi_db = self.root / "multi-repo.db"
-        seed_multi_repo_store(multi_db)
-        for db_path, note in ((zero_db, "zero-repo store"), (multi_db, "multi-repo store")):
-            code, out, err = run_cli(
-                ["export-corpus", "--db", str(db_path), "--format", "json", "--repo", ""]
-            )
-            env2 = parse_envelope(self, out, "OC-AC3")
-            error2 = (env2.get("error") or {}).get("code")
-            self.assertEqual(code, 2, f"OC-AC3: the {note} --repo '' refusal must exit 2; got {code}")
-            self.assertEqual(error2, "repo_required", f"OC-AC3: the {note} --repo '' refusal codes repo_required; got {error2!r}")
-            fresh2 = env2.get("freshness") or {}
-            for key, want in (("synced_at", None), ("age_s", None), ("complete", False)):
-                self.assertEqual(
-                    fresh2.get(key), want,
-                    f"OC-AC3: the {note} --repo '' refusal keeps freshness.{key}"
-                    f" = {want!r} (no single stored repo to report)",
-                )
+        # ROUND 3 (finding 2a, the zero/multi sub-legs; round 5: displaced
+        # into the _f helper at the line cap): with ZERO or SEVERAL stored
+        # repos a no-filter post-open failure cannot pick one repo, so the
+        # null block is the honest answer.
+        problems = repo_filter_freshness_problems(self, str(self.root))
+        self.assertFalse(
+            problems,
+            "OC-AC3: zero/multi-repo --repo '' refusals keep the null block:\n- "
+            + "\n- ".join(problems),
+        )
         # An unexpected RuntimeError AFTER the store opened: the catch-all
         # must report the store's real freshness AND db/repo identity.
         def _boom(conn, *a, **kw):
@@ -430,29 +384,16 @@ class TestAc3CliFailureFreshness(StoreCase):
             "OC-AC3: post-open CLI failures (and the catch-all) must carry"
             " the store's real freshness and identity:\n- " + "\n- ".join(problems),
         )
-        # PRESERVING: pre-open failures keep the null block. Each override
-        # rides AFTER the common flags (argparse last-wins) so the refusal
-        # is actually reached; the executed codes were verified at base
-        # (missing-db no-corpus -> 3, invalid slug -> 2, mismatch -> 2).
-        for post, want_code, note in (
-            (["--repo", "acme/nosuch", "--db", str(self.root / "missing.db")], 3, "no corpus (missing db)"),
-            (["--repo", "NOT A SLUG"], 2, "bad repo slug"),
-            (["--repo", "acme/nosuch"], 2, "repo/--db mismatch"),
-        ):
-            code, out, err = run_cli(["item", "1", *self.base, *post])
-            env = parse_envelope(self, out, "OC-AC3")
-            self.assertEqual(
-                code, want_code,
-                f"OC-AC3: the {note} failure must exit {want_code} (executed at"
-                f" base); got {code}: {(env.get('error') or {}).get('message', err)[:120]!r}",
-            )
-            self.assertIs(env.get("ok"), False, f"OC-AC3: the {note} failure must answer ok:false")
-            fresh = env.get("freshness") or {}
-            for key, want in (("synced_at", None), ("age_s", None), ("complete", False)):
-                self.assertEqual(
-                    fresh.get(key), want,
-                    f"OC-AC3: the {note} failure keeps freshness.{key} = {want!r} (PRESERVING)",
-                )
+        # PRESERVING: pre-open failures keep the null block (round 5:
+        # displaced into the _f helper at the line cap; the executed codes
+        # were verified at base: missing-db no-corpus -> 3, invalid slug
+        # -> 2, mismatch -> 2).
+        problems = preopen_null_freshness_problems(self)
+        self.assertFalse(
+            problems,
+            "OC-AC3: pre-open failures keep the null freshness block:\n- "
+            + "\n- ".join(problems),
+        )
 
         # Reopen rejection: after the command's FIRST successful open, any
         # SECOND open of the store raises -- the failing read must open the
@@ -492,6 +433,66 @@ class TestAc3CliFailureFreshness(StoreCase):
         )
         self.assertIs(fresh.get("complete"), True, "OC-AC3: reopen rejection: freshness.complete must stay true")
         self.assertIsInstance(fresh.get("age_s"), int, "OC-AC3: reopen rejection: freshness.age_s must stay an int")
+
+    def test_ac3_mixed_case_and_refresh_catchall_freshness(self) -> None:
+        synced_at = self._reference_synced_at()
+        # ROUND 5 (review F-4, run FIRST so the store is not yet re-keyed):
+        # a --max-age read whose refresh RAN (the _refresh_if_stale seam
+        # answers True) and whose query then raises: the catch-all must
+        # merge freshness.refreshed = true like emit_result.
+        saved_refresh = cli_mod._refresh_if_stale
+        saved_status = cli_mod.status
+        cli_mod._refresh_if_stale = lambda args, db_path, repo: True
+        cli_mod.status = lambda conn, *a, **kw: (_ for _ in ()).throw(RuntimeError("boom after refresh"))
+        try:
+            code, out, err = run_cli(["status", "--max-age", "0", *self.base])
+        finally:
+            cli_mod._refresh_if_stale = saved_refresh
+            cli_mod.status = saved_status
+        env = parse_envelope(self, out, "OC-AC3")
+        self.assertIs(env.get("ok"), False, "OC-AC3: the refreshed catch-all must answer ok:false")
+        self.assertEqual(
+            (env.get("error") or {}).get("code"),
+            "runtime",
+            "OC-AC3: the refreshed catch-all codes runtime",
+        )
+        fresh = env.get("freshness") or {}
+        self.assertEqual(fresh.get("synced_at"), synced_at, f"OC-AC3: the refreshed catch-all keeps the store's real synced_at {synced_at!r}; got {fresh.get('synced_at')!r}")
+        self.assertIs(
+            fresh.get("refreshed"), True,
+            "OC-AC3: the catch-all after a --max-age refresh must carry"
+            " freshness.refreshed = true exactly like emit_result does (F-4)",
+        )
+
+        # ROUND 5 (review F-3, run second — it re-keys the store): sync_state
+        # re-keyed to mixed case (Acme/ForgeGate) read as acme/forgegate:
+        # the open/sql/status refusals (exit 2 bad_request) fire AFTER the
+        # open and must carry the store's REAL freshness.
+        from zaxbygraph.db import connect as _connect
+
+        conn = _connect(self.db)
+        try:
+            conn.execute("UPDATE sync_state SET repo = 'Acme/ForgeGate' WHERE repo = ?", (REPO,))
+            conn.commit()
+        finally:
+            conn.close()
+        problems: list[str] = []
+        for command, tail in (
+            ("open", []),
+            ("sql", ["SELECT number FROM items"]),
+            ("status", []),
+        ):
+            code, out, err = run_cli([command, *tail, *self.base])
+            env = parse_envelope(self, out, "OC-AC3")
+            error = (env.get("error") or {}).get("code")
+            if code != 2 or env.get("ok") is not False or error != "bad_request":
+                problems.append(f"{command}: the mixed-case refusal must exit 2 bad_request; got exit {code}, ok {env.get('ok')!r}, error {error!r}")
+            self._check_real_freshness(env, f"{command} mixed-case refusal", synced_at, problems)
+        self.assertFalse(
+            problems,
+            "OC-AC3: mixed-case sync_state refusals happen AFTER the open and"
+            " must carry the store's real freshness:\n- " + "\n- ".join(problems),
+        )
 
 
 if __name__ == "__main__":

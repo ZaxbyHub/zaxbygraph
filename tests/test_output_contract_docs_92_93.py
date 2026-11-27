@@ -17,16 +17,14 @@ authorizer), THEN pins the docs table rows to name each of them.
   by layer 2 — a denial word with no negation in its cell (round 3) and no
   trailing-answer form like 'denied by layer 2? no' (round 4); the
   load_extension row is retained (PRESERVING).
-- D10 (AC8): ONE README contract table headed by a row containing 'exit'
-  and 'script on `ok`', with EXPLICIT per-row semantics: exit 0 success;
-  exits 2/3 NOT fixed by an unchanged retry; exit 1 sometimes is; the
-  claim exits 4/5/6 state the claim outcomes are the contract — UNNEGATED
-  (round 4) and covered unconditionally (round 3); the guidance tells
-  callers to branch on `ok`; each binding cell states one digit; the
-  tests/test_docs.py ExitCodeTableDocTests assertions are EXECUTED here.
+- D10 (AC8): ONE contract table ('exit' + 'script on `ok`'): exit 0
+  success; exits 2/3 NOT retry-fixed (a REAL negation word, round 5);
+  exit 1 sometimes; the claim exits 4/5/6 state the contract — UNNEGATED
+  (round 4) and unconditionally covered (round 3); branch on `ok`; one
+  digit per binding cell; test_docs.py ExitCodeTableDocTests EXECUTED
+  here.
 
-Read-only: never edits the documents it pins. Hermetic for the guard legs.
-Stdlib only; unittest. Failures carry OC-AC5 / OC-AC7 / OC-AC8 tags.
+Read-only. Hermetic for the guard legs. Failures carry OC-AC5/7/8 tags.
 """
 
 from __future__ import annotations
@@ -34,6 +32,7 @@ from __future__ import annotations
 import re
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 import zaxbygraph  # noqa: F401  (the OC-ENV guard below needs the module)
@@ -43,7 +42,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"OC-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402
@@ -51,7 +50,6 @@ from test_output_contract_92_93_e import seed_corpus  # noqa: E402
 
 README = _WORKTREE / "README.md"
 SCHEMA_MD = _WORKTREE / "docs" / "schema.md"
-
 
 def _flat(text: str) -> str:
     """Markdown line wraps must not defeat multi-word pins."""
@@ -149,6 +147,28 @@ def _claim_wording_problems(claim_cells) -> list:
     return problems
 
 
+def _dml_row_matches(row: str, word1: str, word2: str) -> bool:
+    """ROUND 5 (cubic #17): the statement-class needles match on WORD
+    BOUNDARIES, so 'without' cannot satisfy the WITH class and 'updated'
+    cannot satisfy the UPDATE class — each docs row pins its own class."""
+    return bool(
+        re.search(rf"\b{re.escape(word1)}\b", row, re.I)
+        and re.search(rf"\b{re.escape(word2)}\b", row, re.I)
+    )
+
+
+def _retry_wording_problems(rowmap) -> list:
+    """The exit-2/3 rule rows must state an unchanged retry does not fix
+    them, with a REAL negation word (round 5, cubic #6: a substring 'not'
+    let 'notes on retry behavior' pass)."""
+    problems: list = []
+    for digit in ("2", "3"):
+        flat = _flat(" ".join(rowmap.get(digit) or [])).lower()
+        if "retry" not in flat or not _NEGATION.search(flat):
+            problems.append(f"the exit-{digit} rule row must state it is NOT fixed by an unchanged retry")
+    return problems
+
+
 def _markdown_tables(text: str) -> list[list[str]]:
     """Contiguous `|...|` line blocks, one table per block, lines stripped."""
     tables: list[list[str]] = []
@@ -187,9 +207,11 @@ class TestAc5ReadmeMcpBundleDefaults(unittest.TestCase):
 
     _SAME_AS = re.compile(r"\bsame\b[^.;]{0,120}\bas\b", re.I)
 
+    _CLI_WORD = re.compile(r"\bcli\b|\bcommand[- ]line\b", re.I)
+
     def _is_parity_claim(self, sentence: str) -> bool:
         low = sentence.lower()
-        if "cli" not in low:
+        if not self._CLI_WORD.search(low):
             return False
         return bool(
             re.search(r"\bmatch(es|ing)?\b", low)
@@ -207,46 +229,34 @@ class TestAc5ReadmeMcpBundleDefaults(unittest.TestCase):
         the negative self-test exercises the SAME code path)."""
         problems: list[str] = []
         for block, in_bullet in _section_prose_blocks(section):
-            block_flat = _flat(block)
-            for sentence in re.split(r"(?<=[.;])\s+", block_flat):
+            for sentence in re.split(r"(?<=[.;])\s+", _flat(block)):
                 if not self._is_parity_claim(sentence):
                     continue
-                has_budget = "4000" in sentence or "4000" in block_flat
-                has_briefs = "brief" in sentence.lower() or "brief" in block_flat.lower()
-                if not (has_budget and has_briefs):
+                # ROUND 5 (cubic #7): BOTH defaults must live in the SAME
+                # sentence — a sibling sentence's defaults do not qualify
+                # the parity claim.
+                if "4000" not in sentence or "brief" not in sentence.lower():
                     where = "bullet" if in_bullet else "non-bullet prose"
                     problems.append(
                         f"a payload-parity claim in {where} without BOTH"
-                        f" defaults (4000 and briefs): {sentence[:220]!r}"
+                        f" defaults (4000 and briefs) in the SAME sentence:"
+                        f" {sentence[:220]!r}"
                     )
         return problems
 
     def test_ac5_readme_states_mcp_bundle_defaults(self) -> None:
-        readme = README.read_text(encoding="utf-8")
-        section = _mcp_server_section(readme)
-        self.assertTrue(
-            section,
-            "OC-AC5: the README must keep an '## MCP server' section to"
-            " state the bundle defaults in",
-        )
+        section = _mcp_server_section(README.read_text(encoding="utf-8"))
+        self.assertTrue(section, "OC-AC5: the README must keep an '## MCP server' section to state the bundle defaults in")
         flat = _flat(section)
-        self.assertIn(
-            "4000", flat,
-            "OC-AC5: the MCP-server parity section must state the bundle's"
-            " 4000-token budget default",
-        )
-        self.assertIn(
-            "briefs", flat.lower(),
-            "OC-AC5: the MCP-server parity section must state that briefs"
-            " are always on (the 'briefs' default)",
-        )
+        self.assertIn("4000", flat, "OC-AC5: the MCP-server parity section must state the bundle's 4000-token budget default")
+        self.assertIn("briefs", flat.lower(), "OC-AC5: the MCP-server parity section must state that briefs are always on (the 'briefs' default)")
         problems = self._parity_problems(section)
         self.assertFalse(
             problems,
-            "OC-AC5: every README sentence claiming CLI/MCP payload parity"
-            " — bullet, preamble or non-bullet prose — must mention BOTH"
-            " the 4000-token default budget AND briefs always on:\n- "
-            + "\n- ".join(problems),
+            "OC-AC5: every README sentence claiming CLI/MCP payload parity —"
+            " bullet, preamble or non-bullet prose — must mention BOTH the"
+            " 4000-token default budget AND briefs always on IN THE SAME"
+            " SENTENCE:\n- " + "\n- ".join(problems),
         )
 
     def test_ac5_recognizer_negative_selftest(self) -> None:
@@ -263,40 +273,34 @@ class TestAc5ReadmeMcpBundleDefaults(unittest.TestCase):
         for phrase in ("The MCP payloads equal the CLI.", "The tool answers mirror the CLI.", "The bundle gives the same payload as the CLI."):
             self.assertTrue(self._is_parity_claim(phrase), f"OC-AC5: SELF-TEST: must catch {phrase!r}")
         self.assertFalse(self._is_parity_claim("Run the CLI sync before querying."), "OC-AC5: SELF-TEST: non-parity stays unflagged")
+        # ROUND 5 (cubic #16): 'client' is not 'cli'; 'command line' is.
+        self.assertFalse(self._is_parity_claim("A client can only match the schema."), "OC-AC5: SELF-TEST: 'client' must not gate a parity claim")
+        self.assertTrue(self._is_parity_claim("The command line and MCP payloads are identical."), "OC-AC5: SELF-TEST: 'command line' must gate a parity claim")
+        # ROUND 5 (cubic #7): defaults in a SIBLING sentence do not qualify.
+        sibling = "## MCP server\n\nThe MCP and CLI payloads match exactly.\nThe bundle defaults are a 4000-token budget and briefs always on.\n"
+        self.assertTrue(
+            self._parity_problems(sibling),
+            "OC-AC5: SELF-TEST: a parity sentence must carry the defaults itself",
+        )
 
 
 class TestAc7SchemaMdGuardLayers(unittest.TestCase):
     """D10 (AC7): the verified guard table names every layer-1-pass /
-    layer-2-DENIAL statement class -- verified against the REAL guards
-    first, then pinned in the docs."""
+    layer-2-DENIAL statement class — verified against the REAL guards
+    first, then pinned in the docs (round 5: word-boundary needles)."""
 
     #: The statement matrix EXECUTED against the real guards before the
     #: docs rows are trusted: {INSERT, UPDATE, DELETE} x {WITH, EXPLAIN}
     #: plus EXPLAIN QUERY PLAN <DML> — each passes layer 1 and is DENIED
     #: at layer 2; each needles pair locates the docs row for the class.
     _DML_STATEMENTS = (
-        ("WITH-prefixed INSERT",
-         "WITH x AS (SELECT 1) INSERT INTO items(repo, number, kind, title,"
-         " state, raw_json) VALUES ('o/r', 1, 'issue', 't', 'open', '{}')",
-         ("with", "insert")),
-        ("WITH-prefixed UPDATE",
-         "WITH x AS (SELECT 1) UPDATE items SET title = 'y'",
-         ("with", "update")),
-        ("WITH-prefixed DELETE",
-         "WITH x AS (SELECT 1) DELETE FROM items",
-         ("with", "delete")),
-        ("EXPLAIN INSERT",
-         "EXPLAIN INSERT INTO items(repo) VALUES ('x')",
-         ("explain", "insert")),
-        ("EXPLAIN UPDATE",
-         "EXPLAIN UPDATE items SET title = 'y'",
-         ("explain", "update")),
-        ("EXPLAIN DELETE",
-         "EXPLAIN DELETE FROM items",
-         ("explain", "delete")),
-        ("EXPLAIN QUERY PLAN DELETE",
-         "EXPLAIN QUERY PLAN DELETE FROM items",
-         ("query plan", "delete")),
+        ("WITH-prefixed INSERT", "WITH x AS (SELECT 1) INSERT INTO items(repo, number, kind, title, state, raw_json) VALUES ('o/r', 1, 'issue', 't', 'open', '{}')", ("with", "insert")),
+        ("WITH-prefixed UPDATE", "WITH x AS (SELECT 1) UPDATE items SET title = 'y'", ("with", "update")),
+        ("WITH-prefixed DELETE", "WITH x AS (SELECT 1) DELETE FROM items", ("with", "delete")),
+        ("EXPLAIN INSERT", "EXPLAIN INSERT INTO items(repo) VALUES ('x')", ("explain", "insert")),
+        ("EXPLAIN UPDATE", "EXPLAIN UPDATE items SET title = 'y'", ("explain", "update")),
+        ("EXPLAIN DELETE", "EXPLAIN DELETE FROM items", ("explain", "delete")),
+        ("EXPLAIN QUERY PLAN DELETE", "EXPLAIN QUERY PLAN DELETE FROM items", ("query plan", "delete")),
     )
 
     def setUp(self) -> None:
@@ -329,54 +333,44 @@ class TestAc7SchemaMdGuardLayers(unittest.TestCase):
                 conn.close()
 
     def test_ac7_schema_md_lists_with_and_explain_dml(self) -> None:
-        # The real guards, executed: each statement class below must pass
-        # layer 1 and be denied by the layer-2 authorizer before the docs
-        # rows are trusted.
+        # The real guards run first: each statement class must pass layer 1
+        # and be denied by the layer-2 authorizer before the docs rows are
+        # trusted.
         self._verify_real_guards()
-        text = SCHEMA_MD.read_text(encoding="utf-8")
         rows = [
             _flat(line.strip())
-            for line in text.splitlines()
+            for line in SCHEMA_MD.read_text(encoding="utf-8").splitlines()
             if line.strip().startswith("|")
         ]
         problems: list[str] = []
         for label, _statement, (word1, word2) in self._DML_STATEMENTS:
             matching = [
                 r for r in rows
-                if word1 in r.lower()
-                and word2 in r.lower()
+                if _dml_row_matches(r, word1, word2)
                 and "passes layer 1" in r.lower()
                 and _positive_denial(r)
             ]
             if not matching:
                 problems.append(
-                    f"docs/schema.md's verified table must list the {label}"
-                    " statement as passing layer 1 and POSITIVELY"
-                    " DENIED/REFUSED by layer 2 (negated denials such as"
-                    " 'not denied by layer 2' and trailing-answer forms"
-                    " such as 'denied by layer 2? no' do not count)"
+                    f"docs/schema.md's verified table must list the {label} statement"
+                    " as passing layer 1 and POSITIVELY DENIED/REFUSED by layer 2"
+                    " (negated denials and trailing-answer forms such as"
+                    " 'denied by layer 2? no' do not count)"
                 )
             elif label.startswith("EXPLAIN"):
                 # The EXPLAIN rows must name the EXPLAIN QUERY PLAN form
-                # explicitly (critic round 2, finding 8).
+                # explicitly (round 2, finding 8).
                 if not any("query plan" in r.lower() for r in matching):
-                    problems.append(
-                        f"the {label} docs row must name the EXPLAIN QUERY PLAN"
-                        " form explicitly"
-                    )
+                    problems.append(f"the {label} docs row must name the EXPLAIN QUERY PLAN form explicitly")
         if not any("load_extension" in r.lower() and "passes layer 1" in r.lower() for r in rows):
             problems.append("the load_extension row stays in the verified table (PRESERVING)")
-        readme_flat = _flat(README.read_text(encoding="utf-8"))
-        if "the one case" in readme_flat:
-            problems.append(
-                "the README 'the one case' wording must be gone once more"
-                " than one layer-1-pass statement class is documented"
-            )
+        if "the one case" in _flat(README.read_text(encoding="utf-8")):
+            problems.append("the README 'the one case' wording must be gone once more than one layer-1-pass class is documented")
         self.assertFalse(
             problems,
-            "OC-AC7: docs/schema.md must name every layer-1-pass / layer-2"
-            "-denial statement class the real guards verify, with the"
-            " POSITIVE denial wording:\n- " + "\n- ".join(problems),
+            "OC-AC7: docs/schema.md must name every layer-1-pass / layer-2-denial"
+            " statement class the real guards verify, with the POSITIVE denial"
+            " wording:\n- " + "\n- ".join(problems),
         )
 
     def test_ac7_positive_denial_negative_selftest(self) -> None:
@@ -387,6 +381,21 @@ class TestAc7SchemaMdGuardLayers(unittest.TestCase):
         self.assertTrue(
             _positive_denial("| x | **passes layer 1**, denied by layer 2 (exit 1) |"),
             "OC-AC7: SELF-TEST: the positive denial wording must count",
+        )
+        # ROUND 5 (cubic #17): word-boundary needles — these rows substring-
+        # matched a WITH-prefixed class under the old matcher and must NOT.
+        for row, word1, word2 in (
+            ("| `INSERT OR IGNORE INTO x` | works without a transaction |", "with", "insert"),
+            ("| `REPLACE INTO items` | rows are updated without history |", "with", "update"),
+            ("| `DELETE FROM items` | without a WHERE clause |", "with", "delete"),
+        ):
+            self.assertFalse(
+                _dml_row_matches(row, word1, word2),
+                f"OC-AC7: SELF-TEST: must not match the ({word1}, {word2}) class: {row!r}",
+            )
+        self.assertTrue(
+            _dml_row_matches("| `WITH x AS (SELECT 1) INSERT …` | **passes layer 1**, denied by layer 2 (exit 1) |", "with", "insert"),
+            "OC-AC7: SELF-TEST: the real WITH-INSERT row must match its class",
         )
 
 
@@ -407,15 +416,9 @@ class TestAc8ReadmeContractTable(unittest.TestCase):
         tables = self._contract_table(readme)
         self.assertEqual(
             len(tables), 1,
-            "OC-AC8: the README must carry exactly ONE contract table headed"
-            f" by 'exit' and 'script on `ok`'; found {len(tables)}",
+            f"OC-AC8: the README must carry exactly ONE contract table headed by 'exit' and 'script on `ok`'; found {len(tables)}",
         )
-        table = tables[0]
-        rows = [
-            _cells(row)
-            for row in table[1:]
-            if not set("".join(_cells(row))) <= set("-: |")  # skip |---|
-        ]
+        rows = [_cells(row) for row in tables[0][1:] if not set("".join(_cells(row))) <= set("-: |")]
 
         def row_for(digit: str):
             matches = [cells for cells in rows if cells and cells[0].strip("`*").strip() == digit]
@@ -430,34 +433,24 @@ class TestAc8ReadmeContractTable(unittest.TestCase):
             problems.append("the exit-0 rule row must state that the command succeeds")
         if rowmap["1"] and "sometimes" not in _flat(" ".join(rowmap["1"])).lower():
             problems.append("the exit-1 rule row must state that an unchanged retry sometimes fixes it")
-        for digit in ("2", "3"):
-            flat = _flat(" ".join(rowmap[digit] or [])).lower()
-            if "retry" not in flat or not ("not" in flat or "never" in flat):
-                problems.append(f"the exit-{digit} rule row must state it is NOT fixed by an unchanged retry")
-        # The claim outcomes 4/5/6 are the contract (outcomes).
+        problems += _retry_wording_problems(rowmap)
+        # The claim outcomes 4/5/6 are the contract; the digit UNION must
+        # cover 4, 5 AND 6 explicitly and UNCONDITIONALLY (round 3: a table
+        # with NO claim row FAILS instead of skating past the wording).
         claim_cells = [
             cells for cells in rows
-            if cells
-            and (
-                cells[0].strip("`*").strip() in ("4", "5", "6")
-                or set(re.findall(r"\d", cells[0])) == {"4", "5", "6"}
-            )
+            if cells and (cells[0].strip("`*").strip() in ("4", "5", "6") or set(re.findall(r"\d", cells[0])) == {"4", "5", "6"})
         ]
         claim_digits: set = set()
         for cells in claim_cells:
             claim_digits |= set(re.findall(r"\d", cells[0]))
         problems += _claim_wording_problems(claim_cells)
-        # The claim-row digit UNION must cover 4, 5 AND 6 explicitly —
-        # ROUND 3: UNCONDITIONALLY, so a table with NO claim row at all
-        # FAILS here instead of skating past the wording checks.
         if claim_digits != {"4", "5", "6"}:
             problems.append(
-                f"the contract table must INCLUDE the claim-outcome exits"
-                f" explicitly (one 4/5/6 row or 4/5/6 rows); covered only"
-                f" {sorted(claim_digits)} — a missing claim row must fail"
+                f"the contract table must INCLUDE the claim-outcome exits explicitly (one 4/5/6 row or 4/5/6 rows); covered only {sorted(claim_digits)} — a missing claim row must fail"
             )
         # The header/guidance tells callers to branch on `ok`.
-        if "branch on" not in _flat(" ".join(cell for row in table for cell in _cells(row))).lower():
+        if "branch on" not in _flat(" ".join(c for r in tables[0] for c in _cells(r))).lower():
             problems.append("the contract table's header/guidance must tell callers to branch on `ok`")
         # Each binding cell states exactly ONE exit digit (keeps
         # test_docs.py's binding parser unambiguous).
@@ -491,6 +484,16 @@ class TestAc8ReadmeContractTable(unittest.TestCase):
         for wording in ("the claim outcomes are not the contract: `4` taken", "claim outcomes are never the contract", "the claim outcomes are excluded from the contract", "outcomes 4/5/6 sit outside the claim contract", "outcome 4 isn't the contract"):
             problems = _claim_wording_problems([["4/5/6", "no", wording]])
             self.assertTrue(any("UNNEGATED" in p for p in problems), f"OC-AC8: SELF-TEST: must reject {wording!r}")
+        # ROUND 5 (cubic #6): a 'notes on retry behavior' row satisfies the
+        # old substring 'not' check but is NOT a negation.
+        self.assertTrue(
+            _retry_wording_problems({"2": ["2", "no", "notes on retry behavior"], "3": ["3", "no", "an unchanged retry is required"]}),
+            "OC-AC8: SELF-TEST: 'notes on retry behavior' must NOT satisfy the retry-negation wording",
+        )
+        self.assertFalse(
+            _retry_wording_problems({"2": ["2", "no", "an unchanged retry will not fix it"], "3": ["3", "no", "never fixed by an unchanged retry"]}),
+            "OC-AC8: SELF-TEST: the real negated wordings must pass",
+        )
 
 
 if __name__ == "__main__":

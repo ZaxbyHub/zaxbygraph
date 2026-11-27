@@ -11,6 +11,7 @@ Failure tags REV-*.
 
 from __future__ import annotations
 
+import os
 import re
 import unittest
 from pathlib import Path
@@ -22,7 +23,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"REV-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from zaxbygraph import cli as cli_mod  # noqa: E402

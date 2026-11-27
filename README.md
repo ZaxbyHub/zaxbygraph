@@ -962,12 +962,15 @@ zaxbygraph mcp [--stale-seconds N]
   block (issue #32). The one exception is the modern (2026-07-28)
   `input_required` answer, whose shape is `{resultType, requestState,
   content}` — no structuredContent, by protocol design. The work-selection/derived tools call the same query
-  layer as their CLI commands, so data payloads match the CLI within the
-  bundle's immutable defaults: a 4000-token answer budget and briefs always
-  on (the CLI's per-call budget/brief knobs do not cross the bundle
-  boundary; identity/freshness fields are per-surface by construction); `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
+  layer as their CLI commands, so data payloads match the CLI up to the
+  bundle tool's defaults: a 4000-token answer budget and briefs always on;
+  the budget is overridable per call via `budget_tokens` (the `brief` tool
+  takes it too), while there is no briefs knob over MCP; the CLI `bundle`
+  command ships no budget and turns briefs off unless `--with-briefs`
+  (`brief` defaults to 4000), so exact parity needs a matching CLI call;
+  identity/freshness fields are per-surface by construction; `sql` reuses the CLI's read-only guard stack; `sync` never blocks —
   it returns a job id and `graph_status` reports progress. The `sync` tool accepts the same `source` (`graphql`/`rest`) argument the CLI flag takes and honors the store's recorded profile when it is omitted.
-  The claim tools mirror their CLI commands: `claim`/`release` write
+  The claim tools follow their CLI commands: `claim`/`release` write
   GitHub comments (readOnlyHint false), `pr_guard` and `claims`
   (`live: bool` for the live view) are reads, and a nonzero claim outcome
   answers `isError: true` with the FULL outcome envelope — data preserved.

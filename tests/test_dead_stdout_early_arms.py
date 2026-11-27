@@ -42,7 +42,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"DSEA-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 _CHILD_TEMPLATE = (
@@ -85,14 +85,17 @@ class TestDeadStdoutEarlyArms(unittest.TestCase):
             env=env,
         )
         proc.stdout.close()  # the reader goes away; the child's flush must stay quiet
-        stderr = proc.stderr.read() if proc.stderr else b""
-        proc.stderr.close()
         try:
             proc.wait(timeout=120)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=30)
             raise AssertionError("DSEA: the child did not exit (deadlock?)")
+        # stderr is drained AFTER wait (PR #98 review P11): the child's
+        # few lines fit the pipe buffer, and reading first could race a
+        # child that fills stderr while we wait.
+        stderr = proc.stderr.read() if proc.stderr else b""
+        proc.stderr.close()
         text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else stderr
         return proc.returncode, text
 

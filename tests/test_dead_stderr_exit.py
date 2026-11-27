@@ -35,6 +35,7 @@ roots. Stdlib only; unittest; Windows + Linux. Failure tags DSE-*.
 from __future__ import annotations
 
 import errno
+import os
 import io
 import json
 import tempfile
@@ -49,7 +50,7 @@ if not Path(zaxbygraph.__file__).resolve().is_relative_to(_WORKTREE / "src"):
     raise AssertionError(
         f"DSE-ENV: zaxbygraph resolved to {zaxbygraph.__file__}, not this"
         f" worktree's src ({_WORKTREE / 'src'}); set"
-        f" PYTHONPATH=<worktree>/src;<worktree>/tests"
+        f" PYTHONPATH=<worktree>/src{os.pathsep}<worktree>/tests"
     )
 
 from fixtures import REPO  # noqa: E402

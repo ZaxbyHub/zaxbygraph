@@ -2176,24 +2176,39 @@ def _vocabulary_warnings(
 
 #: The CANONICAL closed vocabularies for the zero-row hint (issues
 #: #92/#93 AC14): valid_values is this constant set, independent of stored
-#: rows (an empty table still hints).
+#: rows (an empty table still hints). items.state carries deleted and
+#: transferred too — sync's gone-marker writes them (see _mark_gone) and
+#: docs/schema.md documents the column — so the canonical set is the
+#: production order of all four values.
 _HINT_VOCABULARIES = {
     ("items", "kind"): ["issue", "pr"],
-    ("items", "state"): ["open", "closed"],
+    ("items", "state"): ["open", "closed", "deleted", "transferred"],
     ("comments", "kind"): ["issue_comment", "review_comment"],
 }
 
 
-def _zero_row_hints(conn: sqlite3.Connection, sql: str) -> list[dict]:
+def _zero_row_hints(
+    conn: sqlite3.Connection, sql: str, deadline_at: float, deadline: float
+) -> list[dict]:
     """The annotate-only hints block (issues #92/#93 AC14): fires ONLY on a
     zero-row answer whose filter used a known closed-vocabulary column with
-    a literal OUTSIDE the canonical set. The statement is never rewritten;
-    each hint names the column, the literal, the stored DISTINCT values and
-    the canonical valid_values."""
+    a literal OUTSIDE the canonical set (the EMPTY literal '' is outside
+    every vocabulary too). The statement is never rewritten; each hint
+    names the column, the literal, the stored DISTINCT values and the
+    canonical valid_values. Stored values are cached per (table, column)
+    within one call, and the pass shares the statement's deadline: an
+    expiry or a deadline interrupt converts to SqlTimeoutError exactly as
+    the warnings pass does — never a hint whose stored_values lies about
+    why it is empty."""
     stripped = _strip_sql_comments(sql)
     if "'" not in stripped:
         return []
     schema = _store_schema(conn)
+    if time.monotonic() >= deadline_at:
+        # The pass runs only on a live deadline (PR #98 review P1): a hint
+        # computed after the budget expired is an answer the caller paid
+        # for and never received permission to compute.
+        raise SqlTimeoutError(deadline)
     if not schema:
         return []
     scope, aliases = _scope_tables(sql, schema)
@@ -2201,6 +2216,30 @@ def _zero_row_hints(conn: sqlite3.Connection, sql: str) -> list[dict]:
         return []
     hints: list[dict] = []
     seen: set[tuple[str, str]] = set()
+    stored_cache: dict[tuple[str, str], list | None] = {}
+
+    def _stored(table: str, column: str) -> list | None:
+        key = (table, column)
+        if key not in stored_cache:
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT {_quote_ident(column)} FROM"
+                    f" {_quote_ident(table)}"
+                    f" WHERE {_quote_ident(column)} IS NOT NULL"
+                    f" LIMIT {_VOCAB_DISTINCT_LIMIT}"
+                ).fetchall()
+                stored_cache[key] = [row[0] for row in rows]
+            except sqlite3.OperationalError as exc:
+                if "interrupted" in str(exc).lower() and time.monotonic() >= deadline_at:
+                    raise SqlTimeoutError(deadline) from exc
+                # A probe we cannot run must not fabricate an empty
+                # stored_values (mirrors _vocabulary_warnings._stored):
+                # skip the column instead.
+                stored_cache[key] = None
+            except sqlite3.Error:
+                stored_cache[key] = None
+        return stored_cache[key]
+
     for (table, column), valid in _HINT_VOCABULARIES.items():
         if table not in scope or column not in schema.get(table, ()):
             continue
@@ -2220,29 +2259,20 @@ def _zero_row_hints(conn: sqlite3.Connection, sql: str) -> list[dict]:
                 if stripped[m.end(): m.end() + 1] == "'":
                     continue  # the escaped 'it''s' prefix shape
                 literal = m.group(1)[:_SQL_CELL_CAP]
-                if not literal or literal in valid:
+                if literal in valid:
                     continue
                 key = (f"{table}.{column}", literal)
                 if key in seen:
                     continue
                 seen.add(key)
-                try:
-                    stored = [
-                        row[0]
-                        for row in conn.execute(
-                            f"SELECT DISTINCT {_quote_ident(column)} FROM"
-                            f" {_quote_ident(table)}"
-                            f" WHERE {_quote_ident(column)} IS NOT NULL"
-                            f" LIMIT {_VOCAB_DISTINCT_LIMIT}"
-                        ).fetchall()
-                    ]
-                except sqlite3.Error:
-                    stored = []
+                stored = _stored(table, column)
+                if stored is None:
+                    continue
                 hints.append(
                     {
                         "column": f"{table}.{column}",
                         "literal": literal,
-                        "stored_values": stored,
+                        "stored_values": list(stored),
                         "valid_values": list(valid),
                     }
                 )
@@ -2353,7 +2383,7 @@ def run_sql(
         if rows == []:
             # Issues #92/#93 AC14: the annotate-only zero-row vocabulary
             # hint (never a rewrite, never a suppression on empty tables).
-            hints = _zero_row_hints(conn, sql)
+            hints = _zero_row_hints(conn, sql, deadline_at, deadline)
             if hints:
                 result["hints"] = hints
         if truncated:
