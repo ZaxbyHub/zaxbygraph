@@ -406,7 +406,7 @@ def _write_stdout(text: str) -> None:
     except BrokenPipeError:
         _STDOUT_DEAD = True
     except OSError as exc:
-        if exc.errno in (errno.EINVAL, errno.EPIPE):
+        if exc.errno in (errno.EINVAL, errno.EPIPE, errno.EBADF):
             _STDOUT_DEAD = True
             return
         raise
@@ -420,17 +420,18 @@ def _render_json(env: dict, indent: int | None) -> None:
 def _echo_stderr(text: str) -> None:
     """One best-effort stderr write (review F1, issues #92/#93 AC1): the
     human echo must never decide the process outcome. A dead stderr pipe
-    — BrokenPipeError, or the same Windows OSError(EINVAL)/POSIX EPIPE
-    shape _write_stdout translates — is absorbed HERE so the command still
-    renders its envelope on a live stdout and returns its OWN exit code
-    instead of feeding the dispatch-level dead-pipe arm a bare 0."""
+    — BrokenPipeError, or Windows OSError(EINVAL)/POSIX EPIPE/closed-fd
+    EBADF — is absorbed HERE so the command still renders its envelope on a
+    live stdout and returns its OWN exit code instead of feeding the
+    dispatch-level dead-pipe arm a bare 0."""
     try:
         print(text, file=sys.stderr)
     except BrokenPipeError:
-        pass
+        _silence_broken_stderr()
     except OSError as exc:
-        if exc.errno not in (errno.EINVAL, errno.EPIPE):
+        if exc.errno not in (errno.EINVAL, errno.EPIPE, errno.EBADF):
             raise
+        _silence_broken_stderr()
 
 
 def emit_result(
@@ -4491,35 +4492,64 @@ def _usage_envelope_exit(
     return 2
 
 
-def _silence_broken_stdout() -> int:
-    """Give the dying process a valid stdout: point fd 1 at os.devnull so the
-    interpreter's own shutdown flush (the buffered tail of whatever was
-    already written) succeeds quietly instead of raising the unraisable
-    'Exception ignored in' noise and a nonzero shutdown exit (issue #71,
-    check C24). Narrowly scoped: only reached from a broken-stdout shape."""
+def _silence_broken_stream(name: str) -> None:
+    """Give a broken standard stream a valid destination for shutdown."""
+    stream = getattr(sys, name)
     try:
-        sys.stdout.flush()
+        stream.flush()
     except (BrokenPipeError, OSError):
         pass
     try:
-        fd = sys.stdout.fileno()
+        fd = stream.fileno()
+    except (OSError, ValueError):
+        return
+    try:
         devnull = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    if devnull != fd:
         try:
             os.dup2(devnull, fd)
         finally:
             os.close(devnull)
-    except (BrokenPipeError, OSError, ValueError):
+        return
+    try:
+        replacement = os.fdopen(
+            devnull,
+            "w",
+            encoding=getattr(stream, "encoding", None) or "utf-8",
+            errors=getattr(stream, "errors", None) or "replace",
+        )
+    except (OSError, ValueError):
+        os.close(devnull)
+        return
+    setattr(sys, name, replacement)
+    try:
+        stream.detach().close()
+    except (AttributeError, BrokenPipeError, OSError, ValueError):
         pass
+
+
+def _silence_broken_stderr() -> None:
+    """Give the dying process a valid stderr so its shutdown flush is quiet."""
+    _silence_broken_stream("stderr")
+
+
+def _silence_broken_stdout() -> int:
+    """Give the dying process a valid stdout so interpreter shutdown does not
+    raise unraisable 'Exception ignored in' noise (issue #71, check C24).
+    Narrowly scoped: only reached from a broken-stdout shape."""
+    _silence_broken_stream("stdout")
     return 0
 
 
 def _is_broken_stdout_flush(exc: OSError) -> bool:
     """Windows reports the dead pipe at flush time as a plain OSError with
-    errno EINVAL (22), not BrokenPipeError; POSIX raises EPIPE. Only a
-    failure flushing sys.stdout is this shape — the guard that consults this
-    predicate wraps the stdout flush alone, never the dispatch, so unrelated
-    storage/runtime OSErrors keep propagating."""
-    return exc.errno in (errno.EINVAL, errno.EPIPE)
+    errno EINVAL (22), not BrokenPipeError; POSIX raises EPIPE. A closed
+    descriptor raises EBADF. Only a failure flushing sys.stdout is this shape
+    — the guard that consults this predicate wraps the stdout flush alone,
+    never the dispatch, so unrelated storage/runtime OSErrors keep propagating."""
+    return exc.errno in (errno.EINVAL, errno.EPIPE, errno.EBADF)
 
 
 def _runtime_catchall(args: argparse.Namespace, exc: Exception) -> int:
@@ -4590,6 +4620,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            _quiet_flush_exit(0)
+        raise
     except UsageError as exc:
         # A failed parse answers the structured envelope under a machine
         # format (issue #72 AC12); text mode on a TTY keeps the human line.

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **CLI stream boundaries:** A closed stdout or stderr descriptor now preserves
+  the command's intended exit code, and successful help/version exits quietly
+  when stdout's pipe reader has closed.
+
 ## [0.6.0] - 2026-11-25
 
 Output-contract honesty and the self-describing surface on schema v12
