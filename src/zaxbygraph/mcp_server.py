@@ -2901,7 +2901,9 @@ _TOOL_SHAPES: dict[str, dict] = {
         " open issues, newest first, with parsed evidence (token, author,"
         " association, age, named issues) and the matched text wrapped as"
         " untrusted_text. Derived from stored comments by default (ages from"
-        " the store's last sync time); live=true reads the repo-wide"
+        " the last incremental listing stamp or a later-dated claim's latest"
+        " observation proof);"
+        " live=true reads the repo-wide"
         " comments feed from GitHub with wall-clock ages.",
         # FB-024: `claims`/`stale_claims` are CONDITIONAL, not
         # always-present. A live read that FAILED must not fabricate an empty

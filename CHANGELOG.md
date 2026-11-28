@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.6.1] - 2026-11-28
+
+Claim observation ages on schema v12 (CURRENT_USER_VERSION 12; no schema
+change, and the 20-tool MCP registry digest is unchanged from 0.6.0).
+
+- **#100** A trusted claim ingested by a targeted refresh (`sync --numbers`)
+  is reported active with a truthful, non-negative age and gates its issue
+  across the derived claims listing, triage, bundle, brief, and MCP surfaces
+  when the store holds a proof that it observed the claim: the newest
+  successful fetch of its issue, selected in ingestion order, or that issue's
+  stored update time when it is later and at or after the claim. The stored
+  update time counts only beside a readable logged fetch: it proves the claim
+  existed by then, not when the store observed it. A claim without such proof
+  remains inactive and gates nothing, and a caller-supplied as-of view remains
+  strict. (Acceptance criteria AC1, AC2, AC5 and AC8 of the issue.)
+- **Clock skew, stated because it is visible.** Beside a logged fetch the
+  reported age is exact when the local clock is synchronized with GitHub. On
+  a clock that runs behind the age is understated by at most the clock's lag,
+  so a claim that is truly past the window can read active for up to that
+  lag; on a clock that runs ahead, ages are overstated and expiry can come
+  early.
+
 ## [0.6.0] - 2026-11-25
 
 Output-contract honesty and the self-describing surface on schema v12
