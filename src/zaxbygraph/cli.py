@@ -90,11 +90,22 @@ def _force_utf8_streams() -> None:
             pass
 
 
+def _stdout_is_tty() -> bool:
+    """A missing or unusable stdout is non-interactive."""
+    stream = sys.stdout
+    if stream is None:
+        return False
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def _format_of(args: argparse.Namespace) -> str:
     fmt = getattr(args, "format", None)
     if fmt in ("json", "compact", "jsonl", "text"):
         return fmt
-    return "text" if sys.stdout.isatty() else "json"
+    return "text" if _stdout_is_tty() else "json"
 
 
 def _fields_of(args: argparse.Namespace) -> list[str]:
@@ -4481,7 +4492,7 @@ def _usage_envelope_exit(
         elif name == "--repo" and (sep or i + 1 < len(argv)):
             repo = value if sep else (argv[i + 1] if i + 1 < len(argv) else None)
     if fmt is None:
-        fmt = "json" if not sys.stdout.isatty() else "text"
+        fmt = "json" if not _stdout_is_tty() else "text"
     error = {"code": "bad_request", "message": exc.message}
     if exc.hint:
         error["hint"] = exc.hint

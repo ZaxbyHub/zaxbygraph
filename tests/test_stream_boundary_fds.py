@@ -35,8 +35,26 @@ if mode in ("fail-enospc", "fail-eio"):
     sys.stdout = FailingWriter(
         errno.ENOSPC if mode == "fail-enospc" else errno.EIO
     )
+    from zaxbygraph.cli import main
+
+    argv = sys.argv[1:]
+    try:
+        code = main(argv)
+    except OSError as exc:
+        number = sys.stdout.number
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if exc.errno != number:
+            raise
+        print(f"PROPAGATED:{exc.errno}", file=sys.stderr)
+        raise SystemExit(0)
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    print(f"SWALLOWED:{code}", file=sys.stderr)
+    raise SystemExit(1)
 elif mode == "none-stdout":
     sys.stdout = None
+elif mode == "none-both":
+    sys.stdout = None
+    sys.stderr = None
 elif mode == "none-stderr":
     sys.stderr = None
 elif mode == "closed-stdout-silence-write":
@@ -90,16 +108,15 @@ class StreamBoundaryFileDescriptorTests(unittest.TestCase):
             check=False,
         )
 
-    def missing_corpus_args(self) -> tuple[str, ...]:
-        return (
+    def missing_corpus_args(self, *, include_format: bool = True) -> tuple[str, ...]:
+        args = (
             "status",
             "--db",
             self.db_path,
             "--repo",
             "acme/widgets",
-            "--format",
-            "json",
         )
+        return args + (("--format", "json") if include_format else ())
 
     def assert_no_shutdown_noise(self, result: subprocess.CompletedProcess[str]) -> None:
         combined = result.stdout + result.stderr
@@ -150,13 +167,14 @@ class StreamBoundaryFileDescriptorTests(unittest.TestCase):
         self.assertEqual(usage_envelope["error"]["code"], "bad_request")
         self.assertEqual(usage_error.stderr, "")
 
-    def test_other_stdout_os_errors_are_not_swallowed(self) -> None:
-        for mode in ("fail-enospc", "fail-eio"):
+    def test_other_stdout_os_errors_propagate_from_main(self) -> None:
+        for mode, number in (("fail-enospc", errno.ENOSPC), ("fail-eio", errno.EIO)):
             with self.subTest(mode=mode):
                 result = self.run_cli(mode, *self.missing_corpus_args())
 
-                self.assertNotEqual(result.returncode, 0, result.stdout)
-                self.assertIn("forced stream failure", result.stderr)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"PROPAGATED:{number}", result.stderr)
+                self.assertNotIn("SWALLOWED", result.stderr)
 
     def test_stdout_remains_writable_after_silencing_closed_fd(self) -> None:
         result = self.run_cli(
@@ -178,7 +196,9 @@ class StreamBoundaryFileDescriptorTests(unittest.TestCase):
                 self.assertNotIn("Traceback", result.stderr)
 
     def test_none_stdout_keeps_command_exit_without_traceback(self) -> None:
-        result = self.run_cli("none-stdout", *self.missing_corpus_args())
+        result = self.run_cli(
+            "none-stdout", *self.missing_corpus_args(include_format=False)
+        )
 
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -194,6 +214,34 @@ class StreamBoundaryFileDescriptorTests(unittest.TestCase):
         self.assertTrue(result.stdout.endswith("\n"))
         self.assertFalse(result.stdout.endswith("\n\n"))
         self.assertEqual(result.stderr, "")
+
+    def test_none_stdout_default_format_covers_both_streams(self) -> None:
+        result = self.run_cli(
+            "none-stdout", "status", "--db", self.db_path, "--repo", "acme/widgets"
+        )
+
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_none_stdout_bad_slug_keeps_validation_exit(self) -> None:
+        bad_slug = self.run_cli(
+            "none-stdout", "status", "--db", self.db_path, "--repo", "bad!!slug"
+        )
+        self.assertEqual(bad_slug.returncode, 2, bad_slug.stderr)
+        self.assertNotIn("Traceback", bad_slug.stderr)
+
+    def test_none_both_keeps_default_format_exit(self) -> None:
+        result = self.run_cli(
+            "none-both", "status", "--db", self.db_path, "--repo", "acme/widgets"
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_none_stdout_usage_error_keeps_usage_exit(self) -> None:
+        result = self.run_cli("none-stdout", "sql", "--bogus")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_in_process_none_stdout_version_still_raises_system_exit(self) -> None:
         saved_stdout = sys.stdout
