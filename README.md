@@ -507,11 +507,26 @@ every open PR whose closing references name one of the given issues
 
 `claims` lists every claim on open issues — active and stale, newest
 first, untrusted claims included with `trusted: false` (they never gate) —
-derived from stored comments with ages measured from the store's last sync
-time (`derived: true`); the claimed gate in `triage` withholds exactly the
-active trusted claims' issues from the ranking. Read `claims` instead of
-sweeping the comments table with SQL; an empty answer can mean the store
-is stale, so refresh with `--max-age` (or re-sync) before trusting it.
+derived from stored comments (`derived: true`). Derived ages are measured from
+the store's last incremental listing sync time (or the latest completed full
+sync's when no incremental sync has run) or, for a claim dated after that
+anchor, from the store's latest proof that it observed that claim: the newest
+successful fetch of its
+issue, or its issue's stored update time when that is later and at or after the
+claim. Never the wall clock. An issue with no logged fetch whose time is readable
+gives no proof: such a claim stays inactive until that issue is fetched again or
+the listing stamp passes it. On a lagging clock, a comment landing between the
+issue-payload and comments requests can remain without a qualifying proof and
+stays inactive until a later fetch or listing supplies one. Beside a logged fetch
+the reported age is exact when the local clock is synchronized with GitHub, or
+understated by at most the clock's lag when the clock is behind, and the derived
+and live listings can then disagree, so on a lagging clock a claim that is truly
+past the window can read active for up to the clock's lag; a local clock that
+runs ahead overstates ages, so expiry can come early. The claimed gate in
+`triage` withholds exactly the active trusted claims' issues from the ranking.
+Read `claims` instead of sweeping the comments table with SQL; an empty answer
+can mean the store is stale, so refresh with `--max-age` (or re-sync) before
+trusting it.
 `claims --live` reads the repo-wide comment feed from GitHub at call time
 (`live: true`, `derived: false`, wall-clock ages, each candidate
 re-validated through its own issue read plus the open-PR list); the store

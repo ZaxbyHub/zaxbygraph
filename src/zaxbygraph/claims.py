@@ -509,6 +509,8 @@ def collect_claims(
     rows: Sequence[Sequence],
     cfg: dict,
     asof: str | None,
+    *,
+    reanchor_newer_rows: bool = False,
 ) -> list[dict]:
     """The FULL canonical claim list over comment rows, ascending by
     ``(created_at, github_id)`` (every listing order is derived from this).
@@ -519,11 +521,28 @@ def collect_claims(
     which carry comment ids and item titles without re-parsing URLs).
 
     A claim is ACTIVE iff its author association is trusted, it was created
-    at/before ``asof`` with ``0 <= age < window_hours``, no LATER release on
-    the same issue matches its token shape, and claims are enabled. Rows
+    at/before its anchor with ``0 <= age < window_hours``, no LATER release
+    on the same issue matches its token shape, and claims are enabled. Rows
     outside those rules are still LISTED (with ``trusted``/``active``
     flags); they simply gate nothing. Open-ness is the caller's row
     selection.
+
+    Derived ages use the store's last incremental listing sync time (the
+    latest completed full sync's when no incremental sync has run), or for a
+    claim dated after that anchor, the newest successful fetch of its issue
+    or that issue's stored update time when later and at/after the claim.
+    "Newest" means newest row in fetch-log ingestion order, never the
+    greatest timestamp. The update time is admitted only beside a readable
+    logged fetch: it proves the claim existed by then but does not say when
+    the store observed it. Without a readable logged fetch there is no
+    proof, and the stamp remains the anchor.
+    This is never the wall clock. A lagging clock can leave a request-gap
+    comment without a qualifying proof until a later fetch or listing supplies
+    one. Beside a logged fetch, age is exact on a synchronized clock or
+    understated by at most the lag when the clock is behind; expiry can then
+    be late by at most that lag, while a clock ahead overstates age and can
+    expire claims early. Pass ``reanchor_newer_rows=True`` only for a derived
+    listing-stamp anchor; callers that supply ``asof`` retain strict behavior.
     """
     titles = _item_titles(conn, repo)
     asof_dt = _parse_instant(asof)
@@ -578,6 +597,9 @@ def collect_claims(
             )
             continue
 
+    proofs_by_issue: dict[
+        int, tuple[datetime | None, datetime | None] | None
+    ] = {}
     out: list[dict] = []
     for number, claims in claims_by_issue.items():
         claims.sort(key=lambda c: c["_key"])
@@ -591,9 +613,22 @@ def collect_claims(
                 for release in releases
             )
             created = _parse_instant(claim["created_at"])
+            anchor_dt = asof_dt
+            if (
+                reanchor_newer_rows
+                and conn is not None
+                and asof_dt is not None
+                and created is not None
+                and created > asof_dt
+            ):
+                if number not in proofs_by_issue:
+                    proofs_by_issue[number] = _issue_proofs(conn, repo, number)
+                observed = _claim_anchor(proofs_by_issue[number], created)
+                if observed is not None:
+                    anchor_dt = observed
             age_hours = (
-                (asof_dt - created).total_seconds() / 3600.0
-                if asof_dt is not None and created is not None
+                (anchor_dt - created).total_seconds() / 3600.0
+                if anchor_dt is not None and created is not None
                 else None
             )
             active = bool(
@@ -612,6 +647,64 @@ def collect_claims(
             out.append(entry)
     out.sort(key=lambda c: (str(c.get("created_at") or ""), c.get("comment_id") or 0))
     return out
+
+
+def _issue_proofs(
+    conn: sqlite3.Connection | None, repo: str, number: int
+) -> tuple[datetime | None, datetime | None] | None:
+    """Read the raw observation proofs for one issue: its newest eligible
+    successful item fetch in ingestion order, and its stored issue update time.
+
+    "Newest fetch" means the eligible row with greatest ``id``, never the
+    greatest timestamp; the insertion order remains truthful if the local
+    clock steps backwards. The issue's ``updated_at`` is considered only
+    beside a readable logged fetch: a comment bumps that GitHub timestamp, so
+    it proves the claim existed by then, but does not say when the store
+    observed it. Without the fetch row there is no observation proof.
+
+    Each timestamp is parsed here; the caller qualifies both independently
+    against each claim's creation time. A failed fetch query or unreadable
+    fetch timestamp means there is no proof. A failed item query only removes
+    the update-time candidate, leaving a readable fetch usable.
+    """
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT fetched_at FROM fetch_log"
+            " WHERE repo = ? AND resource = 'item' AND resource_id = ?"
+            " AND http_status = 200 AND note IS NULL ORDER BY id DESC LIMIT 1",
+            (repo, str(number)),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    fetched = _parse_instant(row[0])
+    if fetched is None:
+        return None
+    updated = None
+    try:
+        row = conn.execute(
+            "SELECT updated_at FROM items"
+            " WHERE repo = ? AND number = ? AND kind = 'issue'",
+            (repo, number),
+        ).fetchone()
+        updated = _parse_instant(row[0]) if row is not None else None
+    except sqlite3.Error:
+        pass
+    return fetched, updated
+
+
+def _claim_anchor(
+    proofs: tuple[datetime | None, datetime | None] | None, created: datetime
+) -> datetime | None:
+    """Return the greatest parsed proof at or after this claim, if any."""
+    best = None
+    for value in proofs or ():
+        if value is not None and value >= created and (best is None or value > best):
+            best = value
+    return best
 
 
 def _store_claim_rows(conn: sqlite3.Connection, repo: str) -> list[tuple]:
@@ -649,12 +742,15 @@ def claims_gate_by_number(
     or one naming it in its ``issues=``/prose references)."""
     if cfg is None:
         cfg = load_claims_config()
-    if asof is None:
+    derived_default = asof is None
+    if derived_default:
         asof = _sync_stamp(conn, repo)
     if not bool(cfg.get("enabled", True)):
         return {}
     rows = _store_claim_rows(conn, repo)
-    full = collect_claims(conn, repo, rows, cfg, asof)
+    full = collect_claims(
+        conn, repo, rows, cfg, asof, reanchor_newer_rows=derived_default
+    )
     open_numbers: set[int] = set()
     try:
         open_numbers = {
@@ -690,10 +786,13 @@ def claims_listing(
     FIRST (the reverse of the (created_at, github_id) ordering), the
     window-expired subset under ``stale_claims`` with its ages, and the
     values-in-effect echo."""
-    if asof is None:
+    derived_default = asof is None
+    if derived_default:
         asof = _sync_stamp(conn, repo)
     rows = _store_claim_rows(conn, repo)
-    full = collect_claims(conn, repo, rows, cfg, asof)
+    full = collect_claims(
+        conn, repo, rows, cfg, asof, reanchor_newer_rows=derived_default
+    )
     newest_first = list(reversed(full))
     window = float(cfg.get("window_hours", 72) or 0)
     stale = [

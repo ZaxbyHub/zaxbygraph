@@ -2359,8 +2359,16 @@ def _claims_query(
     db_path: Path | None = None,
 ) -> dict:
     """The derived `claims` listing: stored comments of the repo's open
-    issues, classified under the [claims] values in effect, ages measured
-    from the store's last sync time (never the wall clock)."""
+    issues, classified under the [claims] values in effect. Ages use the last
+    incremental listing stamp (the latest completed full sync's when no
+    incremental sync has run) or, for a claim dated after it, the newest
+    successful issue fetch or its stored update time when later and at/after
+    the claim. Fetch
+    recency is ingestion order, never timestamp order; the update time counts
+    only beside a readable logged fetch, since it proves existence but not
+    when the store observed it. Without that fetch there is no proof, and a
+    request-gap comment on a lagging clock can stay inactive until a later
+    fetch or listing. Never the wall clock."""
     store_cfg, cwd_cfg, explicit = _resolve_weight_config(db_path, config)
     cfg = claims_mod.load_claims_config(store_cfg, cwd_cfg, explicit)
     return claims_mod.claims_listing(conn, repo, cfg)

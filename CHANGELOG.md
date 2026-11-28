@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.1] - 2026-11-28
+
+Claim observation ages on schema v12 (CURRENT_USER_VERSION 12; no schema
+change, and the 20-tool MCP registry digest is unchanged from 0.6.0).
+
+- **#100** A trusted claim ingested by a targeted refresh is reported active
+  with a truthful, non-negative age and gates its issue across the derived
+  claims listing, triage, bundle, brief, and MCP surfaces when a readable
+  successful issue fetch or qualifying stored issue update proves the store
+  observed it. Claims without such proof remain inactive; the newest fetch is
+  selected in ingestion order, and caller-supplied as-of views remain strict.
+
 ## [0.6.0] - 2026-11-25
 
 Output-contract honesty and the self-describing surface on schema v12
