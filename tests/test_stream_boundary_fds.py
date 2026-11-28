@@ -10,6 +10,7 @@ import tempfile
 import unittest
 
 from zaxbygraph.cli import main
+from test_output_contract_92_93_e import seed_corpus
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,36 +20,50 @@ import runpy
 import sys
 
 mode = sys.argv.pop(1)
-if mode in ("fail-enospc", "fail-eio"):
+if mode.startswith("stdout-") or mode.startswith("stderr-"):
     import errno
 
-    class FailingWriter:
-        def __init__(self, number):
+    class ConfigurableWriter:
+        def __init__(self, failing_operation, number):
+            self.failing_operation = failing_operation
             self.number = number
 
         def write(self, text):
-            raise OSError(self.number, "forced stream failure")
+            if self.failing_operation == "write":
+                raise OSError(self.number, "forced stream failure")
 
         def flush(self):
-            raise OSError(self.number, "forced stream failure")
+            if self.failing_operation == "flush":
+                raise OSError(self.number, "forced stream failure")
 
-    sys.stdout = FailingWriter(
-        errno.ENOSPC if mode == "fail-enospc" else errno.EIO
-    )
+    operation, failure, error_name = mode.split("-")
+    number = getattr(errno, error_name.upper())
+    writer = ConfigurableWriter(failure, number)
+    if operation == "stdout":
+        sys.stdout = writer
+    else:
+        sys.stderr = writer
+
     from zaxbygraph.cli import main
 
     argv = sys.argv[1:]
+    marker = sys.__stderr__ if operation == "stderr" else sys.stderr
     try:
         code = main(argv)
     except OSError as exc:
-        number = sys.stdout.number
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        if operation == "stdout":
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")
+        else:
+            sys.stderr = sys.__stderr__
         if exc.errno != number:
             raise
-        print(f"PROPAGATED:{exc.errno}", file=sys.stderr)
+        print(f"PROPAGATED:{exc.errno}", file=marker)
         raise SystemExit(0)
-    sys.stdout = open(os.devnull, "w", encoding="utf-8")
-    print(f"SWALLOWED:{code}", file=sys.stderr)
+    if operation == "stdout":
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    else:
+        sys.stderr = sys.__stderr__
+    print(f"SWALLOWED:{code}", file=marker)
     raise SystemExit(1)
 elif mode == "none-stdout":
     sys.stdout = None
@@ -167,11 +182,46 @@ class StreamBoundaryFileDescriptorTests(unittest.TestCase):
         self.assertEqual(usage_envelope["error"]["code"], "bad_request")
         self.assertEqual(usage_error.stderr, "")
 
-    def test_other_stdout_os_errors_propagate_from_main(self) -> None:
-        for mode, number in (("fail-enospc", errno.ENOSPC), ("fail-eio", errno.EIO)):
-            with self.subTest(mode=mode):
-                result = self.run_cli(mode, *self.missing_corpus_args())
+    def test_write_os_errors_propagate_for_failure_and_success(self) -> None:
+        seeded_db = Path(self.temp_dir.name) / "seeded.db"
+        seed_corpus(seeded_db)
+        command_args_set = (
+            self.missing_corpus_args(),
+            (
+                "status",
+                "--db",
+                str(seeded_db),
+                "--repo",
+                "acme/widgets",
+                "--format",
+                "json",
+            ),
+        )
+        for name, number in (("enospc", errno.ENOSPC), ("eio", errno.EIO)):
+            for command_args in command_args_set:
+                with self.subTest(error=name, command=command_args[0]):
+                    result = self.run_cli(f"stdout-write-{name}", *command_args)
 
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(f"PROPAGATED:{number}", result.stderr)
+                    self.assertNotIn("SWALLOWED", result.stderr)
+
+    def test_flush_os_errors_propagate(self) -> None:
+        for name, number in (("enospc", errno.ENOSPC), ("eio", errno.EIO)):
+            with self.subTest(error=name):
+                result = self.run_cli(
+                    f"stdout-flush-{name}", *self.missing_corpus_args()
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"PROPAGATED:{number}", result.stderr)
+                self.assertNotIn("SWALLOWED", result.stderr)
+
+    def test_stderr_human_echo_propagates_non_dead_os_errors(self) -> None:
+        for name, number in (("enospc", errno.ENOSPC), ("eio", errno.EIO)):
+            with self.subTest(error=name):
+                result = self.run_cli(
+                    f"stderr-write-{name}", *self.missing_corpus_args()
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"PROPAGATED:{number}", result.stderr)
                 self.assertNotIn("SWALLOWED", result.stderr)

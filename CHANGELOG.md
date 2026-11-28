@@ -5,10 +5,10 @@
 - **CLI stream boundaries:** A stdout or stderr descriptor closed after process
   start, or a standard stream that is `None` at CLI start, now preserves the
   command's intended exit code and machine-output contract, including default
-  JSON selection when stdout is unavailable. Successful help/version exits
-  quietly when stdout is unavailable. Non-dead-stream write/flush errors still
-  propagate. These one-shot stream replacements are scoped to the CLI; the MCP
-  stdio server is not covered.
+  JSON selection when stdout is unavailable. Help/version with stdout unavailable
+  exit 0 without a traceback; help/version on a dead pipe exit quietly.
+  Non-dead-stream write/flush errors still propagate. These one-shot stream
+  replacements are scoped to the CLI; the MCP stdio server is not covered.
 
 ## [0.6.0] - 2026-11-25
 
