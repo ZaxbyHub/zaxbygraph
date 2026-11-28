@@ -399,7 +399,8 @@ def _write_stdout(text: str) -> None:
     no-op), and the caller returns normally so the command keeps its OWN
     exit code instead of a flattened 0."""
     global _STDOUT_DEAD
-    if _STDOUT_DEAD:
+    if _STDOUT_DEAD or sys.stdout is None:
+        _STDOUT_DEAD = True
         return
     try:
         sys.stdout.write(text)
@@ -424,6 +425,8 @@ def _echo_stderr(text: str) -> None:
     EBADF — is absorbed HERE so the command still renders its envelope on a
     live stdout and returns its OWN exit code instead of feeding the
     dispatch-level dead-pipe arm a bare 0."""
+    if sys.stderr is None:
+        return
     try:
         print(text, file=sys.stderr)
     except BrokenPipeError:
@@ -4495,13 +4498,15 @@ def _usage_envelope_exit(
 def _silence_broken_stream(name: str) -> None:
     """Give a broken standard stream a valid destination for shutdown."""
     stream = getattr(sys, name)
+    if stream is None:
+        return
     try:
         stream.flush()
-    except (BrokenPipeError, OSError):
+    except (AttributeError, BrokenPipeError, OSError):
         pass
     try:
         fd = stream.fileno()
-    except (OSError, ValueError):
+    except (AttributeError, OSError, ValueError):
         return
     try:
         devnull = os.open(os.devnull, os.O_WRONLY)
@@ -4600,10 +4605,12 @@ def _quiet_flush_exit(code: int) -> int:
     OSError ('Exception ignored ... [Errno 22]') and the process exited
     120 instead of the arm's code. Here the dead flush is silenced
     (devnull on fd 1) and the arm's OWN code returns."""
+    if sys.stdout is None:
+        return code
     try:
         sys.stdout.flush()
-    except (BrokenPipeError, OSError) as exc:
-        if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+    except (AttributeError, BrokenPipeError, OSError) as exc:
+        if isinstance(exc, (AttributeError, BrokenPipeError)) or _is_broken_stdout_flush(exc):
             _silence_broken_stdout()
             return code
         raise
@@ -4671,15 +4678,17 @@ def main(argv: list[str] | None = None) -> int:
             # cannot turn the coded runtime exit 1 into the interpreter's
             # unraisable-flush 120.
             return _quiet_flush_exit(_runtime_catchall(args, exc))
+        if sys.stdout is None:
+            return code
         try:
             sys.stdout.flush()
-        except (BrokenPipeError, OSError) as exc:
+        except (AttributeError, BrokenPipeError, OSError) as exc:
             # The shutdown-time shape: the output sat buffered past dispatch
             # and the interpreter's exit flush hit the dead pipe (Windows
             # EINVAL). The dispatched command's OWN code survives the dead
             # flush (issues #92/#93 AC1): a failure keeps 1/2/3/4/5/6, a
             # success 0.
-            if isinstance(exc, BrokenPipeError) or _is_broken_stdout_flush(exc):
+            if isinstance(exc, (AttributeError, BrokenPipeError)) or _is_broken_stdout_flush(exc):
                 _silence_broken_stdout()
                 return code
             raise

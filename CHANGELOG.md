@@ -2,9 +2,11 @@
 
 ## Unreleased
 
-- **CLI stream boundaries:** A closed stdout or stderr descriptor now preserves
-  the command's intended exit code, and successful help/version exits quietly
-  when stdout's pipe reader has closed.
+- **CLI stream boundaries:** A stdout or stderr descriptor closed after process
+  start, or a standard stream that is `None` at CLI start, now preserves the
+  command's intended exit code and machine-output contract. Successful
+  help/version exits quietly when stdout is unavailable. These one-shot stream
+  replacements are scoped to the CLI; the MCP stdio server is not covered.
 
 ## [0.6.0] - 2026-11-25
 
